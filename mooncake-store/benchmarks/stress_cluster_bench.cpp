@@ -1,3 +1,4 @@
+#include <numa.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -48,6 +49,8 @@ DEFINE_uint64(wait_seconds, 5,
               "Seconds to wait before reading (for remote scenarios)");
 DEFINE_bool(verify, true, "Verify data integrity after read");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
+DEFINE_bool(hard_pin, false,
+            "Pin objects to prevent eviction during benchmark");
 
 using Clock = std::chrono::steady_clock;
 using Nanos = std::chrono::nanoseconds;
@@ -212,6 +215,7 @@ class StressBenchmark {
         if (client_) {
             if (buffer_) {
                 client_->unregister_buffer(buffer_);
+                numa_free(buffer_, buffer_size_);
                 buffer_ = nullptr;
             }
             client_->tearDownAll();
@@ -231,9 +235,8 @@ class StressBenchmark {
         LOG(INFO) << "RealClient setup succeeded";
 
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
-        int err = posix_memalign(reinterpret_cast<void**>(&buffer_), 4096,
-                                 buffer_size_);
-        if (err != 0 || !buffer_) {
+        buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));                         
+        if (!buffer_) {
             LOG(ERROR) << "Failed to allocate buffer of " << buffer_size_
                        << " bytes";
             return -1;
@@ -256,6 +259,7 @@ class StressBenchmark {
 
         mooncake::ReplicateConfig config;
         config.replica_num = FLAGS_replica_num;
+        config.with_hard_pin = FLAGS_hard_pin;
 
         size_t written = 0;
         size_t failed = 0;
@@ -363,6 +367,7 @@ class StressBenchmark {
 
         mooncake::ReplicateConfig config;
         config.replica_num = FLAGS_replica_num;
+        config.with_hard_pin = FLAGS_hard_pin;
 
         LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys << " keys...";
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
@@ -435,6 +440,7 @@ class StressBenchmark {
 
         mooncake::ReplicateConfig config;
         config.replica_num = FLAGS_replica_num;
+        config.with_hard_pin = FLAGS_hard_pin;
 
         LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys
                   << " keys (data may be offloaded to SSD)...";
@@ -701,8 +707,18 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
+    LOG(INFO) << "  Hard pin:       " << (FLAGS_hard_pin ? "yes" : "no");
     LOG(INFO) << "  SSD offload:    "
               << (FLAGS_enable_ssd_offload ? "yes" : "no");
+
+    size_t total_data = FLAGS_num_keys * FLAGS_value_size;
+    if (total_data > FLAGS_global_segment_size * 9.5 / 10) {
+        LOG(WARNING) << "Total data (" << total_data / MB << " MB) may exceed "
+                     << "95% of segment (" << FLAGS_global_segment_size / MB
+                     << " MB). Master eviction may delete objects. "
+                     << "Consider increasing --global_segment_size or "
+                     << "decreasing --num_keys, or use --hard_pin=true.";
+    }
 
     StressBenchmark bench;
     int ret = bench.Setup();
