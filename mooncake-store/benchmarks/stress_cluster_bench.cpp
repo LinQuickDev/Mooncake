@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -7,9 +6,7 @@
 #include <iostream>
 #include <latch>
 #include <memory>
-#include <mutex>
 #include <numeric>
-#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -53,10 +50,18 @@ DEFINE_bool(verify, true, "Verify data integrity after read");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 
 using Clock = std::chrono::steady_clock;
-using Duration = std::chrono::duration<double>;
+using Nanos = std::chrono::nanoseconds;
+
+inline int64_t ElapsedNanos(Clock::time_point t0, Clock::time_point t1) {
+    return std::chrono::duration_cast<Nanos>(t1 - t0).count();
+}
+
+inline double NanosToUs(int64_t ns) { return static_cast<double>(ns) / 1000.0; }
+inline double NanosToMs(int64_t ns) { return static_cast<double>(ns) / 1000000.0; }
+inline double NanosToSec(int64_t ns) { return static_cast<double>(ns) / 1e9; }
 
 struct ThreadResult {
-    std::vector<double> latencies_ms;
+    std::vector<int64_t> latencies_ns;
     size_t total_bytes = 0;
     size_t total_ops = 0;
     size_t failed_ops = 0;
@@ -74,40 +79,44 @@ class BenchmarkStats {
     void StartTimer() { start_ = Clock::now(); }
     void StopTimer() { end_ = Clock::now(); }
 
-    double WallSeconds() const { return Duration(end_ - start_).count(); }
+    double WallSeconds() const {
+        return NanosToSec(ElapsedNanos(start_, end_));
+    }
 
     void Finalize() {
-        merged_latencies_.clear();
+        merged_latencies_ns_.clear();
         total_bytes_ = 0;
         total_ops_ = 0;
         total_failed_ = 0;
 
         for (auto& tr : thread_results_) {
-            merged_latencies_.insert(merged_latencies_.end(),
-                                     tr.latencies_ms.begin(),
-                                     tr.latencies_ms.end());
+            merged_latencies_ns_.insert(merged_latencies_ns_.end(),
+                                        tr.latencies_ns.begin(),
+                                        tr.latencies_ns.end());
             total_bytes_ += tr.total_bytes;
             total_ops_ += tr.total_ops;
             total_failed_ += tr.failed_ops;
         }
-        std::sort(merged_latencies_.begin(), merged_latencies_.end());
+        std::sort(merged_latencies_ns_.begin(), merged_latencies_ns_.end());
     }
 
-    double Percentile(double p) const {
-        if (merged_latencies_.empty()) return 0.0;
-        double rank = (p / 100.0) * (merged_latencies_.size() - 1);
+    double PercentileUs(double p) const {
+        if (merged_latencies_ns_.empty()) return 0.0;
+        double rank = (p / 100.0) * (merged_latencies_ns_.size() - 1);
         size_t lo = static_cast<size_t>(rank);
-        size_t hi = std::min(lo + 1, merged_latencies_.size() - 1);
+        size_t hi = std::min(lo + 1, merged_latencies_ns_.size() - 1);
         double frac = rank - lo;
-        return merged_latencies_[lo] * (1.0 - frac) +
-               merged_latencies_[hi] * frac;
+        int64_t ns_val = static_cast<int64_t>(
+            merged_latencies_ns_[lo] * (1.0 - frac) +
+            merged_latencies_ns_[hi] * frac);
+        return NanosToUs(ns_val);
     }
 
-    double MeanLatency() const {
-        if (merged_latencies_.empty()) return 0.0;
-        double sum = std::accumulate(merged_latencies_.begin(),
-                                     merged_latencies_.end(), 0.0);
-        return sum / merged_latencies_.size();
+    double MeanLatencyUs() const {
+        if (merged_latencies_ns_.empty()) return 0.0;
+        int64_t sum = std::accumulate(merged_latencies_ns_.begin(),
+                                      merged_latencies_ns_.end(), int64_t(0));
+        return NanosToUs(sum / static_cast<int64_t>(merged_latencies_ns_.size()));
     }
 
     double ThroughputMBps() const {
@@ -142,25 +151,25 @@ class BenchmarkStats {
         std::cout << "\n";
         std::cout << "  Ops/sec:          " << OpsPerSec() << "\n";
 
-        if (!merged_latencies_.empty()) {
-            size_t n = merged_latencies_.size();
-            std::cout << "\n  Latency (ms)      [n=" << n << "]\n";
-            std::cout << "    Min:   " << std::setw(10)
-                      << merged_latencies_.front() << "\n";
-            std::cout << "    Mean:  " << std::setw(10) << MeanLatency()
+        if (!merged_latencies_ns_.empty()) {
+            size_t n = merged_latencies_ns_.size();
+            std::cout << "\n  Latency (us)      [n=" << n << "]\n";
+            std::cout << "    Min:   " << std::setw(12)
+                      << NanosToUs(merged_latencies_ns_.front()) << "\n";
+            std::cout << "    Mean:  " << std::setw(12) << MeanLatencyUs()
                       << "\n";
-            std::cout << "    P50:   " << std::setw(10) << Percentile(50)
+            std::cout << "    P50:   " << std::setw(12) << PercentileUs(50)
                       << "\n";
-            std::cout << "    P90:   " << std::setw(10) << Percentile(90)
+            std::cout << "    P90:   " << std::setw(12) << PercentileUs(90)
                       << "\n";
-            std::cout << "    P99:   " << std::setw(10) << Percentile(99);
+            std::cout << "    P99:   " << std::setw(12) << PercentileUs(99);
             if (n < 100) std::cout << "  (n<100)";
             std::cout << "\n";
-            std::cout << "    P999:  " << std::setw(10) << Percentile(99.9);
+            std::cout << "    P999:  " << std::setw(12) << PercentileUs(99.9);
             if (n < 1000) std::cout << "  (n<1000)";
             std::cout << "\n";
-            std::cout << "    Max:   " << std::setw(10)
-                      << merged_latencies_.back() << "\n";
+            std::cout << "    Max:   " << std::setw(12)
+                      << NanosToUs(merged_latencies_ns_.back()) << "\n";
         }
         std::cout << "========================================"
                   << "========================================\n\n";
@@ -183,7 +192,7 @@ class BenchmarkStats {
     }
 
     std::vector<ThreadResult> thread_results_;
-    std::vector<double> merged_latencies_;
+    std::vector<int64_t> merged_latencies_ns_;
     size_t total_bytes_ = 0;
     size_t total_ops_ = 0;
     size_t total_failed_ = 0;
@@ -268,9 +277,9 @@ class StressBenchmark {
             ++written;
 
             if ((i + 1) % 10 == 0 || i == FLAGS_num_keys - 1) {
-                double elapsed = Duration(t1 - t0).count();
+                double elapsed_us = NanosToUs(ElapsedNanos(t0, t1));
                 LOG(INFO) << "  Written " << (i + 1) << "/" << FLAGS_num_keys
-                          << " last_latency=" << elapsed * 1000 << " ms";
+                          << " last_latency=" << elapsed_us << " us";
             }
         }
 
@@ -570,7 +579,7 @@ class StressBenchmark {
                     BenchmarkStats& stats, std::latch& start_latch,
                     std::latch& done_latch) {
         ThreadResult& result = stats.GetThreadResult(tid);
-        result.latencies_ms.reserve(my_keys);
+        result.latencies_ns.reserve(my_keys);
 
         start_latch.arrive_and_wait();
 
@@ -587,7 +596,7 @@ class StressBenchmark {
                 int64_t ret = client_->get_into(key, buffer_, FLAGS_value_size);
                 auto t1 = Clock::now();
 
-                double lat_ms = Duration(t1 - t0).count() * 1000.0;
+                int64_t lat_ns = ElapsedNanos(t0, t1);
 
                 if (ret < 0) {
                     ++failed;
@@ -596,7 +605,7 @@ class StressBenchmark {
                 } else {
                     bytes += static_cast<size_t>(ret);
                 }
-                result.latencies_ms.push_back(lat_ms);
+                result.latencies_ns.push_back(lat_ns);
                 ++ops;
             }
         } else {
@@ -625,8 +634,8 @@ class StressBenchmark {
                 auto results = client_->batch_get_into(keys, bufs, sizes);
                 auto t1 = Clock::now();
 
-                double lat_ms = Duration(t1 - t0).count() * 1000.0;
-                result.latencies_ms.push_back(lat_ms);
+                int64_t lat_ns = ElapsedNanos(t0, t1);
+                result.latencies_ns.push_back(lat_ns);
 
                 for (size_t k = 0; k < results.size(); ++k) {
                     if (results[k] < 0) {
