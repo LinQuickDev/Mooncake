@@ -1,4 +1,5 @@
 #include <numa.h>
+#include <sched.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,32 @@ namespace {
 constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 constexpr size_t GB = 1024 * MB;
+
+const static int NR_SOCKETS =
+    numa_available() == 0 ? numa_num_configured_nodes() : 1;
+
+static void bindToSocket(int socket_id) {
+    if (numa_available() < 0) return;
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
+        socket_id = 0;
+    struct bitmask* cpu_list = numa_allocate_cpumask();
+    numa_node_to_cpus(socket_id, cpu_list);
+    int nr_possible_cpus = numa_num_possible_cpus();
+    int nr_cpus = 0;
+    for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {
+        if (numa_bitmask_isbitset(cpu_list, cpu) &&
+            numa_bitmask_isbitset(numa_all_cpus_ptr, cpu)) {
+            CPU_SET(cpu, &cpu_set);
+            ++nr_cpus;
+        }
+    }
+    numa_free_cpumask(cpu_list);
+    if (nr_cpus > 0) {
+        sched_setaffinity(0, sizeof(cpu_set), &cpu_set);
+    }
+}
 }  // namespace
 
 DEFINE_string(local_hostname, "localhost",
@@ -213,6 +240,13 @@ class StressBenchmark {
 
     ~StressBenchmark() {
         if (client_) {
+            for (auto& nb : numa_buffers_) {
+                if (nb.ptr) {
+                    client_->unregister_buffer(nb.ptr);
+                    numa_free(nb.ptr, nb.size);
+                }
+            }
+            numa_buffers_.clear();
             if (buffer_) {
                 client_->unregister_buffer(buffer_);
                 numa_free(buffer_, buffer_size_);
@@ -303,6 +337,9 @@ class StressBenchmark {
                   << FLAGS_num_threads
                   << " threads, batch_size=" << FLAGS_batch_size;
 
+        int buf_ret = AllocateNumaBuffers();
+        if (buf_ret != 0) return buf_ret;
+
         if (FLAGS_scenario == "remote_memory" ||
             FLAGS_scenario == "remote_disk") {
             LOG(INFO) << "Waiting " << FLAGS_wait_seconds
@@ -364,6 +401,9 @@ class StressBenchmark {
 
     int RunLocalMemory() {
         LOG(INFO) << "=== LOCAL MEMORY BENCHMARK ===";
+
+        int buf_ret = AllocateNumaBuffers();
+        if (buf_ret != 0) return buf_ret;
 
         mooncake::ReplicateConfig config;
         config.replica_num = FLAGS_replica_num;
@@ -437,6 +477,9 @@ class StressBenchmark {
         LOG(INFO) << "=== LOCAL DISK BENCHMARK ===";
         LOG(INFO) << "NOTE: Disk reads require Master with enable_offload=true "
                   << "and client with enable_ssd_offload=true";
+
+        int buf_ret = AllocateNumaBuffers();
+        if (buf_ret != 0) return buf_ret;
 
         mooncake::ReplicateConfig config;
         config.replica_num = FLAGS_replica_num;
@@ -584,8 +627,12 @@ class StressBenchmark {
     void ReadWorker(size_t tid, size_t my_keys, size_t key_offset,
                     BenchmarkStats& stats, std::latch& start_latch,
                     std::latch& done_latch) {
+        bindToSocket(tid % NR_SOCKETS);
+
         ThreadResult& result = stats.GetThreadResult(tid);
         result.latencies_ns.reserve(my_keys);
+
+        char* my_buf = numa_buffers_[tid % NR_SOCKETS].ptr;
 
         start_latch.arrive_and_wait();
 
@@ -599,7 +646,7 @@ class StressBenchmark {
                 std::string key = MakeKey(key_idx);
 
                 auto t0 = Clock::now();
-                int64_t ret = client_->get_into(key, buffer_, FLAGS_value_size);
+                int64_t ret = client_->get_into(key, my_buf, FLAGS_value_size);
                 auto t1 = Clock::now();
 
                 int64_t lat_ns = ElapsedNanos(t0, t1);
@@ -632,7 +679,7 @@ class StressBenchmark {
                 for (size_t j = i; j < batch_end; ++j) {
                     size_t key_idx = key_offset + j;
                     keys.push_back(MakeKey(key_idx));
-                    bufs.push_back(buffer_);
+                    bufs.push_back(my_buf);
                     sizes.push_back(FLAGS_value_size);
                 }
 
@@ -691,6 +738,41 @@ class StressBenchmark {
     std::shared_ptr<mooncake::RealClient> client_;
     char* buffer_;
     size_t buffer_size_;
+
+    struct NumaBuffer {
+        char* ptr = nullptr;
+        size_t size = 0;
+        int node = -1;
+    };
+    std::vector<NumaBuffer> numa_buffers_;
+
+    int AllocateNumaBuffers() {
+        int num_nodes = NR_SOCKETS;
+        size_t per_buf_size = FLAGS_batch_size * FLAGS_value_size;
+        numa_buffers_.resize(num_nodes);
+        for (int node = 0; node < num_nodes; ++node) {
+            numa_buffers_[node].size = per_buf_size;
+            numa_buffers_[node].node = node;
+            numa_buffers_[node].ptr =
+                reinterpret_cast<char*>(numa_alloc_onnode(per_buf_size, node));
+            if (!numa_buffers_[node].ptr) {
+                LOG(ERROR) << "Failed to allocate NUMA buffer on node " << node;
+                return -1;
+            }
+            std::memset(numa_buffers_[node].ptr, 0, per_buf_size);
+            int ret = client_->register_buffer(numa_buffers_[node].ptr,
+                                               per_buf_size);
+            if (ret != 0) {
+                LOG(ERROR) << "register_buffer failed for NUMA node " << node;
+                return ret;
+            }
+            LOG(INFO) << "Allocated and registered " << per_buf_size / MB
+                      << " MB buffer on NUMA node " << node;
+        }
+        LOG(INFO) << "Allocated " << num_nodes << " NUMA buffers, each "
+                  << per_buf_size / MB << " MB";
+        return 0;
+    }
 };
 
 int main(int argc, char* argv[]) {
