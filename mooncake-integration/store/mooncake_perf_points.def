@@ -16,8 +16,8 @@ PERF_KEY_DEF(GET_INTERNAL_MEMDISH_READ,      "GetInternal",       "MemDishRead")
 // === batch_get_buffer_internal 子步骤 ===
 PERF_KEY_DEF(GET_BATCH_INTERNAL_QUERY,       "GetBatchInternal",  "BatchQuery")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "GetBatchInternal",  "Preparation")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPL, "GetBatchInternal",  "SelectReplica")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC,       "GetBatchInternal",  "AllocBuffer")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPLICA, "GetBatchInternal",  "SelectReplica")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC_BUFFER,       "GetBatchInternal",  "AllocBuffer")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "GetBatchInternal",  "SSDRead")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"GetBatchInternal",  "MemDishRead")
 
