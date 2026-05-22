@@ -668,17 +668,16 @@ class StressBenchmark {
                   << " keys...";
         int errors = 0;
 
-        std::vector<char> read_buf(FLAGS_value_size);
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
             int64_t ret =
-                client_->get_into(key, read_buf.data(), FLAGS_value_size);
+                client_->get_into(key, buffer_, FLAGS_value_size);
             if (ret < 0) {
                 LOG(ERROR) << "Verify: get_into failed for key=" << key;
                 ++errors;
                 continue;
             }
-            if (!CheckBuffer(i, read_buf.data(), static_cast<size_t>(ret))) {
+            if (!CheckBuffer(i, buffer_, static_cast<size_t>(ret))) {
                 LOG(ERROR) << "Verify: data mismatch for key=" << key;
                 ++errors;
             }
