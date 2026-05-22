@@ -31,6 +31,11 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#ifdef UBDIAG_ENABLED
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -2371,17 +2376,24 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        pt_full.End(-1);
         return nullptr;
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
+        pt_full.End(-1);
         return nullptr;
     }
 
     // Query the object info
+    UbDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY, UbDiag::PerfLevel::MODULE);
+    pt_query.Start();
     auto query_result = client_->Query(key);
+    pt_query.End(query_result ? 0 : -1);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -2403,8 +2415,11 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // then LOCAL_DISK, then DISK.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
+    UbDiag::PerfPoint pt_select(PerfKey::GET_INTERNAL_SELECT_REPLICA, UbDiag::PerfLevel::MODULE);
+    pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    pt_select.End(best_replica ? 0 : -1);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
@@ -2418,7 +2433,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // Allocate buffer
+    UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTERNAL_ALLOC_BUFFER, UbDiag::PerfLevel::MODULE);
+    pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(total_length);
+    pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
         return nullptr;
@@ -2429,6 +2447,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
+        UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTERNAL_SSD_READ, UbDiag::PerfLevel::MODULE);
+        pt_ssd.Start();
         const auto &endpoint =
             best_replica->get_local_disk_descriptor().transport_endpoint;
         std::unordered_map<std::string, std::vector<Slice>> objects;
@@ -2436,11 +2456,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
             key, std::vector<Slice>{{buffer_handle->ptr(), total_length}});
         auto read_result =
             batch_get_into_offload_object_internal(endpoint, objects);
+        pt_ssd.End(read_result ? 0 : -1);
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
             return nullptr;
         }
+        pt_full.End(0);
         return buffer_handle;
     }
 
@@ -2455,16 +2477,21 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                      << "Ensure client_buffer_allocator_ returns host memory.";
     }
 
+    UbDiag::PerfPoint pt_memdisk(PerfKey::GET_INTERNAL_MEMDISH_READ, UbDiag::PerfLevel::MODULE);
+    pt_memdisk.Start();
     std::vector<Slice> slices;
     allocateSlices(slices, replica, buffer_handle->ptr());
     auto filtered_qr = FilterQueryResult(query_result.value(), replica);
     auto get_result = client_->Get(key, filtered_qr, slices);
+    pt_memdisk.End(get_result ? 0 : -1);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
+        pt_full.End(-1);
         return nullptr;
     }
 
+    pt_full.End(0);
     return buffer_handle;
 }
 
@@ -2658,6 +2685,8 @@ std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -2671,9 +2700,14 @@ RealClient::batch_get_buffer_internal(
     }
 
     // 1. Query metadata for all keys
+    UbDiag::PerfPoint pt_bquery(PerfKey::GET_BATCH_INTERNAL_QUERY, UbDiag::PerfLevel::MODULE);
+    pt_bquery.Start();
     auto query_results = client_->BatchQuery(keys);
+    pt_bquery.End(0);
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
+    UbDiag::PerfPoint pt_preparation(PerfKey::GET_BATCH_INTERNAL_PREPARATION, UbDiag::PerfLevel::MODULE);
+    pt_preparation.Start();
     struct KeyOp {
         size_t original_index;
         std::string key;
@@ -2713,8 +2747,11 @@ RealClient::batch_get_buffer_internal(
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
+        UbDiag::PerfPoint pt_bsel(PerfKey::GET_BATCH_INTERNAL_SELECT_REPLICA, UbDiag::PerfLevel::MODULE);
+        pt_bsel.Start();
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
+        pt_bsel.End(best_replica ? 0 : -1);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             continue;
@@ -2727,7 +2764,10 @@ RealClient::batch_get_buffer_internal(
 
         auto &allocator = client_buffer_allocator ? client_buffer_allocator
                                                   : client_buffer_allocator_;
+        UbDiag::PerfPoint pt_balloc(PerfKey::GET_BATCH_INTERNAL_ALLOC_BUFFER, UbDiag::PerfLevel::MODULE);
+        pt_balloc.Start();
         auto alloc_result = allocator->allocate(total_size);
+        pt_balloc.End(alloc_result ? 0 : -1);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate buffer for key: " << key;
             continue;
@@ -2772,9 +2812,12 @@ RealClient::batch_get_buffer_internal(
     if (valid_ops.empty() && disk_ops.empty()) {
         return final_results;
     }
+    pt_preparation.End(0);
 
     // 3. Execute batch get for memory/disk replicas
     if (!valid_ops.empty()) {
+        UbDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ, UbDiag::PerfLevel::MODULE);
+        pt_bget.Start();
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
@@ -2802,10 +2845,13 @@ RealClient::batch_get_buffer_internal(
                            << "': " << toString(batch_get_results[i].error());
             }
         }
+        pt_bget.End(0);
     }
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
     if (!disk_ops.empty()) {
+        UbDiag::PerfPoint pt_bssd(PerfKey::GET_BATCH_INTERNAL_SSD_READ, UbDiag::PerfLevel::MODULE);
+        pt_bssd.Start();
         // Group by transport endpoint
         std::unordered_map<std::string,
                            std::unordered_map<std::string, std::vector<Slice>>>
@@ -2853,8 +2899,10 @@ RealClient::batch_get_buffer_internal(
                 }
             }
         }
+        pt_bssd.End(0);
     }
 
+    pt_full.End(0);
     return final_results;
 }
 

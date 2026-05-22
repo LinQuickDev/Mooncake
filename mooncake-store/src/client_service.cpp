@@ -18,6 +18,11 @@
 
 #include "transfer_engine.h"
 #include "topology.h"
+#ifdef UBDIAG_ENABLED
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+#endif
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
@@ -784,28 +789,44 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    UbDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_FULL, UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
+
     // Find the first complete replica
     Replica::Descriptor replica;
+    UbDiag::PerfPoint pt_find(PerfKey::GET_SINGLE_FIND_REPLICA, UbDiag::PerfLevel::MODULE);
+    pt_find.Start();
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    pt_find.End(err == ErrorCode::OK ? 0 : -1);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
+        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
     if (hot_cache_ && replica.is_memory_replica()) {
+        UbDiag::PerfPoint pt_hc(PerfKey::GET_SINGLE_HOT_CACHE, UbDiag::PerfLevel::MODULE);
+        pt_hc.Start();
         cache_used = RedirectToHotCache(object_key, replica);
+        pt_hc.End(0);
     }
 
     auto t0_get = std::chrono::steady_clock::now();
+    UbDiag::PerfPoint pt_tread(PerfKey::GET_SINGLE_TRANSFER_READ, UbDiag::PerfLevel::MODULE);
+    pt_tread.Start();
     err = TransferRead(replica, slices);
+    pt_tread.End(err == ErrorCode::OK ? 0 : -1);
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
+        UbDiag::PerfPoint pt_rel(PerfKey::GET_SINGLE_RELEASE_CACHE, UbDiag::PerfLevel::MODULE);
+        pt_rel.Start();
         hot_cache_->ReleaseHotKey(object_key);
+        pt_rel.End(0);
     }
 
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -817,6 +838,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
@@ -824,12 +846,16 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
     if (ShouldAdmitToHotCache(object_key, cache_used)) {
+        UbDiag::PerfPoint pt_async(PerfKey::GET_SINGLE_ASYNC_CACHE, UbDiag::PerfLevel::MODULE);
+        pt_async.Start();
         ProcessSlicesAsync(object_key, slices, replica);
+        pt_async.End(0);
     }
 
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     // Log cache hit statistics
@@ -838,6 +864,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
+    pt_full.End(0);
     return {};
 }
 
@@ -1011,6 +1038,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
+    UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_FULL, UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1018,6 +1047,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        pt_full.End(-1);
         return results;
     }
 
@@ -1031,9 +1061,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        pt_full.End(-1);
         return results;
     }
     if (prefer_alloc_in_same_node) {
+        pt_full.End(0);
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
@@ -1063,8 +1095,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
+        UbDiag::PerfPoint pt_find(PerfKey::GET_BATCH_FIND_REPLICA, UbDiag::PerfLevel::MODULE);
+        pt_find.Start();
         ErrorCode err =
             FindFirstCompleteReplica(query_result.replicas, replica);
+        pt_find.End(err == ErrorCode::OK ? 0 : -1);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -1075,15 +1110,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
+            UbDiag::PerfPoint pt_hc(PerfKey::GET_BATCH_HOT_CACHE, UbDiag::PerfLevel::MODULE);
+            pt_hc.Start();
             cache_used = RedirectToHotCache(key, replica);
+            pt_hc.End(0);
             if (cache_used) {
                 total_cache_hits++;
             }
         }
 
         // Submit transfer operation asynchronously
+        UbDiag::PerfPoint pt_submit(PerfKey::GET_BATCH_SUBMIT, UbDiag::PerfLevel::DEBUG);
+        pt_submit.Start();
         auto future = transfer_submitter_->submit(replica, slices_it->second,
                                                   TransferRequest::READ);
+        pt_submit.End(future ? 0 : -1);
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
@@ -1105,11 +1146,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        UbDiag::PerfPoint pt_wait(PerfKey::GET_BATCH_WAIT, UbDiag::PerfLevel::DEBUG);
+        pt_wait.Start();
         ErrorCode result = future.get();
+        pt_wait.End(result == ErrorCode::OK ? 0 : -1);
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
+            UbDiag::PerfPoint pt_rel(PerfKey::GET_BATCH_RELEASE_CACHE, UbDiag::PerfLevel::MODULE);
+            pt_rel.Start();
             hot_cache_->ReleaseHotKey(key);
+            pt_rel.End(0);
         }
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
@@ -1125,7 +1172,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end() &&
                     ShouldAdmitToHotCache(key, cache_used)) {
+                    UbDiag::PerfPoint pt_async(PerfKey::GET_BATCH_ASYNC_CACHE, UbDiag::PerfLevel::MODULE);
+                    pt_async.Start();
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                    pt_async.End(0);
                 }
             }
         }
@@ -1157,6 +1207,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     } else {
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
+    pt_full.End(0);
     return results;
 }
 
@@ -2622,21 +2673,33 @@ void Client::PutToLocalFile(const std::string& key,
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code) {
+    UbDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_TRANSFER_FULL, UbDiag::PerfLevel::MODULE);
+    pt_full.Start();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
+        pt_full.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
 
+    UbDiag::PerfPoint pt_submit(PerfKey::GET_SINGLE_TRANSFER_SUBMIT, UbDiag::PerfLevel::DEBUG);
+    pt_submit.Start();
     auto future =
         transfer_submitter_->submit(replica_descriptor, slices, op_code);
+    pt_submit.End(future ? 0 : -1);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
-    return future->get();
+    UbDiag::PerfPoint pt_wait(PerfKey::GET_SINGLE_TRANSFER_WAIT, UbDiag::PerfLevel::DEBUG);
+    pt_wait.Start();
+    auto result = future->get();
+    pt_wait.End(result == ErrorCode::OK ? 0 : -1);
+    pt_full.End(result == ErrorCode::OK ? 0 : -1);
+    return result;
 }
 
 ErrorCode Client::TransferReadInternal(

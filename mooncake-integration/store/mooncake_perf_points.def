@@ -1,0 +1,44 @@
+// === Python绑定层 ===
+PERF_KEY_DEF(GET_STORE_PY_GET,               "GetStorePy",        "Get")
+PERF_KEY_DEF(GET_STORE_PY_GET_BATCH,         "GetStorePy",        "GetBatch")
+
+// === RealClient核心逻辑层 ===
+PERF_KEY_DEF(GET_BUFFER_INTERNAL,            "GetInternal",       "Full")
+PERF_KEY_DEF(GET_BATCH_BUFFER_INTERNAL,      "GetBatchInternal",  "Full")
+
+// === get_buffer_internal 子步骤 ===
+PERF_KEY_DEF(GET_INTERNAL_QUERY,             "GetInternal",       "Query")
+PERF_KEY_DEF(GET_INTERNAL_SELECT_REPLICA,    "GetInternal",       "SelectReplica")
+PERF_KEY_DEF(GET_INTERNAL_ALLOC_BUFFER,      "GetInternal",       "AllocBuffer")
+PERF_KEY_DEF(GET_INTERNAL_SSD_READ,          "GetInternal",       "SSDRead")
+PERF_KEY_DEF(GET_INTERNAL_MEMDISH_READ,      "GetInternal",       "MemDishRead")
+
+// === batch_get_buffer_internal 子步骤 ===
+PERF_KEY_DEF(GET_BATCH_INTERNAL_QUERY,       "GetBatchInternal",  "BatchQuery")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "GetBatchInternal",  "Preparation")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPL, "GetBatchInternal",  "SelectReplica")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC,       "GetBatchInternal",  "AllocBuffer")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "GetBatchInternal",  "SSDRead")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"GetBatchInternal",  "MemDishRead")
+
+// === Client::Get (单key) ===
+PERF_KEY_DEF(GET_SINGLE_FULL,                "GetSingle",         "Full")
+PERF_KEY_DEF(GET_SINGLE_FIND_REPLICA,        "GetSingle",         "FindReplica")
+PERF_KEY_DEF(GET_SINGLE_HOT_CACHE,           "GetSingle",         "HotCache")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_READ,       "GetSingle",         "TransferRead")
+PERF_KEY_DEF(GET_SINGLE_RELEASE_CACHE,       "GetSingle",         "ReleaseCache")
+PERF_KEY_DEF(GET_SINGLE_ASYNC_CACHE,         "GetSingle",         "AsyncCache")
+
+// === Client::Get 内 TransferData ===
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_FULL,       "GetSingleTransfer", "Full")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_SUBMIT,     "GetSingleTransfer", "Submit")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_WAIT,       "GetSingleTransfer", "Wait")
+
+// === Client::BatchGet (批量) ===
+PERF_KEY_DEF(GET_BATCH_FULL,                 "GetBatch",          "Full")
+PERF_KEY_DEF(GET_BATCH_FIND_REPLICA,         "GetBatch",          "FindReplica")
+PERF_KEY_DEF(GET_BATCH_HOT_CACHE,            "GetBatch",          "HotCache")
+PERF_KEY_DEF(GET_BATCH_SUBMIT,               "GetBatch",          "Submit")
+PERF_KEY_DEF(GET_BATCH_WAIT,                 "GetBatch",          "Wait")
+PERF_KEY_DEF(GET_BATCH_RELEASE_CACHE,        "GetBatch",          "ReleaseCache")
+PERF_KEY_DEF(GET_BATCH_ASYNC_CACHE,          "GetBatch",          "AsyncCache")

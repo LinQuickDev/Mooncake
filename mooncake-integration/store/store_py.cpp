@@ -17,6 +17,12 @@
 
 #include "integration_utils.h"
 
+#ifdef UBDIAG_ENABLED
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+#endif
+
 // Forward declaration for EngramStore bindings
 namespace mooncake {
 namespace engram {
@@ -392,8 +398,11 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::bytes get(const std::string &key) {
+        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET, UbDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            pt.End(-1);
             return pybind11::bytes("\\0", 0);
         }
 
@@ -403,11 +412,13 @@ class MooncakeStorePyWrapper {
             py::gil_scoped_release release_gil;
             auto buffer_handle = store_->get_buffer(key);
             if (!buffer_handle) {
+                pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
                 return kNullString;
             }
 
             py::gil_scoped_acquire acquire_gil;
+            pt.End(0);
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -415,9 +426,12 @@ class MooncakeStorePyWrapper {
 
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
+        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET_BATCH, UbDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            pt.End(-1);
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
@@ -426,6 +440,7 @@ class MooncakeStorePyWrapper {
             py::gil_scoped_release release_gil;
             auto batch_data = store_->batch_get_buffer(keys);
             if (batch_data.empty()) {
+                pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
                 return {kNullString};
             }
@@ -439,6 +454,7 @@ class MooncakeStorePyWrapper {
                     data ? pybind11::bytes((char *)data->ptr(), data->size())
                          : kNullString);
             }
+            pt.End(0);
             return results;
         }
     }

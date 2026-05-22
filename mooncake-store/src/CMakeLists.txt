@@ -111,6 +111,14 @@ else()
   )
 endif()
 
+# Find UbDiag
+find_package(UbDiag REQUIRED)
+message(STATUS "UbDiag found: enabling performance instrumentation")
+target_compile_definitions(mooncake_store PUBLIC UBDIAG_ENABLED)
+target_link_libraries(mooncake_store PUBLIC UbDiag::ubdiag_lib)
+target_include_directories(mooncake_store PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
+
 if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SOURCES ${HF3FS_SOURCES})
