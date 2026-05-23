@@ -69,7 +69,7 @@ DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
 DEFINE_uint64(num_keys, 100, "Number of keys to write/read");
-DEFINE_uint64(batch_size, 1, "Batch size for put/get operations");
+DEFINE_uint64(batch_size, 32, "Batch size for put/get operations");
 DEFINE_uint64(num_threads, 1, "Number of concurrent reader threads");
 DEFINE_uint64(warmup_keys, 5, "Number of warmup keys (not counted in stats)");
 DEFINE_uint64(wait_seconds, 5,
@@ -240,13 +240,13 @@ class StressBenchmark {
 
     ~StressBenchmark() {
         if (client_) {
-            for (auto& nb : numa_buffers_) {
-                if (nb.ptr) {
-                    client_->unregister_buffer(nb.ptr);
-                    numa_free(nb.ptr, nb.size);
+            for (auto& tb : thread_buffers_) {
+                if (tb.ptr) {
+                    client_->unregister_buffer(tb.ptr);
+                    numa_free(tb.ptr, tb.size);
                 }
             }
-            numa_buffers_.clear();
+            thread_buffers_.clear();
             if (buffer_) {
                 client_->unregister_buffer(buffer_);
                 numa_free(buffer_, buffer_size_);
@@ -266,7 +266,8 @@ class StressBenchmark {
             LOG(ERROR) << "RealClient setup_real failed, ret=" << ret;
             return ret;
         }
-        LOG(INFO) << "RealClient setup succeeded";
+        LOG(INFO) << "RealClient setup succeeded"
+                  << (FLAGS_enable_ssd_offload ? " (SSD offload enabled)" : "");
 
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
         buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));                         
@@ -337,7 +338,7 @@ class StressBenchmark {
                   << FLAGS_num_threads
                   << " threads, batch_size=" << FLAGS_batch_size;
 
-        int buf_ret = AllocateNumaBuffers();
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
 
         if (FLAGS_scenario == "remote_memory" ||
@@ -402,7 +403,7 @@ class StressBenchmark {
     int RunLocalMemory() {
         LOG(INFO) << "=== LOCAL MEMORY BENCHMARK ===";
 
-        int buf_ret = AllocateNumaBuffers();
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
 
         mooncake::ReplicateConfig config;
@@ -478,7 +479,7 @@ class StressBenchmark {
         LOG(INFO) << "NOTE: Disk reads require Master with enable_offload=true "
                   << "and client with enable_ssd_offload=true";
 
-        int buf_ret = AllocateNumaBuffers();
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
 
         mooncake::ReplicateConfig config;
@@ -632,7 +633,7 @@ class StressBenchmark {
         ThreadResult& result = stats.GetThreadResult(tid);
         result.latencies_ns.reserve(my_keys);
 
-        char* my_buf = numa_buffers_[tid % NR_SOCKETS].ptr;
+        char* my_buf = thread_buffers_[tid].ptr;
 
         start_latch.arrive_and_wait();
 
@@ -662,24 +663,21 @@ class StressBenchmark {
                 ++ops;
             }
         } else {
-            std::vector<std::string> keys;
-            std::vector<void*> bufs;
-            std::vector<size_t> sizes;
-            keys.reserve(FLAGS_batch_size);
-            bufs.reserve(FLAGS_batch_size);
-            sizes.reserve(FLAGS_batch_size);
-
+            size_t per_key_buf = FLAGS_value_size;
             size_t i = 0;
             while (i < my_keys) {
-                keys.clear();
-                bufs.clear();
-                sizes.clear();
-
+                std::vector<std::string> keys;
+                std::vector<void*> bufs;
+                std::vector<size_t> sizes;
                 size_t batch_end = std::min(i + FLAGS_batch_size, my_keys);
+                keys.reserve(batch_end - i);
+                bufs.reserve(batch_end - i);
+                sizes.reserve(batch_end - i);
+
                 for (size_t j = i; j < batch_end; ++j) {
                     size_t key_idx = key_offset + j;
                     keys.push_back(MakeKey(key_idx));
-                    bufs.push_back(my_buf);
+                    bufs.push_back(my_buf + (j - i) * per_key_buf);
                     sizes.push_back(FLAGS_value_size);
                 }
 
@@ -739,38 +737,39 @@ class StressBenchmark {
     char* buffer_;
     size_t buffer_size_;
 
-    struct NumaBuffer {
+    struct ThreadBuffer {
         char* ptr = nullptr;
         size_t size = 0;
-        int node = -1;
+        int numa_node = -1;
     };
-    std::vector<NumaBuffer> numa_buffers_;
+    std::vector<ThreadBuffer> thread_buffers_;
 
-    int AllocateNumaBuffers() {
-        int num_nodes = NR_SOCKETS;
+    int AllocateThreadBuffers(size_t num_threads) {
+        thread_buffers_.resize(num_threads);
         size_t per_buf_size = FLAGS_batch_size * FLAGS_value_size;
-        numa_buffers_.resize(num_nodes);
-        for (int node = 0; node < num_nodes; ++node) {
-            numa_buffers_[node].size = per_buf_size;
-            numa_buffers_[node].node = node;
-            numa_buffers_[node].ptr =
+        for (size_t t = 0; t < num_threads; ++t) {
+            int node = t % NR_SOCKETS;
+            thread_buffers_[t].size = per_buf_size;
+            thread_buffers_[t].numa_node = node;
+            thread_buffers_[t].ptr =
                 reinterpret_cast<char*>(numa_alloc_onnode(per_buf_size, node));
-            if (!numa_buffers_[node].ptr) {
-                LOG(ERROR) << "Failed to allocate NUMA buffer on node " << node;
+            if (!thread_buffers_[t].ptr) {
+                LOG(ERROR) << "Failed to allocate buffer for thread " << t
+                           << " on NUMA node " << node;
                 return -1;
             }
-            std::memset(numa_buffers_[node].ptr, 0, per_buf_size);
-            int ret = client_->register_buffer(numa_buffers_[node].ptr,
+            std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
+            int ret = client_->register_buffer(thread_buffers_[t].ptr,
                                                per_buf_size);
             if (ret != 0) {
-                LOG(ERROR) << "register_buffer failed for NUMA node " << node;
+                LOG(ERROR) << "register_buffer failed for thread " << t
+                           << " on NUMA node " << node;
                 return ret;
             }
-            LOG(INFO) << "Allocated and registered " << per_buf_size / MB
-                      << " MB buffer on NUMA node " << node;
         }
-        LOG(INFO) << "Allocated " << num_nodes << " NUMA buffers, each "
-                  << per_buf_size / MB << " MB";
+        LOG(INFO) << "Allocated " << num_threads << " thread buffers, each "
+                  << per_buf_size / MB << " MB (NUMA-aware, "
+                  << NR_SOCKETS << " sockets)";
         return 0;
     }
 };
