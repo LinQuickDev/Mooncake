@@ -1536,34 +1536,51 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    UbDiag::PerfPoint pt_full(PerfKey::PUT_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    UbDiag::PerfPoint pt_alloc(PerfKey::PUT_INTERNAL_ALLOC_BUFFER, UbDiag::PerfLevel::MODULE);
+    pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
+    pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
                    << key << ", value size: " << value.size();
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
+    UbDiag::PerfPoint pt_memcpy(PerfKey::PUT_INTERNAL_MEM_COPY, UbDiag::PerfLevel::MODULE);
+    pt_memcpy.Start();
     memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    pt_memcpy.End(0);
 
+    UbDiag::PerfPoint pt_split(PerfKey::PUT_INTERNAL_SPLIT_SLICES, UbDiag::PerfLevel::MODULE);
+    pt_split.Start();
     std::vector<Slice> slices = split_into_slices(buffer_handle);
+    pt_split.End(0);
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
+        pt_full.End(-1);
         return tl::unexpected(put_result.error());
     }
 
+    pt_full.End(0);
     return {};
 }
 
@@ -1601,20 +1618,26 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (keys.size() != values.size()) {
         LOG(ERROR) << "Key and value size mismatch";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::vector<BufferHandle> buffer_handles;
@@ -1624,17 +1647,27 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto &key = keys[i];
         auto &value = values[i];
+        UbDiag::PerfPoint pt_alloc(PerfKey::PUT_BATCH_INTERNAL_ALLOC_BUFFER, UbDiag::PerfLevel::MODULE);
+        pt_alloc.Start();
         auto alloc_result =
             client_buffer_allocator->allocate(value.size_bytes());
+        pt_alloc.End(alloc_result ? 0 : -1);
         if (!alloc_result) {
             LOG(ERROR)
                 << "Failed to allocate buffer for put_batch operation, key: "
                 << key << ", value size: " << value.size();
+            pt_full.End(-1);
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
+        UbDiag::PerfPoint pt_memcpy(PerfKey::PUT_BATCH_INTERNAL_MEM_COPY, UbDiag::PerfLevel::MODULE);
+        pt_memcpy.Start();
         memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        pt_memcpy.End(0);
+        UbDiag::PerfPoint pt_split(PerfKey::PUT_BATCH_INTERNAL_SPLIT_SLICES, UbDiag::PerfLevel::MODULE);
+        pt_split.Start();
         auto slices = split_into_slices(buffer_handle);
+        pt_split.End(0);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
     }
@@ -1648,6 +1681,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             ordered_batched_slices.emplace_back(it->second);
         } else {
             LOG(ERROR) << "Missing slices for key: " << key;
+            pt_full.End(-1);
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -1657,9 +1691,11 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
+            pt_full.End(-1);
             return tl::unexpected(results[i].error());
         }
     }
+    pt_full.End(0);
     return {};
 }
 

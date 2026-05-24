@@ -2532,13 +2532,17 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::buffer buf,
                const ReplicateConfig &config = ReplicateConfig{}) {
+                UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT, UbDiag::PerfLevel::SUB_SYSTEM);
+                pt.Start();
                 py::buffer_info info = buf.request(/*writable=*/false);
                 py::gil_scoped_release release;
-                return self.store_->put(
+                auto ret = self.store_->put(
                     key,
                     std::span<const char>(static_cast<char *>(info.ptr),
                                           static_cast<size_t>(info.size)),
                     config);
+                pt.End(ret == 0 ? 0 : -1);
+                return ret;
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{})
@@ -2576,6 +2580,8 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<py::buffer> &buffers,
                const ReplicateConfig &config = ReplicateConfig{}) {
+                UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT_BATCH, UbDiag::PerfLevel::SUB_SYSTEM);
+                pt.Start();
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
@@ -2590,7 +2596,9 @@ PYBIND11_MODULE(store, m) {
                 }
 
                 py::gil_scoped_release release;
-                return self.store_->put_batch(keys, spans, config);
+                auto ret = self.store_->put_batch(keys, spans, config);
+                pt.End(ret == 0 ? 0 : -1);
+                return ret;
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})

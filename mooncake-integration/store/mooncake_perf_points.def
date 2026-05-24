@@ -1,44 +1,83 @@
 // === Python绑定层 ===
-PERF_KEY_DEF(GET_STORE_PY_GET,               "GetStorePy",        "Get")
-PERF_KEY_DEF(GET_STORE_PY_GET_BATCH,         "GetStorePy",        "GetBatch")
+PERF_KEY_DEF(GET_STORE_PY_GET,               "store_py.cpp::get",                          "Get")
+PERF_KEY_DEF(GET_STORE_PY_GET_BATCH,         "store_py.cpp::get_batch",                    "GetBatch")
 
 // === RealClient核心逻辑层 ===
-PERF_KEY_DEF(GET_BUFFER_INTERNAL,            "GetInternal",       "Full")
-PERF_KEY_DEF(GET_BATCH_BUFFER_INTERNAL,      "GetBatchInternal",  "Full")
+PERF_KEY_DEF(GET_BUFFER_INTERNAL,            "real_client.cpp::get_buffer_internal",       "Full")
+PERF_KEY_DEF(GET_BATCH_BUFFER_INTERNAL,      "real_client.cpp::batch_get_buffer_internal", "Full")
 
 // === get_buffer_internal 子步骤 ===
-PERF_KEY_DEF(GET_INTERNAL_QUERY,             "GetInternal",       "Query")
-PERF_KEY_DEF(GET_INTERNAL_SELECT_REPLICA,    "GetInternal",       "SelectReplica")
-PERF_KEY_DEF(GET_INTERNAL_ALLOC_BUFFER,      "GetInternal",       "AllocBuffer")
-PERF_KEY_DEF(GET_INTERNAL_SSD_READ,          "GetInternal",       "SSDRead")
-PERF_KEY_DEF(GET_INTERNAL_MEMDISH_READ,      "GetInternal",       "MemDishRead")
+PERF_KEY_DEF(GET_INTERNAL_QUERY,             "real_client.cpp::get_buffer_internal",       "Query")
+PERF_KEY_DEF(GET_INTERNAL_SELECT_REPLICA,    "real_client.cpp::get_buffer_internal",       "SelectReplica")
+PERF_KEY_DEF(GET_INTERNAL_ALLOC_BUFFER,      "real_client.cpp::get_buffer_internal",       "AllocBuffer")
+PERF_KEY_DEF(GET_INTERNAL_SSD_READ,          "real_client.cpp::get_buffer_internal",       "SSDRead")
+PERF_KEY_DEF(GET_INTERNAL_MEMDISH_READ,      "real_client.cpp::get_buffer_internal",       "MemDishRead")
 
 // === batch_get_buffer_internal 子步骤 ===
-PERF_KEY_DEF(GET_BATCH_INTERNAL_QUERY,       "GetBatchInternal",  "BatchQuery")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "GetBatchInternal",  "Preparation")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPLICA, "GetBatchInternal",  "SelectReplica")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC_BUFFER,       "GetBatchInternal",  "AllocBuffer")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "GetBatchInternal",  "SSDRead")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"GetBatchInternal",  "MemDishRead")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_QUERY,       "real_client.cpp::batch_get_buffer_internal", "BatchQuery")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "real_client.cpp::batch_get_buffer_internal", "Preparation")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_buffer_internal", "SelectReplica")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC_BUFFER,       "real_client.cpp::batch_get_buffer_internal", "AllocBuffer")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "real_client.cpp::batch_get_buffer_internal", "SSDRead")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"real_client.cpp::batch_get_buffer_internal", "MemDishRead")
 
 // === Client::Get (单key) ===
-PERF_KEY_DEF(GET_SINGLE_FULL,                "GetSingle",         "Full")
-PERF_KEY_DEF(GET_SINGLE_FIND_REPLICA,        "GetSingle",         "FindReplica")
-PERF_KEY_DEF(GET_SINGLE_HOT_CACHE,           "GetSingle",         "HotCache")
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_READ,       "GetSingle",         "TransferRead")
-PERF_KEY_DEF(GET_SINGLE_RELEASE_CACHE,       "GetSingle",         "ReleaseCache")
-PERF_KEY_DEF(GET_SINGLE_ASYNC_CACHE,         "GetSingle",         "AsyncCache")
+PERF_KEY_DEF(GET_SINGLE_FULL,                "client_service.cpp::Get",                    "Full")
+PERF_KEY_DEF(GET_SINGLE_FIND_REPLICA,        "client_service.cpp::Get",                    "FindReplica")
+PERF_KEY_DEF(GET_SINGLE_HOT_CACHE,           "client_service.cpp::Get",                    "HotCache")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_READ,       "client_service.cpp::Get",                    "TransferRead")
+PERF_KEY_DEF(GET_SINGLE_RELEASE_CACHE,       "client_service.cpp::Get",                    "ReleaseCache")
+PERF_KEY_DEF(GET_SINGLE_ASYNC_CACHE,         "client_service.cpp::Get",                    "AsyncCache")
 
 // === Client::Get 内 TransferData ===
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_FULL,       "GetSingleTransfer", "Full")
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_SUBMIT,     "GetSingleTransfer", "Submit")
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_WAIT,       "GetSingleTransfer", "Wait")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_FULL,       "client_service.cpp::TransferData",           "Full")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_SUBMIT,     "client_service.cpp::TransferData",           "Submit")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_WAIT,       "client_service.cpp::TransferData",           "Wait")
 
 // === Client::BatchGet (批量) ===
-PERF_KEY_DEF(GET_BATCH_FULL,                 "GetBatch",          "Full")
-PERF_KEY_DEF(GET_BATCH_FIND_REPLICA,         "GetBatch",          "FindReplica")
-PERF_KEY_DEF(GET_BATCH_HOT_CACHE,            "GetBatch",          "HotCache")
-PERF_KEY_DEF(GET_BATCH_SUBMIT,               "GetBatch",          "Submit")
-PERF_KEY_DEF(GET_BATCH_WAIT,                 "GetBatch",          "Wait")
-PERF_KEY_DEF(GET_BATCH_RELEASE_CACHE,        "GetBatch",          "ReleaseCache")
-PERF_KEY_DEF(GET_BATCH_ASYNC_CACHE,          "GetBatch",          "AsyncCache")
+PERF_KEY_DEF(GET_BATCH_FULL,                 "client_service.cpp::BatchGet",               "Full")
+PERF_KEY_DEF(GET_BATCH_FIND_REPLICA,         "client_service.cpp::BatchGet",               "FindReplica")
+PERF_KEY_DEF(GET_BATCH_HOT_CACHE,            "client_service.cpp::BatchGet",               "HotCache")
+PERF_KEY_DEF(GET_BATCH_SUBMIT,               "client_service.cpp::BatchGet",               "Submit")
+PERF_KEY_DEF(GET_BATCH_WAIT,                 "client_service.cpp::BatchGet",               "Wait")
+PERF_KEY_DEF(GET_BATCH_RELEASE_CACHE,        "client_service.cpp::BatchGet",               "ReleaseCache")
+PERF_KEY_DEF(GET_BATCH_ASYNC_CACHE,          "client_service.cpp::BatchGet",               "AsyncCache")
+
+// === Python绑定层 ===
+PERF_KEY_DEF(PUT_STORE_PY_PUT,               "store_py.cpp::put",              "Put")
+PERF_KEY_DEF(PUT_STORE_PY_PUT_BATCH,         "store_py.cpp::put_batch",        "PutBatch")
+
+// === RealClient核心逻辑层 ===
+PERF_KEY_DEF(PUT_INTERNAL_FULL,              "real_client.cpp::put_internal",              "Full")
+PERF_KEY_DEF(PUT_INTERNAL_ALLOC_BUFFER,      "real_client.cpp::put_internal",              "AllocBuffer")
+PERF_KEY_DEF(PUT_INTERNAL_MEM_COPY,          "real_client.cpp::put_internal",              "MemCopy")
+PERF_KEY_DEF(PUT_INTERNAL_SPLIT_SLICES,      "real_client.cpp::put_internal",              "SplitSlices")
+
+PERF_KEY_DEF(PUT_BATCH_INTERNAL_FULL,        "real_client.cpp::put_batch_internal",        "Full")
+PERF_KEY_DEF(PUT_BATCH_INTERNAL_ALLOC_BUFFER,"real_client.cpp::put_batch_internal",        "AllocBuffer")
+PERF_KEY_DEF(PUT_BATCH_INTERNAL_MEM_COPY,    "real_client.cpp::put_batch_internal",        "MemCopy")
+PERF_KEY_DEF(PUT_BATCH_INTERNAL_SPLIT_SLICES,"real_client.cpp::put_batch_internal",        "SplitSlices")
+
+// === Client::Put (单key) ===
+PERF_KEY_DEF(PUT_SINGLE_FULL,                "client_service.cpp::Put",                    "Full")
+PERF_KEY_DEF(PUT_SINGLE_PUT_START,           "client_service.cpp::Put",                    "PutStart")
+PERF_KEY_DEF(PUT_SINGLE_DISK_WRITE,          "client_service.cpp::Put",                    "DiskWrite")
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_WRITE,      "client_service.cpp::Put",                    "TransferWrite")
+PERF_KEY_DEF(PUT_SINGLE_PUT_END,             "client_service.cpp::Put",                    "PutEnd")
+PERF_KEY_DEF(PUT_SINGLE_PUT_REVOKE,          "client_service.cpp::Put",                    "PutRevoke")
+
+// === Client::Put 内 TransferData ===
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_FULL,       "client_service.cpp::TransferData",           "Full")
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_SUBMIT,     "client_service.cpp::TransferData",           "Submit")
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_WAIT,       "client_service.cpp::TransferData",           "Wait")
+
+// === Client::BatchPut (批量) ===
+PERF_KEY_DEF(PUT_BATCH_FULL,                 "client_service.cpp::BatchPut",               "Full")
+PERF_KEY_DEF(PUT_BATCH_CREATE_OPS,           "client_service.cpp::BatchPut",               "CreateOps")
+PERF_KEY_DEF(PUT_BATCH_PUT_START,            "client_service.cpp::StartBatchPut",          "PutStart")
+PERF_KEY_DEF(PUT_BATCH_SUBMIT,               "client_service.cpp::SubmitTransfers",        "Submit")
+PERF_KEY_DEF(PUT_BATCH_DISK_WRITE,           "client_service.cpp::SubmitTransfers",        "DiskWrite")
+PERF_KEY_DEF(PUT_BATCH_WAIT,                 "client_service.cpp::WaitForTransfers",       "Wait")
+PERF_KEY_DEF(PUT_BATCH_PUT_END,              "client_service.cpp::FinalizeBatchPut",       "PutEnd")
+PERF_KEY_DEF(PUT_BATCH_PUT_REVOKE,           "client_service.cpp::FinalizeBatchPut",       "PutRevoke")
+PERF_KEY_DEF(PUT_BATCH_COLLECT_RESULTS,      "client_service.cpp::BatchPut",               "CollectResults")
