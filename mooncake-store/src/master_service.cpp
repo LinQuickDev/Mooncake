@@ -1836,16 +1836,17 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         // Sum sizes of LOCAL_DISK replicas being evicted for SSD tracking
         int64_t evicted_size = 0;
         metadata.VisitReplicas(
-            [&client_id, &evicted_size](const Replica& replica) {
-                if (replica.is_local_disk_replica() &&
+            [&client_id](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            },
+            [&evicted_size](Replica& replica) {
+                evicted_size += static_cast<int64_t>(
                     replica.get_descriptor()
-                            .get_local_disk_descriptor()
-                            .client_id == client_id) {
-                    evicted_size += static_cast<int64_t>(
-                        replica.get_descriptor()
-                            .get_local_disk_descriptor()
-                            .object_size);
-                }
+                        .get_local_disk_descriptor()
+                        .object_size);
             });
         metadata.EraseReplicas([&client_id](const Replica& replica) {
             return replica.is_local_disk_replica() &&
