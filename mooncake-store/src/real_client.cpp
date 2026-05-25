@@ -1576,10 +1576,12 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
+        LOG(INFO) << "put_result key[" << key << "] rc[" << static_cast<int>(put_result.error()) << "] size[" << value.size_bytes() << "]";
         pt_full.End(-1);
         return tl::unexpected(put_result.error());
     }
 
+    LOG(INFO) << "put_result key[" << key << "] rc[0] size[" << value.size_bytes() << "]";
     pt_full.End(0);
     return {};
 }
@@ -1689,6 +1691,14 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     auto results = client_->BatchPut(keys, ordered_batched_slices, config);
 
     // Check if any operations failed
+    size_t num_failed = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            num_failed++;
+        }
+    }
+    LOG(INFO) << "batch_put_result num_keys[" << keys.size() << "] num_failed[" << num_failed << "]";
+
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             pt_full.End(-1);
@@ -2438,6 +2448,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    LOG(INFO) << "query_success key[" << key << "] replicas[" << query_result.value().replicas.size() << "]";
+
     const std::vector<Replica::Descriptor> &replica_list =
         query_result.value().replicas;
     if (replica_list.empty()) {
@@ -2461,6 +2473,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
+
+    LOG(INFO) << "replica_selected key[" << key << "] type["
+              << (best_replica->is_memory_replica() ? "memory" : "disk")
+              << "] size[" << total_length << "]";
 
     if (total_length == 0) {
         return nullptr;
@@ -2511,13 +2527,16 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                      << "Ensure client_buffer_allocator_ returns host memory.";
     }
 
-    UbDiag::PerfPoint pt_memdisk(PerfKey::GET_INTERNAL_MEMDISH_READ, UbDiag::PerfLevel::MODULE);
-    pt_memdisk.Start();
+    const PerfKey read_key = replica.is_memory_replica()
+                                 ? PerfKey::GET_INTERNAL_MEM_READ
+                                 : PerfKey::GET_INTERNAL_DISK_READ;
+    UbDiag::PerfPoint pt_read(read_key, UbDiag::PerfLevel::MODULE);
+    pt_read.Start();
     std::vector<Slice> slices;
     allocateSlices(slices, replica, buffer_handle->ptr());
     auto filtered_qr = FilterQueryResult(query_result.value(), replica);
     auto get_result = client_->Get(key, filtered_qr, slices);
-    pt_memdisk.End(get_result ? 0 : -1);
+    pt_read.End(get_result ? 0 : -1);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -2525,6 +2544,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    LOG(INFO) << "transfer_read_complete key[" << key << "] size[" << total_length << "]";
     pt_full.End(0);
     return buffer_handle;
 }
@@ -2739,9 +2759,13 @@ RealClient::batch_get_buffer_internal(
     auto query_results = client_->BatchQuery(keys);
     pt_bquery.End(0);
 
+    size_t num_found = 0;
+    for (const auto &result : query_results) {
+        if (result) num_found++;
+    }
+    LOG(INFO) << "batch_query_result num_keys[" << keys.size() << "] num_found[" << num_found << "]";
+
     // 2. Prepare for batch get: filter valid keys and prepare buffers
-    UbDiag::PerfPoint pt_preparation(PerfKey::GET_BATCH_INTERNAL_PREPARATION, UbDiag::PerfLevel::MODULE);
-    pt_preparation.Start();
     struct KeyOp {
         size_t original_index;
         std::string key;
@@ -2846,12 +2870,9 @@ RealClient::batch_get_buffer_internal(
     if (valid_ops.empty() && disk_ops.empty()) {
         return final_results;
     }
-    pt_preparation.End(0);
 
     // 3. Execute batch get for memory/disk replicas
     if (!valid_ops.empty()) {
-        UbDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ, UbDiag::PerfLevel::MODULE);
-        pt_bget.Start();
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
@@ -2879,7 +2900,6 @@ RealClient::batch_get_buffer_internal(
                            << "': " << toString(batch_get_results[i].error());
             }
         }
-        pt_bget.End(0);
     }
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
@@ -2937,6 +2957,13 @@ RealClient::batch_get_buffer_internal(
     }
 
     pt_full.End(0);
+
+    size_t success_count = 0;
+    for (const auto &result : final_results) {
+        if (result) success_count++;
+    }
+    LOG(INFO) << "batch_get_complete num_keys[" << keys.size() << "] success[" << success_count << "]";
+
     return final_results;
 }
 

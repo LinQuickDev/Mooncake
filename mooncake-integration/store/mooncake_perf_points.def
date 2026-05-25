@@ -11,7 +11,8 @@ PERF_KEY_DEF(GET_INTERNAL_QUERY,             "real_client.cpp::get_buffer_intern
 PERF_KEY_DEF(GET_INTERNAL_SELECT_REPLICA,    "real_client.cpp::get_buffer_internal",       "SelectReplica")
 PERF_KEY_DEF(GET_INTERNAL_ALLOC_BUFFER,      "real_client.cpp::get_buffer_internal",       "AllocBuffer")
 PERF_KEY_DEF(GET_INTERNAL_SSD_READ,          "real_client.cpp::get_buffer_internal",       "SSDRead")
-PERF_KEY_DEF(GET_INTERNAL_MEMDISH_READ,      "real_client.cpp::get_buffer_internal",       "MemDishRead")
+PERF_KEY_DEF(GET_INTERNAL_MEM_READ,          "real_client.cpp::get_buffer_internal",       "MemRead")
+PERF_KEY_DEF(GET_INTERNAL_DISK_READ,         "real_client.cpp::get_buffer_internal",       "DiskRead")
 
 // === batch_get_buffer_internal 子步骤 ===
 PERF_KEY_DEF(GET_BATCH_INTERNAL_QUERY,       "real_client.cpp::batch_get_buffer_internal", "BatchQuery")
