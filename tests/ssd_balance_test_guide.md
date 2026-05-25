@@ -2,188 +2,216 @@
 
 ## 前置条件
 
-### 1. 启动Master
+- 编译完成 mooncake_store（含 `mooncake_master` 可执行文件）
+- 编译完成 mooncake-wheel（含 Python `mooncake.store` 模块）
+- 安装 Python 3
+
+## 验证脚本
+
+验证脚本位于 `mooncake-wheel/tests/verify_ssd_balance.py`，支持 4 个测试场景：
+
+```
+python verify_ssd_balance.py --test <test_name>
+```
+
+| test_name | 验证内容 |
+|-----------|---------|
+| `load_balancing` | **基础测试**：2个Client不对称SSD，验证数据按SSD空闲比例分布 |
+| `ssd_eviction_protection` | SSD满时禁止写入，已有数据不被驱逐 |
+| `ddr_admission` | DDR满时临时禁止写入，释放空间后自动恢复 |
+| `all_ssd_full` | 所有节点SSD满后全局拒绝，释放后恢复 |
+
+## 默认规模
+
+DDR=4GB, SSD=16GB, Key=4MB
+
+## 注意事项
+
+- **每次测试前清空SSD目录**：`rm -rf <SSD_PATH> && mkdir -p <SSD_PATH>`
+- **MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS必须设为1**：默认10s会导致offload延迟过长
+- **put()不抛异常**：`store.put()` 返回整数状态码（0=成功，非0=失败）
+- **每次插入间等0.01s**：避免写入过快导致问题
+
+---
+
+## 验证 1：SSD负载均衡（应首先运行）
+
+两个Client使用不同的SSD容量：
+- Client 1（写入端）：DDR=4GB, SSD=8GB → effective=4GB
+- Client 2：DDR=4GB, SSD=16GB → effective=12GB
+
+写入约1200个4MB key（4.8GB），超过Client 1水位后自动溢出到Client 2。
+
+**Terminal 1** — 启动Master：
 
 ```bash
-# 方式一：命令行参数
-./mooncake_master \
+mooncake_master \
+    --port=50053 \
+    --http_metadata_server_port=8880 \
+    --enable_http_metadata_server=true \
+    --metrics_port=9104 \
     --allocation_strategy=ssd_balance \
     --ssd_high_watermark_ratio=0.90 \
-    --master_server=0.0.0.0:50051 \
-    --metadata_server=127.0.0.1:2379
+    --enable_offload=true \
+    --default_kv_lease_ttl=2000
+```
 
-# 方式二：配置文件
-./mooncake_master \
+**Terminal 2** — 运行验证脚本：
+
+```bash
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_lb \
+python mooncake-wheel/tests/verify_ssd_balance.py --test load_balancing
+```
+
+### 预期观察
+
+- Client 1写入约1200个key
+- 等待60s offload后，两个SSD目录均有文件
+- **Client 2的SSD数据量 > Client 1的SSD数据量**（溢出行为正常）
+
+### 判断标准
+
+- 两个SSD目录文件大小均 > 0
+- Client 2 SSD > Client 1 SSD（free-ratio-first分配策略有效）
+
+---
+
+## 验证 2：SSD驱逐保护
+
+写入数据触发offload，然后继续写入填满SSD到高水位。
+验证已有数据不被驱逐。
+
+**Terminal 1** — 启动Master：
+
+```bash
+mooncake_master \
+    --port=50053 \
+    --http_metadata_server_port=8880 \
+    --enable_http_metadata_server=true \
+    --metrics_port=9104 \
     --allocation_strategy=ssd_balance \
     --ssd_high_watermark_ratio=0.90 \
-    --config=master_config.json
+    --enable_offload=true \
+    --default_kv_lease_ttl=2000
 ```
 
-### 2. 启动多个Client节点
-
-每个节点需要启动Mooncake client并挂载segment，同时配置本地SSD目录：
+**Terminal 2** — 运行验证脚本：
 
 ```bash
-# 节点A (SSD容量大)
-export PROTOCOL=tcp
-export DEVICE_NAME=eth0
-export LOCAL_HOSTNAME=node_a
-export MC_METADATA_SERVER=127.0.0.1:2379
-export MASTER_SERVER=127.0.0.1:50051
-
-# 节点B (SSD容量小)
-# 同上，修改LOCAL_HOSTNAME=node_b
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=17179869184 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_evict \
+python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_eviction_protection
 ```
 
-### 3. 环境变量
+### 预期观察
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PROTOCOL` | `tcp` | 传输协议 |
-| `DEVICE_NAME` | `eth0` | 网卡名 |
-| `LOCAL_HOSTNAME` | `localhost` | 本机主机名 |
-| `MC_METADATA_SERVER` | `127.0.0.1:2379` | 元数据服务器地址 |
-| `MASTER_SERVER` | `127.0.0.1:50051` | Master地址 |
+- 先写入20个初始key（80MB），等待20s offload
+- 继续写入压力key直到SSD满或DDR满
+- 初始key全部可读（未被驱逐）
+
+### 判断标准
+
+- 初始写入的20个key全部可读，0个丢失
 
 ---
 
-## 运行全部测试
+## 验证 3：DDR准入控制
+
+写入大对象填满DDR，验证DDR满时写入被临时禁止，释放后恢复。
+
+**Terminal 1** — 启动Master：
 
 ```bash
-cd tests
-python ssd_balance_verify.py --master 127.0.0.1:50051 --num-keys 100
+mooncake_master \
+    --port=50053 \
+    --http_metadata_server_port=8880 \
+    --enable_http_metadata_server=true \
+    --metrics_port=9104 \
+    --allocation_strategy=ssd_balance \
+    --ssd_high_watermark_ratio=0.90 \
+    --enable_offload=true \
+    --default_kv_lease_ttl=2000
 ```
+
+**Terminal 2** — 运行验证脚本：
+
+```bash
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_ddr \
+python mooncake-wheel/tests/verify_ssd_balance.py --test ddr_admission
+```
+
+### 预期观察
+
+- 写入64MB大对象直到DDR满
+- DDR满后新写入失败（`NO_AVAILABLE_HANDLE`）
+- 删除部分对象后写入恢复
+
+### 判断标准
+
+- DDR满时写入被阻止
+- 释放空间后写入恢复成功
 
 ---
 
-## 单独运行每个测试
+## 验证 4：全节点SSD满
 
-### Test 1: SSD负载均衡验证
+写入大量数据填满所有节点SSD，验证全局拒绝后释放可恢复。
 
-验证数据按SSD空闲比例分布到不同节点。
+**Terminal 1** — 启动Master：
 
 ```bash
-python tests/ssd_balance_verify.py --master 127.0.0.1:50051 --test balance --num-keys 200 --value-size 4096
+mooncake_master \
+    --port=50053 \
+    --http_metadata_server_port=8880 \
+    --enable_http_metadata_server=true \
+    --metrics_port=9104 \
+    --allocation_strategy=ssd_balance \
+    --ssd_high_watermark_ratio=0.90 \
+    --enable_offload=true \
+    --default_kv_lease_ttl=2000
 ```
 
-**预期行为：**
-- 向集群写入200个key
-- SSD空闲的节点应该分配到更多数据
-- 所有写入的key都能成功读回
+**Terminal 2** — 运行验证脚本：
 
-**通过条件：** 所有写入的key都能成功读回，无数据丢失。
+```bash
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=17179869184 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_allfull \
+python mooncake-wheel/tests/verify_ssd_balance.py --test all_ssd_full
+```
 
-**需要的环境：** 多节点集群，各节点SSD使用率不同。
+### 预期观察
+
+- 写入大量16MB对象填满SSD
+- SSD满后新写入失败
+- 删除部分数据后写入恢复
+
+### 判断标准
+
+- SSD满时写入被阻止
+- 释放空间后写入恢复
 
 ---
 
-### Test 2: SSD驱逐保护验证
+## 关键环境变量
 
-验证SSD达到高水位时禁止写入但不驱逐已有数据。
+| 变量 | 值 | 说明 |
+|------|----|------|
+| `MC_METADATA_SERVER` | `http://127.0.0.1:8880/metadata` | HTTP元数据服务器地址 |
+| `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `17179869184` | SSD容量16GB |
+| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `1` | **必须设为1**，默认10s太慢 |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | 测试专用目录 | 每次测试前清空 |
 
-```bash
-python tests/ssd_balance_verify.py --master 127.0.0.1:50051 --test eviction --num-keys 300 --value-size 16384
-```
+## 判断标准
 
-**预期行为：**
-1. 先写入一批初始对象（约20个）
-2. 等待offloading完成（15秒）
-3. 继续写入压力对象（300个），试图填满SSD
-4. 验证初始对象仍然存在（未被驱逐）
-
-**通过条件：** 初始写入的20个对象全部可读，无数据丢失。
-
-**需要的环境：** 至少一个节点有SSD offload功能。
-
----
-
-### Test 3: DDR准入控制验证
-
-验证DDR达到驱逐水位时临时禁止写入，释放空间后自动恢复。
-
-```bash
-python tests/ssd_balance_verify.py --master 127.0.0.1:50051 --test ddr --num-keys 100 --value-size 67108864
-```
-
-**预期行为：**
-1. 写入大对象（每个64MB）直到DDR满
-2. DDR满后写入失败（返回NO_AVAILABLE_HANDLE）
-3. 删除部分对象释放DDR空间
-4. 写入恢复成功
-
-**通过条件：** DDR满时写入被阻止，释放空间后写入恢复。
-
-**需要的环境：** 单节点或集群，DDR容量有限。
-
----
-
-### Test 4: 全节点SSD满验证
-
-验证所有节点SSD都满时写入暂停，释放后恢复。
-
-```bash
-python tests/ssd_balance_verify.py --master 127.0.0.1:50051 --test allfull --num-keys 50 --value-size 16777216
-```
-
-**预期行为：**
-1. 写入大量数据（每个16MB）填满所有节点SSD
-2. 等待offloading（20秒）
-3. SSD满后新写入失败
-4. 删除部分数据释放SSD
-5. 写入恢复
-
-**通过条件：** SSD满时写入被阻止，释放后写入恢复。
-
-**需要的环境：** 多节点集群，所有节点有SSD。
-
----
-
-## 自定义参数
-
-```bash
-python tests/ssd_balance_verify.py \
-    --master 192.168.1.100:50051 \  # Master地址
-    --num-keys 500 \                 # 每个测试写入的key数量
-    --value-size 8192 \              # 每个value的大小（字节）
-    --test balance                   # 指定运行的测试
-```
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--master` | 环境变量`MASTER_SERVER` | Master地址 |
-| `--num-keys` | 100 | 每个测试写入的key数量 |
-| `--value-size` | 4096 | 每个value的字节大小 |
-| `--test` | `all` | 指定测试：`balance`/`eviction`/`ddr`/`allfull`/`all` |
-
-## 输出示例
-
-```
-======================================================================
-SSD Balance Allocation Strategy Verification
-======================================================================
-Config: num_keys=100, value_size=4096
-
-==================================================
-Test 1: SSD Load Balancing
-==================================================
-  Writing 100 objects (4096 bytes each)...
-  Results: 100 success, 0 failure
-  Read verification: 50/50 objects readable
-
-  Result: [PASS] SSD Load Balancing
-
-==================================================
-Test 2: SSD Eviction Protection
-==================================================
-  ...
-
-======================================================================
-Summary
-======================================================================
-  [PASS] Test 1: SSD Load Balancing
-  [PASS] Test 2: SSD Eviction Protection
-  [PASS] Test 3: DDR Admission Control
-  [PASS] Test 4: All Nodes SSD Full
-
-Total: 4 passed, 0 failed out of 4
-```
+| 日志关键词 | 含义 |
+|-----------|------|
+| `DDR overflow protection: rejecting allocation` | DDR准入控制生效 |
+| `client_service.cpp ... NO_AVAILABLE_HANDLE` | Client端收到水位拒绝（预期行为） |
