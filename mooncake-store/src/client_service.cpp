@@ -840,6 +840,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(err);
     }
 
+    LOG(INFO) << "transfer_read_completed key[" << object_key << "] elapsed_us[" << us_get << "]";
+
     // Frequency admission: only promote frequently accessed keys to hot cache.
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
@@ -1205,6 +1207,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     } else {
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
+
+    size_t num_success = 0;
+    for (const auto& r : results) {
+        if (r.has_value()) num_success++;
+    }
+    LOG(INFO) << "batch_get_transfer_complete num_keys[" << object_keys.size()
+              << "] success[" << num_success << "] elapsed_us[" << us_batch_get << "]";
+
     pt_full.End(0);
     return results;
 }
@@ -1259,6 +1269,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
+            LOG(INFO) << "put_start key[" << key << "] rc[OBJECT_ALREADY_EXISTS]";
             pt_full.End(0);
             return {};
         }
@@ -1272,6 +1283,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         pt_full.End(-1);
         return tl::unexpected(err);
     }
+
+    LOG(INFO) << "put_start_success key[" << key << "] replicas[" << start_result.value().size() << "]";
 
     // Record Put transfer latency (all replicas)
     auto t0_put = std::chrono::steady_clock::now();
@@ -1337,6 +1350,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         pt_full.End(-1);
         return tl::unexpected(err);
     }
+
+    LOG(INFO) << "put_end_success key[" << key << "] transfer_us[" << us_put << "]";
 
     pt_full.End(0);
     return {};
@@ -2107,6 +2122,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
+    LOG(INFO) << "batch_put start num_keys[" << keys.size() << "]";
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.replica_num != 1) {
@@ -2118,6 +2134,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         }
         StartBatchPut(ops, client_cfg);
         auto results = BatchPutWhenPreferSameNode(ops);
+        int num_failed = 0;
+        for (auto& r : results) if (!r) num_failed++;
+        LOG(INFO) << "batch_put complete num_keys[" << keys.size()
+                  << "] num_failed[" << num_failed << "]";
         pt_full.End(0);
         return results;
     }
@@ -2135,6 +2155,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     FinalizeBatchPut(ops);
     auto results = CollectResults(ops);
+    int num_failed = 0;
+    for (auto& r : results) if (!r) num_failed++;
+    LOG(INFO) << "batch_put complete num_keys[" << keys.size()
+              << "] num_failed[" << num_failed << "] transfer_us[" << us << "]";
     pt_full.End(0);
     return results;
 }
