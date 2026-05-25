@@ -193,14 +193,13 @@ def test_load_balancing():
     client1_ssd = 8 * 1024 * 1024 * 1024    # 8GB
     ddr_per_client = DEFAULT_DDR_SIZE        # 4GB
 
-    ssd_path_1 = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
-                            "/tmp/mooncake_ssd_balance_c1")
-    ssd_path_2 = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
-                            "/tmp/mooncake_ssd_balance_c2").replace("_c1", "_c2")
+    base_ssd_path = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+                              "/tmp/mooncake_ssd_balance_lb")
+    ssd_path_1 = os.path.join(base_ssd_path, "client1")
+    ssd_path_2 = os.path.join(base_ssd_path, "client2")
 
-    # 清空 SSD 目录
-    for p in [ssd_path_1, ssd_path_2]:
-        os.system(f"rm -rf {p} && mkdir -p {p}")
+    # 清空整个 SSD 基础目录
+    os.system(f"rm -rf {base_ssd_path} && mkdir -p {base_ssd_path}")
 
     # Client 2 (大 SSD) 先注册
     print("  [1] 创建 Client 2 (SSD=16GB)...")

@@ -68,13 +68,19 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test load_balancing
 ### 预期观察
 
 - Client 1写入约1200个key
-- 等待60s offload后，两个SSD目录均有文件
+- 等待60s offload后，两个SSD子目录均有文件：
+  - Client 1: `/tmp/mooncake_ssd_balance_lb/client1`
+  - Client 2: `/tmp/mooncake_ssd_balance_lb/client2`
 - **Client 2的SSD数据量 > Client 1的SSD数据量**（溢出行为正常）
 
 ### 判断标准
 
-- 两个SSD目录文件大小均 > 0
-- Client 2 SSD > Client 1 SSD（free-ratio-first分配策略有效）
+```bash
+du -sh /tmp/mooncake_ssd_balance_lb/client1 /tmp/mooncake_ssd_balance_lb/client2
+```
+
+- 两个子目录大小均 > 0
+- client2 > client1（按SSD空闲比例分配策略有效）
 
 ---
 
