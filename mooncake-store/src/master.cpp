@@ -172,7 +172,11 @@ DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 DEFINE_string(
     allocation_strategy, "random",
-    "Allocation strategy for segments, random | free_ratio_first | cxl");
+    "Allocation strategy for segments, random | free_ratio_first | cxl | "
+    "ssd_balance");
+DEFINE_double(ssd_high_watermark_ratio, 0.90,
+              "SSD usage ratio above which a segment is excluded from "
+              "allocation (0.0-1.0)");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -378,6 +382,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+    default_config.GetDouble("ssd_high_watermark_ratio",
+                             &master_config.ssd_high_watermark_ratio,
+                             FLAGS_ssd_high_watermark_ratio);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -715,6 +722,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
+    if ((google::GetCommandLineFlagInfo("ssd_high_watermark_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ssd_high_watermark_ratio =
+            FLAGS_ssd_high_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||

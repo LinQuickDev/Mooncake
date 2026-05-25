@@ -405,6 +405,7 @@ enum class AllocationStrategyType {
     RANDOM = 0,        // Pure random allocation
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
     CXL,               // CXL-specific allocation
+    SSD_BALANCE,       // SSD-ratio-based load balancing
 };
 
 /**

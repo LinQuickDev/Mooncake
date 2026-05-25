@@ -1218,6 +1218,7 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double ssd_high_watermark_ratio_;           // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
