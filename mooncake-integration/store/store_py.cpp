@@ -412,7 +412,10 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
+            UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
             auto buffer_handle = store_->get_buffer(key);
+            pt_full.End(buffer_handle ? 0 : -1);
             if (!buffer_handle) {
                 pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
@@ -453,7 +456,10 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
+            UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
             auto batch_data = store_->batch_get_buffer(keys);
+            pt_full.End(0);
             if (batch_data.empty()) {
                 pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
@@ -2566,11 +2572,14 @@ PYBIND11_MODULE(store, m) {
                 UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT, UbDiag::PerfLevel::SUB_SYSTEM);
                 pt.Start();
                 py::gil_scoped_release release;
+                UbDiag::PerfPoint pt_full(PerfKey::PUT_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
+                pt_full.Start();
                 auto ret = self.store_->put(
                     key,
                     std::span<const char>(static_cast<char *>(info.ptr),
                                           static_cast<size_t>(info.size)),
                     config);
+                pt_full.End(ret == 0 ? 0 : -1);
                 pt.End(ret == 0 ? 0 : -1);
 
                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2636,7 +2645,10 @@ PYBIND11_MODULE(store, m) {
                 LOG(INFO) << "put_batch start num_keys[" << keys.size() << "] total_size[" << total_size << "]";
 
                 py::gil_scoped_release release;
+                UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
+                pt_full.Start();
                 auto ret = self.store_->put_batch(keys, spans, config);
+                pt_full.End(ret == 0 ? 0 : -1);
                 pt.End(ret == 0 ? 0 : -1);
 
                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(

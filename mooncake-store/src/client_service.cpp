@@ -787,8 +787,6 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
-    UbDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_FULL, UbDiag::PerfLevel::KEY_MODULE);
-    pt_full.Start();
 
     // Find the first complete replica
     Replica::Descriptor replica;
@@ -800,7 +798,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
-        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
@@ -836,7 +833,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
-        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
@@ -855,7 +851,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     // Log cache hit statistics
@@ -864,7 +859,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
-    pt_full.End(0);
     return {};
 }
 
@@ -1038,8 +1032,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
-    UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_FULL, UbDiag::PerfLevel::KEY_MODULE);
-    pt_full.Start();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1047,7 +1039,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        pt_full.End(-1);
         return results;
     }
 
@@ -1061,11 +1052,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        pt_full.End(-1);
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        pt_full.End(0);
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
@@ -1215,7 +1204,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     LOG(INFO) << "batch_get_transfer_complete num_keys[" << object_keys.size()
               << "] success[" << num_success << "] elapsed_us[" << us_batch_get << "]";
 
-    pt_full.End(0);
     return results;
 }
 

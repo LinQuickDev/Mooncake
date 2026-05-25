@@ -1536,21 +1536,16 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
-    UbDiag::PerfPoint pt_full(PerfKey::PUT_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
-    pt_full.Start();
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     UbDiag::PerfPoint pt_alloc(PerfKey::PUT_INTERNAL_ALLOC_BUFFER, UbDiag::PerfLevel::MODULE);
@@ -1560,7 +1555,6 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
                    << key << ", value size: " << value.size();
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
@@ -1577,12 +1571,10 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         LOG(INFO) << "put_result key[" << key << "] rc[" << static_cast<int>(put_result.error()) << "] size[" << value.size_bytes() << "]";
-        pt_full.End(-1);
         return tl::unexpected(put_result.error());
     }
 
     LOG(INFO) << "put_result key[" << key << "] rc[0] size[" << value.size_bytes() << "]";
-    pt_full.End(0);
     return {};
 }
 
@@ -1620,26 +1612,20 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
-    UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
-    pt_full.Start();
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (keys.size() != values.size()) {
         LOG(ERROR) << "Key and value size mismatch";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
-        pt_full.End(-1);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::vector<BufferHandle> buffer_handles;
@@ -1658,7 +1644,6 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             LOG(ERROR)
                 << "Failed to allocate buffer for put_batch operation, key: "
                 << key << ", value size: " << value.size();
-            pt_full.End(-1);
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
@@ -1683,7 +1668,6 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             ordered_batched_slices.emplace_back(it->second);
         } else {
             LOG(ERROR) << "Missing slices for key: " << key;
-            pt_full.End(-1);
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -1701,11 +1685,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
-            pt_full.End(-1);
             return tl::unexpected(results[i].error());
         }
     }
-    pt_full.End(0);
     return {};
 }
 
@@ -2420,16 +2402,12 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
-    UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
-    pt_full.Start();
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        pt_full.End(-1);
         return nullptr;
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
-        pt_full.End(-1);
         return nullptr;
     }
 
@@ -2512,7 +2490,6 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(read_result.error());
             return nullptr;
         }
-        pt_full.End(0);
         return buffer_handle;
     }
 
@@ -2540,12 +2517,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
-        pt_full.End(-1);
         return nullptr;
     }
 
     LOG(INFO) << "transfer_read_complete key[" << key << "] size[" << total_length << "]";
-    pt_full.End(0);
     return buffer_handle;
 }
 
@@ -2739,8 +2714,6 @@ std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
-    UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
-    pt_full.Start();
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -2873,6 +2846,8 @@ RealClient::batch_get_buffer_internal(
 
     // 3. Execute batch get for memory/disk replicas
     if (!valid_ops.empty()) {
+        UbDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ, UbDiag::PerfLevel::MODULE);
+        pt_bget.Start();
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
@@ -2900,6 +2875,7 @@ RealClient::batch_get_buffer_internal(
                            << "': " << toString(batch_get_results[i].error());
             }
         }
+        pt_bget.End(0);
     }
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
@@ -2955,8 +2931,6 @@ RealClient::batch_get_buffer_internal(
         }
         pt_bssd.End(0);
     }
-
-    pt_full.End(0);
 
     size_t success_count = 0;
     for (const auto &result : final_results) {
