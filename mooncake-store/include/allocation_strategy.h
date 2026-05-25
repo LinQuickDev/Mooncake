@@ -566,12 +566,10 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num,
-        const std::vector<std::string>& preferred_segments =
-            std::vector<std::string>(),
-        const std::set<std::string>& excluded_segments =
-            std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY,
-        const SsdMetricsProvider* ssd_provider = nullptr) override {
+        const std::vector<std::string>& preferred_segments,
+        const std::set<std::string>& excluded_segments,
+        const ReplicaType replica_type,
+        const SsdMetricsProvider* ssd_provider) override {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }

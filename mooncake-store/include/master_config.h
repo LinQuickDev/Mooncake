@@ -1083,6 +1083,7 @@ struct InProcMasterConfig {
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
     std::optional<double> eviction_high_watermark_ratio;
+    std::optional<double> ssd_high_watermark_ratio;
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
