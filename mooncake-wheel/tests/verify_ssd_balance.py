@@ -108,8 +108,7 @@ def create_store(segment_size=DEFAULT_DDR_SIZE,
         else:
             ssd_limit = int(ssd_limit_str)
         os.environ["MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"] = str(ssd_limit)
-        effective = ssd_limit - segment_size
-        if effective <= 0:
+        if ssd_limit <= segment_size:
             print(f"[ERROR] SSD({ssd_limit}) 必须 > DDR({segment_size})")
             sys.exit(1)
         ssd_path = ssd_path_override or os.getenv(
@@ -126,7 +125,6 @@ def create_store(segment_size=DEFAULT_DDR_SIZE,
     print(f"    DDR: {ddr_str}")
     if enable_offload:
         print(f"    SSD: {ssd_limit/1024/1024/1024:.1f}GB")
-        print(f"    effective: {effective/1024/1024/1024:.1f}GB")
         print(f"    SSD 路径: {ssd_path}")
         print(f"    心跳间隔: {heartbeat_interval}s")
     else:
@@ -279,14 +277,19 @@ def test_load_balancing():
 # Test 2: SSD 驱逐保护
 # ============================================================================
 
-def test_ssd_eviction_protection():
-    """验证 SSD 满时禁止写入但已有数据不被驱逐。"""
-    print("=== 验证：SSD 驱逐保护 ===\n")
+def test_ssd_high_watermark_blocking():
+    """验证 SSD 达到高水位后 Master 拒绝新分配，已有数据可读。"""
+    print("=== 验证：SSD 高水位分配阻断 ===\n")
 
     # 使用较小 SSD（5GB）以便测试能填满到高水位
     # DDR=4GB, SSD=5GB → high_watermark=90% → 4.5GB（约 1150 个 4MB key）
     ssd_size = 5 * 1024 * 1024 * 1024   # 5GB
     ddr_size = DEFAULT_DDR_SIZE          # 4GB
+
+    # 设置较小的 bucket size（40MB），使初始 20 key（80MB）足以填满 2 个 bucket 落盘
+    # 默认 bucket_size_limit=256MB，80MB 不够一个 bucket 不会落盘
+    os.environ["MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"] = str(
+        40 * 1024 * 1024)
 
     store = create_store(
         segment_size=ddr_size,
@@ -372,6 +375,120 @@ def test_ssd_eviction_protection():
 
     if lost == 0 and survived == len(initial_keys):
         print(f"\n  PASS: 所有初始数据存活，SSD 驱逐保护生效")
+    elif lost > 0:
+        print(f"\n  FAIL: {lost} 个初始 key 丢失，SSD 驱逐保护失败")
+    else:
+        print(f"\n  WARN: 无初始数据可验证")
+
+    # Cleanup
+    for key in initial_keys + pressure_keys:
+        try:
+            store.remove(key)
+        except Exception:
+            pass
+
+    print(f"\n  >>> 按回车退出")
+    input()
+
+
+# ============================================================================
+# Test 2b: SSD 驱逐保护
+# ============================================================================
+
+def test_ssd_eviction_protection():
+    """验证启用 FIFO 驱逐策略 + disable_ssd_eviction 后，已有 SSD 数据不被驱逐。"""
+    print("=== 验证：SSD 驱逐保护 ===\n")
+
+    # 使用较小 SSD + bucket 参数，使测试能快速填满并触发容量检查
+    ssd_size = 5 * 1024 * 1024 * 1024    # 5GB
+    ddr_size = DEFAULT_DDR_SIZE           # 4GB
+
+    # 关键配置：
+    # - bucket_size_limit=40MB 使初始 80MB 数据能填满 2 个 bucket 落盘
+    # - eviction_policy=fifo 启用驱逐（否则驱逐从不发生，测试无意义）
+    # - disable_ssd_eviction=true 强制跳过驱逐（核心保护机制）
+    # - max_total_size=256MB 使容量检查尽早触发
+    os.environ["MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"] = str(
+        40 * 1024 * 1024)
+    os.environ["MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY"] = "fifo"
+    os.environ["MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE"] = str(
+        256 * 1024 * 1024)
+    os.environ["MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION"] = "true"
+
+    store = create_store(
+        segment_size=ddr_size,
+        enable_offload=True,
+        ssd_total_size_override=ssd_size,
+    )
+
+    num_initial = 20
+    num_pressure = 200
+
+    # Phase 1: 写入初始数据
+    initial_keys = []
+    print(f"\n  [1] 写入 {num_initial} 个初始 key ({num_initial*4}MB)...")
+    for i in range(num_initial):
+        key = f"evict_initial_{i}"
+        data = bytes([i % 256]) * KEY_SIZE
+        retcode = store.put(key, data)
+        if retcode == 0:
+            initial_keys.append(key)
+        else:
+            print(f"    警告: 写入 {key} 失败: retcode={retcode}")
+        time.sleep(INSERT_INTERVAL)
+
+    print(f"  初始写入: {len(initial_keys)}/{num_initial} 成功")
+    print_metrics("初始写入后")
+
+    # 等待 offload
+    print(f"\n  [2] 等待 20s 让初始数据 offload 到 SSD...")
+    wait_with_progress(20)
+    print_metrics("offload 后")
+
+    # Phase 2: 写入压力数据，触发容量检查
+    # max_total_size=256MB，初始已用 80MB，写入 200 key（800MB）远超容量
+    # 如果 disable_ssd_eviction 不生效，PrepareEviction 会按 FIFO 驱逐初始 bucket
+    pressure_keys = []
+    rejected = 0
+    print(f"\n  [3] 写入 {num_pressure} 个压力 key（触发容量检查）...")
+    for i in range(num_pressure):
+        key = f"evict_pressure_{i}"
+        data = b"\x00" * KEY_SIZE
+        retcode = store.put(key, data)
+        if retcode == 0:
+            pressure_keys.append(key)
+        else:
+            rejected += 1
+        time.sleep(INSERT_INTERVAL)
+        # 每 50 个 key 等待一次 offload，让容量检查有机会触发
+        if (i + 1) % 50 == 0:
+            print(f"    {i+1}/{num_pressure} ({len(pressure_keys)} 成功, "
+                  f"{rejected} 拒绝)")
+            wait_with_progress(10)
+
+    print(f"  压力写入: {len(pressure_keys)} 成功, {rejected} 拒绝")
+
+    # 等待最终 offload
+    print(f"\n  [4] 等待 30s 让 offload 完成...")
+    wait_with_progress(30)
+    print_metrics("最终状态")
+
+    # Phase 3: 验证初始数据
+    print(f"\n  [5] 验证 {len(initial_keys)} 个初始 key...")
+    survived = 0
+    lost = 0
+    for key in initial_keys:
+        result = store.get(key)
+        if result and len(result) == KEY_SIZE:
+            survived += 1
+        else:
+            lost += 1
+            print(f"    丢失: {key}")
+
+    print(f"  结果: {survived}/{len(initial_keys)} 存活, {lost} 丢失")
+
+    if lost == 0 and survived == len(initial_keys):
+        print(f"\n  PASS: disable_ssd_eviction 生效，初始数据未被驱逐")
     elif lost > 0:
         print(f"\n  FAIL: {lost} 个初始 key 丢失，SSD 驱逐保护失败")
     else:
@@ -564,6 +681,7 @@ def test_all_ssd_full():
 
 TESTS = {
     "load_balancing": test_load_balancing,
+    "ssd_high_watermark_blocking": test_ssd_high_watermark_blocking,
     "ssd_eviction_protection": test_ssd_eviction_protection,
     "ddr_admission": test_ddr_admission,
     "all_ssd_full": test_all_ssd_full,

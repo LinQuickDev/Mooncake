@@ -81,6 +81,9 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
         config.eviction_policy = BucketEvictionPolicy::NONE;
     }
 
+    config.disable_ssd_eviction = GetEnvOr<bool>(
+        "MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", false);
+
     return config;
 }
 
@@ -1764,9 +1767,10 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
-    // When eviction is enabled, always allow offloading since PrepareEviction
-    // will manage capacity by evicting old buckets as needed.
-    if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
+    // When eviction is enabled (and not force-disabled), always allow offloading
+    // since PrepareEviction will manage capacity by evicting old buckets.
+    if (!bucket_backend_config_.disable_ssd_eviction &&
+        bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
         bucket_backend_config_.max_total_size > 0) {
         return true;
     }
@@ -2210,7 +2214,8 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
     int64_t required_size) {
     PendingEviction result;
 
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE ||
+        bucket_backend_config_.disable_ssd_eviction) {
         return result;
     }
 

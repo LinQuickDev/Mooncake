@@ -8,7 +8,7 @@
 
 ## 验证脚本
 
-验证脚本位于 `mooncake-wheel/tests/verify_ssd_balance.py`，支持 4 个测试场景：
+验证脚本位于 `mooncake-wheel/tests/verify_ssd_balance.py`，支持 5 个测试场景：
 
 ```
 python verify_ssd_balance.py --test <test_name>
@@ -17,7 +17,8 @@ python verify_ssd_balance.py --test <test_name>
 | test_name | 验证内容 |
 |-----------|---------|
 | `load_balancing` | **基础测试**：2个Client不对称SSD，验证数据按SSD空闲比例分布 |
-| `ssd_eviction_protection` | SSD满时禁止写入，已有数据不被驱逐 |
+| `ssd_high_watermark_blocking` | SSD达到90%高水位后Master拒绝新分配 |
+| `ssd_eviction_protection` | 启用FIFO驱逐+强制禁用驱逐，验证已有SSD数据不被驱逐 |
 | `ddr_admission` | DDR满时临时禁止写入，释放空间后自动恢复 |
 | `all_ssd_full` | 所有节点SSD满后全局拒绝，释放后恢复 |
 
@@ -110,10 +111,13 @@ du -sh /tmp/mooncake_ssd_balance_lb/client1 /tmp/mooncake_ssd_balance_lb/client2
 
 ---
 
-## 验证 2：SSD驱逐保护
+## 验证 2a：SSD高水位分配阻断
 
 脚本内部使用较小SSD（DDR=4GB, SSD=5GB），使少量数据即可填满SSD到90%高水位。
-写入初始数据 → offload落盘 → 分批写入压力数据填满SSD → 验证初始数据不被驱逐。
+写入初始数据 → offload落盘 → 分批写入压力数据填满SSD → 验证写入被拒绝 + 初始数据可读。
+
+注意：Bucket存储后端默认 `bucket_size_limit=256MB`，数据量不足一个 bucket 时不会落盘。
+脚本设置了 `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=40MB` 使初始 80MB 数据足以填满 2 个 bucket。
 
 **Terminal 1** — 启动Master：
 
@@ -134,8 +138,8 @@ mooncake_master \
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
-MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_evict \
-python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_eviction_protection
+MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_hwb \
+python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_high_watermark_blocking
 ```
 
 注意：SSD容量由脚本内部控制（5GB），无需设置 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`。
@@ -149,12 +153,46 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_eviction_protection
   批次 5/6: 950 成功, 20 拒绝
   ```
 - 脚本输出 `rejected` 计数 > 0 表示SSD接近满，分配策略开始拒绝
-- 初始20个key全部可读（未被驱逐）
+- 初始20个key全部可读
 
 ### 判断标准
 
 - 初始写入的20个key全部可读，0个丢失
 - 压力阶段出现被拒绝的写入（SSD使用率超过90%）
+
+---
+
+## 验证 2b：SSD驱逐保护
+
+验证存储后端驱逐保护机制：启用 FIFO 驱逐策略 + `disable_ssd_eviction=true`，
+写入压力数据触发容量检查，验证初始数据不被驱逐。
+
+脚本内部设置：
+- `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=fifo`（启用驱逐策略）
+- `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=256MB`（容量上限）
+- `MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION=true`（强制禁止驱逐）
+
+**Terminal 1** — 启动Master（同 2a）
+
+**Terminal 2** — 运行验证脚本：
+
+```bash
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ssd_balance_evict \
+python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_eviction_protection
+```
+
+### 预期观察
+
+- 写入20个初始key（80MB），等待20s确保offload落盘到SSD
+- 写入200个压力key（800MB），远超 `max_total_size=256MB`
+- 如果 `disable_ssd_eviction` 不生效，初始 bucket 会按 FIFO 被驱逐
+- 初始20个key全部可读（`PrepareEviction` 因 `disable_ssd_eviction` 跳过驱逐）
+
+### 判断标准
+
+- 初始写入的20个key全部可读，0个丢失
 
 ---
 
