@@ -69,6 +69,11 @@ def get_client(store, master_address=None, enable_ssd_offload=True,
     offload_path = ssd_offload_path or os.getenv(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_offload_promotion")
 
+    if enable_ssd_offload:
+        # FileStorage::ValidatePath requires the directory to already exist
+        os.makedirs(offload_path, exist_ok=True)
+        print(f"  SSD offload path: {offload_path}")
+
     retcode = store.setup(
         local_hostname,
         metadata_server,
