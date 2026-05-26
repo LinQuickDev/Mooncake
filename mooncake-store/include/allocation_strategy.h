@@ -745,7 +745,9 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
 
     bool isDdrHighWatermark(const std::string& name,
                             const SsdMetricsProvider* provider) const {
-        if (ddr_admission_watermark_ >= 1.0) return false;
+        if (ddr_admission_watermark_ <= 0.0 ||
+            ddr_admission_watermark_ >= 1.0)
+            return false;
         double ratio = provider->getDdrUsedRatio(name);
         return ratio >= ddr_admission_watermark_;
     }
