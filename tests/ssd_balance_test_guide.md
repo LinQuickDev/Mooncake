@@ -114,7 +114,11 @@ du -sh /tmp/mooncake_ssd_balance_lb/client1 /tmp/mooncake_ssd_balance_lb/client2
 ## 验证 2a：SSD高水位分配阻断
 
 脚本内部使用较小SSD（DDR=4GB, SSD=5GB），使少量数据即可填满SSD到90%高水位。
-写入初始数据 → offload落盘 → 分批写入压力数据填满SSD → 验证写入被拒绝 + 初始数据可读。
+
+**关键机制**：`ssd_used_bytes` 仅在 `NotifyOffloadSuccess` 回调时异步更新。写入阶段 DDR 缓冲数据（4GB），DDR eviction 不断释放空间，因此写入期间 SSD watermark 无法阻断分配。
+正确验证方式：offload 全部完成后 `ssd_used_bytes` 反映真实 SSD 使用率 > 90%，此时新写入应被拒绝。
+
+流程：写入初始数据 → offload落盘 → 写入压力数据填满SSD → 等待offload完成 → 验证新写入被拒绝 → 验证初始数据可读 → 释放恢复。
 
 注意：Bucket存储后端默认 `bucket_size_limit=256MB`，数据量不足一个 bucket 时不会落盘。
 脚本设置了 `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=40MB` 使初始 80MB 数据足以填满 2 个 bucket。
@@ -148,17 +152,22 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_high_watermark_bloc
 
 - 写入20个初始key（80MB），等待20s确保offload落盘到SSD
 - 分6批写入1200个压力key（4.8GB），每批200个，批间等待20s offload
-- 前几批写入全部成功，后几批开始出现拒绝：
+  - **此阶段写入全部成功是正常的**（DDR缓冲 + ssd_used_bytes滞后）
+  - 部分压力key可能被DDR eviction丢弃（预期行为）
+- 等待40s让所有offload完成，metrics显示SSD使用率 > 90%
+- offload完成后写入新key `hw_blocked_test`，此时应被拒绝：
   ```
-  批次 5/6: 950 成功, 20 拒绝
+  W... client_service.cpp:...] Failed to start put operation for key=hw_blocked_test
+      due to insufficient space...
   ```
-- 脚本输出 `rejected` 计数 > 0 表示SSD接近满，分配策略开始拒绝
-- 初始20个key全部可读
+- 初始20个key全部可读（已offload到SSD）
+- 释放部分数据后写入恢复
 
 ### 判断标准
 
+- offload完成后新写入被拒绝（`store.put()` 返回非0）
 - 初始写入的20个key全部可读，0个丢失
-- 压力阶段出现被拒绝的写入（SSD使用率超过90%）
+- 释放空间后写入恢复（`store.put()` 返回0）
 
 ---
 

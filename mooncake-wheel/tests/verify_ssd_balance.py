@@ -278,7 +278,13 @@ def test_load_balancing():
 # ============================================================================
 
 def test_ssd_high_watermark_blocking():
-    """验证 SSD 达到高水位后 Master 拒绝新分配，已有数据可读。"""
+    """验证 SSD 达到高水位后 Master 拒绝新分配，已有数据可读。
+
+    关键：ssd_used_bytes 仅在 NotifyOffloadSuccess 回调时异步更新，
+    因此写入阶段无法被 SSD watermark 阻断（DDR 缓冲 + ssd_used_bytes 滞后）。
+    正确验证方式：offload 完成后 ssd_used_bytes 反映真实使用率 > 90%，
+    此时新写入应被拒绝。
+    """
     print("=== 验证：SSD 高水位分配阻断 ===\n")
 
     # 使用较小 SSD（5GB）以便测试能填满到高水位
@@ -287,7 +293,6 @@ def test_ssd_high_watermark_blocking():
     ddr_size = DEFAULT_DDR_SIZE          # 4GB
 
     # 设置较小的 bucket size（40MB），使初始 20 key（80MB）足以填满 2 个 bucket 落盘
-    # 默认 bucket_size_limit=256MB，80MB 不够一个 bucket 不会落盘
     os.environ["MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"] = str(
         40 * 1024 * 1024)
 
@@ -301,11 +306,11 @@ def test_ssd_high_watermark_blocking():
     num_pressure = 1200
     batch_size = 200
 
-    # Phase 1: 写入初始数据
+    # Phase 1: 写入初始数据（80MB），确保 offload 落盘
     initial_keys = []
     print(f"\n  [1] 写入 {num_initial} 个初始 key ({num_initial*4}MB)...")
     for i in range(num_initial):
-        key = f"protect_initial_{i}"
+        key = f"hw_initial_{i}"
         data = bytes([i % 256]) * KEY_SIZE
         retcode = store.put(key, data)
         if retcode == 0:
@@ -317,50 +322,54 @@ def test_ssd_high_watermark_blocking():
     print(f"  初始写入: {len(initial_keys)}/{num_initial} 成功")
     print_metrics("初始写入后")
 
-    # 等待 offload，确保初始数据已落盘
     print(f"\n  [2] 等待 20s 让初始数据 offload 到 SSD...")
     wait_with_progress(20)
     print_metrics("offload 后")
 
-    # Phase 2: 分批写入压力数据填满 SSD
+    # Phase 2: 写入压力数据填满 SSD（不期望此阶段写入被拒绝）
     pressure_keys = []
-    rejected = 0
-    total_written = 0
+    print(f"\n  [3] 写入 {num_pressure} 个压力 key 填满 SSD "
+          f"（{num_pressure*4//1024:.1f}GB）...")
     num_batches = (num_pressure + batch_size - 1) // batch_size
-    print(f"\n  [3] 分批写入 {num_pressure} 个压力 key（{num_batches} 批 × "
-          f"{batch_size} key）填满 SSD...")
-
     for batch_start in range(0, num_pressure, batch_size):
         batch_end = min(batch_start + batch_size, num_pressure)
         batch_num = batch_start // batch_size + 1
+        batch_written = 0
         for i in range(batch_start, batch_end):
-            key = f"protect_pressure_{i}"
+            key = f"hw_pressure_{i}"
             data = b"\x00" * KEY_SIZE
             retcode = store.put(key, data)
             if retcode == 0:
                 pressure_keys.append(key)
-                total_written += 1
-            else:
-                rejected += 1
+                batch_written += 1
             time.sleep(INSERT_INTERVAL)
 
-        print(f"    批次 {batch_num}/{num_batches}: "
-              f"{total_written} 成功, {rejected} 拒绝")
+        print(f"    批次 {batch_num}/{num_batches}: {batch_written} 写入")
         print_metrics(f"批次 {batch_num} 后")
 
         if batch_end < num_pressure:
             print(f"    等待 20s 让 offload 排空 DDR...")
             wait_with_progress(20)
 
-    print(f"  压力写入完成: {total_written} 成功, {rejected} 拒绝")
+    print(f"  压力写入完成: {len(pressure_keys)} 个 key")
 
-    # 等待最终 offload
-    print(f"\n  [4] 等待 30s 让最终 offload 完成...")
-    wait_with_progress(30)
-    print_metrics("最终 offload 后")
+    # Phase 3: 等待最终 offload，让 ssd_used_bytes 追上实际使用量
+    print(f"\n  [4] 等待 40s 让所有 offload 完成...")
+    wait_with_progress(40)
+    print_metrics("offload 完成后")
 
-    # Phase 3: 验证初始数据
-    print(f"\n  [5] 验证 {len(initial_keys)} 个初始 key...")
+    # Phase 4: 验证写入被阻断（此时 ssd_used_bytes 已更新，SSD > 90%）
+    print(f"\n  [5] 验证 SSD 高水位阻断（offload 完成后新写入应被拒绝）...")
+    blocked_key = "hw_blocked_test"
+    retcode = store.put(blocked_key, b"\x00" * KEY_SIZE)
+    write_blocked = (retcode != 0)
+    if write_blocked:
+        print(f"  写入被拒绝 (retcode={retcode}) -- SSD 高水位阻断生效")
+    else:
+        print(f"  写入成功 (retcode={retcode}) -- SSD 可能未到高水位")
+
+    # Phase 5: 验证初始数据可读
+    print(f"\n  [6] 验证 {len(initial_keys)} 个初始 key...")
     survived = 0
     lost = 0
     for key in initial_keys:
@@ -373,12 +382,43 @@ def test_ssd_high_watermark_blocking():
 
     print(f"  结果: {survived}/{len(initial_keys)} 存活, {lost} 丢失")
 
-    if lost == 0 and survived == len(initial_keys):
-        print(f"\n  PASS: 所有初始数据存活，SSD 驱逐保护生效")
-    elif lost > 0:
-        print(f"\n  FAIL: {lost} 个初始 key 丢失，SSD 驱逐保护失败")
+    # Phase 6: 释放空间后验证写入恢复
+    freed_count = min(20, len(pressure_keys))
+    print(f"\n  [7] 释放 {freed_count} 个压力 key...")
+    freed_ok = 0
+    for key in pressure_keys[:freed_count]:
+        try:
+            store.remove(key)
+            freed_ok += 1
+        except Exception:
+            pass
+
+    print(f"  释放了 {freed_ok} 个 key")
+    print(f"  等待 10s 让 Master 更新 ssd_used_bytes...")
+    wait_with_progress(10)
+    print_metrics("释放后")
+
+    resume_key = "hw_resume_test"
+    retcode = store.put(resume_key, b"\x00" * KEY_SIZE)
+    write_resumed = (retcode == 0)
+    if write_resumed:
+        print(f"  释放后写入成功 -- SSD 高水位恢复")
     else:
-        print(f"\n  WARN: 无初始数据可验证")
+        print(f"  释放后写入仍被拒绝 (retcode={retcode})")
+
+    # 判断
+    if write_blocked and lost == 0 and write_resumed:
+        print(f"\n  PASS: SSD 高水位阻断生效（阻断 → 初始数据存活 → 恢复）")
+    elif not write_blocked and lost == 0:
+        print(f"\n  WARN: SSD 未到高水位（可能 offload 未完全完成），"
+              f"但初始数据存活")
+    elif write_blocked and lost == 0 and not write_resumed:
+        print(f"\n  WARN: 阻断生效且初始数据存活，但释放后未恢复"
+              f"（可能释放量不够或 ssd_used_bytes 未更新）")
+    elif lost > 0:
+        print(f"\n  FAIL: {lost} 个初始 key 丢失")
+    else:
+        print(f"\n  FAIL: 意外结果")
 
     # Cleanup
     for key in initial_keys + pressure_keys:
