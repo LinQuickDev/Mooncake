@@ -1178,7 +1178,7 @@ auto MasterService::AllocateAndInsertMetadata(
                     ErrorCode::DDR_ADMISSION_REJECTED) {
                     need_mem_eviction_ = true;
                 }
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                return tl::make_unexpected(allocation_result.error());
             }
         } else {
             allocated_memory_replicas = allocation_result->size();

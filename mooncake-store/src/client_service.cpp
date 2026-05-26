@@ -1305,9 +1305,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             pt_full.End(0);
             return {};
         }
-        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE ||
+            err == ErrorCode::DDR_ADMISSION_REJECTED) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
-                         << PUT_NO_SPACE_HELPER_STR;
+                         << PUT_NO_SPACE_HELPER_STR
+                         << " (error=" << toString(err) << ")";
         } else {
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
@@ -1411,9 +1413,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
     if (!start_result) {
         ErrorCode err = start_result.error();
-        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE ||
+            err == ErrorCode::DDR_ADMISSION_REJECTED) {
             LOG(WARNING) << "Failed to start upsert operation for key=" << key
-                         << PUT_NO_SPACE_HELPER_STR;
+                         << PUT_NO_SPACE_HELPER_STR
+                         << " (error=" << toString(err) << ")";
         } else {
             LOG(ERROR) << "Failed to start upsert operation for key=" << key
                        << ": " << toString(err);
@@ -3135,7 +3139,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
         bool should_retry =
-            (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
+            (result == ErrorCode::NO_AVAILABLE_HANDLE ||
+             result == ErrorCode::DDR_ADMISSION_REJECTED) &&
             (current_retry_count < assignment.max_retry_attempts);
 
         if (should_retry) {
