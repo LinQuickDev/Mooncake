@@ -33,7 +33,13 @@ python tests/verify_offload_promotion.py --test <test_name>
 
 ## 默认规模
 
-DDR = 32MB（`SEGMENT_SIZE_BYTES`），Value = 1MB，NumKeys = 80（≈80MB，远超 32MB DDR，必然触发 eviction）
+DDR = 32MB（`SEGMENT_SIZE_BYTES`），Value = 1MB，NumKeys = 80（≈80MB），每批写入 10 个 key 后暂停 2s 让 eviction+offload 释放内存。
+
+## 分批写入机制
+
+`offload_on_evict=true` 模式下，eviction 必须先 offload 到 SSD 才能释放 DDR 空间。如果 80 个 key 连续写入（无间隔），DDR 在 ~32 个 key 时写满，后续全部被 `NO_AVAILABLE_HANDLE` 拒绝。
+
+脚本使用 `batch_put(store, keys, batch_size=10, batch_pause=2.0)` 分批写入：每 10 个 key 暂停 2s，给 eviction 线程时间完成 offload→释放内存→下一批写入成功。
 
 ## 注意事项
 
@@ -251,6 +257,7 @@ After promotion cycle:
   Cold keys: 2 with MEMORY, 58 LOCAL_DISK-only
 ```
 
+- 80 个 key 分批写入，绝大多数成功（~80 vs 之前 ~32）
 - 热 key 中至少有一部分获得了 MEMORY 副本（promoted）
 - 冷 key 绝大多数保持在 LOCAL_DISK-only（未触发 promotion）
 

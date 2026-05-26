@@ -74,6 +74,13 @@ def get_client(store, master_address=None, enable_ssd_offload=True,
         os.makedirs(offload_path, exist_ok=True)
         print(f"  SSD offload path: {offload_path}")
 
+        # BucketStorageBackend defaults (256 MB / 500 keys) are too large for
+        # a single-process test — data would stay in the ungrouped pool forever.
+        # Set small thresholds so a handful of 1 MB objects flush to disk.
+        os.environ.setdefault("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES",
+                              str(10 * 1024 * 1024))   # 10 MB
+        os.environ.setdefault("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10")
+
     retcode = store.setup(
         local_hostname,
         metadata_server,
@@ -96,6 +103,28 @@ def random_key(prefix="op_test"):
 
 def random_value(size=DEFAULT_VALUE_SIZE):
     return os.urandom(size)
+
+
+def batch_put(store, keys, value_size, batch_size=10, batch_pause=2.0):
+    """Write keys in batches, pausing between batches to let eviction drain DDR.
+
+    With offload_on_evict=true, eviction must offload to SSD before freeing
+    DDR space. Writing all keys in a tight loop fills DDR immediately and
+    causes NO_AVAILABLE_HANDLE rejections. Batching gives the eviction thread
+    time to catch up.
+    """
+    reference = {}
+    total_batches = (len(keys) + batch_size - 1) // batch_size
+    for bi in range(total_batches):
+        batch = keys[bi * batch_size:(bi + 1) * batch_size]
+        for key in batch:
+            value = random_value(value_size)
+            retcode = store.put(key, value)
+            if retcode == 0:
+                reference[key] = value
+        if bi < total_batches - 1:
+            time.sleep(batch_pause)
+    return reference
 
 
 def replica_types(descs, key):
@@ -189,14 +218,10 @@ def test_basic_offload(num_keys=30, value_size=DEFAULT_VALUE_SIZE):
 
     timestamp = int(time.time())
     keys = [f"offload_{i}_{timestamp}" for i in range(num_keys)]
-    written = []
 
     print(f"  Writing {num_keys} objects ({value_size // 1024} KB each)...")
-    for key in keys:
-        value = random_value(value_size)
-        retcode = store.put(key, value)
-        if retcode == 0:
-            written.append(key)
+    reference = batch_put(store, keys, value_size, batch_size=10)
+    written = list(reference.keys())
 
     if len(written) == 0:
         result.fail_test("No objects written successfully")
@@ -258,15 +283,10 @@ def test_load_from_ssd(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
 
     timestamp = int(time.time())
     keys = [f"load_{i}_{timestamp}" for i in range(num_keys)]
-    reference = {}
 
     print(f"  Writing {num_keys} x {value_size // 1024}KB = "
           f"{(num_keys * value_size) // (1024*1024)}MB to overflow 32MB DDR...")
-    for key in keys:
-        value = random_value(value_size)
-        retcode = store.put(key, value)
-        if retcode == 0:
-            reference[key] = value
+    reference = batch_put(store, keys, value_size, batch_size=10)
 
     if len(reference) == 0:
         result.fail_test("No objects written")
@@ -367,16 +387,11 @@ def test_promotion_on_hit(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
 
     timestamp = int(time.time())
     keys = [f"promo_{i}_{timestamp}" for i in range(num_keys)]
-    reference = {}
 
     # Phase 1: Write enough to overflow memory
     print(f"  Phase 1: Writing {num_keys} x {value_size // 1024}KB = "
           f"{(num_keys * value_size) // (1024*1024)}MB...")
-    for key in keys:
-        value = random_value(value_size)
-        retcode = store.put(key, value)
-        if retcode == 0:
-            reference[key] = value
+    reference = batch_put(store, keys, value_size, batch_size=10)
 
     if len(reference) == 0:
         result.fail_test("No objects written")
@@ -501,16 +516,11 @@ def test_cold_hot_exchange(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
     hot_keys = [f"hot_{i}_{timestamp}" for i in range(hot_count)]
     cold_keys = [f"cold_{i}_{timestamp}" for i in range(hot_count, total_keys)]
     all_keys = hot_keys + cold_keys
-    reference = {}
 
-    # Phase 1: Write all keys
+    # Phase 1: Write all keys in batches to let eviction drain DDR
     print(f"  Phase 1: Writing {total_keys} keys "
           f"({hot_count} hot, {total_keys - hot_count} cold)...")
-    for key in all_keys:
-        value = random_value(value_size)
-        retcode = store.put(key, value)
-        if retcode == 0:
-            reference[key] = value
+    reference = batch_put(store, all_keys, value_size, batch_size=10)
 
     print(f"  Written {len(reference)}/{total_keys} objects")
 
