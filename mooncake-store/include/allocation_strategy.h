@@ -589,6 +589,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
         std::set<std::string> used_segments;
+        size_t ddr_rejected_count = 0;
 
         // Handle preferred segments first
         for (const auto& preferred_segment : preferred_segments) {
@@ -602,6 +603,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
             }
             if (ssd_provider &&
                 isDdrHighWatermark(preferred_segment, ssd_provider)) {
+                ddr_rejected_count++;
                 continue;
             }
 
@@ -645,6 +647,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
             if (ssd_provider && isDdrHighWatermark(name, ssd_provider)) {
+                ddr_rejected_count++;
                 continue;
             }
 
@@ -698,6 +701,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
             if (ssd_provider && isDdrHighWatermark(name, ssd_provider)) {
+                ddr_rejected_count++;
                 continue;
             }
 
@@ -711,6 +715,9 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
         }
 
         if (replicas.empty()) {
+            if (ddr_rejected_count > 0) {
+                return tl::make_unexpected(ErrorCode::DDR_ADMISSION_REJECTED);
+            }
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         return replicas;

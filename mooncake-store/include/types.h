@@ -269,6 +269,8 @@ enum class ErrorCode : int32_t {
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
         -200,  ///< Memory allocation failed due to insufficient space.
+    DDR_ADMISSION_REJECTED =
+        -201,  ///< Allocation rejected by DDR admission watermark.
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.

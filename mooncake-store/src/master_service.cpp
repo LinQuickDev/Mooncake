@@ -1174,7 +1174,10 @@ auto MasterService::AllocateAndInsertMetadata(
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
-                need_mem_eviction_ = true;
+                if (allocation_result.error() !=
+                    ErrorCode::DDR_ADMISSION_REJECTED) {
+                    need_mem_eviction_ = true;
+                }
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
         } else {
