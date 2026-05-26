@@ -164,6 +164,13 @@ target_link_libraries(
   PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
          ${EXTRA_LIBS} asio_shared
   PRIVATE transfer_engine)
+
+# UbDiag instrumentation
+find_package(UbDiag REQUIRED)
+target_link_libraries(mooncake_store PRIVATE UbDiag::ubdiag_lib)
+target_include_directories(mooncake_store PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
+
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()

@@ -27,3 +27,8 @@ add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
 target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
+
+add_executable(stress_cluster_bench stress_cluster_bench.cpp)
+target_link_libraries(
+  stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
+                               gflags::gflags glog::glog pthread)

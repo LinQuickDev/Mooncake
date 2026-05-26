@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <chrono>
 #include <functional>
 #include <numeric>
 #include <unordered_map>
@@ -16,6 +17,10 @@
 #include <memory>
 
 #include "integration_utils.h"
+
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {
@@ -395,8 +400,14 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::bytes get(const std::string &key) {
+        auto start = std::chrono::steady_clock::now();
+        LOG(INFO) << "get start key[" << key << "]";
+
+        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET, UbDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            pt.End(-1);
             return pybind11::bytes("\\0", 0);
         }
 
@@ -404,13 +415,31 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
+            UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
             auto buffer_handle = store_->get_buffer(key);
+            pt_full.End(buffer_handle ? 0 : -1);
             if (!buffer_handle) {
+                pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                LOG(INFO) << "get complete key[" << key << "] rc[-1] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 3000) {
+                    LOG(WARNING) << "get_slow key[" << key << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return kNullString;
             }
 
             py::gil_scoped_acquire acquire_gil;
+            pt.End(0);
+            auto size = buffer_handle->size();
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            LOG(INFO) << "get complete key[" << key << "] rc[0] size[" << size << "] elapsed_us[" << elapsed_us << "]";
+            if (elapsed_us > 3000) {
+                LOG(WARNING) << "get_slow key[" << key << "] size[" << size << "] elapsed_us[" << elapsed_us << "]";
+            }
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -418,18 +447,37 @@ class MooncakeStorePyWrapper {
 
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
+        auto start = std::chrono::steady_clock::now();
+        LOG(INFO) << "get_batch start num_keys[" << keys.size() << "]";
+
+        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET_BATCH, UbDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            pt.End(-1);
             py::gil_scoped_acquire acquire_gil;
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            LOG(INFO) << "get_batch complete num_keys[" << keys.size() << "] rc[-1] elapsed_us[" << elapsed_us << "]";
             return {kNullString};
         }
 
         {
             py::gil_scoped_release release_gil;
+            UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL, UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
             auto batch_data = store_->batch_get_buffer(keys);
+            pt_full.End(0);
             if (batch_data.empty()) {
+                pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                LOG(INFO) << "get_batch complete num_keys[" << keys.size() << "] rc[-1] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 10000) {
+                    LOG(WARNING) << "get_batch_slow num_keys[" << keys.size() << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return {kNullString};
             }
 
@@ -437,10 +485,20 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
+            size_t success_count = 0;
             for (const auto &data : batch_data) {
+                if (data) success_count++;
                 results.emplace_back(
                     data ? pybind11::bytes((char *)data->ptr(), data->size())
                          : kNullString);
+            }
+            pt.End(0);
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            LOG(INFO) << "get_batch complete num_keys[" << keys.size() << "] success[" << success_count
+                      << "] rc[0] elapsed_us[" << elapsed_us << "]";
+            if (elapsed_us > 10000) {
+                LOG(WARNING) << "get_batch_slow num_keys[" << keys.size() << "] elapsed_us[" << elapsed_us << "]";
             }
             return results;
         }
@@ -2546,13 +2604,31 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self, const std::string &key,
                py::buffer buf,
                const ReplicateConfig &config = ReplicateConfig{}) {
+                auto start = std::chrono::steady_clock::now();
                 py::buffer_info info = buf.request(/*writable=*/false);
+                size_t size = static_cast<size_t>(info.size);
+                LOG(INFO) << "put start key[" << key << "] size[" << size << "]";
+
+                UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT, UbDiag::PerfLevel::SUB_SYSTEM);
+                pt.Start();
                 py::gil_scoped_release release;
-                return self.store_->put(
+                UbDiag::PerfPoint pt_full(PerfKey::PUT_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
+                pt_full.Start();
+                auto ret = self.store_->put(
                     key,
                     std::span<const char>(static_cast<char *>(info.ptr),
                                           static_cast<size_t>(info.size)),
                     config);
+                pt_full.End(ret == 0 ? 0 : -1);
+                pt.End(ret == 0 ? 0 : -1);
+
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                LOG(INFO) << "put complete key[" << key << "] rc[" << ret << "] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 3000) {
+                    LOG(WARNING) << "put_slow key[" << key << "] size[" << size << "] elapsed_us[" << elapsed_us << "]";
+                }
+                return ret;
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{})
@@ -2590,21 +2666,41 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<py::buffer> &buffers,
                const ReplicateConfig &config = ReplicateConfig{}) {
+                auto start = std::chrono::steady_clock::now();
+
+                UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT_BATCH, UbDiag::PerfLevel::SUB_SYSTEM);
+                pt.Start();
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(buffers.size());
                 spans.reserve(buffers.size());
 
+                size_t total_size = 0;
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
                     const auto &info = infos.back();
+                    total_size += static_cast<size_t>(info.size);
                     spans.emplace_back(static_cast<const char *>(info.ptr),
                                        static_cast<size_t>(info.size));
                 }
 
+                LOG(INFO) << "put_batch start num_keys[" << keys.size() << "] total_size[" << total_size << "]";
+
                 py::gil_scoped_release release;
-                return self.store_->put_batch(keys, spans, config);
+                UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL, UbDiag::PerfLevel::KEY_MODULE);
+                pt_full.Start();
+                auto ret = self.store_->put_batch(keys, spans, config);
+                pt_full.End(ret == 0 ? 0 : -1);
+                pt.End(ret == 0 ? 0 : -1);
+
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                LOG(INFO) << "put_batch complete num_keys[" << keys.size() << "] rc[" << ret << "] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 10000) {
+                    LOG(WARNING) << "put_batch_slow num_keys[" << keys.size() << "] elapsed_us[" << elapsed_us << "]";
+                }
+                return ret;
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
