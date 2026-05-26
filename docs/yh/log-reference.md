@@ -334,3 +334,251 @@ PerfPoint 定义在 `mooncake-integration/store/mooncake_perf_points.def`。
 | `PUT_BATCH_PUT_END` | client_service.cpp::FinalizeBatchPut | PutEnd | — |
 | `PUT_BATCH_PUT_REVOKE` | client_service.cpp::FinalizeBatchPut | PutRevoke | — |
 | `PUT_BATCH_COLLECT_RESULTS` | client_service.cpp::BatchPut | CollectResults | — |
+
+---
+
+## 6. 日志配置
+
+Mooncake 使用 glog 作为日志库，通过环境变量控制日志级别和输出位置。
+
+### 6.1 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|-------|------|
+| `MC_LOG_LEVEL` | `INFO` | 日志输出级别 |
+| `MC_LOG_DIR` | 空（stderr） | 日志文件输出目录 |
+
+代码来源：`mooncake-transfer-engine/src/config.cpp`
+
+### 6.2 设置日志级别 — `MC_LOG_LEVEL`
+
+可选值：
+
+| 值 | 效果 |
+|----|------|
+| `TRACE` | 最详细，输出 INFO/WARNING/ERROR，额外启用 trace 标志 |
+| `INFO` | 默认，输出 INFO/WARNING/ERROR |
+| `WARNING` | 只输出 WARNING/ERROR |
+| `ERROR` | 只输出 ERROR |
+
+**操作方法：**
+
+```bash
+# 在启动 Mooncake 服务前设置
+export MC_LOG_LEVEL=WARNING
+./mooncake_master
+
+# 或在 Python 端（import mooncake 前）
+import os
+os.environ['MC_LOG_LEVEL'] = 'WARNING'
+import mooncake
+```
+
+**注意：** 设置日志级别只影响日志输出，不影响时间记录代码（`steady_clock::now()` 调用仍会执行）。
+
+### 6.3 设置日志输出位置 — `MC_LOG_DIR`
+
+| 情况 | 行为 |
+|------|------|
+| 未设置或为空 | 日志输出到 stderr（终端） |
+| 目录不存在 | 输出 WARNING，回退到 stderr |
+| 目录不可写 | 输出 WARNING，回退到 stderr |
+| 目录存在且可写 | 日志写入该目录下的文件 |
+
+**操作方法：**
+
+```bash
+# 输出到指定目录
+export MC_LOG_DIR=/var/log/mooncake
+./mooncake_master
+
+# 需要先确保目录存在且可写
+mkdir -p /var/log/mooncake
+chmod 755 /var/log/mooncake
+```
+
+### 6.4 常用配置场景
+
+| 场景 | 配置 |
+|------|------|
+| 生产环境 | `export MC_LOG_LEVEL=WARNING && export MC_LOG_DIR=/var/log/mooncake` |
+| 调试排查 | `export MC_LOG_LEVEL=INFO`（默认输出到 stderr） |
+| 性能测试（减少日志） | `export MC_LOG_LEVEL=ERROR` |
+| 完全禁用日志输出 | `export MC_LOG_LEVEL=ERROR`（ERROR 很少触发，近似禁用） |
+
+---
+
+## 7. 异步日志改造方案
+
+当前日志为同步输出（glog 直接写文件），在极端场景下可能阻塞工作线程。
+以下提供两种异步改造方案。
+
+### 7.1 方案 1：替换为 spdlog 异步模式
+
+使用 spdlog 的 `async_logger`，内部基于无锁环形队列，写日志只做一次 `memcpy` 到队列，后台线程负责刷盘。
+
+**改造步骤：**
+
+1. **CMake 引入依赖**
+
+在 `mooncake-store/CMakeLists.txt` 中：
+```cmake
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.x
+)
+FetchContent_MakeAvailable(spdlog)
+target_link_libraries(mooncake_store PUBLIC spdlog::spdlog)
+```
+
+2. **创建全局 async logger**
+
+新增 `mooncake-store/src/async_logger.h`：
+```cpp
+#pragma once
+#include <spdlog/async.h>
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
+inline std::shared_ptr<spdlog::async_logger> get_mc_logger() {
+    static auto logger = [] {
+        auto dir = std::getenv("MC_LOG_DIR");
+        std::vector<spdlog::sink_ptr> sinks;
+        sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+        if (dir && *dir) {
+            sinks.push_back(std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+                std::string(dir) + "/mooncake.log"));
+        }
+        auto logger = std::make_shared<spdlog::async_logger>(
+            "mooncake", sinks.begin(), sinks.end(),
+            spdlog::thread_pool(), spdlog::async_overflow_policy::block);
+        spdlog::register_logger(logger);
+        return logger;
+    }();
+    return logger;
+}
+```
+
+3. **替换 LOG 宏**
+
+在源文件中：
+```cpp
+// 之前
+LOG(INFO) << "get_breakdown key[" << key << "]";
+// 之后
+get_mc_logger()->info("get_breakdown key[{}]", key);
+```
+
+**优点：**
+- 成熟方案，性能好，零分配（fmt 编译期格式化）
+- 内置日志文件滚动、多 sink 支持
+- 日志顺序由队列保证
+
+**缺点：**
+- 引入第三方依赖
+- 需要改所有 LOG 调用点（store_py.cpp、real_client.cpp、client_service.cpp）
+- glog 的 `VLOG(1)` 需要单独处理
+
+### 7.2 方案 2：在 glog 上包装异步队列
+
+不替换 glog，在其上层加一个线程安全队列，LOG 宏改为写入队列，后台线程消费并调用 glog 输出。
+
+**改造步骤：**
+
+1. **定义异步日志队列**
+
+新增 `mooncake-store/src/async_log_queue.h`：
+```cpp
+#pragma once
+#include <string>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <glog/logging.h>
+
+class AsyncLogQueue {
+public:
+    static AsyncLogQueue& Instance() {
+        static AsyncLogQueue q;
+        return q;
+    }
+
+    void Push(int severity, const std::string& msg) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.emplace(severity, msg);
+        }
+        cv_.notify_one();
+    }
+
+private:
+    AsyncLogQueue() {
+        thread_ = std::thread([this] { DrainLoop(); });
+    }
+
+    void DrainLoop() {
+        while (running_) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
+            while (!queue_.empty()) {
+                auto [sev, msg] = std::move(queue_.front());
+                queue_.pop();
+                lock.unlock();
+                google::LogMessage(__FILE__, __LINE__, sev).stream() << msg;
+                lock.lock();
+            }
+        }
+    }
+
+    struct Entry { int severity; std::string message; };
+    std::queue<Entry> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread thread_;
+    bool running_ = true;
+};
+```
+
+2. **封装宏替换**
+
+```cpp
+#define MC_LOG(severity)                              \
+    [&]() -> AsyncLogQueue& {                         \
+        if (severity < FLAGS_minloglevel) {           \
+            static AsyncLogQueue* dummy = nullptr;    \
+            return *dummy;  // 不执行                 \
+        }                                             \
+        return AsyncLogQueue::Instance();             \
+    }().Push(google::severity,                        \
+        [](std::ostream& os) { os <<
+
+// 替换使用：
+// MC_LOG(INFO) << "get_breakdown key[" << key << "]";
+```
+
+3. **逐文件替换**
+
+将 `LOG(INFO)` → `MC_LOG(INFO)`，`LOG(WARNING)` → `MC_LOG(WARNING)`，`LOG(ERROR)` → `MC_LOG(ERROR)`。
+
+**优点：**
+- 不引入新依赖，保持 glog
+- 改动范围小，只改宏名
+- 日志格式与之前一致
+
+**缺点：**
+- 日志顺序可能因多线程队列而乱序
+- 进程崩溃时队列中未刷出的日志会丢失
+- 需要处理 glog 的 `LogMessage` API 兼容性
+
+### 7.3 方案对比
+
+| 维度 | 方案 1：spdlog | 方案 2：glog 包装 |
+|------|---------------|-------------------|
+| 依赖 | 新增 spdlog | 无新依赖 |
+| 性能 | 高（零分配 fmt） | 中（string 构造） |
+| 日志顺序 | 保证 | 可能乱序 |
+| 崩溃安全 | 可能丢少量 | 可能丢少量 |
+| 改动量 | 大（所有 LOG 调用） | 中（宏替换） |
+| 生态 | spdlog 活跃维护 | glog 成熟稳定 |
