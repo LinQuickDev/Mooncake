@@ -75,7 +75,7 @@ MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_1 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
 SEGMENT_SIZE_BYTES=33554432 \
-python tests/verify_offload_promotion.py --test offload
+python tests/verify_offload_promotion.py --test offload --master 127.0.0.1:50053
 ```
 
 ### 预期观察
@@ -125,7 +125,7 @@ MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_2 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
 SEGMENT_SIZE_BYTES=33554432 \
-python tests/verify_offload_promotion.py --test load
+python tests/verify_offload_promotion.py --test load --master 127.0.0.1:50053
 ```
 
 ### 预期观察
@@ -182,7 +182,7 @@ MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_3 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
 SEGMENT_SIZE_BYTES=33554432 \
-python tests/verify_offload_promotion.py --test promotion
+python tests/verify_offload_promotion.py --test promotion --master 127.0.0.1:50053
 ```
 
 ### 预期观察
@@ -240,7 +240,7 @@ MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_4 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
 SEGMENT_SIZE_BYTES=33554432 \
-python tests/verify_offload_promotion.py --test exchange
+python tests/verify_offload_promotion.py --test exchange --master 127.0.0.1:50053
 ```
 
 ### 预期观察
@@ -270,7 +270,7 @@ MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_all \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
 SEGMENT_SIZE_BYTES=33554432 \
-python tests/verify_offload_promotion.py --test all
+python tests/verify_offload_promotion.py --test all --master 127.0.0.1:50053
 ```
 
 ## 关键环境变量
