@@ -35,9 +35,27 @@ python tests/verify_offload_promotion.py --test <test_name>
 
 DDR = 32MB（`SEGMENT_SIZE_BYTES`），Value = 1MB，NumKeys = 80（≈80MB，远超 32MB DDR，必然触发 eviction）
 
+## 关键机制：LOCAL_DISK 读取必须走 self-RPC
+
+当 Python Client 以嵌入式模式（`enable_ssd_offload=True`）运行时，FileStorage + offload RPC Server 在进程内启动。读取 LOCAL_DISK 数据时，代码走 self-RPC 路径：
+
+```
+store.get(key)
+  → RealClient::get_buffer_internal()           [real_client.cpp:2633]
+    → transport_endpoint = "localhost:xxxxx"    [← local_hostname 拼接]
+    → batch_get_into_offload_object_internal()  [real_client.cpp:2643]
+      → client_requester_->batch_get_offload_object("localhost:xxxxx")
+        → coro_rpc 向 localhost:xxxxx 发起 TCP 连接  ← 可能失败!
+```
+
+`transport_endpoint` 在 offload 时由 `FileStorage::OffloadObjects()` 写入为 `local_rpc_addr_`，而 `local_rpc_addr_` 来自 `setup()` 时传入的 `local_hostname` + 内核分配的端口（`real_client.cpp:890-891`）。
+
+**如果 `local_hostname` 无法被 coro_rpc 客户端正确解析或连接到自身，该 RPC 就会失败。**
+
 ## 注意事项
 
 - **每次测试前清空 SSD 目录**：`rm -rf <SSD_PATH> && mkdir -p <SSD_PATH>`
+- **LOCAL_HOSTNAME 必须设为 127.0.0.1**：默认 `localhost` 在部分系统（尤其是 Windows）上可能导致 self-RPC 连接失败（IPv6 解析、防火墙等）。设为数字 IPv4 地址可避免此问题
 - **MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS 必须设为 1**：默认 10s 会导致 offload/promotion 延迟过长
 - **MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES 设小（如 10MB）**：默认 256MB 太大，测试数据量不够一个桶，不会落盘
 - **put() 不抛异常**：`store.put()` 返回整数状态码（0=成功，非0=失败）
@@ -70,6 +88,7 @@ mooncake_master \
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+LOCAL_HOSTNAME=127.0.0.1 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_1 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
@@ -120,6 +139,7 @@ mooncake_master \
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+LOCAL_HOSTNAME=127.0.0.1 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_2 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
@@ -177,6 +197,7 @@ mooncake_master \
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+LOCAL_HOSTNAME=127.0.0.1 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_3 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
@@ -235,6 +256,7 @@ mooncake_master \
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+LOCAL_HOSTNAME=127.0.0.1 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_4 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
@@ -265,6 +287,7 @@ After promotion cycle:
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+LOCAL_HOSTNAME=127.0.0.1 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_all \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
@@ -276,6 +299,7 @@ python tests/verify_offload_promotion.py --test all
 
 | 变量 | 推荐值 | 说明 |
 |------|--------|------|
+| `LOCAL_HOSTNAME` | `127.0.0.1` | **必须设为数字 IP**，默认 `localhost` 会导致 self-RPC 连接失败 |
 | `MC_METADATA_SERVER` | `http://127.0.0.1:8880/metadata` | HTTP 元数据服务器地址 |
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `1` | **必须设为 1**，默认 10s 太慢 |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | 测试专用目录 | 每次测试前清空 |
@@ -328,6 +352,7 @@ watch -n 1 'find /tmp/mooncake_offload_promotion_all -name "*.bucket" -exec du -
 
 | 现象 | 可能原因 | 解决方案 |
 |------|----------|----------|
+| RPC 连接错误（`batch_get_offload_object` / `invoke_rpc` 失败） | `LOCAL_HOSTNAME` 默认 `localhost` 在 Windows 上可能解析为 IPv6 或受网络配置影响导致 self-RPC 失败 | 设置 `LOCAL_HOSTNAME=127.0.0.1`（数字 IPv4 地址），这是最常见的原因 |
 | No LOCAL_DISK replicas after offload wait | 数据量不足一个 bucket（256MB 默认）/ 心跳间隔太长 | 设 `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760` 和 `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1` |
 | No LOCAL_DISK-only keys（全部 memory_only） | DDR 太大未触发 eviction | 设 `SEGMENT_SIZE_BYTES=33554432`（32MB），增加 `--num-keys` |
 | No promotion even after repeated reads | Master 未启动 `promotion_on_hit` / promotion 等待不够 | 确认 `--promotion_on_hit=true`，增加 `PROMOTION_WAIT_SECONDS` |
