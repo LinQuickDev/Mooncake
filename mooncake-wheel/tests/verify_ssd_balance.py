@@ -516,10 +516,10 @@ def test_ssd_eviction_protection():
 # ============================================================================
 
 def test_ddr_admission():
-    """验证 DDR 满时临时禁止写入，释放后恢复。
+    """验证 DDR 准入水位阻断写入。
 
-    DDR=4GB, eviction_high_watermark=95% → 3.8GB 触发。
-    写入大量 4MB key（1500 个 = 6GB），观察 DDR 满时的行为。
+    DDR=4GB, ddr_admission_watermark_ratio=0.90（需通过 master 启动参数设置）。
+    写入大量 4MB key（1500 个 = 6GB），观察 DDR 超过准入水位时的写入拒绝。
     """
     print("=== 验证：DDR 准入控制 ===\n")
 
@@ -531,8 +531,9 @@ def test_ddr_admission():
     first_reject_at = -1
 
     print(f"\n  [1] 写入 {num_keys} 个 4MB key ({num_keys*4//1024:.1f}GB)，"
-          f"观察 DDR 满时行为...")
-    print(f"  DDR=4GB, 高水位=95% ({4*1024*0.95:.0f}MB)")
+          f"观察 DDR 准入水位阻断...")
+    print(f"  DDR=4GB, 准入水位=90% ({4*1024*0.90:.0f}MB) "
+          f"(需 --ddr_admission_watermark_ratio=0.90)")
     t0 = time.time()
 
     for i in range(num_keys):

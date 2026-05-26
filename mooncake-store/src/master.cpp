@@ -83,6 +83,10 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(ddr_admission_watermark_ratio,
+              mooncake::DEFAULT_DDR_ADMISSION_WATERMARK_RATIO,
+              "Ratio above which DDR allocation is rejected (0.0 = use "
+              "eviction_high_watermark_ratio)");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -326,6 +330,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("ddr_admission_watermark_ratio",
+                             &master_config.ddr_admission_watermark_ratio,
+                             FLAGS_ddr_admission_watermark_ratio);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -728,6 +735,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.ssd_high_watermark_ratio =
             FLAGS_ssd_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("ddr_admission_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ddr_admission_watermark_ratio =
+            FLAGS_ddr_admission_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||

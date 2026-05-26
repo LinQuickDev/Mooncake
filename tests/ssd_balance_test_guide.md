@@ -218,7 +218,10 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_eviction_protection
 ## 验证 3：DDR准入控制
 
 关闭 SSD offload，写入大量 4MB key（1500 个 = 6GB）填满 DDR（4GB），
-观察 DDR 使用率超过 95% 高水位时的写入行为。
+观察 DDR 使用率超过准入水位时的写入行为。
+
+通过 `--ddr_admission_watermark_ratio=0.90` 将准入水位设为 90%（低于 eviction 的 95%），
+使 admission control 在 eviction 启动前触发，阻断新写入。
 
 **Terminal 1** — 启动Master：
 
@@ -230,6 +233,7 @@ mooncake_master \
     --metrics_port=9104 \
     --allocation_strategy=ssd_balance \
     --ssd_high_watermark_ratio=0.90 \
+    --ddr_admission_watermark_ratio=0.90 \
     --enable_offload=true \
     --default_kv_lease_ttl=2000
 ```
@@ -245,17 +249,17 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ddr_admission
 
 ### 预期观察
 
-- 前 ~950 个 key（3.8GB）正常写入
-- DDR 使用率超过 95% 后，Master 拒绝新分配，Client 日志出现：
+- 前 ~900 个 key（3.6GB）正常写入
+- DDR 使用率超过 90% 后，Master 拒绝新分配，Client 日志出现：
   ```
   W... Failed to start put operation for key=ddr_fill_xxx
       due to insufficient space...
   ```
   Master（需 `--v=1`）出现：
   ```
-  DDR overflow protection: rejecting allocation, ratio=0.95
+  DDR overflow protection: rejecting allocation, ratio=0.90
   ```
-- DDR eviction 后台线程驱逐旧 key，释放空间后新写入恢复
+- DDR eviction 后台线程驱逐旧 key（95% 水位），释放空间后新写入恢复
 - 整体表现为：写入穿插成功与拒绝，rejected > 0
 
 ### 判断标准

@@ -1345,4 +1345,10 @@ int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
     if (disk_it == client_local_disk_segment_.end()) return 0;
     return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
 }
+
+double ScopedLocalDiskSegmentAccess::getDdrUsedRatio(
+    const std::string& segment_name) const {
+    return MasterMetricManager::instance().get_segment_mem_used_ratio(
+        segment_name);
+}
 }  // namespace mooncake

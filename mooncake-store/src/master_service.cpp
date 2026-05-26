@@ -141,7 +141,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(
           CreateAllocationStrategy(config.allocation_strategy_type,
-                                   config.ssd_high_watermark_ratio)),
+                                   config.ssd_high_watermark_ratio,
+                                   config.ddr_admission_watermark_ratio)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -1142,17 +1143,6 @@ auto MasterService::AllocateAndInsertMetadata(
     const ReplicateConfig& config,
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    // DDR overflow admission control: temporarily block allocations when
-    // global DDR usage exceeds eviction watermark, resume when it drops.
-    double global_ddr_ratio =
-        MasterMetricManager::instance().get_global_mem_used_ratio();
-    if (global_ddr_ratio > eviction_high_watermark_ratio_) {
-        VLOG(1) << "DDR overflow protection: rejecting allocation, ratio="
-                << global_ddr_ratio;
-        need_mem_eviction_ = true;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
