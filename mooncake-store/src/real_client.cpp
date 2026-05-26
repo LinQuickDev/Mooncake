@@ -2411,10 +2411,15 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
+    auto t_query = t0, t_select = t0, t_alloc = t0;
+    std::string replica_type;
+
     // Query the object info
     UbDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY, UbDiag::PerfLevel::MODULE);
     pt_query.Start();
     auto query_result = client_->Query(key);
+    t_query = std::chrono::steady_clock::now();
     pt_query.End(query_result ? 0 : -1);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -2443,6 +2448,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    t_select = std::chrono::steady_clock::now();
     pt_select.End(best_replica ? 0 : -1);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
@@ -2452,11 +2458,23 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
 
-    LOG(INFO) << "replica_selected key[" << key << "] type["
-              << (best_replica->is_memory_replica()
-                      ? "memory"
-                      : (best_replica->is_local_disk_replica() ? "local_disk" : "disk"))
-              << "] size[" << total_length << "]";
+    // Set replica_type for breakdown log and build endpoint string
+    if (replica.is_memory_replica()) {
+        replica_type = "memory";
+        std::string endpoint = replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+        LOG(INFO) << "replica_selected key[" << key << "] type[" << replica_type
+                  << "] endpoint[" << endpoint << "] size[" << total_length << "]";
+    } else if (replica.is_local_disk_replica()) {
+        replica_type = "local_disk";
+        std::string endpoint = replica.get_local_disk_descriptor().transport_endpoint;
+        LOG(INFO) << "replica_selected key[" << key << "] type[" << replica_type
+                  << "] endpoint[" << endpoint << "] size[" << total_length << "]";
+    } else {
+        replica_type = "disk";
+        std::string file_path = replica.get_disk_descriptor().file_path;
+        LOG(INFO) << "replica_selected key[" << key << "] type[" << replica_type
+                  << "] file_path[" << file_path << "] size[" << total_length << "]";
+    }
 
     if (total_length == 0) {
         return nullptr;
@@ -2466,6 +2484,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTERNAL_ALLOC_BUFFER, UbDiag::PerfLevel::MODULE);
     pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(total_length);
+    t_alloc = std::chrono::steady_clock::now();
     pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
@@ -2474,6 +2493,18 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
+
+    auto log_breakdown = [&](const char *status) {
+        auto now = std::chrono::steady_clock::now();
+        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0).count();
+        auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(t_select - t_query).count();
+        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(t_alloc - t_select).count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc).count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
+        LOG(INFO) << "get_breakdown key[" << key << "] query_us[" << query_us << "] select_us[" << select_us
+                  << "] alloc_us[" << alloc_us << "] read_us[" << read_us << "] total_us[" << total_us
+                  << "] type[" << replica_type << "] status[" << status << "]";
+    };
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
@@ -2490,8 +2521,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
+            log_breakdown("ssd_fail");
             return nullptr;
         }
+        log_breakdown("ssd_ok");
         return buffer_handle;
     }
 
@@ -2519,10 +2552,11 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
+        log_breakdown("read_fail");
         return nullptr;
     }
 
-    LOG(INFO) << "transfer_read_complete key[" << key << "] size[" << total_length << "]";
+    log_breakdown("read_ok");
     return buffer_handle;
 }
 
@@ -2728,10 +2762,14 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
+    auto t_query = t0, t_prep = t0, t_read = t0;
+
     // 1. Query metadata for all keys
     UbDiag::PerfPoint pt_bquery(PerfKey::GET_BATCH_INTERNAL_QUERY, UbDiag::PerfLevel::MODULE);
     pt_bquery.Start();
     auto query_results = client_->BatchQuery(keys);
+    t_query = std::chrono::steady_clock::now();
     pt_bquery.End(0);
 
     size_t num_found = 0;
@@ -2842,6 +2880,8 @@ RealClient::batch_get_buffer_internal(
             .slices = std::move(slices)});
     }
 
+    t_prep = std::chrono::steady_clock::now();
+
     if (valid_ops.empty() && disk_ops.empty()) {
         return final_results;
     }
@@ -2934,11 +2974,24 @@ RealClient::batch_get_buffer_internal(
         pt_bssd.End(0);
     }
 
+    t_read = std::chrono::steady_clock::now();
+
     size_t success_count = 0;
     for (const auto &result : final_results) {
         if (result) success_count++;
     }
-    LOG(INFO) << "batch_get_complete num_keys[" << keys.size() << "] success[" << success_count << "]";
+    {
+        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0).count();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t_query).count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(t_read - t_prep).count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_read - t0).count();
+        LOG(INFO) << "batch_get_breakdown num_keys[" << keys.size()
+                  << "] query_us[" << query_us << "] prep_us[" << prep_us
+                  << "] read_us[" << read_us << "] total_us[" << total_us
+                  << "] batch_get_ops[" << valid_ops.size()
+                  << "] ssd_offload_ops[" << disk_ops.size()
+                  << "] success[" << success_count << "]";
+    }
 
     return final_results;
 }
@@ -5447,12 +5500,13 @@ RealClient::batch_get_into_offload_object_internal(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
                                                               start_time)
             .count());
-    LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
-              << elapsed_time
-              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
-              << ", key size: " << objects.size()
-              << ", batch_id: " << batchGetResp->batch_id
-              << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+    int64_t total_size = 0;
+    for (auto s : sizes) total_size += s;
+    LOG(INFO) << "ssd_read_detail endpoint[" << target_rpc_service_addr
+              << "] num_keys[" << objects.size()
+              << "] total_size[" << total_size
+              << "] elapsed_ms[" << elapsed_time
+              << "] batch_id[" << batchGetResp->batch_id << "]";
 
     // Release buffer immediately after transfer completion (fire-and-forget)
     // This allows early buffer reclamation instead of waiting for GC lease

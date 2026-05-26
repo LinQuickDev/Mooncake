@@ -836,7 +836,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(err);
     }
 
-    LOG(INFO) << "transfer_read_completed key[" << object_key << "] elapsed_us[" << us_get << "]";
+    size_t data_size = 0;
+    for (const auto &s : slices) data_size += s.size;
+    LOG(INFO) << "transfer_read_completed key[" << object_key << "] elapsed_us[" << us_get
+              << "] data_size[" << data_size
+              << "] cache_hit[" << (cache_used ? 1 : 0) << "]";
 
     // Frequency admission: only promote frequently accessed keys to hot cache.
     // Skip when cache_used — data was already served from local cache, no need
@@ -1202,7 +1206,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (r.has_value()) num_success++;
     }
     LOG(INFO) << "batch_get_transfer_complete num_keys[" << object_keys.size()
-              << "] success[" << num_success << "] elapsed_us[" << us_batch_get << "]";
+              << "] success[" << num_success << "] elapsed_us[" << us_batch_get
+              << "] pending_count[" << pending_transfers.size() << "]";
 
     return results;
 }
@@ -1339,7 +1344,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
-    LOG(INFO) << "put_end_success key[" << key << "] transfer_us[" << us_put << "]";
+    size_t data_size = 0;
+    for (const auto &s : slices) data_size += s.size;
+    LOG(INFO) << "put_end_success key[" << key << "] transfer_us[" << us_put
+              << "] data_size[" << data_size << "]";
 
     pt_full.End(0);
     return {};
@@ -2124,8 +2132,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         auto results = BatchPutWhenPreferSameNode(ops);
         int num_failed = 0;
         for (auto& r : results) if (!r) num_failed++;
+        size_t total_size = 0;
+        for (const auto& key_slices : batched_slices)
+            for (const auto& s : key_slices) total_size += s.size;
         LOG(INFO) << "batch_put complete num_keys[" << keys.size()
-                  << "] num_failed[" << num_failed << "]";
+                  << "] num_failed[" << num_failed << "] total_size[" << total_size << "]";
         pt_full.End(0);
         return results;
     }
@@ -2145,8 +2156,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     auto results = CollectResults(ops);
     int num_failed = 0;
     for (auto& r : results) if (!r) num_failed++;
+    size_t total_size = 0;
+    for (const auto& key_slices : batched_slices)
+        for (const auto& s : key_slices) total_size += s.size;
     LOG(INFO) << "batch_put complete num_keys[" << keys.size()
-              << "] num_failed[" << num_failed << "] transfer_us[" << us << "]";
+              << "] num_failed[" << num_failed << "] transfer_us[" << us
+              << "] total_size[" << total_size << "]";
     pt_full.End(0);
     return results;
 }
@@ -2744,6 +2759,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    auto t0_transfer = std::chrono::steady_clock::now();
     UbDiag::PerfPoint pt_submit(is_write ? PerfKey::PUT_SINGLE_TRANSFER_SUBMIT : PerfKey::GET_SINGLE_TRANSFER_SUBMIT, UbDiag::PerfLevel::DEBUG);
     pt_submit.Start();
     auto future =
@@ -2755,6 +2771,9 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::TRANSFER_FAIL;
     }
 
+    auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0_transfer).count();
+
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
     UbDiag::PerfPoint pt_wait(is_write ? PerfKey::PUT_SINGLE_TRANSFER_WAIT : PerfKey::GET_SINGLE_TRANSFER_WAIT, UbDiag::PerfLevel::DEBUG);
@@ -2762,6 +2781,12 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     auto result = future->get();
     pt_wait.End(result == ErrorCode::OK ? 0 : -1);
     pt_full.End(result == ErrorCode::OK ? 0 : -1);
+
+    auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0_transfer).count() - submit_us;
+    LOG(INFO) << "transfer_data op[" << (is_write ? "WRITE" : "READ")
+              << "] submit_us[" << submit_us << "] wait_us[" << wait_us
+              << "] result[" << toString(result) << "]";
     return result;
 }
 

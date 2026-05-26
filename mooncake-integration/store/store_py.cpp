@@ -422,6 +422,9 @@ class MooncakeStorePyWrapper {
                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 LOG(INFO) << "get complete key[" << key << "] rc[-1] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 3000) {
+                    LOG(WARNING) << "get_slow key[" << key << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return kNullString;
             }
 
@@ -431,6 +434,9 @@ class MooncakeStorePyWrapper {
             auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - start).count();
             LOG(INFO) << "get complete key[" << key << "] rc[0] size[" << size << "] elapsed_us[" << elapsed_us << "]";
+            if (elapsed_us > 3000) {
+                LOG(WARNING) << "get_slow key[" << key << "] size[" << size << "] elapsed_us[" << elapsed_us << "]";
+            }
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -466,6 +472,9 @@ class MooncakeStorePyWrapper {
                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 LOG(INFO) << "get_batch complete num_keys[" << keys.size() << "] rc[-1] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 10000) {
+                    LOG(WARNING) << "get_batch_slow num_keys[" << keys.size() << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return {kNullString};
             }
 
@@ -485,6 +494,9 @@ class MooncakeStorePyWrapper {
                 std::chrono::steady_clock::now() - start).count();
             LOG(INFO) << "get_batch complete num_keys[" << keys.size() << "] success[" << success_count
                       << "] rc[0] elapsed_us[" << elapsed_us << "]";
+            if (elapsed_us > 10000) {
+                LOG(WARNING) << "get_batch_slow num_keys[" << keys.size() << "] elapsed_us[" << elapsed_us << "]";
+            }
             return results;
         }
     }
@@ -2585,6 +2597,9 @@ PYBIND11_MODULE(store, m) {
                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 LOG(INFO) << "put complete key[" << key << "] rc[" << ret << "] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 3000) {
+                    LOG(WARNING) << "put_slow key[" << key << "] size[" << size << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return ret;
             },
             py::arg("key"), py::arg("value"),
@@ -2654,6 +2669,9 @@ PYBIND11_MODULE(store, m) {
                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 LOG(INFO) << "put_batch complete num_keys[" << keys.size() << "] rc[" << ret << "] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 10000) {
+                    LOG(WARNING) << "put_batch_slow num_keys[" << keys.size() << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return ret;
             },
             py::arg("keys"), py::arg("values"),
