@@ -190,6 +190,10 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
+    bool disable_ssd_eviction = false;  // Force disable eviction regardless of
+                                        // eviction_policy. Set via
+                                        // MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION.
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
