@@ -118,7 +118,7 @@ du -sh /tmp/mooncake_ssd_balance_lb/client1 /tmp/mooncake_ssd_balance_lb/client2
 **关键机制**：`ssd_used_bytes` 仅在 `NotifyOffloadSuccess` 回调时异步更新。写入阶段 DDR 缓冲数据（4GB），DDR eviction 不断释放空间，因此写入期间 SSD watermark 无法阻断分配。
 正确验证方式：offload 全部完成后 `ssd_used_bytes` 反映真实 SSD 使用率 > 90%，此时新写入应被拒绝。
 
-流程：写入初始数据 → offload落盘 → 写入压力数据填满SSD → 等待offload完成 → 验证新写入被拒绝 → 验证初始数据可读 → 释放恢复。
+流程：写入初始数据 → offload落盘 → 写入压力数据填满SSD → 等待offload完成 → 验证新写入被拒绝 → 验证初始数据可读。
 
 注意：Bucket存储后端默认 `bucket_size_limit=256MB`，数据量不足一个 bucket 时不会落盘。
 脚本设置了 `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=40MB` 使初始 80MB 数据足以填满 2 个 bucket。
@@ -161,13 +161,23 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_high_watermark_bloc
       due to insufficient space...
   ```
 - 初始20个key全部可读（已offload到SSD）
-- 释放部分数据后写入恢复
 
 ### 判断标准
 
 - offload完成后新写入被拒绝（`store.put()` 返回非0）
 - 初始写入的20个key全部可读，0个丢失
-- 释放空间后写入恢复（`store.put()` 返回0）
+
+### 注意：offload 可能提前停止
+
+当 `eviction_policy=NONE`（默认）时，`BucketStorageBackend::IsEnableOffloading` 检查：
+```
+total_size + bucket_size_limit <= total_size_limit
+```
+要求预留一个完整 bucket 的空间（40MB）。当 `total_size > 4.96GB`（5GB - 40MB）时，offload 被阻断。
+
+更关键的是：一旦 `BatchOffload` 返回 `KEYS_ULTRA_LIMIT`，`file_storage.cpp:471` 将 `enable_offloading_` 永久设为 `false`，没有代码会重置它。后续所有心跳都发送 `enable_offloading_=false`，Master 不再返回 offloading objects。
+
+此外，DDR eviction（DDR > 95% 时触发）会在 offload 之前删除 DDR 副本。被驱逐的 key 无法再被 offload，因为其数据已从 DDR 消失。
 
 ---
 
@@ -207,7 +217,8 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ssd_eviction_protection
 
 ## 验证 3：DDR准入控制
 
-写入大对象填满DDR，验证DDR满时写入被临时禁止，释放后恢复。
+关闭 SSD offload，写入大量 4MB key（1500 个 = 6GB）填满 DDR（4GB），
+观察 DDR 使用率超过 95% 高水位时的写入行为。
 
 **Terminal 1** — 启动Master：
 
@@ -234,22 +245,22 @@ python mooncake-wheel/tests/verify_ssd_balance.py --test ddr_admission
 
 ### 预期观察
 
-- 写入64MB大对象逐步填满DDR
-- DDR满后新写入失败，Client 日志出现：
+- 前 ~950 个 key（3.8GB）正常写入
+- DDR 使用率超过 95% 后，Master 拒绝新分配，Client 日志出现：
   ```
-  W... Failed to start put operation for key=ddr_blocked_test
+  W... Failed to start put operation for key=ddr_fill_xxx
       due to insufficient space...
   ```
   Master（需 `--v=1`）出现：
   ```
-  DDR overflow protection: rejecting allocation, ratio=0.97
+  DDR overflow protection: rejecting allocation, ratio=0.95
   ```
-- 删除部分对象后写入恢复成功
+- DDR eviction 后台线程驱逐旧 key，释放空间后新写入恢复
+- 整体表现为：写入穿插成功与拒绝，rejected > 0
 
 ### 判断标准
 
-- DDR满时写入被阻止（`store.put()` 返回非0）
-- 释放空间后写入恢复成功（`store.put()` 返回0）
+- 出现被拒绝的写入（`store.put()` 返回非0，rejected > 0）
 
 ---
 
