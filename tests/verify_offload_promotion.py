@@ -41,17 +41,16 @@ except ImportError:
 # ============================================================================
 
 DEFAULT_MASTER = "127.0.0.1:50051"
-DEFAULT_NUM_KEYS = 400
+DEFAULT_NUM_KEYS = 800
 DEFAULT_VALUE_SIZE = 1024 * 1024  # 1 MB
-DEFAULT_SEGMENT_SIZE = 320 * 1024 * 1024  # 320 MB — 5x scale
-DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
+DEFAULT_SEGMENT_SIZE = 64 * 1024 * 1024  # fallback, auto-scale overrides
+DEFAULT_LOCAL_BUFFER_SIZE = 64 * 1024 * 1024  # 64 MB
 
-# Wait constants — extended to let limited-rate pipelines drain fully.
-# Offload moves the entire queue in one RPC but SSD I/O + NotifyOffloadSuccess
-# RPCs are synchronous.  KEYS_ULTRA_LIMIT on any bucket permanently sets
-# enable_offloading_=false (file_storage.cpp:471) → all remaining keys lost.
-# Promotion has kMaxPerHeartbeat=1 (master_service.cpp:2991) → at most ~1 key/s.
-OFFLOAD_WAIT_SECONDS = int(os.getenv("OFFLOAD_WAIT_SECONDS", "120"))
+# DDR is auto-scaled in get_client() to total_data × 0.6.
+# Promotion bottleneck: kMaxPerHeartbeat=1 (master_service.cpp:2991).
+# Offload bottleneck: KEYS_ULTRA_LIMIT → enable_offloading_=false permanently
+#                     (file_storage.cpp:471), scale wait times with num_keys.
+OFFLOAD_WAIT_SECONDS = int(os.getenv("OFFLOAD_WAIT_SECONDS", "60"))
 PROMOTION_WAIT_SECONDS = int(os.getenv("PROMOTION_WAIT_SECONDS", "180"))
 
 
@@ -60,12 +59,26 @@ PROMOTION_WAIT_SECONDS = int(os.getenv("PROMOTION_WAIT_SECONDS", "180"))
 # ============================================================================
 
 def get_client(store, master_address=None, enable_ssd_offload=True,
-               ssd_offload_path=None):
-    """Initialize and setup a distributed store client with SSD offload."""
+               ssd_offload_path=None, num_keys=None, value_size=None):
+    """Initialize and setup a distributed store client with SSD offload.
+
+    If num_keys and value_size are provided, SEGMENT_SIZE_BYTES is
+    auto-scaled to ~60% of total data so eviction reliably triggers
+    (eviction_high_watermark * DDR < total data).  Explicitly setting
+    SEGMENT_SIZE_BYTES in the environment overrides this.
+    """
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "eth0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
+
+    # Auto-scale DDR: ~60% of expected total data so eviction punches
+    # through at ~42% of key count (0.60 * 0.70 = 0.42).
+    if num_keys and value_size and "SEGMENT_SIZE_BYTES" not in os.environ:
+        auto_ddr = int(num_keys * value_size * 0.6)
+        auto_ddr = max(auto_ddr, 32 * 1024 * 1024)  # floor 32 MB
+        os.environ["SEGMENT_SIZE_BYTES"] = str(auto_ddr)
+
     segment_size = int(os.getenv("SEGMENT_SIZE_BYTES", DEFAULT_SEGMENT_SIZE))
     local_buffer_size = int(os.getenv("LOCAL_BUFFER_SIZE_BYTES",
                                        DEFAULT_LOCAL_BUFFER_SIZE))
@@ -218,7 +231,7 @@ def test_basic_offload(num_keys=30, value_size=DEFAULT_VALUE_SIZE):
     """Write data → wait for offload → verify LOCAL_DISK replicas exist."""
     result = TestResult("Basic Offload (MEMORY -> SSD)")
     store = MooncakeDistributedStore()
-    get_client(store)
+    get_client(store, num_keys=num_keys, value_size=value_size)
 
     timestamp = int(time.time())
     keys = [f"offload_{i}_{timestamp}" for i in range(num_keys)]
@@ -283,7 +296,7 @@ def test_load_from_ssd(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
     """Overflow memory → verify LOCAL_DISK-only keys can be read via Load path."""
     result = TestResult("SSD Load Path (SSD -> Client)")
     store = MooncakeDistributedStore()
-    get_client(store)
+    get_client(store, num_keys=num_keys, value_size=value_size)
 
     timestamp = int(time.time())
     keys = [f"load_{i}_{timestamp}" for i in range(num_keys)]
@@ -387,7 +400,7 @@ def test_promotion_on_hit(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
     """Verify hot LOCAL_DISK-only data is promoted back to MEMORY."""
     result = TestResult("Promotion on Hit (SSD -> MEMORY)")
     store = MooncakeDistributedStore()
-    get_client(store)
+    get_client(store, num_keys=num_keys, value_size=value_size)
 
     timestamp = int(time.time())
     keys = [f"promo_{i}_{timestamp}" for i in range(num_keys)]
@@ -509,7 +522,7 @@ def test_cold_hot_exchange(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
     cold keys on LOCAL_DISK only."""
     result = TestResult("Cold-Hot Exchange")
     store = MooncakeDistributedStore()
-    get_client(store)
+    get_client(store, num_keys=num_keys, value_size=value_size)
 
     timestamp = int(time.time())
     total_keys = num_keys

@@ -33,7 +33,7 @@ python tests/verify_offload_promotion.py --test <test_name>
 
 ## 默认规模
 
-DDR = 320MB（`SEGMENT_SIZE_BYTES`），Value = 1MB，NumKeys = 400（≈400MB），每批 30 个 key 后暂停 3s。
+DDR = **自动计算**（`800 × 1MB × 0.6` ≈ 480MB），Value = 1MB，NumKeys = 800（≈800MB），每批 30 个 key 后暂停 3s。显式设 `SEGMENT_SIZE_BYTES` 环境变量则跳过自动计算。
 
 ## 两个流水线瓶颈
 
@@ -88,7 +88,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_1 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
-SEGMENT_SIZE_BYTES=671088640 \
 python tests/verify_offload_promotion.py --test offload --master 127.0.0.1:50053
 ```
 
@@ -138,7 +137,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_2 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
-SEGMENT_SIZE_BYTES=671088640 \
 python tests/verify_offload_promotion.py --test load --master 127.0.0.1:50053
 ```
 
@@ -195,7 +193,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_3 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
-SEGMENT_SIZE_BYTES=671088640 \
 python tests/verify_offload_promotion.py --test promotion --master 127.0.0.1:50053
 ```
 
@@ -253,7 +250,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_4 \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
-SEGMENT_SIZE_BYTES=671088640 \
 python tests/verify_offload_promotion.py --test exchange --master 127.0.0.1:50053
 ```
 
@@ -284,7 +280,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_offload_promotion_all \
 MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
-SEGMENT_SIZE_BYTES=671088640 \
 python tests/verify_offload_promotion.py --test all --master 127.0.0.1:50053
 ```
 
@@ -296,7 +291,7 @@ python tests/verify_offload_promotion.py --test all --master 127.0.0.1:50053
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `1` | **必须设为 1**，默认 10s 太慢 |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | 测试专用目录 | 每次测试前清空 |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `10485760`（10MB） | 必须设小，默认 256MB 导致不足一桶不落盘 |
-| `SEGMENT_SIZE_BYTES` | `335544320`（320MB） | DDR 段大小，5x 规模 |
+| `SEGMENT_SIZE_BYTES` | 自动计算（默认 ≈480MB） | DDR = `num_keys × value_size × 0.6`，显式设置则优先 |
 | `DEFAULT_KV_LEASE_TTL` | `2000` | 缩短 lease 使 eviction 更快生效 |
 
 ## 关键 Master 启动参数
