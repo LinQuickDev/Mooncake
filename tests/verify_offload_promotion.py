@@ -41,14 +41,14 @@ except ImportError:
 # ============================================================================
 
 DEFAULT_MASTER = "127.0.0.1:50051"
-DEFAULT_NUM_KEYS = 80
+DEFAULT_NUM_KEYS = 800
 DEFAULT_VALUE_SIZE = 1024 * 1024  # 1 MB
-DEFAULT_SEGMENT_SIZE = 64 * 1024 * 1024  # 64 MB — enough for batched writes to succeed
-DEFAULT_LOCAL_BUFFER_SIZE = 64 * 1024 * 1024  # 64 MB
+DEFAULT_SEGMENT_SIZE = 640 * 1024 * 1024  # 640 MB — 10x scale
+DEFAULT_LOCAL_BUFFER_SIZE = 256 * 1024 * 1024  # 256 MB
 
-# Wait constants
-OFFLOAD_WAIT_SECONDS = int(os.getenv("OFFLOAD_WAIT_SECONDS", "15"))
-PROMOTION_WAIT_SECONDS = int(os.getenv("PROMOTION_WAIT_SECONDS", "25"))
+# Wait constants (scaled up for 10x data volume)
+OFFLOAD_WAIT_SECONDS = int(os.getenv("OFFLOAD_WAIT_SECONDS", "45"))
+PROMOTION_WAIT_SECONDS = int(os.getenv("PROMOTION_WAIT_SECONDS", "60"))
 
 
 # ============================================================================
@@ -105,7 +105,7 @@ def random_value(size=DEFAULT_VALUE_SIZE):
     return os.urandom(size)
 
 
-def batch_put(store, keys, value_size, batch_size=10, batch_pause=2.0):
+def batch_put(store, keys, value_size, batch_size=30, batch_pause=3.0):
     """Write keys in batches, pausing between batches to let eviction drain DDR.
 
     With offload_on_evict=true, eviction must offload to SSD before freeing
@@ -566,64 +566,95 @@ def test_cold_hot_exchange(num_keys=80, value_size=DEFAULT_VALUE_SIZE):
     print(f"  Phase 4: Waiting {PROMOTION_WAIT_SECONDS}s for promotion...")
     time.sleep(PROMOTION_WAIT_SECONDS)
 
-    # Phase 5: Check state
+    # Phase 5: Check state — classify hot/cold keys separately by replica type
     descs_after = store.batch_get_replica_desc(list(reference.keys()))
     classification_after = classify_keys(descs_after, list(reference.keys()))
 
-    hot_with_memory = 0
-    hot_local_disk_only = 0
-    cold_with_memory = 0
-    cold_local_disk_only = 0
+    # Per-group breakdown
+    def classify_group(descs, group_keys):
+        """Count keys by replica composition: memory_only, local_disk_only, both."""
+        result = {"memory_only": 0, "local_disk_only": 0, "both": 0, "none": 0}
+        for key in group_keys:
+            types = set(replica_types(descs, key))
+            if "MEMORY" in types and "LOCAL_DISK" in types:
+                result["both"] += 1
+            elif "MEMORY" in types:
+                result["memory_only"] += 1
+            elif "LOCAL_DISK" in types:
+                result["local_disk_only"] += 1
+            else:
+                result["none"] += 1
+        return result
 
-    for key in hot_keys_written:
-        types = set(replica_types(descs_after, key))
-        if "MEMORY" in types:
-            hot_with_memory += 1
-        elif "LOCAL_DISK" in types:
-            hot_local_disk_only += 1
+    hot_breakdown = classify_group(descs_after, hot_keys_written)
+    cold_breakdown = classify_group(descs_after, cold_keys_written)
 
-    for key in cold_keys_written:
-        types = set(replica_types(descs_after, key))
-        if "MEMORY" in types:
-            cold_with_memory += 1
-        elif "LOCAL_DISK" in types:
-            cold_local_disk_only += 1
-
-    print(f"  After promotion cycle:")
-    print(f"    Hot  keys: {hot_with_memory} with MEMORY, "
-          f"{hot_local_disk_only} LOCAL_DISK-only")
-    print(f"    Cold keys: {cold_with_memory} with MEMORY, "
-          f"{cold_local_disk_only} LOCAL_DISK-only")
-    print(f"    Full classification: "
-          f"memory_only={len(classification_after['memory_only'])}, "
-          f"local_disk_only={len(classification_after['local_disk_only'])}, "
-          f"both={len(classification_after['both'])}")
+    print(f"  After promotion cycle ({len(hot_keys_written)} hot, "
+          f"{len(cold_keys_written)} cold):")
+    print(f"    Hot  keys — MEMORY_only: {hot_breakdown['memory_only']}, "
+          f"LOCAL_DISK_only: {hot_breakdown['local_disk_only']}, "
+          f"BOTH: {hot_breakdown['both']}, "
+          f"none: {hot_breakdown['none']}")
+    print(f"    Cold keys — MEMORY_only: {cold_breakdown['memory_only']}, "
+          f"LOCAL_DISK_only: {cold_breakdown['local_disk_only']}, "
+          f"BOTH: {cold_breakdown['both']}, "
+          f"none: {cold_breakdown['none']}")
+    print(f"    Overall — MEMORY_only: {len(classification_after['memory_only'])}, "
+          f"LOCAL_DISK_only: {len(classification_after['local_disk_only'])}, "
+          f"BOTH: {len(classification_after['both'])}")
 
     # Acceptance criteria:
     # - At least some hot keys should have MEMORY (promoted)
     # - Cold keys should be predominantly LOCAL_DISK-only
-    hot_promoted = hot_with_memory > 0
+    hot_promoted = hot_breakdown["memory_only"] + hot_breakdown["both"]
+    hot_local_disk_only = hot_breakdown["local_disk_only"]
+    cold_with_memory = cold_breakdown["memory_only"] + cold_breakdown["both"]
+    cold_local_disk_only = cold_breakdown["local_disk_only"]
     cold_stays_cold = cold_local_disk_only >= cold_with_memory
+
+    # Hot keys still LOCAL_DISK-only are normal — each promotion heartbeat
+    # processes only 1 key (kMaxPerHeartbeat=1).  Wait time may not cover
+    # all hot keys.  Cold keys appearing in MEMORY are also expected if
+    # phase-3 spot-checks happened to push their Count-Min Sketch counter
+    # past promotion_admission_threshold.
+    if hot_local_disk_only > 0:
+        print(f"    Note: {hot_local_disk_only} hot keys remain LOCAL_DISK-only. "
+              "Each heartbeat promotes at most 1 key — increase "
+              "PROMOTION_WAIT_SECONDS to promote more.")
+    if cold_with_memory > cold_local_disk_only:
+        print(f"    Note: cold keys with MEMORY ({cold_with_memory}) > "
+              f"LOCAL_DISK-only ({cold_local_disk_only}). "
+              "Phase-3 spot reads may have triggered unintended promotions. "
+              "Reduce spot-read count (min(3, ...)) in phase 3.")
 
     if hot_promoted and cold_stays_cold:
         result.pass_test(
-            hot_promoted=hot_with_memory,
-            hot_not_promoted=hot_local_disk_only,
+            hot_promoted=hot_promoted,
+            hot_local_disk_only=hot_local_disk_only,
             cold_in_memory=cold_with_memory,
             cold_local_disk=cold_local_disk_only,
+            hot_breakdown=hot_breakdown,
+            cold_breakdown=cold_breakdown,
         )
     elif hot_promoted:
         result.pass_test(
-            hot_promoted=hot_with_memory,
-            hot_not_promoted=hot_local_disk_only,
+            hot_promoted=hot_promoted,
+            hot_local_disk_only=hot_local_disk_only,
             cold_in_memory=cold_with_memory,
             cold_local_disk=cold_local_disk_only,
-            note="Some cold keys also in memory (may be normal if memory sufficient)",
+            hot_breakdown=hot_breakdown,
+            cold_breakdown=cold_breakdown,
+            note="Some cold keys also in memory (phase-3 spot reads may have "
+                 "triggered unintended promotions)",
         )
     else:
         result.fail_test(
             f"No hot keys promoted to MEMORY. "
             f"Is promotion_on_hit=true on master?",
+            hot_promoted=hot_promoted,
+            hot_local_disk_only=hot_local_disk_only,
+            cold_in_memory=cold_with_memory,
+            cold_local_disk_only=cold_local_disk_only,
             hot_promoted=hot_with_memory,
             hot_local_disk_only=hot_local_disk_only,
             cold_in_memory=cold_with_memory,
