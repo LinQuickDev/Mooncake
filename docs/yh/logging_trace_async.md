@@ -30,7 +30,7 @@ trace_id[123456789] get_into_breakdown key[k1] query_us[10] select_us[2] read_us
 trace_id[none] ...
 ```
 
-## 日志开关
+## 日志开关与级别
 
 新增环境变量：
 
@@ -41,9 +41,19 @@ MC_LOG_ENABLE=off  # 关闭 INFO/WARNING/ERROR 普通日志
 
 可接受的关闭值包括 `off`、`0`、`false`、`no`。`FATAL` 不受关闭影响。
 
+`MC_LOG` 同时尊重 glog 当前的 `FLAGS_minloglevel`，因此 `MC_LOG_LEVEL` 仍然可以控制新日志的最低输出级别：
+
+```bash
+MC_LOG_LEVEL=INFO     # 输出 INFO/WARNING/ERROR
+MC_LOG_LEVEL=WARNING  # 输出 WARNING/ERROR
+MC_LOG_LEVEL=ERROR    # 只输出 ERROR
+```
+
+`MC_LOG_ENABLE=off` 的优先级更高，会关闭普通 `MC_LOG` 日志。
+
 ## 异步 glog 输出
 
-`MC_LOG` 默认异步输出，不额外增加 `MC_LOG_ASYNC` 开关：
+`MC_LOG` 默认异步输出，不额外增加 `MC_LOG_ASYNC` 开关。未迁移到 `MC_LOG` 的原生 `LOG(...)` 仍然走 glog 自己的同步输出路径，不会进入本队列。
 
 1. 业务线程构造日志消息。
 2. `AsyncLogMessage` 析构时把 `severity/file/line/trace_id/message` 放入有界队列。
@@ -62,5 +72,40 @@ MC_LOG_ENABLE=off  # 关闭 INFO/WARNING/ERROR 普通日志
 - `submit_transfer_breakdown`：记录 `allocateBatchID`、`submitTransfer`、batch id、request 数和是否首次 transfer。
 - `transfer_future_wait`：记录 `future->get()` 等待耗时、策略、是否首次 wait。
 - `transfer_data`：记录 submit/wait 总拆分、策略、读写方向和结果。
+- UB / URMA 首次建连路径额外增加：
+  - `urma_create_jetty_breakdown`
+  - `urma_endpoint_construct_breakdown`
+  - `urma_active_setup_breakdown`
+  - `urma_passive_setup_breakdown`
+  - `urma_do_setup_all_breakdown`
+  - `urma_import_jetty_breakdown`
+  - `urma_bind_jetty_breakdown`
 
 使用方法：连续执行两次相同 get/put，对比第一次和第二次的上述日志。如果第一次主要长在 `open_segment_breakdown` 或 `submit_transfer_breakdown`，说明更接近 transfer/连接 lazy init；如果长在 `transfer_future_wait`，继续看底层 transport 完成路径。
+
+对应 UbDiag PerfPoint：
+
+- `UB_HANDSHAKE_ENCODE` / `UB_HANDSHAKE_DECODE`
+- `UB_ENDPOINT_CONSTRUCT` / `UB_ENDPOINT_CREATE_JETTY`
+- `UB_ENDPOINT_ACTIVE_SETUP` / `UB_ENDPOINT_ACTIVE_HANDSHAKE`
+- `UB_ENDPOINT_PASSIVE_SETUP`
+- `UB_ENDPOINT_DO_SETUP_ALL`
+- `UB_ENDPOINT_IMPORT_JETTY` / `UB_ENDPOINT_BIND_JETTY`
+
+`store_py.cpp` 中原先新增的 `get start/get complete/get_slow` 和 `put start/put complete/put_slow` 已移除，避免 Python binding 层同步 glog 与 store/transfer 层异步 `MC_LOG` 混排造成顺序误读。
+
+## RealClient 慢操作告警
+
+RealClient 公开入口统一输出慢操作 WARNING，默认阈值为 `3000us`：
+
+- 单 key：`get_buffer_slow`、`get_into_slow`、`put_slow`、`put_from_slow`、`put_parts_slow`
+- 批量：`batch_get_buffer_slow`、`batch_get_into_slow`、`put_batch_slow`、`batch_put_from_slow`、`batch_put_from_multi_buffers_slow`
+
+示例：
+
+```text
+trace_id[...] get_buffer_slow key[k1] size[4194304] elapsed_us[18143] rc[0]
+trace_id[...] batch_get_into_slow num_keys[128] size[536870912] elapsed_us[12000] success[127]
+```
+
+慢日志位于 `execute_timed_operation` 的 latency callback 中，复用入口级耗时，并受 `MC_LOG_ENABLE` / `MC_LOG_LEVEL` 控制。

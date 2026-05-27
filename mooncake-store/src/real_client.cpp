@@ -167,6 +167,35 @@ size_t sum_positive_ranges(
     return total;
 }
 
+constexpr uint64_t kRealClientSlowLogThresholdUs = 3000;
+
+bool IsRealClientSlow(uint64_t latency_us) {
+    return latency_us > kRealClientSlowLogThresholdUs;
+}
+
+void LogRealClientSingleSlow(const char *op, const std::string &key,
+                             uint64_t size, uint64_t latency_us, int rc) {
+    if (!IsRealClientSlow(latency_us)) return;
+    MC_LOG(WARNING) << op << "_slow key[" << key << "] size[" << size
+                    << "] elapsed_us[" << latency_us << "] rc[" << rc << "]";
+}
+
+void LogRealClientBatchSlow(const char *op, size_t num_keys, uint64_t size,
+                            uint64_t latency_us, size_t success) {
+    if (!IsRealClientSlow(latency_us)) return;
+    MC_LOG(WARNING) << op << "_slow num_keys[" << num_keys << "] size["
+                    << size << "] elapsed_us[" << latency_us << "] success["
+                    << success << "]";
+}
+
+void LogRealClientBatchRcSlow(const char *op, size_t num_keys, uint64_t size,
+                              uint64_t latency_us, int rc) {
+    if (!IsRealClientSlow(latency_us)) return;
+    MC_LOG(WARNING) << op << "_slow num_keys[" << num_keys << "] size["
+                    << size << "] elapsed_us[" << latency_us << "] rc[" << rc
+                    << "]";
+}
+
 size_t sum_buffer_handle_sizes(
     const std::vector<std::shared_ptr<BufferHandle>> &buffers) {
     size_t total = 0;
@@ -1719,10 +1748,12 @@ int RealClient::put(const std::string &key, std::span<const char> value,
             return put_internal(key, value, config, client_buffer_allocator_);
         },
         [](const auto &ret) { return ret.has_value(); },
-        [&](uint64_t latency_us, const auto &) {
+        [&](uint64_t latency_us, const auto &ret) {
             client_->ObserveTransferOperation(TransferOperationKind::kWrite,
                                               "put", value.size_bytes(),
                                               latency_us);
+            LogRealClientSingleSlow("put", key, value.size_bytes(),
+                                    latency_us, to_py_ret(ret));
         });
     return to_py_ret(result);
 }
@@ -1839,10 +1870,13 @@ int RealClient::put_batch(const std::vector<std::string> &keys,
                                       client_buffer_allocator_);
         },
         [](const auto &ret) { return ret.has_value(); },
-        [&](uint64_t latency_us, const auto &) {
+        [&](uint64_t latency_us, const auto &ret) {
             client_->ObserveTransferOperation(
                 TransferOperationKind::kWrite, "put_batch",
                 sum_value_sizes(values), latency_us);
+            LogRealClientBatchRcSlow("put_batch", keys.size(),
+                                     sum_value_sizes(values), latency_us,
+                                     to_py_ret(ret));
         });
     return to_py_ret(result);
 }
@@ -1934,10 +1968,12 @@ int RealClient::put_parts(const std::string &key,
                                       client_buffer_allocator_);
         },
         [](const auto &ret) { return ret.has_value(); },
-        [&](uint64_t latency_us, const auto &) {
+        [&](uint64_t latency_us, const auto &ret) {
             client_->ObserveTransferOperation(
                 TransferOperationKind::kWrite, "put_parts",
                 sum_value_sizes(values), latency_us);
+            LogRealClientSingleSlow("put_parts", key, sum_value_sizes(values),
+                                    latency_us, to_py_ret(ret));
         });
     return to_py_ret(result);
 }
@@ -2717,9 +2753,12 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
         },
         [](const auto &buffer) { return buffer != nullptr; },
         [&](uint64_t latency_us, const auto &buffer) {
+            const uint64_t size = buffer ? buffer->size() : 0;
             client_->ObserveTransferOperation(TransferOperationKind::kRead,
-                                              "get_buffer", buffer->size(),
+                                              "get_buffer", size,
                                               latency_us);
+            LogRealClientSingleSlow("get_buffer", key, size, latency_us,
+                                    buffer ? 0 : -1);
         });
 }
 
@@ -3163,9 +3202,16 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
         },
         [](const auto &) { return true; },
         [&](uint64_t latency_us, const auto &buffers) {
+            const auto size = sum_buffer_handle_sizes(buffers);
+            size_t success = 0;
+            for (const auto &buffer : buffers) {
+                if (buffer) success++;
+            }
             client_->ObserveTransferOperation(
-                TransferOperationKind::kRead, "batch_get_buffer",
-                sum_buffer_handle_sizes(buffers), latency_us);
+                TransferOperationKind::kRead, "batch_get_buffer", size,
+                latency_us);
+            LogRealClientBatchSlow("batch_get_buffer", keys.size(), size,
+                                   latency_us, success);
         });
 }
 
@@ -3616,9 +3662,14 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &ret) {
+            const int64_t bytes = ret ? ret.value() : -1;
             client_->ObserveTransferOperation(
                 TransferOperationKind::kRead, "get_into",
-                static_cast<uint64_t>(ret.value()), latency_us);
+                bytes > 0 ? static_cast<uint64_t>(bytes) : 0, latency_us);
+            LogRealClientSingleSlow("get_into", key,
+                                    bytes > 0 ? static_cast<uint64_t>(bytes)
+                                              : 0,
+                                    latency_us, to_py_ret(ret));
         });
     return to_py_ret(result);
 }
@@ -3776,9 +3827,16 @@ std::vector<int> RealClient::batch_put_from(
                 for (const auto &item : ret) {
                     py_results.push_back(to_py_ret(item));
                 }
+                const auto size = sum_successful_sizes(py_results, sizes);
                 client_->ObserveTransferOperation(
-                    TransferOperationKind::kWrite, "batch_put_from",
-                    sum_successful_sizes(py_results, sizes), latency_us);
+                    TransferOperationKind::kWrite, "batch_put_from", size,
+                    latency_us);
+                size_t success = 0;
+                for (int rc : py_results) {
+                    if (rc == 0) success++;
+                }
+                LogRealClientBatchSlow("batch_put_from", keys.size(), size,
+                                       latency_us, success);
             });
     std::vector<int> results;
     results.reserve(internal_results.size());
@@ -3927,9 +3985,11 @@ int RealClient::put_from(const std::string &key, void *buffer, size_t size,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return put_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
-        [&](uint64_t latency_us, const auto &) {
+        [&](uint64_t latency_us, const auto &ret) {
             client_->ObserveTransferOperation(TransferOperationKind::kWrite,
                                               "put_from", size, latency_us);
+            LogRealClientSingleSlow("put_from", key, size, latency_us,
+                                    to_py_ret(ret));
         });
     return to_py_ret(result);
 }
@@ -4377,9 +4437,16 @@ std::vector<int64_t> RealClient::batch_get_into(
                 for (const auto &item : ret) {
                     py_results.push_back(to_py_ret(item));
                 }
+                const auto size = sum_positive_results(py_results);
                 client_->ObserveTransferOperation(
-                    TransferOperationKind::kRead, "batch_get_into",
-                    sum_positive_results(py_results), latency_us);
+                    TransferOperationKind::kRead, "batch_get_into", size,
+                    latency_us);
+                size_t success = 0;
+                for (int64_t rc : py_results) {
+                    if (rc >= 0) success++;
+                }
+                LogRealClientBatchSlow("batch_get_into", keys.size(), size,
+                                       latency_us, success);
             });
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
@@ -5078,10 +5145,17 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                 for (const auto &item : ret) {
                     py_results.push_back(to_py_ret(item));
                 }
+                const auto size =
+                    sum_successful_nested_sizes(py_results, sizes);
                 client_->ObserveTransferOperation(
                     TransferOperationKind::kWrite,
-                    "batch_put_from_multi_buffers",
-                    sum_successful_nested_sizes(py_results, sizes), latency_us);
+                    "batch_put_from_multi_buffers", size, latency_us);
+                size_t success = 0;
+                for (int rc : py_results) {
+                    if (rc == 0) success++;
+                }
+                LogRealClientBatchSlow("batch_put_from_multi_buffers",
+                                       keys.size(), size, latency_us, success);
             });
     std::vector<int> results;
     results.reserve(internal_results.size());

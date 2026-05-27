@@ -187,7 +187,8 @@ bool IsMooncakeLogEnabled() {
 }
 
 bool ShouldLog(google::LogSeverity severity) {
-    return severity == google::FATAL || IsMooncakeLogEnabled();
+    if (severity == google::FATAL) return true;
+    return IsMooncakeLogEnabled() && severity >= FLAGS_minloglevel;
 }
 
 bool ShouldVLog(int level) {

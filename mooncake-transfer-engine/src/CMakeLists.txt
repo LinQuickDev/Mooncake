@@ -1,4 +1,5 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
+find_package(UbDiag REQUIRED)
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -14,6 +15,9 @@ add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
+
+target_include_directories(transfer_engine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
 
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
 if(USE_ETCD)
@@ -56,7 +60,8 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs)
+         yalantinglibs::yalantinglibs
+         UbDiag::ubdiag_lib)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

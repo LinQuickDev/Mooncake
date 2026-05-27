@@ -24,6 +24,9 @@
 #include "config.h"
 #include "error.h"
 #include "transfer_metadata_plugin.h"
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
 
 namespace mooncake {
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -82,12 +85,16 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
+        UbDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_ENCODE,
+                             UbDiag::PerfLevel::DEBUG);
+        pt.Start();
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
         root["jetty_num"] = jettyNums;
         LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
                   << " peer_nic_path is " << desc.peer_nic_path
                   << " jetty_num size is " << desc.jetty_num.size();
+        pt.End(0);
 #endif
         return root;
     }
@@ -116,12 +123,16 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
+        UbDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_DECODE,
+                             UbDiag::PerfLevel::DEBUG);
+        pt.Start();
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
         }
         LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
                   << " peer_nic_path is " << desc.peer_nic_path
                   << " jetty_num size is " << desc.jetty_num.size();
+        pt.End(0);
 #endif
         return 0;
     }

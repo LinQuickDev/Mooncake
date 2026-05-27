@@ -107,3 +107,15 @@ PERF_KEY_DEF(PUT_BATCH_COLLECT_RESULTS,      "client_service.cpp::BatchPut",    
 PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC,            "real_client.cpp::batch_get_into_offload_object_internal",  "OffloadRpc")
 PERF_KEY_DEF(GET_SSD_TRANSFER_DATA,          "real_client.cpp::batch_get_into_offload_object_internal",  "TransferData")
 PERF_KEY_DEF(GET_SSD_RELEASE_BUFFER,         "real_client.cpp::batch_get_into_offload_object_internal",  "ReleaseBuffer")
+
+// === UB / URMA endpoint first connection path ===
+PERF_KEY_DEF(UB_HANDSHAKE_ENCODE,            "transfer_metadata.cpp::TransferHandshakeUtil::encode",     "Encode")
+PERF_KEY_DEF(UB_HANDSHAKE_DECODE,            "transfer_metadata.cpp::TransferHandshakeUtil::decode",     "Decode")
+PERF_KEY_DEF(UB_ENDPOINT_CONSTRUCT,          "urma_endpoint.cpp::construct",                            "Construct")
+PERF_KEY_DEF(UB_ENDPOINT_CREATE_JETTY,       "urma_endpoint.cpp::construct",                            "CreateJetty")
+PERF_KEY_DEF(UB_ENDPOINT_ACTIVE_SETUP,       "urma_endpoint.cpp::setupConnectionsByActive",             "ActiveSetup")
+PERF_KEY_DEF(UB_ENDPOINT_ACTIVE_HANDSHAKE,   "urma_endpoint.cpp::setupConnectionsByActive",             "SendHandshake")
+PERF_KEY_DEF(UB_ENDPOINT_PASSIVE_SETUP,      "urma_endpoint.cpp::setupConnectionsByPassive",            "PassiveSetup")
+PERF_KEY_DEF(UB_ENDPOINT_DO_SETUP_ALL,       "urma_endpoint.cpp::doSetupConnection",                    "DoSetupAll")
+PERF_KEY_DEF(UB_ENDPOINT_IMPORT_JETTY,       "urma_endpoint.cpp::doSetupConnection",                    "ImportJetty")
+PERF_KEY_DEF(UB_ENDPOINT_BIND_JETTY,         "urma_endpoint.cpp::doSetupConnection",                    "BindJetty")

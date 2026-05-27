@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdlib>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -353,6 +354,7 @@ class StressBenchmark {
         if (warmup_ret != 0) {
             LOG(WARNING) << "Warmup had errors, continuing anyway";
         }
+        system("ubdiag clear");
 
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
