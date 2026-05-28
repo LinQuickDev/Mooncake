@@ -29,7 +29,9 @@ MC_LOG 通过 `AsyncLogMessage` 临时对象在析构时将日志条目入队，
 
 - **生成**：`NewTraceId()` 使用 `(PID << 48) ^ (steady_clock_ns & 0x0000FFFFFFFF0000) ^ atomic_counter++` 生成全局唯一 ID
 - **线程传递**：`ScopedTraceId` 通过 `thread_local` 保存/恢复当前线程的 trace_id
-- **异步任务传播**：`MemcpyTask` 和 `FilereadTask` 携带 `trace_id` 字段，工作线程通过 `ScopedTraceId` 恢复，确保异步路径日志可追踪
+- **同步调用链传递**：`RealClient` 入口创建 `ScopedTraceId(NewTraceId())` 后，同线程下游函数通过 `CurrentTraceId()` 读取同一个 trace_id
+- **异步任务传播**：提交线程用 `CurrentTraceId()` 捕获当前 trace_id，并写入 `MemcpyTask`、`FilereadTask` 或线程池 lambda；工作线程执行时通过 `ScopedTraceId` 恢复，确保异步路径日志可追踪
+- **上下文恢复**：`ScopedTraceId` 析构时恢复旧值，避免线程池复用、嵌套调用或提前返回后把上一个请求的 trace_id 带到后续日志
 
 ---
 
@@ -72,7 +74,7 @@ real_client::get_buffer
 | `alloc_us` | 缓冲区分配耗时 |
 | `read_us` | 数据读取耗时（RDMA/文件IO/SSD RPC） |
 | `total_us` | 总耗时 |
-| `type` | 副本类型：`memory` / `local_disk` / `disk` |
+| `type` | 副本类型：`memory_local` / `memory_remote` / `local_disk_local` / `local_disk_remote` / `disk` |
 | `status` | 结果：`read_ok` / `read_fail` / `ssd_ok` / `ssd_fail` |
 
 ### 1.2 传输服务层 — `client_service.cpp::Get`
@@ -677,12 +679,62 @@ PID 保证跨进程唯一，steady_clock_ns 保证同进程每次启动不同，
 
 - `thread_local uint64_t current_trace_id` 存储当前线程的 trace_id
 - `ScopedTraceId` 在构造时保存旧值、设置新值，析构时恢复旧值
-- RAII 模式，支持嵌套
+- `AsyncLogMessage` 构造时读取 `CurrentTraceId()`，并把该值固化到日志条目中；日志之后即使由后台线程异步落盘，也不会丢失原始 trace_id
+- RAII 模式，支持嵌套、提前返回和异常退出
+
+恢复旧值的原因是 `current_trace_id` 绑定在线程上，而 Mooncake 中大量使用线程池和后台 worker。线程处理完一个请求或任务后会继续处理其他工作；如果不恢复，后续不属于该请求的日志可能仍然带着旧 trace_id，导致排查时误以为它们属于同一条调用链。
+
+**函数间传递链路：**
+
+1. 入口函数生成 trace：`real_client.cpp` 中 `get_buffer`、`get_into`、`batch_get_into`、`put`、`put_batch` 等公开入口创建 `ScopedTraceId trace(NewTraceId())`，从这里开始一次用户操作拥有独立 trace_id。
+2. 同步函数调用自动继承：入口函数继续调用 `*_internal`、`client_service`、`TransferSubmitter` 等下游函数时，只要仍在同一线程执行，下游 `MC_LOG` 会通过 `CurrentTraceId()` 读到同一个 thread-local trace_id，不需要把 trace_id 作为函数参数层层传递。
+3. MC_LOG 捕获当前 trace：每条 `MC_LOG` / `MC_VLOG` 在构造 `AsyncLogMessage` 时立即捕获当前 trace_id，并随 `LogEntry` 放入异步日志队列。后台日志线程只负责输出已经捕获好的 trace_id。
+4. 跨线程提交前显式捕获：当执行流要进入线程池或 worker 队列时，提交线程先调用 `CurrentTraceId()` 取出当前 trace_id，并把它放进任务对象或 lambda 捕获列表。
+5. 工作线程恢复上下文：worker 取出任务后创建 `ScopedTraceId trace(task.trace_id)` 或 `ScopedTraceId trace(trace_id)`，让该任务执行期间的所有 `MC_LOG` 都继续带原始请求的 trace_id。
+6. 任务结束自动恢复：worker 任务作用域结束后 `ScopedTraceId` 析构，恢复该线程之前的 trace_id，通常恢复为 `0`，后续空闲、清理或下一任务日志不会串到刚完成的请求上。
+
+典型同步链路：
+
+```
+RealClient::get_buffer
+  -> ScopedTraceId(NewTraceId())
+  -> RealClient::get_buffer_internal
+  -> Client::Get / TransferSubmitter
+  -> MC_LOG 捕获 CurrentTraceId()
+```
+
+典型异步链路：
+
+```
+RealClient::put
+  -> ScopedTraceId(NewTraceId())
+  -> client_service 提交异步任务前 CurrentTraceId()
+  -> write_thread_pool_.enqueue(..., trace_id)
+  -> worker lambda 内 ScopedTraceId(trace_id)
+  -> StoreObject / PutEnd 相关 MC_LOG 继续使用同一 trace_id
+```
+
+典型传输任务链路：
+
+```
+TransferSubmitter::submitTransfer
+  -> MemcpyTask(..., CurrentTraceId())
+  -> MemcpyWorkerPool::workerThread
+  -> ScopedTraceId(task.trace_id)
+  -> memcpy / GPU copy 相关 MC_LOG 使用原始 trace_id
+
+TransferSubmitter::submitFileReadOperation
+  -> FilereadTask(..., CurrentTraceId())
+  -> FilereadWorkerPool::workerThread
+  -> ScopedTraceId(task.trace_id)
+  -> LoadObject 相关 MC_LOG 使用原始 trace_id
+```
 
 **异步任务传播：**
 
 - `MemcpyTask` 和 `FilereadTask` 携带 `trace_id` 字段
-- 工作线程取出任务后通过 `ScopedTraceId trace(task.trace_id)` 恢复上下文
+- `client_service.cpp` 中异步 `StoreObject + PutEnd` 的线程池 lambda 通过捕获列表携带 `trace_id`
+- 工作线程取出任务后通过 `ScopedTraceId trace(task.trace_id)` 或 `ScopedTraceId trace(trace_id)` 恢复上下文
 - 确保异步路径的日志可关联到原始操作
 
 **日志格式：**

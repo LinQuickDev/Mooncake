@@ -56,7 +56,7 @@ inline std::ostream& operator<<(std::ostream& os,
  */
 class OperationState {
    public:
-    OperationState() = default;
+    explicit OperationState(uint64_t trace_id = 0) : trace_id_(trace_id) {}
     virtual ~OperationState() = default;
 
     // Non-copyable, non-movable
@@ -92,10 +92,13 @@ class OperationState {
      */
     virtual void wait_for_completion() = 0;
 
+    uint64_t trace_id() const { return trace_id_; }
+
    protected:
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    uint64_t trace_id_ = 0;
 };
 
 /**
@@ -117,6 +120,9 @@ class EmptyOperationState : public OperationState {
  */
 class MemcpyOperationState : public OperationState {
    public:
+    explicit MemcpyOperationState(uint64_t trace_id = 0)
+        : OperationState(trace_id) {}
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -143,6 +149,9 @@ class MemcpyOperationState : public OperationState {
 
 class FilereadOperationState : public OperationState {
    public:
+    explicit FilereadOperationState(uint64_t trace_id = 0)
+        : OperationState(trace_id) {}
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -173,8 +182,9 @@ class FilereadOperationState : public OperationState {
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
-        : engine_(engine),
+                                 size_t batch_size, uint64_t trace_id = 0)
+        : OperationState(trace_id),
+          engine_(engine),
           batch_id_(batch_id),
           batch_size_(batch_size),
           start_ts_(getCurrentTimeInMilli()) {}
