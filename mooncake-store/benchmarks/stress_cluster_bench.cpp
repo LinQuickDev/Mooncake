@@ -19,6 +19,11 @@
 #include "glog/logging.h"
 #include "real_client.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 namespace {
 constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
@@ -60,6 +65,84 @@ static std::string FormatBytes(size_t bytes) {
     oss << std::fixed << std::setprecision(2) << val << " " << units[i];
     return oss.str();
 }
+
+static std::vector<std::string> DiscoverSegmentsFromMaster(
+    const std::string& master_host, int master_admin_port) {
+    std::vector<std::string> segments;
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        LOG(ERROR) << "Failed to create socket for discovering segments";
+        return segments;
+    }
+
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(master_admin_port);
+
+    std::string host = master_host;
+    size_t colon_pos = host.find(':');
+    if (colon_pos != std::string::npos) {
+        host = host.substr(0, colon_pos);
+    }
+
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        LOG(ERROR) << "Invalid master host: " << host;
+        close(sockfd);
+        return segments;
+    }
+
+    if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG(ERROR) << "Failed to connect to master admin at " << host << ":"
+                   << master_admin_port;
+        close(sockfd);
+        return segments;
+    }
+
+    std::string request = "GET /get_all_segments HTTP/1.0\r\nHost: " +
+                          host + "\r\nConnection: close\r\n\r\n";
+    if (send(sockfd, request.c_str(), request.size(), 0) < 0) {
+        LOG(ERROR) << "Failed to send HTTP request to master";
+        close(sockfd);
+        return segments;
+    }
+
+    std::string response;
+    char buf[4096];
+    ssize_t n;
+    while ((n = recv(sockfd, buf, sizeof(buf), 0)) > 0) {
+        response.append(buf, n);
+    }
+    close(sockfd);
+
+    size_t header_end = response.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        LOG(ERROR) << "Invalid HTTP response from master";
+        return segments;
+    }
+
+    std::string body = response.substr(header_end + 4);
+    std::istringstream iss(body);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                 line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        if (!line.empty()) {
+            segments.push_back(line);
+        }
+    }
+
+    return segments;
+}
 }  // namespace
 
 DEFINE_string(local_hostname, "localhost",
@@ -93,7 +176,10 @@ DEFINE_bool(hard_pin, false,
 
 DEFINE_string(segments, "",
               "Comma-separated segment names for segment_write/segment_read "
-              "scenarios (e.g. seg1,seg2,seg3)");
+              "scenarios. Use segment 'name' (typically hostname), NOT "
+              "IP:port. Leave empty to auto-discover from master.");
+DEFINE_uint64(master_admin_port, 9003,
+              "Master admin HTTP port for auto-discovering segments");
 DEFINE_uint64(read_segment_nums, 0,
               "Number of segments to read from in segment_read scenario (0 = "
               "read from all segments)");
@@ -593,8 +679,20 @@ class StressBenchmark {
     int RunSegmentWrite() {
         auto segments = ParseSegments();
         if (segments.empty()) {
-            LOG(ERROR) << "--segments is required for segment_write scenario";
-            return -1;
+            LOG(INFO) << "--segments not specified, auto-discovering from "
+                      << "master at " << FLAGS_master_server
+                      << ":" << FLAGS_master_admin_port;
+            segments = DiscoverSegmentsFromMaster(
+                FLAGS_master_server,
+                static_cast<int>(FLAGS_master_admin_port));
+            if (segments.empty()) {
+                LOG(ERROR) << "No segments discovered from master. "
+                           << "Specify --segments manually or check master "
+                           << "connectivity.";
+                return -1;
+            }
+            LOG(INFO) << "Discovered " << segments.size()
+                      << " segments from master";
         }
 
         LOG(INFO) << "=== SEGMENT WRITE MODE ===";
@@ -664,8 +762,20 @@ class StressBenchmark {
     int RunSegmentRead() {
         auto segments = ParseSegments();
         if (segments.empty()) {
-            LOG(ERROR) << "--segments is required for segment_read scenario";
-            return -1;
+            LOG(INFO) << "--segments not specified, auto-discovering from "
+                      << "master at " << FLAGS_master_server
+                      << ":" << FLAGS_master_admin_port;
+            segments = DiscoverSegmentsFromMaster(
+                FLAGS_master_server,
+                static_cast<int>(FLAGS_master_admin_port));
+            if (segments.empty()) {
+                LOG(ERROR) << "No segments discovered from master. "
+                           << "Specify --segments manually or check master "
+                           << "connectivity.";
+                return -1;
+            }
+            LOG(INFO) << "Discovered " << segments.size()
+                      << " segments from master";
         }
 
         size_t read_segment_nums = FLAGS_read_segment_nums;
@@ -1208,10 +1318,13 @@ int main(int argc, char* argv[]) {
               << (FLAGS_enable_ssd_offload ? "yes" : "no");
     if (!FLAGS_segments.empty()) {
         LOG(INFO) << "  Segments:       " << FLAGS_segments;
-        LOG(INFO) << "  Read seg nums:  " << FLAGS_read_segment_nums;
-        LOG(INFO) << "  Duration:       " << FLAGS_duration << "s";
-        LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
+    } else {
+        LOG(INFO) << "  Segments:       auto-discover from master";
     }
+    LOG(INFO) << "  Master admin:   " << FLAGS_master_admin_port;
+    LOG(INFO) << "  Read seg nums:  " << FLAGS_read_segment_nums;
+    LOG(INFO) << "  Duration:       " << FLAGS_duration << "s";
+    LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
 
     size_t total_data = FLAGS_num_keys * FLAGS_value_size;
     if (total_data > FLAGS_global_segment_size * 9.5 / 10) {
