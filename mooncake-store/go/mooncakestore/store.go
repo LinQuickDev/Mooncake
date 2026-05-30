@@ -34,7 +34,13 @@ type Store struct {
 // New creates a new Store instance. Call Setup before performing operations,
 // and Close when done.
 func New() (*Store, error) {
-	h := C.mooncake_store_create()
+	return NewWithType(C.MOONCAKE_CLIENT_REAL)
+}
+
+// NewWithType creates a new Store instance with the specified client type.
+// Use MOONCAKE_CLIENT_REAL or MOONCAKE_CLIENT_DUMMY.
+func NewWithType(clientType C.mooncake_client_type_t) (*Store, error) {
+	h := C.mooncake_store_create(clientType)
 	if h == nil {
 		return nil, ErrStoreNil
 	}
@@ -43,7 +49,7 @@ func New() (*Store, error) {
 
 // Setup initialises the store client and connects to the cluster.
 //
-// Parameters:
+// For real client (MOONCAKE_CLIENT_REAL), the relevant parameters are:
 //   - localHostname: hostname/IP of this node
 //   - metadataServer: metadata server URL (e.g. "http://host:8080/metadata")
 //   - globalSegmentSize: size of the global memory segment in bytes
@@ -51,9 +57,16 @@ func New() (*Store, error) {
 //   - protocol: transport protocol ("tcp" or "rdma")
 //   - deviceName: RDMA device name (empty for TCP or auto-discovery)
 //   - masterServerAddr: master service address (e.g. "host:50051")
+//
+// For dummy client (MOONCAKE_CLIENT_DUMMY), the relevant parameters are:
+//   - localBufferSize: size of the local transfer buffer in bytes
+//   - memPoolSize: size of the memory pool in bytes
+//   - serverAddress: server address for dummy client
+//   - ipcSocketPath: IPC socket path for dummy client
 func (s *Store) Setup(localHostname, metadataServer string,
 	globalSegmentSize, localBufferSize uint64,
-	protocol, deviceName, masterServerAddr string) error {
+	protocol, deviceName, masterServerAddr string,
+	memPoolSize uint64, serverAddress, ipcSocketPath string) error {
 	if s.handle == nil {
 		return ErrStoreNil
 	}
@@ -63,16 +76,21 @@ func (s *Store) Setup(localHostname, metadataServer string,
 	cProtocol := C.CString(protocol)
 	cDeviceName := C.CString(deviceName)
 	cMasterAddr := C.CString(masterServerAddr)
+	cServerAddress := C.CString(serverAddress)
+	cIpcSocketPath := C.CString(ipcSocketPath)
 	defer C.free(unsafe.Pointer(cLocalHostname))
 	defer C.free(unsafe.Pointer(cMetadataServer))
 	defer C.free(unsafe.Pointer(cProtocol))
 	defer C.free(unsafe.Pointer(cDeviceName))
 	defer C.free(unsafe.Pointer(cMasterAddr))
+	defer C.free(unsafe.Pointer(cServerAddress))
+	defer C.free(unsafe.Pointer(cIpcSocketPath))
 
 	ret := C.mooncake_store_setup(s.handle,
 		cLocalHostname, cMetadataServer,
 		C.uint64_t(globalSegmentSize), C.uint64_t(localBufferSize),
-		cProtocol, cDeviceName, cMasterAddr)
+		cProtocol, cDeviceName, cMasterAddr,
+		C.uint64_t(memPoolSize), cServerAddress, cIpcSocketPath)
 	if ret != 0 {
 		return ErrSetupFailed
 	}

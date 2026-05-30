@@ -21,7 +21,7 @@ target_link_libraries(
                                 gflags::gflags glog::glog pthread)
 
 # Add allocation strategy benchmark executable
-# This benchmark tests AllocationStrategy performance with configurable 
+# This benchmark tests AllocationStrategy performance with configurable
 # segment counts, allocation sizes, replica counts, and workload patterns
 add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
 target_link_libraries(
@@ -32,3 +32,10 @@ add_executable(stress_cluster_bench stress_cluster_bench.cpp)
 target_link_libraries(
   stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
                                gflags::gflags glog::glog pthread)
+
+# Add NoF worker pool benchmark executable
+if(USE_NOF)
+  add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
+  target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
+                                                       gflags::gflags)
+endif()

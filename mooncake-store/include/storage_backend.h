@@ -190,6 +190,11 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
+    bool disable_ssd_eviction =
+        false;  // Force disable eviction regardless of
+                // eviction_policy. Set via
+                // MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION.
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
@@ -266,6 +271,11 @@ class StorageBackendInterface {
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
+
+    // Reset internal scan iterator so that the next ScanMeta() call
+    // starts from the beginning.  Required for backends that use
+    // cursor-based iteration (e.g. BucketStorageBackend).
+    virtual void ResetScanIterator() {}
 
     // Test-only: Set predicate to force failures for specific keys in
     // BatchOffload. Default implementation does nothing (no failures injected).
@@ -780,6 +790,11 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    void ResetScanIterator() override {
+        MutexLocker locker(&iterator_mutex_);
+        next_bucket_ = -1;
+    }
 
     /**
      * @brief Checks whether the backend is allowed to continue offloading.

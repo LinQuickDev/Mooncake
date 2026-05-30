@@ -88,7 +88,9 @@ inline int64_t ElapsedNanos(Clock::time_point t0, Clock::time_point t1) {
 }
 
 inline double NanosToUs(int64_t ns) { return static_cast<double>(ns) / 1000.0; }
-inline double NanosToMs(int64_t ns) { return static_cast<double>(ns) / 1000000.0; }
+inline double NanosToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+}
 inline double NanosToSec(int64_t ns) { return static_cast<double>(ns) / 1e9; }
 
 struct ThreadResult {
@@ -137,9 +139,9 @@ class BenchmarkStats {
         size_t lo = static_cast<size_t>(rank);
         size_t hi = std::min(lo + 1, merged_latencies_ns_.size() - 1);
         double frac = rank - lo;
-        int64_t ns_val = static_cast<int64_t>(
-            merged_latencies_ns_[lo] * (1.0 - frac) +
-            merged_latencies_ns_[hi] * frac);
+        int64_t ns_val =
+            static_cast<int64_t>(merged_latencies_ns_[lo] * (1.0 - frac) +
+                                 merged_latencies_ns_[hi] * frac);
         return NanosToUs(ns_val);
     }
 
@@ -147,7 +149,8 @@ class BenchmarkStats {
         if (merged_latencies_ns_.empty()) return 0.0;
         int64_t sum = std::accumulate(merged_latencies_ns_.begin(),
                                       merged_latencies_ns_.end(), int64_t(0));
-        return NanosToUs(sum / static_cast<int64_t>(merged_latencies_ns_.size()));
+        return NanosToUs(sum /
+                         static_cast<int64_t>(merged_latencies_ns_.size()));
     }
 
     double ThroughputMBps() const {
@@ -271,7 +274,7 @@ class StressBenchmark {
                   << (FLAGS_enable_ssd_offload ? " (SSD offload enabled)" : "");
 
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
-        buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));                         
+        buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));
         if (!buffer_) {
             LOG(ERROR) << "Failed to allocate buffer of " << buffer_size_
                        << " bytes";
@@ -717,8 +720,7 @@ class StressBenchmark {
 
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
-            int64_t ret =
-                client_->get_into(key, buffer_, FLAGS_value_size);
+            int64_t ret = client_->get_into(key, buffer_, FLAGS_value_size);
             if (ret < 0) {
                 LOG(ERROR) << "Verify: get_into failed for key=" << key;
                 ++errors;
@@ -761,8 +763,8 @@ class StressBenchmark {
                 return -1;
             }
             std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
-            int ret = client_->register_buffer(thread_buffers_[t].ptr,
-                                               per_buf_size);
+            int ret =
+                client_->register_buffer(thread_buffers_[t].ptr, per_buf_size);
             if (ret != 0) {
                 LOG(ERROR) << "register_buffer failed for thread " << t
                            << " on NUMA node " << node;
@@ -770,8 +772,8 @@ class StressBenchmark {
             }
         }
         LOG(INFO) << "Allocated " << num_threads << " thread buffers, each "
-                  << per_buf_size / MB << " MB (NUMA-aware, "
-                  << NR_SOCKETS << " sockets)";
+                  << per_buf_size / MB << " MB (NUMA-aware, " << NR_SOCKETS
+                  << " sockets)";
         return 0;
     }
 };
