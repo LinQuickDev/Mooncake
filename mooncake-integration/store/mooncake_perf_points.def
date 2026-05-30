@@ -51,9 +51,9 @@ PERF_KEY_DEF(GET_SINGLE_RELEASE_CACHE,       "client_service.cpp::Get",         
 PERF_KEY_DEF(GET_SINGLE_ASYNC_CACHE,         "client_service.cpp::Get",                    "AsyncCache")
 
 // === Client::Get 内 TransferData ===
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_FULL,       "client_service.cpp::TransferData",           "TransferData")
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_SUBMIT,     "client_service.cpp::TransferData",           "Submit")
-PERF_KEY_DEF(GET_SINGLE_TRANSFER_WAIT,       "client_service.cpp::TransferData",           "Wait")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_FULL,       "client_service.cpp::TransferData",           "TransferData[G]")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_SUBMIT,     "client_service.cpp::TransferData",           "Submit[G]")
+PERF_KEY_DEF(GET_SINGLE_TRANSFER_WAIT,       "client_service.cpp::TransferData",           "Wait[G]")
 
 // === Client::BatchGet (批量) ===
 PERF_KEY_DEF(GET_BATCH_FULL,                 "client_service.cpp::BatchGet",               "TransferBatchGet")
@@ -88,9 +88,9 @@ PERF_KEY_DEF(PUT_SINGLE_PUT_END,             "client_service.cpp::Put",         
 PERF_KEY_DEF(PUT_SINGLE_PUT_REVOKE,          "client_service.cpp::Put",                    "PutRevoke")
 
 // === Client::Put 内 TransferData ===
-PERF_KEY_DEF(PUT_SINGLE_TRANSFER_FULL,       "client_service.cpp::TransferData",           "TransferData")
-PERF_KEY_DEF(PUT_SINGLE_TRANSFER_SUBMIT,     "client_service.cpp::TransferData",           "Submit")
-PERF_KEY_DEF(PUT_SINGLE_TRANSFER_WAIT,       "client_service.cpp::TransferData",           "Wait")
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_FULL,       "client_service.cpp::TransferData",           "TransferData[W]")
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_SUBMIT,     "client_service.cpp::TransferData",           "Submit[W]")
+PERF_KEY_DEF(PUT_SINGLE_TRANSFER_WAIT,       "client_service.cpp::TransferData",           "Wait[W]")
 
 // === Client::BatchPut (批量) ===
 PERF_KEY_DEF(PUT_BATCH_FULL,                 "client_service.cpp::BatchPut",               "TransferBatchPut")
