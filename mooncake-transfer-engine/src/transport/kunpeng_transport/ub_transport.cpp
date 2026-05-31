@@ -224,6 +224,8 @@ Status UbTransport::submitTransferTask(
             if (!slice->from_cache) {
                 nr_slices++;
             }
+            slice->peer_nic_path.clear();
+            slice->dest_rkeys.clear();
             bool merge_final_slice =
                 request.length - offset <= kBlockSize + kFragmentSize;
             slice->source_addr = (char*)request.source + offset;

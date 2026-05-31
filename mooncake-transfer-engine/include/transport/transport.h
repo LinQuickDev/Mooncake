@@ -261,6 +261,8 @@ class Transport {
                 slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
                 tail_++;
                 slice->from_cache = true;
+                slice->peer_nic_path.clear();
+                slice->dest_rkeys.clear();
             }
 
             return slice;
