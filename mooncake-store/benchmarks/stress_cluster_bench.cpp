@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -484,20 +485,9 @@ class StressBenchmark {
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        std::vector<std::thread> threads;
-
-        size_t keys_per_thread = FLAGS_num_keys / FLAGS_num_threads;
-        size_t remainder = FLAGS_num_keys % FLAGS_num_threads;
-
-        for (size_t t = 0; t < FLAGS_num_threads; ++t) {
-            size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
-            size_t key_offset = t * keys_per_thread + std::min(t, remainder);
-
-            threads.emplace_back([&, t, my_keys, key_offset]() {
-                ReadWorker(t, my_keys, key_offset, stats, start_latch,
-                           done_latch);
-            });
-        }
+        auto threads = LaunchReadWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
+            [](size_t idx) { return MakeKey(idx); });
 
         done_latch.wait();
         stats.StopTimer();
@@ -563,20 +553,9 @@ class StressBenchmark {
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        std::vector<std::thread> threads;
-
-        size_t keys_per_thread = FLAGS_num_keys / FLAGS_num_threads;
-        size_t remainder = FLAGS_num_keys % FLAGS_num_threads;
-
-        for (size_t t = 0; t < FLAGS_num_threads; ++t) {
-            size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
-            size_t key_offset = t * keys_per_thread + std::min(t, remainder);
-
-            threads.emplace_back([&, t, my_keys, key_offset]() {
-                ReadWorker(t, my_keys, key_offset, stats, start_latch,
-                           done_latch);
-            });
-        }
+        auto threads = LaunchReadWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
+            [](size_t idx) { return MakeKey(idx); });
 
         done_latch.wait();
         stats.StopTimer();
@@ -644,20 +623,9 @@ class StressBenchmark {
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        std::vector<std::thread> threads;
-
-        size_t keys_per_thread = FLAGS_num_keys / FLAGS_num_threads;
-        size_t remainder = FLAGS_num_keys % FLAGS_num_threads;
-
-        for (size_t t = 0; t < FLAGS_num_threads; ++t) {
-            size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
-            size_t key_offset = t * keys_per_thread + std::min(t, remainder);
-
-            threads.emplace_back([&, t, my_keys, key_offset]() {
-                ReadWorker(t, my_keys, key_offset, stats, start_latch,
-                           done_latch);
-            });
-        }
+        auto threads = LaunchReadWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
+            [](size_t idx) { return MakeKey(idx); });
 
         done_latch.wait();
         stats.StopTimer();
@@ -705,23 +673,13 @@ class StressBenchmark {
     }
 
     int RunSegmentWrite() {
-        auto segments = ParseSegments();
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
         if (segments.empty()) {
-            LOG(INFO) << "--segments not specified, auto-discovering from "
-                      << "master at " << FLAGS_master_server
-                      << ":" << FLAGS_master_admin_port;
-            segments = DiscoverSegmentsFromMaster(
-                FLAGS_master_server,
-                static_cast<int>(FLAGS_master_admin_port));
-            if (segments.empty()) {
-                LOG(ERROR) << "No segments discovered from master. "
-                           << "Specify --segments manually or check master "
-                           << "connectivity.";
-                return -1;
-            }
-            LOG(INFO) << "Discovered " << segments.size()
-                      << " segments from master";
+            return -1;
         }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
 
         LOG(INFO) << "=== SEGMENT WRITE MODE ===";
         LOG(INFO) << "Writing to " << segments.size() << " segments, "
@@ -784,23 +742,13 @@ class StressBenchmark {
     }
 
     int RunSegmentRead() {
-        auto segments = ParseSegments();
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
         if (segments.empty()) {
-            LOG(INFO) << "--segments not specified, auto-discovering from "
-                      << "master at " << FLAGS_master_server
-                      << ":" << FLAGS_master_admin_port;
-            segments = DiscoverSegmentsFromMaster(
-                FLAGS_master_server,
-                static_cast<int>(FLAGS_master_admin_port));
-            if (segments.empty()) {
-                LOG(ERROR) << "No segments discovered from master. "
-                           << "Specify --segments manually or check master "
-                           << "connectivity.";
-                return -1;
-            }
-            LOG(INFO) << "Discovered " << segments.size()
-                      << " segments from master";
+            return -1;
         }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
 
         size_t read_segment_nums = FLAGS_read_segment_nums;
         if (read_segment_nums == 0 || read_segment_nums > segments.size()) {
@@ -867,20 +815,9 @@ class StressBenchmark {
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        std::vector<std::thread> threads;
-
-        size_t keys_per_thread = all_keys.size() / FLAGS_num_threads;
-        size_t remainder = all_keys.size() % FLAGS_num_threads;
-
-        for (size_t t = 0; t < FLAGS_num_threads; ++t) {
-            size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
-            size_t key_offset = t * keys_per_thread + std::min(t, remainder);
-
-            threads.emplace_back([&, t, my_keys, key_offset]() {
-                SegmentReadWorker(t, my_keys, key_offset, all_keys, stats,
-                                  start_latch, done_latch);
-            });
-        }
+        auto threads = LaunchReadWorkers(
+            FLAGS_num_threads, all_keys.size(), stats, start_latch, done_latch,
+            [&all_keys](size_t idx) { return all_keys[idx % all_keys.size()]; });
 
         done_latch.wait();
         stats.StopTimer();
@@ -897,6 +834,47 @@ class StressBenchmark {
         return 0;
     }
 
+    struct IntervalLatencyStats {
+        std::vector<int64_t> latencies_ns;
+        int64_t min_latency_ns = std::numeric_limits<int64_t>::max();
+        int64_t max_latency_ns = 0;
+        double p99_latency_ns = 0;
+        double p999_latency_ns = 0;
+        double p9999_latency_ns = 0;
+        double avg_latency_ns = 0;
+        double throughput_mbps = 0;
+
+        void Finalize() {
+            if (latencies_ns.empty()) return;
+            std::sort(latencies_ns.begin(), latencies_ns.end());
+            min_latency_ns = latencies_ns.front();
+            max_latency_ns = latencies_ns.back();
+            size_t n = latencies_ns.size();
+            avg_latency_ns = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) / n;
+            if (n >= 100) {
+                p99_latency_ns = latencies_ns[static_cast<size_t>(n * 0.99)];
+            }
+            if (n >= 1000) {
+                p999_latency_ns = latencies_ns[static_cast<size_t>(n * 0.999)];
+            }
+            if (n >= 10000) {
+                p9999_latency_ns = latencies_ns[static_cast<size_t>(n * 0.9999)];
+            }
+        }
+
+        void Aggregate(const IntervalLatencyStats& other) {
+            min_latency_ns = std::min(min_latency_ns, other.min_latency_ns);
+            max_latency_ns = std::max(max_latency_ns, other.max_latency_ns);
+            p99_latency_ns = std::max(p99_latency_ns, other.p99_latency_ns);
+            p999_latency_ns = std::max(p999_latency_ns, other.p999_latency_ns);
+            p9999_latency_ns = std::max(p9999_latency_ns, other.p9999_latency_ns);
+            throughput_mbps += other.throughput_mbps;
+            total_samples += other.latencies_ns.size();
+        }
+
+        size_t total_samples = 0;
+    };
+
     int RunSegmentReadDuration(
         const std::vector<std::string>& read_segments,
         const std::vector<std::string>& all_keys) {
@@ -908,6 +886,9 @@ class StressBenchmark {
         std::atomic<size_t> global_ops{0};
         std::atomic<size_t> global_bytes{0};
         std::atomic<size_t> global_failed{0};
+
+        std::vector<std::vector<int64_t>> thread_latencies(FLAGS_num_threads);
+        std::vector<std::mutex> latency_mutexes(FLAGS_num_threads);
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::vector<std::thread> threads;
@@ -930,8 +911,16 @@ class StressBenchmark {
                     while (!stop_flag.load(std::memory_order_relaxed)) {
                         const std::string& key =
                             all_keys[key_idx % total_keys];
+                        auto t0 = Clock::now();
                         int64_t ret =
                             client_->get_into(key, my_buf, FLAGS_value_size);
+                        auto t1 = Clock::now();
+                        int64_t latency_ns = ElapsedNanos(t0, t1);
+
+                        {
+                            std::lock_guard<std::mutex> lock(latency_mutexes[t]);
+                            thread_latencies[t].push_back(latency_ns);
+                        }
 
                         if (ret < 0) {
                             global_failed.fetch_add(1,
@@ -962,8 +951,18 @@ class StressBenchmark {
                             ++key_idx;
                         }
 
+                        auto t0 = Clock::now();
                         auto results =
                             client_->batch_get_into(keys, bufs, sizes);
+                        auto t1 = Clock::now();
+                        int64_t latency_ns = ElapsedNanos(t0, t1);
+
+                        {
+                            std::lock_guard<std::mutex> lock(latency_mutexes[t]);
+                            for (size_t k = 0; k < results.size(); ++k) {
+                                thread_latencies[t].push_back(latency_ns / FLAGS_batch_size);
+                            }
+                        }
 
                         for (size_t k = 0; k < results.size(); ++k) {
                             if (results[k] < 0) {
@@ -991,6 +990,8 @@ class StressBenchmark {
         size_t prev_bytes = 0;
         size_t prev_failed = 0;
         auto prev_time = bench_start;
+
+        std::vector<IntervalLatencyStats> interval_stats_list;
 
         std::cout << "\n";
         std::cout << "========================================"
@@ -1024,6 +1025,19 @@ class StressBenchmark {
                         ? static_cast<double>(interval_ops) / interval_sec
                         : 0;
 
+                IntervalLatencyStats interval_stats;
+                interval_stats.throughput_mbps = interval_throughput_mbps;
+                for (size_t t = 0; t < FLAGS_num_threads; ++t) {
+                    std::lock_guard<std::mutex> lock(latency_mutexes[t]);
+                    interval_stats.latencies_ns.insert(
+                        interval_stats.latencies_ns.end(),
+                        thread_latencies[t].begin(),
+                        thread_latencies[t].end());
+                    thread_latencies[t].clear();
+                }
+                interval_stats.Finalize();
+                interval_stats_list.push_back(interval_stats);
+
                 double total_sec = NanosToSec(ElapsedNanos(bench_start, now));
                 double total_throughput_mbps =
                     (total_sec > 0)
@@ -1038,6 +1052,10 @@ class StressBenchmark {
                           << "  interval: " << interval_throughput_mbps
                           << " MB/s, " << interval_ops_per_sec << " ops/s"
                           << " (failed=" << interval_failed << ")"
+                          << "  lat[us]: min=" << NanosToUs(interval_stats.min_latency_ns)
+                          << ", max=" << NanosToUs(interval_stats.max_latency_ns)
+                          << ", avg=" << NanosToUs(interval_stats.avg_latency_ns)
+                          << ", P99=" << NanosToUs(interval_stats.p99_latency_ns)
                           << "  total: " << cur_ops << " ops, "
                           << total_throughput_mbps << " MB/s, "
                           << total_ops_per_sec << " ops/s"
@@ -1070,6 +1088,14 @@ class StressBenchmark {
         double final_ops_per_sec =
             (total_sec > 0) ? static_cast<double>(final_ops) / total_sec : 0;
 
+        IntervalLatencyStats overall;
+        for (const auto& stats : interval_stats_list) {
+            overall.Aggregate(stats);
+        }
+        double avg_throughput_mbps =
+            !interval_stats_list.empty() ? overall.throughput_mbps / interval_stats_list.size() : 0;
+        size_t total_latency_samples = overall.total_samples;
+
         std::cout << "\n  FINAL SUMMARY\n";
         std::cout << "  Total time:       " << total_sec << " s\n";
         std::cout << "  Total ops:        " << final_ops
@@ -1077,12 +1103,63 @@ class StressBenchmark {
         std::cout << "  Total data:       " << FormatBytes(final_bytes)
                   << "\n";
         std::cout << "  Throughput:       " << final_throughput_mbps
-                  << " MB/s";
+                  << " MB/s (avg: " << avg_throughput_mbps << " MB/s)";
         if (final_throughput_mbps > 1024) {
             std::cout << " (" << final_throughput_mbps / 1024 << " GB/s)";
         }
         std::cout << "\n";
         std::cout << "  Ops/sec:          " << final_ops_per_sec << "\n";
+
+        if (total_latency_samples > 0) {
+            std::cout << "\n  Latency (us)      [n=" << total_latency_samples << "]\n";
+            std::cout << "    Min:   " << std::setw(12) << NanosToUs(overall.min_latency_ns) << "\n";
+            std::cout << "    Max:   " << std::setw(12) << NanosToUs(overall.max_latency_ns) << "\n";
+            std::cout << "    P99:   " << std::setw(12) << NanosToUs(overall.p99_latency_ns);
+            if (total_latency_samples < 100) std::cout << "  (n<100)";
+            std::cout << "\n";
+            std::cout << "    P999:  " << std::setw(12) << NanosToUs(overall.p999_latency_ns);
+            if (total_latency_samples < 1000) std::cout << "  (n<1000)";
+            std::cout << "\n";
+            std::cout << "    P9999: " << std::setw(12) << NanosToUs(overall.p9999_latency_ns);
+            if (total_latency_samples < 10000) std::cout << "  (n<10000)";
+            std::cout << "\n";
+        }
+
+        std::cout << "========================================"
+                  << "========================================\n\n";
+
+        return 0;
+    }
+
+    int RunListSegments() {
+        LOG(INFO) << "Discovering segments from master at "
+                  << FLAGS_master_server << ":" << FLAGS_master_admin_port;
+
+        auto segments = DiscoverSegmentsFromMaster(
+            FLAGS_master_server,
+            static_cast<int>(FLAGS_master_admin_port));
+
+        if (segments.empty()) {
+            LOG(ERROR) << "No segments discovered from master. "
+                       << "Check master connectivity at "
+                       << FLAGS_master_server << ":" << FLAGS_master_admin_port;
+            return -1;
+        }
+
+        std::cout << "\n";
+        std::cout << "========================================"
+                  << "========================================\n";
+        std::cout << "  DISCOVERED SEGMENTS [count=" << segments.size() << "]\n";
+        std::cout << "========================================"
+                  << "========================================\n";
+
+        for (size_t i = 0; i < segments.size(); ++i) {
+            std::cout << "  [" << std::setw(4) << i << "] " << segments[i] << "\n";
+        }
+
+        std::cout << "========================================"
+                  << "========================================\n";
+        std::cout << "  Total segments: " << segments.size() << "\n";
         std::cout << "========================================"
                   << "========================================\n\n";
 
@@ -1098,6 +1175,8 @@ class StressBenchmark {
             return RunSegmentWrite();
         } else if (FLAGS_scenario == "segment_read") {
             return RunSegmentRead();
+        } else if (FLAGS_scenario == "list_segments") {
+            return RunListSegments();
         } else if (FLAGS_scenario == "remote_memory" ||
                    FLAGS_scenario == "remote_disk") {
             if (FLAGS_role == "writer") {
@@ -1163,9 +1242,10 @@ class StressBenchmark {
         return 0;
     }
 
-    void ReadWorker(size_t tid, size_t my_keys, size_t key_offset,
-                    BenchmarkStats& stats, std::latch& start_latch,
-                    std::latch& done_latch) {
+    void BatchReadWorker(size_t tid, size_t my_keys, size_t key_offset,
+                         BenchmarkStats& stats, std::latch& start_latch,
+                         std::latch& done_latch,
+                         const std::function<std::string(size_t)>& key_func) {
         bindToSocket(tid % NR_SOCKETS);
 
         ThreadResult& result = stats.GetThreadResult(tid);
@@ -1182,7 +1262,7 @@ class StressBenchmark {
         if (FLAGS_batch_size <= 1) {
             for (size_t i = 0; i < my_keys; ++i) {
                 size_t key_idx = key_offset + i;
-                std::string key = MakeKey(key_idx);
+                std::string key = key_func(key_idx);
 
                 auto t0 = Clock::now();
                 int64_t ret = client_->get_into(key, my_buf, FLAGS_value_size);
@@ -1214,7 +1294,7 @@ class StressBenchmark {
 
                 for (size_t j = i; j < batch_end; ++j) {
                     size_t key_idx = key_offset + j;
-                    keys.push_back(MakeKey(key_idx));
+                    keys.push_back(key_func(key_idx));
                     bufs.push_back(my_buf + (j - i) * per_key_buf);
                     sizes.push_back(FLAGS_value_size);
                 }
@@ -1246,92 +1326,42 @@ class StressBenchmark {
         done_latch.arrive_and_wait();
     }
 
-    void SegmentReadWorker(size_t tid, size_t my_keys, size_t key_offset,
-                           const std::vector<std::string>& all_keys,
-                           BenchmarkStats& stats,
-                           std::latch& start_latch,
-                           std::latch& done_latch) {
-        bindToSocket(tid % NR_SOCKETS);
+    std::vector<std::thread> LaunchReadWorkers(
+        size_t num_threads, size_t total_keys, BenchmarkStats& stats,
+        std::latch& start_latch, std::latch& done_latch,
+        const std::function<std::string(size_t)>& key_func) {
+        std::vector<std::thread> threads;
+        size_t keys_per_thread = total_keys / num_threads;
+        size_t remainder = total_keys % num_threads;
 
-        ThreadResult& result = stats.GetThreadResult(tid);
-        result.latencies_ns.reserve(my_keys);
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
+            size_t key_offset = t * keys_per_thread + std::min(t, remainder);
 
-        char* my_buf = thread_buffers_[tid].ptr;
+            threads.emplace_back([&, t, my_keys, key_offset]() {
+                BatchReadWorker(t, my_keys, key_offset, stats, start_latch,
+                               done_latch, key_func);
+            });
+        }
+        return threads;
+    }
 
-        start_latch.arrive_and_wait();
-
-        size_t ops = 0;
-        size_t failed = 0;
-        size_t bytes = 0;
-
-        if (FLAGS_batch_size <= 1) {
-            for (size_t i = 0; i < my_keys; ++i) {
-                size_t key_idx = key_offset + i;
-                const std::string& key = all_keys[key_idx % all_keys.size()];
-
-                auto t0 = Clock::now();
-                int64_t ret = client_->get_into(key, my_buf, FLAGS_value_size);
-                auto t1 = Clock::now();
-
-                int64_t lat_ns = ElapsedNanos(t0, t1);
-
-                if (ret < 0) {
-                    ++failed;
-                    LOG_EVERY_N(ERROR, 100)
-                        << "get_into failed key=" << key << " ret=" << ret;
-                } else {
-                    bytes += static_cast<size_t>(ret);
-                }
-                result.latencies_ns.push_back(lat_ns);
-                ++ops;
-            }
-        } else {
-            size_t per_key_buf = FLAGS_value_size;
-            size_t i = 0;
-            while (i < my_keys) {
-                std::vector<std::string> keys;
-                std::vector<void*> bufs;
-                std::vector<size_t> sizes;
-                size_t batch_end = std::min(i + FLAGS_batch_size, my_keys);
-                keys.reserve(batch_end - i);
-                bufs.reserve(batch_end - i);
-                sizes.reserve(batch_end - i);
-
-                for (size_t j = i; j < batch_end; ++j) {
-                    size_t key_idx = key_offset + j;
-                    keys.push_back(all_keys[key_idx % all_keys.size()]);
-                    bufs.push_back(my_buf + (j - i) * per_key_buf);
-                    sizes.push_back(FLAGS_value_size);
-                }
-
-                auto t0 = Clock::now();
-                auto results = client_->batch_get_into(keys, bufs, sizes);
-                auto t1 = Clock::now();
-
-                int64_t lat_ns = ElapsedNanos(t0, t1);
-                result.latencies_ns.push_back(lat_ns);
-
-                for (size_t k = 0; k < results.size(); ++k) {
-                    if (results[k] < 0) {
-                        ++failed;
-                        LOG_EVERY_N(ERROR, 100)
-                            << "batch_get_into failed key=" << keys[k]
-                            << " ret=" << results[k];
-                    } else {
-                        bytes += static_cast<size_t>(results[k]);
-                    }
-                    ++ops;
-                }
-
-                i = batch_end;
-            }
+    std::vector<std::string> DiscoverSegmentsIfNeeded(const std::string& context) {
+        auto segments = ParseSegments();
+        if (!segments.empty()) {
+            return segments;
         }
 
-        result.total_bytes = bytes;
-        result.total_ops = ops;
-        result.failed_ops = failed;
-
-        done_latch.arrive_and_wait();
+        LOG(INFO) << context << ", auto-discovering from master at "
+                  << FLAGS_master_server << ":" << FLAGS_master_admin_port;
+        segments = DiscoverSegmentsFromMaster(
+            FLAGS_master_server,
+            static_cast<int>(FLAGS_master_admin_port));
+        if (segments.empty()) {
+            LOG(ERROR) << "No segments discovered from master. "
+                       << "Check master connectivity.";
+        }
+        return segments;
     }
 
     int VerifyData() {
