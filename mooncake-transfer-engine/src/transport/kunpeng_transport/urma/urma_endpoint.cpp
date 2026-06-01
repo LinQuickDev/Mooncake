@@ -129,7 +129,7 @@ int UrmaContext::construct(GlobalConfig& config) {
         jfr_cfg[i].depth = 2048;
         jfr_cfg[i].flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
         jfr_cfg[i].flag.bs.lock_free = 0;
-        jfr_cfg[i].trans_mode = URMA_TM_RC;
+        jfr_cfg[i].trans_mode = URMA_TM_RM;
         jfr_cfg[i].min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         jfr_cfg[i].token_value = urma_token;
         jfr_cfg[i].id = 0;
@@ -408,7 +408,20 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-
+        // todo 如果是bonding设备需要加上下面的配置
+        LOG(INFO) << "Try change binding mode balance";
+        bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_BALANCE,
+                                                      .bonding_level = BONDP_BONDING_LEVEL_PORT };
+        urma_user_ctl_in_t in{ .addr = reinterpret_cast<uint64_t>(&mode),
+                                           .len = sizeof(mode),
+                                           .opcode = BONDP_USER_CTL_SET_BONDING_MODE };
+        urma_user_ctl_out_t out;
+        memset(&out, 0, sizeof(out));
+        auto ret = urma_user_ctl(context, &in, &out);
+        if (ret != URMA_SUCCESS) {
+            LOG(ERROR) << "Failed to set bonding balance mode, ret = " << ret;
+            return ERR_CONTEXT;
+        }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
             PLOG(ERROR) << "Failed to query dev attr( " << device_name << " ) ";
@@ -615,7 +628,7 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
     }
     urma_jfs_cfg_t jfs_cfg = {
         .depth = 2048,            // DEFAULT_DEPTH (512)
-        .trans_mode = URMA_TM_RC, /* Reliable connection */
+        .trans_mode = URMA_TM_RM, /* Reliable connection */
         .priority = 15,           // URMA_MAX_PRIORITY 15
         .max_sge = 5,             // SGE_NUM_MAX 5
         .rnr_retry = 7,           // URMA_TYPICAL_RNR_RETRY    7

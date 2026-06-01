@@ -22,6 +22,7 @@
 #include "common.h"
 #include "config.h"
 #include "urma_api.h"
+#include "urma_ubagg.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 
