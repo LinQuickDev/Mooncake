@@ -984,7 +984,7 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     urma_rjetty_t rjetty = {};
     rjetty.jetty_id.id = peer_jetty_num;
     rjetty.jetty_id.eid = eid;
-    rjetty.trans_mode = URMA_TM_RC;
+    rjetty.trans_mode = URMA_TM_RM;
     rjetty.type = URMA_JETTY;
     rjetty.tp_type = URMA_CTP;
     rjetty.flag.value = 0;
