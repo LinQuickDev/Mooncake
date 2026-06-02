@@ -34,7 +34,7 @@ size_t remove_store_memory_range(void* ptr) {
 }
 
 void* ub_allocate_memory(size_t alignment, size_t total_size) {
-    void* ptr = numa_alloc_local(total_size);
+    void* ptr = numa_alloc_onnode(total_size, 0);
     if (!ptr) {
         LOG(ERROR) << "failed for UB protocol, size=" << total_size
                    << ", alignment : " << alignment;
