@@ -77,6 +77,7 @@ class UrmaContext : public UbContext {
     urma_jfc_t* jfc();
     urma_jfr_t* jfr();
     urma_jfce_t* JFCE();
+    urma_transport_mode_t transMode() const { return trans_mode_; }
     static bool uninit();
     static bool init();
 
@@ -145,6 +146,8 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
+
+    urma_transport_mode_t trans_mode_ = URMA_TM_RM;
 };
 
 // define the UrmaEndpoint class

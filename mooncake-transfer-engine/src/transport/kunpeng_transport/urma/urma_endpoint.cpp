@@ -28,6 +28,15 @@ static urma_transport_mode_t parseTransMode(const std::string& mode) {
                      << "\", falling back to RM";
     return URMA_TM_RM;
 }
+
+static const char* transModeToString(urma_transport_mode_t mode) {
+    switch (mode) {
+        case URMA_TM_RM: return "RM";
+        case URMA_TM_RC: return "RC";
+        case URMA_TM_UM: return "UM";
+        default:         return "UNKNOWN";
+    }
+}
 static int isNullEid(urma_eid_t* eid) {
     for (int i = 0; i < URMA_EID_SIZE; ++i) {
         if (eid->raw[i] != 0) return 0;
@@ -69,6 +78,7 @@ int UrmaContext::submitPostSend(
 }
 
 int UrmaContext::construct(GlobalConfig& config) {
+    trans_mode_ = parseTransMode(config.urma_trans_mode);
     size_t num_jfc_list = config.num_jfc_per_ctx;
     size_t num_jfces = config.num_jfce_per_ctx;
     int eid_index = config.eid_index;
@@ -138,7 +148,7 @@ int UrmaContext::construct(GlobalConfig& config) {
         jfr_cfg[i].depth = 2048;
         jfr_cfg[i].flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
         jfr_cfg[i].flag.bs.lock_free = 0;
-        jfr_cfg[i].trans_mode = parseTransMode(globalConfig().urma_trans_mode);
+        jfr_cfg[i].trans_mode = trans_mode_;
         jfr_cfg[i].min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         jfr_cfg[i].token_value = urma_token;
         jfr_cfg[i].id = 0;
@@ -154,7 +164,8 @@ int UrmaContext::construct(GlobalConfig& config) {
     }
     LOG(INFO) << "create jfr done";
     LOG(INFO) << "URMA device: " << urma_context_->dev->name
-              << ", EID: (EID_Index " << eid_index_ << ") " << eid();
+              << ", EID: (EID_Index " << eid_index_ << ") " << eid()
+              << ", transport mode: " << transModeToString(trans_mode_);
 
     LOG(INFO) << "context_ == NULL ? "
               << (urma_context_ == nullptr ? "TRUE" : "FALSE");
@@ -417,20 +428,21 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        // todo 如果是bonding设备需要加上下面的配置
-        LOG(INFO) << "Try change binding mode balance";
-        bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_BALANCE,
-                                                      .bonding_level = BONDP_BONDING_LEVEL_PORT };
-        urma_user_ctl_in_t in{ .addr = reinterpret_cast<uint64_t>(&mode),
-                                           .len = sizeof(mode),
-                                           .opcode = BONDP_USER_CTL_SET_BONDING_MODE };
-        urma_user_ctl_out_t out;
-        memset(&out, 0, sizeof(out));
-        auto ret = urma_user_ctl(context, &in, &out);
-        if (ret != URMA_SUCCESS) {
-            LOG(ERROR) << "Failed to set bonding balance mode, ret = " << ret;
-            return ERR_CONTEXT;
-        }
+        // if (globalConfig().urma_bonding_balance) {
+        //     LOG(INFO) << "Try change binding mode balance";
+        //     bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_BALANCE,
+        //                                       .bonding_level = BONDP_BONDING_LEVEL_PORT };
+        //     urma_user_ctl_in_t in{ .addr = reinterpret_cast<uint64_t>(&mode),
+        //                            .len = sizeof(mode),
+        //                            .opcode = BONDP_USER_CTL_SET_BONDING_MODE };
+        //     urma_user_ctl_out_t out;
+        //     memset(&out, 0, sizeof(out));
+        //     auto ret = urma_user_ctl(context, &in, &out);
+        //     if (ret != URMA_SUCCESS) {
+        //         LOG(ERROR) << "Failed to set bonding balance mode, ret = " << ret;
+        //         return ERR_CONTEXT;
+        //     }
+        // }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
             PLOG(ERROR) << "Failed to query dev attr( " << device_name << " ) ";
@@ -637,7 +649,7 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
     }
     urma_jfs_cfg_t jfs_cfg = {
         .depth = 2048,            // DEFAULT_DEPTH (512)
-        .trans_mode = parseTransMode(globalConfig().urma_trans_mode), /* override via MC_URMA_TRANS_MODE */
+        .trans_mode = context_->transMode(), /* override via MC_URMA_TRANS_MODE */
         .priority = 15,           // URMA_MAX_PRIORITY 15
         .max_sge = 5,             // SGE_NUM_MAX 5
         .rnr_retry = 7,           // URMA_TYPICAL_RNR_RETRY    7
@@ -677,7 +689,7 @@ int UrmaEndpoint::deconstruct() {
         auto imported_jetty = (imported_it != imported_jetty_map_.end())
                                   ? imported_it->second
                                   : nullptr;
-        if (parseTransMode(globalConfig().urma_trans_mode) == URMA_TM_RC) {
+        if (context_->transMode() == URMA_TM_RC) {
             ret = urma_unbind_jetty(jetty_list_[i]);
             if (ret) PLOG(ERROR) << "Failed to unbind jetty";
         }
@@ -799,7 +811,7 @@ void UrmaEndpoint::disconnectUnlocked() {
         int ret = urma_modify_jetty(jetty_list_[i], &attr);
         if (ret) PLOG(ERROR) << "Failed to modify jetty to RESET";
         auto imported_jetty = imported_jetty_map_[jetty_list_[i]];
-        if (parseTransMode(globalConfig().urma_trans_mode) == URMA_TM_RC) {
+        if (context_->transMode() == URMA_TM_RC) {
             ret = urma_unbind_jetty(jetty_list_[i]);
             if (ret) PLOG(ERROR) << "Failed to unbind jetty";
         }
@@ -997,14 +1009,14 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     urma_rjetty_t rjetty = {};
     rjetty.jetty_id.id = peer_jetty_num;
     rjetty.jetty_id.eid = eid;
-    rjetty.trans_mode = parseTransMode(globalConfig().urma_trans_mode);
+    rjetty.trans_mode = context_->transMode();
     rjetty.type = URMA_JETTY;
     rjetty.tp_type = URMA_CTP;
     rjetty.flag.value = 0;
     LOG(INFO) << "Peer jetty id = " << peer_jetty_num;
     urma_target_jetty_t* imported_jetty =
         urma_import_jetty(context_->urma_context_, &rjetty, &urma_token);
-    if (parseTransMode(globalConfig().urma_trans_mode) == URMA_TM_RC) {
+    if (context_->transMode() == URMA_TM_RC) {
         urma_status_t ret = urma_bind_jetty(jetty, imported_jetty);
         if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
             std::string message = "Failed to bind jetty";

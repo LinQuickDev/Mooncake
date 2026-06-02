@@ -408,6 +408,10 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (std::getenv("MC_URMA_BONDING_BALANCE")) {
+        config.urma_bonding_balance = true;
+    }
+
     const char* urma_trans_mode_env = std::getenv("MC_URMA_TRANS_MODE");
     if (urma_trans_mode_env && *urma_trans_mode_env) {
         std::string val(urma_trans_mode_env);
@@ -501,6 +505,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
     LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
+    LOG(INFO) << "urma_bonding_balance = " << (config.urma_bonding_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {
