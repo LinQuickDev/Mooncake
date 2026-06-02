@@ -15,11 +15,6 @@ BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
 # Get output directory from environment variable or argument
 OUTPUT_DIR="${OUTPUT_DIR:-${2:-rpm-output}}"
 
-<<<<<<< HEAD
-# Get target platform from environment variable or argument
-# Supported: x86_64, aarch64, all (build both)
-TARGET_PLATFORM="${TARGET_PLATFORM:-${3:-all}}"
-=======
 # Detect current host architecture
 HOST_ARCH=$(uname -m)
 
@@ -27,7 +22,6 @@ HOST_ARCH=$(uname -m)
 # If not specified, default to the current host architecture
 # Supported: x86_64, aarch64, all (build both)
 TARGET_PLATFORM="${TARGET_PLATFORM:-${3:-${HOST_ARCH}}}"
->>>>>>> supercache_dev
 
 # Package information
 PACKAGE_NAME="mooncake"
@@ -38,12 +32,6 @@ PACKAGE_DESCRIPTION="High-performance distributed KVCache store for LLM inferenc
 PACKAGE_VENDOR="KVCache.AI"
 PACKAGE_LICENSE="Apache-2.0"
 
-<<<<<<< HEAD
-# Detect current host architecture
-HOST_ARCH=$(uname -m)
-
-=======
->>>>>>> supercache_dev
 echo "Building RPM package for Mooncake"
 echo "Build directory: ${BUILD_DIR_ABS}"
 echo "Output directory: ${OUTPUT_DIR}"
@@ -175,46 +163,13 @@ build_rpm_for_platform() {
     fi
     
     # -------------------------------------------------------------------------
-<<<<<<< HEAD
-    # Copy header files
-    # -------------------------------------------------------------------------
-    echo "Copying header files..."
-=======
     # Copy header files (only core headers for real_client and dummy_client)
     # -------------------------------------------------------------------------
     echo "Copying core header files for real_client and dummy_client..."
->>>>>>> supercache_dev
     
     # Create include directories
     mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake
     
-<<<<<<< HEAD
-    # Store headers
-    cp -r mooncake-store/include/*.h rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake/ 2>/dev/null || true
-    
-    # Transfer engine headers
-    cp -r mooncake-transfer-engine/include/*.h rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake/ 2>/dev/null || true
-    
-    # Real client header specifically
-    if [ -f mooncake-store/include/real_client.h ]; then
-        cp mooncake-store/include/real_client.h rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake/
-    fi
-    
-    # PyClient header
-    if [ -f mooncake-store/include/pyclient.h ]; then
-        cp mooncake-store/include/pyclient.h rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake/
-    fi
-    
-    # Store C API header
-    if [ -f mooncake-store/include/store_c.h ]; then
-        cp mooncake-store/include/store_c.h rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake/
-    fi
-    
-    # Transfer engine C API header
-    if [ -f mooncake-transfer-engine/include/transfer_engine_c.h ]; then
-        cp mooncake-transfer-engine/include/transfer_engine_c.h rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake/
-    fi
-=======
     # Core client headers (real_client and dummy_client dependencies)
     # These are the essential headers needed for client-side development
     CORE_HEADERS=(
@@ -296,7 +251,6 @@ build_rpm_for_platform() {
     # - serialize/ (serialization utilities)
     # - spdk/ (SPDK integration)
     # - utils/s3_helper.h, zstd_util.h (specific utilities)
->>>>>>> supercache_dev
     
     # -------------------------------------------------------------------------
     # Copy configuration files
@@ -342,10 +296,7 @@ ${PACKAGE_DESCRIPTION}
 /usr/${LIB_DIR}/libmooncake_engine.so
 /usr/${LIB_DIR}/libmooncake_store_python.so
 /usr/include/mooncake/*.h
-<<<<<<< HEAD
-=======
 /usr/include/mooncake/*.hpp
->>>>>>> supercache_dev
 /etc/mooncake/master.yaml
 /etc/mooncake/master.json
 
