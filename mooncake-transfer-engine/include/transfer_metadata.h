@@ -121,6 +121,7 @@ class TransferMetadata {
         uint16_t local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
+        uint64_t trace_id = 0;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
 #endif

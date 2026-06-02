@@ -15,9 +15,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdlib>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "mooncake_logging.h"
 #include "real_client.h"
 
 #include <arpa/inet.h>
@@ -477,6 +479,7 @@ class StressBenchmark {
         if (warmup_ret != 0) {
             LOG(WARNING) << "Warmup had errors, continuing anyway";
         }
+        system("ubdiag clear");
 
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
@@ -1430,10 +1433,15 @@ class StressBenchmark {
 };
 
 int main(int argc, char* argv[]) {
-    google::InitGoogleLogging(argv[0]);
+    if (!google::IsGoogleLoggingInitialized()) {
+        google::InitGoogleLogging(argv[0]);
+    }
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    FLAGS_logtostderr = true;
+    if (std::getenv("MC_LOG_DIR") == nullptr) {
+        FLAGS_logtostderr = true;
+    }
+    mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     LOG(INFO) << "Mooncake Stress Cluster Benchmark";
     LOG(INFO) << "  Scenario:       " << FLAGS_scenario;

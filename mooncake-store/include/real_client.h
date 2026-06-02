@@ -527,6 +527,9 @@ class RealClient : public PyClient {
         QueryResult query_result;
         Replica::Descriptor replica;
         uint64_t total_size;
+        int64_t query_us;
+        int64_t select_us;
+        std::string replica_type;
     };
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(

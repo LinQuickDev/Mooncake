@@ -12,6 +12,7 @@
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
 #include "http_metadata_server.h"
+#include "mooncake_logging.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -965,6 +966,7 @@ int main(int argc, char* argv[]) {
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
     }
+    mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     // Initialize the master configuration
     mooncake::MasterConfig master_config;

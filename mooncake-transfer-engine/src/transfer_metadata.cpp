@@ -23,7 +23,11 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
+#include "mooncake_logging.h"
 #include "transfer_metadata_plugin.h"
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
 
 namespace mooncake {
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -77,17 +81,22 @@ struct TransferHandshakeUtil {
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
         root["reply_msg"] = desc.reply_msg;
+        root["trace_id"] = static_cast<Json::UInt64>(desc.trace_id);
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
 
 #ifdef USE_UB
+        UbDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_ENCODE,
+                             UbDiag::PerfLevel::DEBUG);
+        pt.Start();
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
         root["jetty_num"] = jettyNums;
-        LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
-                  << " peer_nic_path is " << desc.peer_nic_path
-                  << " jetty_num size is " << desc.jetty_num.size();
+        MC_LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
+                     << " peer_nic_path is " << desc.peer_nic_path
+                     << " jetty_num size is " << desc.jetty_num.size();
+        pt.End(0);
 #endif
         return root;
     }
@@ -111,17 +120,26 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
+        if (root.isMember("trace_id") && root["trace_id"].isUInt64()) {
+            desc.trace_id = root["trace_id"].asUInt64();
+        } else {
+            desc.trace_id = 0;
+        }
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
 #endif
 
 #ifdef USE_UB
+        UbDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_DECODE,
+                             UbDiag::PerfLevel::DEBUG);
+        pt.Start();
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
         }
-        LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
-                  << " peer_nic_path is " << desc.peer_nic_path
-                  << " jetty_num size is " << desc.jetty_num.size();
+        MC_LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
+                     << " peer_nic_path is " << desc.peer_nic_path
+                     << " jetty_num size is " << desc.jetty_num.size();
+        pt.End(0);
 #endif
         return 0;
     }
@@ -1209,10 +1227,12 @@ int TransferMetadata::startHandshakeDaemon(
                                Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
             TransferHandshakeUtil::decode(peer, peer_desc);
+            mooncake::logging::ScopedTraceId trace(peer_desc.trace_id);
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
                 if (ret) return ret;
             }
+            local_desc.trace_id = peer_desc.trace_id;
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });

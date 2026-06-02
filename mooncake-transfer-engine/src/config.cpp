@@ -17,8 +17,11 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <dirent.h>
 #include <sstream>
+#include <string>
 #include <unistd.h>
 
 namespace mooncake {
@@ -256,6 +259,16 @@ void loadGlobalConfig(GlobalConfig& config) {
             config.log_level = google::ERROR;
     }
     FLAGS_minloglevel = config.log_level;
+    const char* log_enable = std::getenv("MC_LOG_ENABLE");
+    std::string log_enable_value = log_enable ? log_enable : "";
+    std::transform(log_enable_value.begin(), log_enable_value.end(),
+                   log_enable_value.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (log_enable_value.empty() || log_enable_value == "off" ||
+        log_enable_value == "0" || log_enable_value == "false" ||
+        log_enable_value == "no") {
+        FLAGS_minloglevel = google::FATAL + 1;
+    }
 
     const char* slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
     if (slice_timeout_env) {
@@ -269,7 +282,9 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        if (!google::IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging("mooncake-transfer-engine");
+        }
         if (opendir(log_dir_path) == NULL) {
             LOG(WARNING)
                 << "Path [" << log_dir_path

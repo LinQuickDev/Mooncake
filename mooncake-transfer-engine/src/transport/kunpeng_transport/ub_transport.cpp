@@ -20,6 +20,7 @@
 #include "transport/kunpeng_transport/ub_transport.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
+#include "mooncake_logging.h"
 
 namespace mooncake {
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
@@ -232,6 +233,7 @@ Status UbTransport::submitTransferTask(
             slice->length =
                 merge_final_slice ? request.length - offset : kBlockSize;
             slice->opcode = request.opcode;
+            slice->trace_id = mooncake::logging::CurrentTraceId();
             // LOG(INFO) << "target_offset : " << request.target_offset << ",
             // offset : " << offset;
             slice->ub.dest_addr = request.target_offset + offset;

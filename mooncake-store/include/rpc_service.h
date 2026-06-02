@@ -53,18 +53,21 @@ class WrappedMasterService {
     GetReplicaListByRegex(const std::string& str);
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key);
+        const std::string& key, uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        uint64_t client_trace_id = 0);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
-        const uint64_t slice_length, const ReplicateConfig& config);
+        const uint64_t slice_length, const ReplicateConfig& config,
+        uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
@@ -73,11 +76,13 @@ class WrappedMasterService {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
-                  const ReplicateConfig& config);
+                  const ReplicateConfig& config,
+                  uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,

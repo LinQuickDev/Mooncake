@@ -108,6 +108,7 @@ class Transport {
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
+        uint64_t trace_id = 0;
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;

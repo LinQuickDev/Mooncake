@@ -232,7 +232,7 @@ bool MasterAdminServer::Start() {
 
     auto ec = http_server_.async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start master admin server on port "
+        MC_LOG(ERROR) << "Failed to start master admin server on port "
                    << http_port_;
         return false;
     }
@@ -263,14 +263,14 @@ bool MasterAdminServer::Start() {
                         << ", view_version="
                         << snapshot.leader_view->view_version;
                 }
-                LOG(INFO) << log_stream.str();
+                MC_LOG(INFO) << log_stream.str();
                 std::this_thread::sleep_for(
                     std::chrono::seconds(kMetricReportIntervalSeconds));
             }
         });
     }
 
-    LOG(INFO) << "Master admin server started on port " << http_server_.port();
+    MC_LOG(INFO) << "Master admin server started on port " << http_server_.port();
     return true;
 }
 
@@ -740,7 +740,7 @@ void MasterAdminServer::InitHttpServer() {
 
             body += "}}";
             if (results.size() != keys.size()) {
-                LOG(WARNING)
+                MC_LOG(WARNING)
                     << "BatchGetReplicaList size mismatch: keys=" << keys.size()
                     << " results=" << results.size();
             }
@@ -756,7 +756,8 @@ WrappedMasterService::CalcCacheStats() {
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key) {
     return execute_rpc(
-        "ExistKey", [&] { return master_service_.ExistKey(key); },
+        "ExistKey", PerfKey::MASTER_RPC_EXIST_KEY,
+        [&] { return master_service_.ExistKey(key); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_exist_key_requests(); },
         [] { MasterMetricManager::instance().inc_exist_key_failures(); });
@@ -776,7 +777,7 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
         if (!result[i].has_value()) {
             failure_count++;
             auto error = result[i].error();
-            LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
+            MC_LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
                        << keys[i] << "': " << toString(error);
         }
     }
@@ -815,7 +816,7 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
             const auto& client_id = client_ids[i];
             if (result.value().find(client_id) == result.value().end()) {
                 failure_count++;
-                VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
+                MC_VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
                         << client_id << "': not found in results";
             }
         }
@@ -853,7 +854,7 @@ WrappedMasterService::BatchReplicaClear(
     size_t failure_count = 0;
     if (!result.has_value()) {
         failure_count = total_keys;
-        LOG(WARNING) << "BatchReplicaClear failed: "
+        MC_LOG(WARNING) << "BatchReplicaClear failed: "
                      << toString(result.error());
     } else {
         const size_t cleared_count = result.value().size();
@@ -892,9 +893,16 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaList(const std::string& key) {
+WrappedMasterService::GetReplicaList(const std::string& key,
+                                     uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
+            client_trace_id);
+    }
     return execute_rpc(
-        "GetReplicaList", [&] { return master_service_.GetReplicaList(key); },
+        "GetReplicaList", PerfKey::MASTER_RPC_GET_REPLICA_LIST,
+        [&] { return master_service_.GetReplicaList(key); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
@@ -904,7 +912,16 @@ WrappedMasterService::GetReplicaList(const std::string& key) {
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys,
+    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
+            client_trace_id);
+    }
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -925,10 +942,10 @@ WrappedMasterService::BatchGetReplicaList(
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_NOT_FOUND ||
                 error == ErrorCode::REPLICA_IS_NOT_READY) {
-                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
+                MC_VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
                         << keys[i] << "': " << toString(error);
             } else {
-                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                MC_LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
                            << "] '" << keys[i] << "': " << toString(error);
             }
         }
@@ -945,15 +962,22 @@ WrappedMasterService::BatchGetReplicaList(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
-                               const ReplicateConfig& config) {
+                               const ReplicateConfig& config,
+                               uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
+            client_trace_id);
+    }
     return execute_rpc(
-        "PutStart",
+        "PutStart", PerfKey::MASTER_RPC_PUT_START,
         [&] {
             return master_service_.PutStart(client_id, key, slice_length,
                                             config);
@@ -967,9 +991,15 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    const UUID& client_id, const std::string& key, ReplicaType replica_type,
+    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
+            client_trace_id);
+    }
     return execute_rpc(
-        "PutEnd",
+        "PutEnd", PerfKey::MASTER_RPC_PUT_END,
         [&] { return master_service_.PutEnd(client_id, key, replica_type); },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -982,7 +1012,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutRevoke",
+        "PutRevoke", PerfKey::MASTER_RPC_PUT_REVOKE,
         [&] { return master_service_.PutRevoke(client_id, key, replica_type); },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -996,7 +1026,16 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<std::string>& keys,
                                     const std::vector<uint64_t>& slice_lengths,
-                                    const ReplicateConfig& config) {
+                                    const ReplicateConfig& config,
+                                    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
+            client_trace_id);
+    }
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_START,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -1007,13 +1046,13 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     results.reserve(keys.size());
 
     if (keys.size() != slice_lengths.size()) {
-        LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
+        MC_LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
                config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchPutStart: group_ids.size()="
+        MC_LOG(ERROR) << "BatchPutStart: group_ids.size()="
                    << config.group_ids->size()
                    << " != keys.size()=" << keys.size();
         results.assign(keys.size(),
@@ -1056,19 +1095,19 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             failure_count++;
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
+                MC_VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
                         << keys[i] << "': " << toString(error);
             } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
-                LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
+                MC_LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
                            << keys[i] << "': " << toString(error);
             }
         }
     }
 
     if (no_available_handle_count > 0) {
-        LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
+        MC_LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
@@ -1083,12 +1122,21 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
+            client_trace_id);
+    }
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_END,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -1107,7 +1155,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i]
+            MC_LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i]
                        << "': " << toString(error);
         }
     }
@@ -1123,12 +1171,16 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_REVOKE,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -1147,7 +1199,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
+            MC_LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
                        << keys[i] << "': " << toString(error);
         }
     }
@@ -1163,6 +1215,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
@@ -1171,7 +1224,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
                                   const ReplicateConfig& config) {
     return execute_rpc(
-        "UpsertStart",
+        "UpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
             return master_service_.UpsertStart(client_id, key, slice_length,
                                                config);
@@ -1187,7 +1240,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "UpsertEnd",
+        "UpsertEnd", PerfKey::MASTER_RPC_UPSERT_END,
         [&] { return master_service_.UpsertEnd(client_id, key, replica_type); },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -1200,7 +1253,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "UpsertRevoke",
+        "UpsertRevoke", PerfKey::MASTER_RPC_UPSERT_REVOKE,
         [&] {
             return master_service_.UpsertRevoke(client_id, key, replica_type);
         },
@@ -1229,7 +1282,7 @@ WrappedMasterService::BatchUpsertStart(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
+            MC_LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
                        << keys[i] << "': " << toString(error);
         }
     }
@@ -1262,7 +1315,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchUpsertEnd failed for key[" << i << "] '"
+            MC_LOG(ERROR) << "BatchUpsertEnd failed for key[" << i << "] '"
                        << keys[i] << "': " << toString(error);
         }
     }
@@ -1296,7 +1349,7 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchUpsertRevoke failed for key[" << i << "] '"
+            MC_LOG(ERROR) << "BatchUpsertRevoke failed for key[" << i << "] '"
                        << keys[i] << "': " << toString(error);
         }
     }
@@ -1318,7 +1371,8 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key, bool force) {
     return execute_rpc(
-        "Remove", [&] { return master_service_.Remove(key, force); },
+        "Remove", PerfKey::MASTER_RPC_REMOVE,
+        [&] { return master_service_.Remove(key, force); },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
@@ -1327,7 +1381,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
     const std::string& str, bool force) {
     return execute_rpc(
-        "RemoveByRegex",
+        "RemoveByRegex", PerfKey::MASTER_RPC_REMOVE_BY_REGEX,
         [&] { return master_service_.RemoveByRegex(str, force); },
         [&](auto& timer) {
             timer.LogRequest("regex=", str, ", force=", force);
@@ -1371,7 +1425,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
     return execute_rpc(
-        "MountSegment",
+        "MountSegment", PerfKey::MASTER_RPC_MOUNT_SEGMENT,
         [&] { return master_service_.MountSegment(segment, client_id); },
         [&](auto& timer) {
             timer.LogRequest("base=", segment.base, ", size=", segment.size,
@@ -1434,7 +1488,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
     const UUID& segment_id, const UUID& client_id) {
     return execute_rpc(
-        "UnmountSegment",
+        "UnmountSegment", PerfKey::MASTER_RPC_UNMOUNT_SEGMENT,
         [&] { return master_service_.UnmountSegment(segment_id, client_id); },
         [&](auto& timer) {
             timer.LogRequest("segment_id=", segment_id,
@@ -1509,7 +1563,7 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
     return execute_rpc(
-        "CopyStart",
+        "CopyStart", PerfKey::MASTER_RPC_COPY_START,
         [&] {
             return master_service_.CopyStart(client_id, key, src_segment,
                                              tgt_segments);
@@ -1526,7 +1580,8 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
 tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
     const UUID& client_id, const std::string& key) {
     return execute_rpc(
-        "CopyEnd", [&] { return master_service_.CopyEnd(client_id, key); },
+        "CopyEnd", PerfKey::MASTER_RPC_COPY_END,
+        [&] { return master_service_.CopyEnd(client_id, key); },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key);
         },
@@ -1537,7 +1592,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
     return execute_rpc(
-        "CopyRevoke",
+        "CopyRevoke", PerfKey::MASTER_RPC_COPY_REVOKE,
         [&] { return master_service_.CopyRevoke(client_id, key); },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key);
@@ -1624,7 +1679,7 @@ WrappedMasterService::BatchEvictDiskReplica(
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
+            MC_LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
                          << "] '" << keys[i]
                          << "': " << toString(results[i].error());
         }
@@ -1760,7 +1815,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
-    LOG(INFO) << "Mount local disk segment with client id is : " << client_id
+    MC_LOG(INFO) << "Mount local disk segment with client id is : " << client_id
               << ", enable offloading is: " << enable_offloading;
     auto result =
         master_service_.MountLocalDiskSegment(client_id, enable_offloading);

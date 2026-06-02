@@ -10,6 +10,7 @@
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "mooncake_logging.h"
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -517,8 +518,9 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key);
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key);
+                             GetReplicaListResponse>(object_key, trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -528,9 +530,10 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size());
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   GetReplicaListResponse>(object_keys.size(),
-                                                           object_keys);
+                                   GetReplicaListResponse>(
+        object_keys.size(), object_keys, trace_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -547,9 +550,10 @@ MasterClient::PutStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config);
+        client_id_, key, total_slice_length, config, trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -572,9 +576,10 @@ MasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config);
+        keys.size(), client_id_, keys, total_slice_lengths, config, trace_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -584,8 +589,9 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, key, replica_type);
+        client_id_, key, replica_type, trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -595,8 +601,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", keys.size());
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        keys.size(), client_id_, keys, replica_type);
+        keys.size(), client_id_, keys, replica_type, trace_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
