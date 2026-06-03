@@ -1297,14 +1297,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         MC_VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
 
-    size_t num_success = 0;
-    for (const auto& r : results) {
-        if (r.has_value()) num_success++;
-    }
-    MC_LOG(INFO) << "batch_get_transfer_complete num_keys[" << object_keys.size()
-              << "] success[" << num_success << "] elapsed_us[" << us_batch_get
-              << "] pending_count[" << pending_transfers.size() << "]";
-
     return results;
 }
 
@@ -3005,9 +2997,6 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code) {
     bool is_write = (op_code == TransferRequest::WRITE);
-    static std::atomic<bool> first_transfer_data_logged{false};
-    const bool first_transfer_data = !first_transfer_data_logged.exchange(
-        true, std::memory_order_relaxed);
     UbDiag::PerfPoint pt_full(is_write ? PerfKey::PUT_SINGLE_TRANSFER_FULL : PerfKey::GET_SINGLE_TRANSFER_FULL, UbDiag::PerfLevel::MODULE);
     pt_full.Start();
     if (!transfer_submitter_) {
@@ -3016,7 +3005,6 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto t0_transfer = std::chrono::steady_clock::now();
     UbDiag::PerfPoint pt_submit(is_write ? PerfKey::PUT_SINGLE_TRANSFER_SUBMIT
                                          : PerfKey::GET_SINGLE_TRANSFER_SUBMIT,
                                 UbDiag::PerfLevel::DEBUG);
@@ -3030,10 +3018,6 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now() - t0_transfer)
-                         .count();
-
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
 
     UbDiag::PerfPoint pt_wait(is_write ? PerfKey::PUT_SINGLE_TRANSFER_WAIT
@@ -3043,15 +3027,6 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     auto result = future->get();
     pt_wait.End(result == ErrorCode::OK ? 0 : -1);
     pt_full.End(result == ErrorCode::OK ? 0 : -1);
-
-    auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - t0_transfer).count() - submit_us;
-    MC_LOG(INFO) << "transfer_data first_transfer_data["
-              << (first_transfer_data ? 1 : 0) << "] op["
-              << (is_write ? "WRITE" : "READ") << "] strategy["
-              << static_cast<int>(future->strategy()) << "] submit_us["
-              << submit_us << "] wait_us[" << wait_us << "] result["
-              << toString(result) << "]";
     return result;
 }
 

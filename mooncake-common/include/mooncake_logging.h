@@ -15,6 +15,13 @@ bool ShouldLog(google::LogSeverity severity);
 bool ShouldVLog(int level);
 void ApplyMooncakeLogEnableToGlog();
 
+// High-frequency log sampling.  Parses MC_HIFREQ_LOG_SAMPLE_RATE once (default
+// 0.1, clamped to [0,1]) and caches it process-wide.  ShouldSampleHiFreqLog()
+// rolls a thread-local RNG: each call returns true with probability == rate.
+// Used to gate per-request high-frequency logs (e.g. real_client breakdown).
+double HiFreqLogSampleRate();
+bool ShouldSampleHiFreqLog();
+
 class ScopedTraceId {
    public:
     explicit ScopedTraceId(uint64_t trace_id);

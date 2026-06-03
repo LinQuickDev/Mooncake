@@ -905,23 +905,10 @@ bool TransferFuture::isReady() const { return state_->is_completed(); }
 
 ErrorCode TransferFuture::wait() {
     [[maybe_unused]] auto trace = RestoreTraceIfMissing(state_->trace_id());
-    static std::atomic<bool> first_wait_logged{false};
-    const bool first_wait =
-        !first_wait_logged.exchange(true, std::memory_order_relaxed);
-    const auto t0 = std::chrono::steady_clock::now();
-    const bool ready_before_wait = isReady();
     if (!isReady()) {
         state_->wait_for_completion();
     }
     ErrorCode result = state_->get_result();
-    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count();
-    MC_LOG(INFO) << "transfer_future_wait first_wait[" << (first_wait ? 1 : 0)
-                 << "] ready_before_wait[" << (ready_before_wait ? 1 : 0)
-                 << "] strategy[" << static_cast<int>(state_->get_strategy())
-                 << "] wait_us[" << wait_us << "] result[" << toString(result)
-                 << "]";
     return result;
 }
 
@@ -1054,19 +1041,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         }
         auto& handle = mem_desc.buffer_descriptor;
         uint64_t offset = 0;
-        const auto t_open_start = std::chrono::steady_clock::now();
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        const auto open_segment_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t_open_start)
-                .count();
-        MC_LOG(INFO) << "open_segment_breakdown endpoint["
-                     << handle.transport_endpoint_ << "] open_segment_us["
-                     << open_segment_us << "] status["
-                     << (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)
-                             ? -1
-                             : 0)
-                     << "]";
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             MC_LOG(ERROR) << "Failed to open segment "
                        << handle.transport_endpoint_;
@@ -1101,17 +1076,7 @@ TransferSubmitter::submit_batch_get_offload_object(
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     // Open the segment once 鈥?all keys share the same transfer_engine_addr.
-    const auto t_open_start = std::chrono::steady_clock::now();
     SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
-    const auto open_segment_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t_open_start)
-            .count();
-    MC_LOG(INFO) << "open_segment_breakdown endpoint[" << transfer_engine_addr
-                 << "] open_segment_us[" << open_segment_us << "] status["
-                 << (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT) ? -1
-                                                                        : 0)
-                 << "]";
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
         MC_LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
         // nullopt = failure (caller checks !future).  The function returns
@@ -1189,14 +1154,9 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests) {
-    static std::atomic<bool> first_submit_transfer_logged{false};
-    const bool first_transfer =
-        !first_submit_transfer_logged.exchange(true, std::memory_order_relaxed);
-    const auto t0 = std::chrono::steady_clock::now();
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
-    const auto t_alloc = std::chrono::steady_clock::now();
     if (batch_id == INVALID_BATCH_ID) {
         MC_LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
@@ -1204,21 +1164,6 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
     // Submit transfer
     Status s = engine_.submitTransfer(batch_id, requests);
-    const auto t_submit = std::chrono::steady_clock::now();
-    const auto alloc_batch_id_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(t_alloc - t0)
-            .count();
-    const auto submit_transfer_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(t_submit -
-                                                              t_alloc)
-            .count();
-    const int submit_status = s.ok() ? 0 : static_cast<int>(s.code());
-    MC_LOG(INFO) << "submit_transfer_breakdown first_transfer["
-                 << (first_transfer ? 1 : 0) << "] batch_id[" << batch_id
-                 << "] request_count[" << requests.size()
-                 << "] alloc_batch_id_us[" << alloc_batch_id_us
-                 << "] submit_transfer_us[" << submit_transfer_us
-                 << "] status[" << submit_status << "]";
     if (!s.ok()) {
         MC_LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
@@ -1250,18 +1195,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
                    << handle.buffer_address_;
         return std::nullopt;
     }
-    const auto t_open_start = std::chrono::steady_clock::now();
     SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-    const auto open_segment_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t_open_start)
-            .count();
-    MC_LOG(INFO) << "open_segment_breakdown endpoint["
-                 << handle.transport_endpoint_ << "] open_segment_us["
-                 << open_segment_us << "] status["
-                 << (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT) ? -1
-                                                                        : 0)
-                 << "]";
 
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
         MC_LOG(ERROR) << "Failed to open segment for endpoint='"

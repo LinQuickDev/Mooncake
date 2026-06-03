@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -53,6 +55,18 @@ bool ParseLogEnabled() {
         return false;
     }
     return true;
+}
+
+double ParseHiFreqLogSampleRate() {
+    const char* value = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
+    if (value == nullptr || *value == '\0') return 0.1;
+    errno = 0;
+    char* end = nullptr;
+    double rate = std::strtod(value, &end);
+    if (end == value || errno != 0) return 0.1;  // non-numeric / overflow
+    if (rate < 0.0) return 0.0;
+    if (rate > 1.0) return 1.0;
+    return rate;
 }
 
 struct LogEntry {
@@ -184,6 +198,21 @@ uint64_t CurrentTraceId() { return current_trace_id; }
 bool IsMooncakeLogEnabled() {
     static const bool enabled = ParseLogEnabled();
     return enabled;
+}
+
+double HiFreqLogSampleRate() {
+    static const double rate = ParseHiFreqLogSampleRate();
+    return rate;
+}
+
+bool ShouldSampleHiFreqLog() {
+    const double rate = HiFreqLogSampleRate();
+    if (rate >= 1.0) return true;
+    if (rate <= 0.0) return false;
+    thread_local std::mt19937 rng(static_cast<uint32_t>(
+        SteadyClockNs() ^ reinterpret_cast<uintptr_t>(&rng)));
+    thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng) < rate;
 }
 
 bool ShouldLog(google::LogSeverity severity) {
