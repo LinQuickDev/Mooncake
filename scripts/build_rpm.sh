@@ -148,6 +148,15 @@ build_rpm_for_platform() {
         echo "Warning: libetcd_wrapper.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
     
+    # libmooncake_common.so
+    if [ -f ${PLATFORM_BUILD_DIR}/mooncake-common/libmooncake_common.so ]; then
+        cp ${PLATFORM_BUILD_DIR}/mooncake-common/libmooncake_common.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
+    elif [ -f ${PLATFORM_BUILD_DIR}/mooncake-common/src/libmooncake_common.so ]; then
+        cp ${PLATFORM_BUILD_DIR}/mooncake-common/src/libmooncake_common.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
+    else
+        echo "Warning: libmooncake_common.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
+    fi
+    
     # engine.so (Python binding)
     if compgen -G "${PLATFORM_BUILD_DIR}/mooncake-integration/engine.*.so" >/dev/null; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-integration/engine.*.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/libmooncake_engine.so
@@ -281,6 +290,25 @@ Vendor:         ${PACKAGE_VENDOR}
 URL:            https://github.com/KVCache-AI/Mooncake
 BuildArch:      ${PLATFORM}
 
+# System dependencies - these will be automatically resolved by RPM during installation
+Requires:       libgflags.so.2.2()(64bit)
+Requires:       libglog.so.1()(64bit)
+Requires:       libjsoncpp.so.25()(64bit)
+Requires:       libxxhash.so.0()(64bit)
+Requires:       libyaml-cpp.so.0.7()(64bit)
+Requires:       liburing.so.2()(64bit)
+
+# Optional dependencies - RDMA support (required for network transport)
+Requires:       libibverbs.so.1()(64bit)
+
+# Optional dependencies - CUDA support (for GPU acceleration, not required for basic functionality)
+# These are recommended but not required for basic operations
+Recommends:     libcudart.so.12()(64bit)
+Recommends:     liburma.so.0()(64bit)
+
+# Optional dependencies - not required but recommended
+Requires(pre):  /usr/sbin/ldconfig
+
 %description
 ${PACKAGE_DESCRIPTION}
 
@@ -291,6 +319,7 @@ ${PACKAGE_DESCRIPTION}
 /usr/bin/transfer_engine_bench
 /usr/${LIB_DIR}/libmooncake_store.so
 /usr/${LIB_DIR}/libtransfer_engine.so
+/usr/${LIB_DIR}/libmooncake_common.so
 /usr/${LIB_DIR}/libasio.so
 /usr/${LIB_DIR}/libetcd_wrapper.so
 /usr/${LIB_DIR}/libmooncake_engine.so
