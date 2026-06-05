@@ -243,6 +243,8 @@ Status UbTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->ts = 0;
             slice->status = Slice::PENDING;
+            slice->ub.src_chip_id = INVALID_CHIP_ID;
+            slice->ub.dst_chip_id = INVALID_CHIP_ID;
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
@@ -293,6 +295,12 @@ Status UbTransport::submitTransferTask(
             auto local_tseg_index =
                 local_segment_desc->buffers[buffer_id].l_seg_index[device_id];
             slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
+            if (context->multipath()) {
+                const auto& local_buf = local_segment_desc->buffers[buffer_id];
+                int numa = resolveBufferNumaNode(local_buf.name, local_buf.length, 
+                    (uint64_t)slice->source_addr - local_buf.addr);
+                slice->ub.src_chip_id = numaNodeToChipId(numa);
+            }   
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;
             __sync_fetch_and_add(&task.slice_count, 1);
@@ -415,10 +423,15 @@ int UbTransport::selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
             continue;
         }
 
+        string location = buffer.name;
+        SegmentsLocationInfo seg_info;
+        if (parseSegmentsLocation(buffer.name, seg_info)) {
+            location = resolveSegmentsLocation(seg_info, buffer.length, offset - buffer.addr);
+        }
         device_id =
             hint.empty()
-                ? desc->topology.selectDevice(buffer.name, retry_cnt)
-                : desc->topology.selectDevice(buffer.name, hint, retry_cnt);
+                ? desc->topology.selectDevice(location, retry_cnt)
+                : desc->topology.selectDevice(location, hint, retry_cnt);
         if (device_id >= 0) return 0;
         device_id = hint.empty() ? desc->topology.selectDevice(
                                        kWildcardLocation, retry_cnt)

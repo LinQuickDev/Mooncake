@@ -433,10 +433,10 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        if (globalConfig().urma_bonding_multipath) {
+        if (multipath()) {
             LOG(INFO) << "Try change binding mode balance";
-            bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_STANDALONE,
-                                              .bonding_level = BONDP_BONDING_LEVEL_IODIE };
+            bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_BALANCE,
+                                              .bonding_level = BONDP_BONDING_LEVEL_PORT };
             urma_user_ctl_in_t in{ .addr = reinterpret_cast<uint64_t>(&mode),
                                    .len = sizeof(mode),
                                    .opcode = BONDP_USER_CTL_SET_BONDING_MODE };
@@ -1010,66 +1010,74 @@ int UrmaEndpoint::submitPostSend(
         std::min(int(globalConfig().max_jfc_e) - *jfc_outstanding_, wr_count);
     if (wr_count <= 0) return 0;
 
-    urma_jfs_wr_t wr_list[wr_count], *bad_wr = nullptr;
+    const bool multipath = context_->multipath(); 
     urma_sge_t l_sge_list[wr_count];
     urma_sge_t r_sge_list[wr_count];
-    memset(wr_list, 0, sizeof(urma_jfs_wr_t) * wr_count);
-    for (int i = 0; i < wr_count; ++i) {
-        auto slice = slice_list[i];
-        auto& l_sge = l_sge_list[i];
-        auto& r_sge = r_sge_list[i];
-        l_sge.addr = (uint64_t)slice->source_addr;
-        l_sge.len = slice->length;
-        l_sge.tseg = static_cast<urma_target_seg_t*>(slice->ub.l_seg);
-        r_sge.addr = slice->ub.dest_addr;
-        r_sge.len = slice->length;
-        r_sge.tseg = static_cast<urma_target_seg_t*>(slice->ub.r_seg);
 
-        auto& wr = wr_list[i];
+    // 两分支共用：填一个 WR 的公共字段（SGE 方向、opcode、flag、tjetty、user_ctx + slice 记账）
+    auto fill_common = [&](urma_jfs_wr_t& wr, Transport::Slice* slice,
+                           urma_sge_t& l_sge, urma_sge_t& r_sge) {
+        const bool is_read = slice->opcode == Transport::TransferRequest::READ;
+        l_sge.addr = (uint64_t)slice->source_addr; l_sge.len = slice->length;
+        l_sge.tseg = static_cast<urma_target_seg_t*>(slice->ub.l_seg);
+        r_sge.addr = slice->ub.dest_addr;          r_sge.len = slice->length;
+        r_sge.tseg = static_cast<urma_target_seg_t*>(slice->ub.r_seg);
         wr.user_ctx = (uint64_t)slice;
-        wr.opcode = slice->opcode == Transport::TransferRequest::READ
-                        ? URMA_OPC_READ
-                        : URMA_OPC_WRITE;
-        wr.rw.src.sge =
-            slice->opcode == Transport::TransferRequest::READ ? &r_sge : &l_sge;
-        wr.rw.src.num_sge = 1;
-        wr.rw.dst.sge =
-            slice->opcode == Transport::TransferRequest::READ ? &l_sge : &r_sge;
-        wr.rw.dst.num_sge = 1;
-        wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
-        wr.flag.bs.complete_enable = 1;
-        wr.flag.bs.inline_flag = 0;
-        // Check if the jetty is in the imported_jetty_map_
+        wr.opcode = is_read ? URMA_OPC_READ : URMA_OPC_WRITE;
+        wr.rw.src.sge = is_read ? &r_sge : &l_sge; wr.rw.src.num_sge = 1;  // 按数据流向定 src/dst
+        wr.rw.dst.sge = is_read ? &l_sge : &r_sge; wr.rw.dst.num_sge = 1;
+        wr.flag.bs.complete_enable = 1; wr.flag.bs.inline_flag = 0;
         auto it = imported_jetty_map_.find(jetty_list_[jetty_index]);
-        if (it == imported_jetty_map_.end()) {
-            LOG(ERROR) << "Jetty not imported for endpoint, tjetty is nullptr"
-                       << jetty_index << ", local_nic=";
-        }
-        if (it != imported_jetty_map_.end()) {
-            wr.tjetty = it->second;
-        } else {
-            // If not found, use a dummy value
-            wr.tjetty = nullptr;
-        }
+        wr.tjetty = (it != imported_jetty_map_.end()) ? it->second : nullptr;
         slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
         slice->ub.jetty_depth = &wr_depth_list_[jetty_index];
-    }
+    };
+
     __sync_fetch_and_add(&wr_depth_list_[jetty_index], wr_count);
     __sync_fetch_and_add(jfc_outstanding_, wr_count);
-    if (jetty_list_[jetty_index]->remote_jetty == NULL) {
-    }
-    int rc =
-        urma_post_jetty_send_wr(jetty_list_[jetty_index], wr_list, &bad_wr);
-    if (rc) {
-        PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
-        while (bad_wr) {
-            int i = bad_wr - wr_list;
-            LOG(ERROR) << "slice (" << i << ") post send failed.";
-            failed_slice_list.push_back(slice_list[i]);
-            __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
-            __sync_fetch_and_sub(jfc_outstanding_, 1);
-            bad_wr = bad_wr->next;
+    urma_jfs_wr_t* bad_wr = nullptr;
+    int rc;
+
+    if (multipath) {
+        // —— 分支一：chip 亲和，用 bondp_jfs_wr_t 链 ——
+        bondp_jfs_wr_t wr_list[wr_count];
+        memset(wr_list, 0, sizeof(bondp_jfs_wr_t) * wr_count);
+        for (int i = 0; i < wr_count; ++i) {
+            fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
+            wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
+            wr_list[i].src_chip_id = slice_list[i]->ub.src_chip_id;   // 本地 chip，不随 opcode 换
+            wr_list[i].dst_chip_id = slice_list[i]->ub.dst_chip_id;   // 远端 chip
+        }
+        rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
+        if (rc) {
+            PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
+            while (bad_wr) {
+                // 用 user_ctx 直接还原失败 slice —— 不依赖 base 是不是首成员
+                failed_slice_list.push_back((Transport::Slice*)bad_wr->user_ctx);
+                __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
+                __sync_fetch_and_sub(jfc_outstanding_, 1);
+                bad_wr = bad_wr->next;
+            }
+        }
+    } else {
+        // —— 分支二：非亲和，保持 Mooncake 现状（urma_jfs_wr_t 链）——
+        urma_jfs_wr_t wr_list[wr_count];
+        memset(wr_list, 0, sizeof(urma_jfs_wr_t) * wr_count);
+        for (int i = 0; i < wr_count; ++i) {
+            fill_common(wr_list[i], slice_list[i], l_sge_list[i], r_sge_list[i]);
+            wr_list[i].next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
+        }
+        rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0], &bad_wr);
+        if (rc) {
+            PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
+            while (bad_wr) {
+                int i = bad_wr - wr_list;
+                failed_slice_list.push_back(slice_list[i]);
+                __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
+                __sync_fetch_and_sub(jfc_outstanding_, 1);
+                bad_wr = bad_wr->next;
+            }
         }
     }
     slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);

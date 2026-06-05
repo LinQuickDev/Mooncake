@@ -133,6 +133,8 @@ class Transport {
                 uint32_t max_retry_cnt;
                 void *r_seg;
                 void *l_seg;
+                uint8_t src_chip_id;
+                uint8_t dst_chip_id;
             } ub;
             struct {
                 void *dest_addr;

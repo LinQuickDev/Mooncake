@@ -860,7 +860,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
         // global_segment across them for full NIC utilization.
         std::vector<int> seg_numa_nodes;
-        if (protocol == "rdma") {
+        if (protocol == "rdma" || protocol == "ub") {
             seg_numa_nodes = client_->GetNicNumaNodes();
             if (seg_numa_nodes.size() > 1) {
                 std::string nodes_str;
@@ -913,15 +913,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
-            } else if (this->protocol == "ub") {
-                ub_segment_ptrs_.emplace_back(ptr,
-                                              UbSegmentDeleter{mapped_size});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
-            } else {
+            } else if (this->protocol == "ub") {
+                ub_segment_ptrs_.emplace_back(ptr,
+                                              UbSegmentDeleter{mapped_size});
+            }  else {
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =

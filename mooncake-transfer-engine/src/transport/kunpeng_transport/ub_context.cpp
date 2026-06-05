@@ -22,6 +22,7 @@
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
+#include "memory_location.h"
 
 namespace mooncake {
 namespace {
@@ -257,6 +258,12 @@ int UbWorkerPool::submitPostSend(
         auto targetSegment =
             peer_segment_desc->buffers[buffer_id].tseg[device_id];
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+        if (context_.multipath()) {
+            const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+            uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
+            int numa = resolveBufferNumaNode(peer_buf.name, peer_buf.length, in_buf_off);
+            slice->ub.dst_chip_id = numaNodeToChipId(numa);
+        }  
         if (!slice->ub.r_seg) {
             LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
                        << slice->target_id << " buffer_id=" << buffer_id
@@ -468,6 +475,12 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
             auto targetSegment =
                 peer_segment_desc->buffers[buffer_id].tseg[device_id];
             slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+            if (context_.multipath()) {
+                const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+                uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
+                int numa = resolveBufferNumaNode(peer_buf.name, peer_buf.length, in_buf_off);
+                slice->ub.dst_chip_id = numaNodeToChipId(numa);
+            } 
             auto peer_nic_path =
                 MakeNicPath(peer_segment_desc->name,
                             peer_segment_desc->devices[device_id].name);

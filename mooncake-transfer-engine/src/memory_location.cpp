@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dirent.h>
+#include <cstring>
+#include <cctype>
+
 #include "memory_location.h"
 
 #include "cuda_alike.h"
@@ -19,6 +23,44 @@
 namespace mooncake {
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }
+
+int parseCpuNumaNode(const std::string& location) {
+    const std::string prefix = "cpu:";
+    if (location.rfind(prefix, 0) != 0) return -1;
+    try { return std::stoi(location.substr(prefix.size())); }
+    catch (const std::exception&) { return -1; }
+}
+
+int resolveBufferNumaNode(const std::string& name, uint64_t length, uint64_t offset) {
+    SegmentsLocationInfo info;
+    if (parseSegmentsLocation(name, info))                 // 分段 buffer
+        return parseCpuNumaNode(resolveSegmentsLocation(info, length, offset));
+    return parseCpuNumaNode(name);                         // 非分段 "cpu:N"
+}
+
+// 数 /sys/devices/system/node 下的 NUMA 节点数
+static size_t getNumaNodeCount() {
+    int count = 0;
+    DIR* dir = opendir("/sys/devices/system/node");
+    if (!dir) return 0;
+    for (dirent* e = readdir(dir); e; e = readdir(dir))
+        if (strncmp(e->d_name, "node", 4) == 0 && isdigit((unsigned char)e->d_name[4])) count++;
+    closedir(dir);
+    return (size_t)count;
+}
+
+// 前半 -> chip1，后半 -> chip2（直接对齐用户给的 NumaIdToChipId 参考实现）
+uint8_t numaNodeToChipId(int numa_node, size_t numa_count) {
+    constexpr uint8_t chipId1 = 1, chipId2 = 2;
+    if (numa_node < 0) return INVALID_CHIP_ID;          // 对应 INVALID_NUMA_ID
+    if (numa_count == 0) {
+        numa_count = getNumaNodeCount();
+        if (numa_count == 0) return INVALID_CHIP_ID;
+    }
+    if ((size_t)numa_node >= numa_count) return INVALID_CHIP_ID;
+    const size_t firstHalfCount = (numa_count + 1) / 2;
+    return ((size_t)numa_node < firstHalfCount) ? chipId1 : chipId2;
+}
 
 std::string genCpuNodeName(int node) {
     if (node >= 0) return "cpu:" + std::to_string(node);

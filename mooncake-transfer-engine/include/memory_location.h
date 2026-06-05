@@ -31,6 +31,19 @@ struct MemoryLocationEntry {
     std::string location;
 };
 
+const static uint8_t INVALID_CHIP_ID = 0xFF;
+
+// "cpu:3" -> 3; "*" 或 非cpu串返回-1
+int parseCpuNumaNode(const std::string& location); 
+
+// 统一入口：给定 buffer 名字/长度/段内 offset，返回该处数据所在 NUMA 节点；失败 -1。
+// 同时兼容 "segments:..."（按 offset 解析）和 "cpu:N"（直接取）。
+int resolveBufferNumaNode(const std::string& name, uint64_t length, uint64_t offset);
+
+// NUMA 节点 -> chip id：按 NUMA 总数前半归 chip1、后半归 chip2。
+// numa_count=0 时自动数 /sys/devices/system/node；失败返回 INVALID_CHIP_ID。
+uint8_t numaNodeToChipId(int numa_node, size_t numa_count = 0);
+
 // If only_first_page is true, only the location of the first page will be
 // returned. Scan all pages may take a long time, so set only_first_page if only
 // the location of the first page is needed.
