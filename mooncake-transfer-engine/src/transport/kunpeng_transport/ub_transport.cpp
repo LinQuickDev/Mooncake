@@ -423,7 +423,7 @@ int UbTransport::selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
             continue;
         }
 
-        string location = buffer.name;
+        std::string location = buffer.name;
         SegmentsLocationInfo seg_info;
         if (parseSegmentsLocation(buffer.name, seg_info)) {
             location = resolveSegmentsLocation(seg_info, buffer.length, offset - buffer.addr);
