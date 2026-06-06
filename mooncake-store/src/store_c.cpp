@@ -21,7 +21,6 @@
 #include <string>
 #include <vector>
 
-#include "dummy_client.h"
 #include "real_client.h"
 #include "replica.h"
 #include "types.h"
@@ -32,8 +31,7 @@ namespace {
 // RealClient::create() returns shared_ptr and registers a weak_ptr in
 // ResourceTracker, so we must not let the shared_ptr die prematurely.
 struct StoreHandle {
-    std::shared_ptr<mooncake::PyClient> client;
-    mooncake_client_type_t client_type;
+    std::shared_ptr<mooncake::RealClient> client;
 };
 
 inline const char *c_str_or(const char *s, const char *fallback) {
@@ -64,7 +62,7 @@ StoreHandle *as_handle(mooncake_store_t store) {
     return static_cast<StoreHandle *>(store);
 }
 
-mooncake::PyClient *as_client(mooncake_store_t store) {
+mooncake::RealClient *as_client(mooncake_store_t store) {
     return as_handle(store)->client.get();
 }
 
@@ -76,17 +74,11 @@ extern "C" {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-mooncake_store_t mooncake_store_create(mooncake_client_type_t client_type) {
+mooncake_store_t mooncake_store_create() {
     try {
-        std::shared_ptr<mooncake::PyClient> client;
-        if (client_type == MOONCAKE_CLIENT_DUMMY) {
-            client = std::make_shared<mooncake::DummyClient>();
-        } else {
-            client = mooncake::RealClient::create();
-        }
+        auto client = mooncake::RealClient::create();
         if (!client) return nullptr;
-        auto *handle =
-            new (std::nothrow) StoreHandle{std::move(client), client_type};
+        auto *handle = new (std::nothrow) StoreHandle{std::move(client)};
         if (!handle) return nullptr;
         return static_cast<mooncake_store_t>(handle);
     } catch (...) {
@@ -111,27 +103,14 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          uint64_t global_segment_size,
                          uint64_t local_buffer_size, const char *protocol,
                          const char *device_name,
-                         const char *master_server_addr,
-                         uint64_t mem_pool_size,
-                         const char *server_address,
-                         const char *ipc_socket_path) {
+                         const char *master_server_addr) {
     if (!store) return -1;
     try {
-        auto *handle = as_handle(store);
-        if (handle->client_type == MOONCAKE_CLIENT_DUMMY) {
-            return handle->client->setup_dummy(
-                mem_pool_size, local_buffer_size,
-                c_str_or(server_address, ""),
-                c_str_or(ipc_socket_path, ""));
-        } else {
-            return handle->client->setup_real(
-                c_str_or(local_hostname, ""),
-                c_str_or(metadata_server, ""),
-                global_segment_size, local_buffer_size,
-                c_str_or(protocol, "tcp"), c_str_or(device_name, ""),
-                c_str_or(master_server_addr, "127.0.0.1:50051"),
-                nullptr, "", false, "");
-        }
+        return as_client(store)->setup_real(
+            c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
+            global_segment_size, local_buffer_size, c_str_or(protocol, "tcp"),
+            c_str_or(device_name, ""),
+            c_str_or(master_server_addr, "127.0.0.1:50051"));
     } catch (...) {
         return -1;
     }
