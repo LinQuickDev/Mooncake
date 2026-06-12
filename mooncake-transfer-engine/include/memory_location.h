@@ -40,9 +40,12 @@ int parseCpuNumaNode(const std::string& location);
 // 同时兼容 "segments:..."（按 offset 解析）和 "cpu:N"（直接取）。
 int resolveBufferNumaNode(const std::string& name, uint64_t length, uint64_t offset);
 
-// NUMA 节点 -> chip id：按 NUMA 总数前半归 chip1、后半归 chip2。
-// numa_count=0 时自动数 /sys/devices/system/node；失败返回 INVALID_CHIP_ID。
+// NUMA 节点 -> chip id：优先按 sysfs 真实拓扑(physical_package_id)映射；
+// sysfs 不可读时回退「前半 chip1 / 后半 chip2」启发式；失败返回 INVALID_CHIP_ID。
 uint8_t numaNodeToChipId(int numa_node, size_t numa_count = 0);
+
+// NUMA 节点 -> location 字符串："cpu:N"（node>=0）或 "*"（node<0）。
+std::string genCpuNodeName(int node);
 
 // If only_first_page is true, only the location of the first page will be
 // returned. Scan all pages may take a long time, so set only_first_page if only

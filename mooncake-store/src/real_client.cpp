@@ -858,9 +858,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t current_glbseg_size = 0;                  // For logging
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
-        // global_segment across them for full NIC utilization.
+        // global_segment across them for full NIC utilization. RDMA keeps the
+        // legacy single-segment-with-multi-region ("segments:...") behavior.
         std::vector<int> seg_numa_nodes;
-        if (protocol == "rdma" || protocol == "ub") {
+        if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
             if (seg_numa_nodes.size() > 1) {
                 std::string nodes_str;
@@ -875,12 +876,76 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        // For UB, when NUMA affinity is enabled, mount ONE segment per
+        // NIC-NUMA node (each bound to its node, location="cpu:N"). This lets
+        // the master allocate across NUMA via its per-segment load balancing,
+        // and lets the transfer engine pick the NUMA-local NIC. Independent of
+        // urma_bonding_multipath; gated by MC_UB_NUMA_AFFINITY_ENABLE.
+        std::vector<int> ub_numa_nodes;
+        if (protocol == "ub") {
+            ub_numa_nodes = client_->GetNicNumaNodes();
+            if (ub_numa_nodes.size() > 1) {
+                std::string nodes_str;
+                for (size_t i = 0; i < ub_numa_nodes.size(); ++i) {
+                    if (i) nodes_str += ",";
+                    nodes_str += std::to_string(ub_numa_nodes[i]);
+                }
+                MC_LOG(INFO) << "UB per-NUMA mode: NIC NUMA nodes=[" << nodes_str
+                          << "]";
+            } else {
+                ub_numa_nodes.clear();
+            }
+        }
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
             current_glbseg_size += segment_size;
             MC_LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
+
+            // UB NUMA affinity: split this chunk into one segment per NIC-NUMA
+            // node, each physically bound to its node and registered with
+            // location "cpu:N" (so selectDevice picks the NUMA-local NIC).
+            if (!ub_numa_nodes.empty()) {
+                size_t page_sz = should_use_hugepage
+                                     ? get_hugepage_size_from_env()
+                                     : static_cast<size_t>(getpagesize());
+                size_t n = ub_numa_nodes.size();
+                size_t per_node_size = align_up(segment_size / n, page_sz);
+                if (per_node_size == 0) {
+                    MC_LOG(ERROR) << "UB per-NUMA: per_node_size is 0, segment "
+                                     "too small for " << n << " NUMA nodes";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                for (int node : ub_numa_nodes) {
+                    // Reuse allocate_buffer_numa_segments with a single-element
+                    // vector: one mmap'd region mbind'd to this node.
+                    std::vector<int> one_node{node};
+                    void *ptr = allocate_buffer_numa_segments(per_node_size,
+                                                              one_node, page_sz);
+                    if (!ptr) {
+                        MC_LOG(ERROR) << "UB per-NUMA: failed to allocate "
+                                         "segment for node " << node;
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    // mmap-backed => track for munmap cleanup.
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{per_node_size});
+
+                    std::string loc = genCpuNodeName(node);  // "cpu:<node>"
+                    MC_LOG(INFO) << "Mounting UB per-NUMA segment: node=" << node
+                              << ", size=" << per_node_size << ", loc=" << loc;
+                    auto mr = client_->MountSegment(ptr, per_node_size, protocol,
+                                                    loc);
+                    if (!mr.has_value()) {
+                        MC_LOG(ERROR) << "Failed to mount UB per-NUMA segment: "
+                                   << toString(mr.error());
+                        return tl::unexpected(mr.error());
+                    }
+                }
+                continue;  // this chunk fully mounted across NUMA nodes
+            }
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;

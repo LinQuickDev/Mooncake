@@ -15,6 +15,13 @@
 #include <dirent.h>
 #include <cstring>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <set>
+#include <string>
+#include <unordered_map>
 
 #include "memory_location.h"
 
@@ -49,10 +56,104 @@ static size_t getNumaNodeCount() {
     return (size_t)count;
 }
 
-// 前半 -> chip1，后半 -> chip2（直接对齐用户给的 NumaIdToChipId 参考实现）
+namespace {
+
+// 读取 NUMA 节点 nodeN 下第一个 CPU 的物理 package(chip) 编号。
+// 路径：/sys/devices/system/node/nodeN/cpulist -> 取首个 cpu ->
+//       /sys/devices/system/cpu/cpuX/topology/physical_package_id。失败返回 -1。
+int readNodePackageId(int node) {
+    char path[256];
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/node/node%d/cpulist", node);
+    std::ifstream cpulist(path);
+    if (!cpulist) return -1;
+    std::string s;
+    std::getline(cpulist, s);  // 形如 "0-23" 或 "0-7,16-23"
+    int cpu = -1;
+    try {
+        cpu = std::stoi(s);  // 取列表首个 CPU
+    } catch (const std::exception&) {
+        return -1;
+    }
+    if (cpu < 0) return -1;
+
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+    std::ifstream pkg(path);
+    if (!pkg) return -1;
+    int package_id = -1;
+    pkg >> package_id;
+    return package_id;
+}
+
+// 进程内只构建一次：从服务器拓扑(sysfs)读取 NUMA节点 -> chip(物理package) 映射。
+// chip id 采用「package 排序后 1-based」编号，兼容旧约定（双 chip 即 1/2），
+// 同时正确处理节点与 package 非顺序对应的拓扑。
+class NumaChipMap {
+   public:
+    static const NumaChipMap& Instance() {
+        static const NumaChipMap inst;
+        return inst;
+    }
+
+    // 返回该 NUMA 节点所属 chip id；未知返回 INVALID_CHIP_ID。
+    uint8_t ChipId(int numa_node) const {
+        auto it = node_to_chip_.find(numa_node);
+        return it == node_to_chip_.end() ? INVALID_CHIP_ID : it->second;
+    }
+
+    bool Empty() const { return node_to_chip_.empty(); }
+
+   private:
+    NumaChipMap() { Build(); }
+
+    void Build() {
+        std::map<int, int> node_to_pkg;  // numa node -> physical package id
+        std::set<int> packages;
+
+        DIR* dir = opendir("/sys/devices/system/node");
+        if (!dir) return;
+        for (dirent* e = readdir(dir); e; e = readdir(dir)) {
+            if (strncmp(e->d_name, "node", 4) != 0 ||
+                !isdigit((unsigned char)e->d_name[4]))
+                continue;
+            int node = atoi(e->d_name + 4);
+            int pkg = readNodePackageId(node);
+            if (pkg < 0) continue;
+            node_to_pkg[node] = pkg;
+            packages.insert(pkg);
+        }
+        closedir(dir);
+
+        // package id 排序去重 -> 1-based chip id
+        std::map<int, uint8_t> pkg_to_chip;
+        uint8_t chip = 1;
+        for (int p : packages) pkg_to_chip[p] = chip++;
+
+        for (const auto& [node, pkg] : node_to_pkg)
+            node_to_chip_[node] = pkg_to_chip[pkg];
+
+        LOG(INFO) << "NumaChipMap built from sysfs: " << node_to_chip_.size()
+                  << " NUMA nodes, " << packages.size() << " chips";
+    }
+
+    std::unordered_map<int, uint8_t> node_to_chip_;
+};
+
+}  // namespace
+
+// NUMA 节点 -> chip id：优先按 sysfs 真实拓扑(physical_package_id)映射；
+// 若 sysfs 不可读则回退到旧的「前半 chip1 / 后半 chip2」启发式。
 uint8_t numaNodeToChipId(int numa_node, size_t numa_count) {
+    if (numa_node < 0) return INVALID_CHIP_ID;  // 对应 INVALID_NUMA_ID
+
+    const auto& chip_map = NumaChipMap::Instance();
+    if (!chip_map.Empty()) {
+        return chip_map.ChipId(numa_node);
+    }
+
+    // Fallback：sysfs 读取失败（如受限容器），退回原启发式，保证不破坏既有行为。
     constexpr uint8_t chipId1 = 1, chipId2 = 2;
-    if (numa_node < 0) return INVALID_CHIP_ID;          // 对应 INVALID_NUMA_ID
     if (numa_count == 0) {
         numa_count = getNumaNodeCount();
         if (numa_count == 0) return INVALID_CHIP_ID;

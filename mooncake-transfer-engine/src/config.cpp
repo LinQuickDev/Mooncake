@@ -440,6 +440,18 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
     }
 
+    const char* ub_numa_affinity_enable =
+        std::getenv("MC_UB_NUMA_AFFINITY_ENABLE");
+    if (ub_numa_affinity_enable && *ub_numa_affinity_enable) {
+        std::string val(ub_numa_affinity_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.ub_numa_affinity = true;
+            LOG(WARNING) << "MC_UB_NUMA_AFFINITY_ENABLE is " << val;
+        } else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_UB_NUMA_AFFINITY_ENABLE, it should be true|1|on";
+    }
+
     const char* mlx5_qp_lag_port_balance_env =
         std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
     if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {

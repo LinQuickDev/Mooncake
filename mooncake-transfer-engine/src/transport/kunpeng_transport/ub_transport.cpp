@@ -295,12 +295,12 @@ Status UbTransport::submitTransferTask(
             auto local_tseg_index =
                 local_segment_desc->buffers[buffer_id].l_seg_index[device_id];
             slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
-            if (context->multipath()) {
+            if (context->numa_affinity()) {
                 const auto& local_buf = local_segment_desc->buffers[buffer_id];
-                int numa = resolveBufferNumaNode(local_buf.name, local_buf.length, 
+                int numa = resolveBufferNumaNode(local_buf.name, local_buf.length,
                     (uint64_t)slice->source_addr - local_buf.addr);
                 slice->ub.src_chip_id = numaNodeToChipId(numa);
-            }   
+            }
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;
             __sync_fetch_and_add(&task.slice_count, 1);
