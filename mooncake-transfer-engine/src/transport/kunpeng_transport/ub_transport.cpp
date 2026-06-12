@@ -110,12 +110,18 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         buffer_desc.name = entries[0].location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
+        // Precompute chip_id for single-NUMA ("cpu:N") buffers so peers read it
+        // directly instead of resolving per-slice. -1 stays for non-cpu names.
+        int node = parseCpuNumaNode(buffer_desc.name);
+        if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
         if (rc) return rc;
     } else {
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
+        int node = parseCpuNumaNode(buffer_desc.name);
+        if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
         if (rc) return rc;
     }
@@ -297,9 +303,15 @@ Status UbTransport::submitTransferTask(
             slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
             if (context->numa_affinity()) {
                 const auto& local_buf = local_segment_desc->buffers[buffer_id];
-                int numa = resolveBufferNumaNode(local_buf.name, local_buf.length,
-                    (uint64_t)slice->source_addr - local_buf.addr);
-                slice->ub.src_chip_id = numaNodeToChipId(numa);
+                if (local_buf.chip_id >= 0) {
+                    // Use the chip_id published at registration (single-NUMA buf)
+                    slice->ub.src_chip_id = (uint8_t)local_buf.chip_id;
+                } else {
+                    int numa = resolveBufferNumaNode(local_buf.name,
+                        local_buf.length,
+                        (uint64_t)slice->source_addr - local_buf.addr);
+                    slice->ub.src_chip_id = numaNodeToChipId(numa);
+                }
             }
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;
