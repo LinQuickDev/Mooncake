@@ -365,21 +365,36 @@ class StressBenchmark {
           buffer_size_(0) {}
 
     ~StressBenchmark() {
-        if (client_) {
-            for (auto& tb : thread_buffers_) {
-                if (tb.ptr) {
-                    client_->unregister_buffer(tb.ptr);
-                    numa_free(tb.ptr, tb.size);
-                }
-            }
-            thread_buffers_.clear();
-            if (buffer_) {
-                client_->unregister_buffer(buffer_);
-                numa_free(buffer_, buffer_size_);
-                buffer_ = nullptr;
-            }
-            client_->tearDownAll();
+        // Early return if already cleaned up
+        if (!client_) {
+            return;
         }
+
+        // Unregister and free thread buffers (these are allocated by this class)
+        for (auto& tb : thread_buffers_) {
+            if (tb.ptr) {
+                try {
+                    client_->unregister_buffer(tb.ptr);
+                } catch (...) {
+                    LOG(WARNING) << "Failed to unregister thread buffer, ignoring";
+                }
+                numa_free(tb.ptr, tb.size);
+                tb.ptr = nullptr;
+            }
+        }
+        thread_buffers_.clear();
+
+        // Unregister and free main buffer (allocated by this class)
+        if (buffer_) {
+            try {
+                client_->unregister_buffer(buffer_);
+            } catch (...) {
+                LOG(WARNING) << "Failed to unregister main buffer, ignoring";
+            }
+            numa_free(buffer_, buffer_size_);
+            buffer_ = nullptr;
+        }
+        client_ = nullptr;
     }
 
     int Setup() {
