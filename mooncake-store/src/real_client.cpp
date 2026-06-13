@@ -1765,11 +1765,15 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
-        MC_LOG(INFO) << "put_result key[" << key << "] rc[" << static_cast<int>(put_result.error()) << "] size[" << value.size_bytes() << "]";
+        if (mooncake::logging::ShouldSampleHiFreqLog()) {
+            MC_LOG(INFO) << "put_result key[" << key << "] rc[" << static_cast<int>(put_result.error()) << "] size[" << value.size_bytes() << "]";
+        }
         return tl::unexpected(put_result.error());
     }
 
-    MC_LOG(INFO) << "put_result key[" << key << "] rc[0] size[" << value.size_bytes() << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_result key[" << key << "] rc[0] size[" << value.size_bytes() << "]";
+    }
     return {};
 }
 
@@ -1790,8 +1794,10 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_start key[" << key << "] size[" << value.size_bytes()
-                 << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_start key[" << key << "] size["
+                     << value.size_bytes() << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_internal(key, value, config, client_buffer_allocator_);
@@ -1884,7 +1890,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             num_failed++;
         }
     }
-    MC_LOG(INFO) << "batch_put_result num_keys[" << keys.size() << "] num_failed[" << num_failed << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "batch_put_result num_keys[" << keys.size() << "] num_failed[" << num_failed << "]";
+    }
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
@@ -1914,8 +1922,10 @@ int RealClient::put_batch(const std::vector<std::string> &keys,
                           const std::vector<std::span<const char>> &values,
                           const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_batch_start num_keys[" << keys.size()
-                 << "] total_size[" << sum_value_sizes(values) << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_batch_start num_keys[" << keys.size()
+                     << "] total_size[" << sum_value_sizes(values) << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
@@ -2012,8 +2022,10 @@ int RealClient::put_parts(const std::string &key,
                           std::vector<std::span<const char>> values,
                           const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_parts_start key[" << key << "] total_size["
-                 << sum_value_sizes(values) << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_parts_start key[" << key << "] total_size["
+                     << sum_value_sizes(values) << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_parts_internal(key, values, config,
@@ -3887,8 +3899,10 @@ std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "batch_put_from_start num_keys[" << keys.size()
-                 << "] total_size[" << sum_sizes(sizes) << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "batch_put_from_start num_keys[" << keys.size()
+                     << "] total_size[" << sum_sizes(sizes) << "]";
+    }
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -4055,7 +4069,12 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_from_start key[" << key << "] size[" << size << "]";
+    // High-frequency put entry log: gate by the hi-freq sample rate
+    // (MC_HIFREQ_LOG_SAMPLE_RATE) in addition to MC_LOG_ENABLE.
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_from_start key[" << key << "] size[" << size
+                     << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return put_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
@@ -5233,9 +5252,11 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "batch_put_from_multi_buffers_start num_keys["
-                 << keys.size() << "] total_size[" << sum_nested_sizes(sizes)
-                 << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "batch_put_from_multi_buffers_start num_keys["
+                     << keys.size() << "] total_size[" << sum_nested_sizes(sizes)
+                     << "]";
+    }
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
