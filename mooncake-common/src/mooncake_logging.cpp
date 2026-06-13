@@ -39,24 +39,6 @@ uint64_t SteadyClockNs() {
             .count());
 }
 
-std::string LowerEnvValue(const char* value) {
-    if (value == nullptr) return "";
-    std::string text(value);
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char ch) { return std::tolower(ch); });
-    return text;
-}
-
-bool ParseLogEnabled() {
-    const std::string value = LowerEnvValue(std::getenv("MC_LOG_ENABLE"));
-    if (value.empty()) return false;
-    if (value == "off" || value == "0" || value == "false" ||
-        value == "no") {
-        return false;
-    }
-    return true;
-}
-
 double ParseHiFreqLogSampleRate() {
     const char* value = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
     if (value == nullptr || *value == '\0') return 0.1;
@@ -195,11 +177,6 @@ uint64_t NewTraceId() {
 
 uint64_t CurrentTraceId() { return current_trace_id; }
 
-bool IsMooncakeLogEnabled() {
-    static const bool enabled = ParseLogEnabled();
-    return enabled;
-}
-
 double HiFreqLogSampleRate() {
     static const double rate = ParseHiFreqLogSampleRate();
     return rate;
@@ -216,17 +193,17 @@ bool ShouldSampleHiFreqLog() {
 }
 
 bool ShouldLog(google::LogSeverity severity) {
+    // MC_LOG_ENABLE was removed: MC_LOG now behaves like plain glog LOG and is
+    // gated only by glog's own severity threshold (still async + trace_id).
     if (severity == google::FATAL) return true;
-    return IsMooncakeLogEnabled() && severity >= FLAGS_minloglevel;
+    return severity >= FLAGS_minloglevel;
 }
 
-bool ShouldVLog(int level) {
-    return IsMooncakeLogEnabled() && VLOG_IS_ON(level);
-}
+bool ShouldVLog(int level) { return VLOG_IS_ON(level); }
 
 void ApplyMooncakeLogEnableToGlog() {
-    // MC_LOG_ENABLE only controls MC_LOG macros via ShouldLog().
-    // Do not touch FLAGS_minloglevel to avoid suppressing other LOG() calls.
+    // No-op retained for call-site compatibility (master/real_client main).
+    // MC_LOG_ENABLE was removed; nothing to apply.
 }
 
 ScopedTraceId::ScopedTraceId(uint64_t trace_id)

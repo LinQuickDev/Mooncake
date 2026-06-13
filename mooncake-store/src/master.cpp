@@ -1,6 +1,9 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <dirent.h>  // For opendir (MC_LOG_DIR validation)
+#include <unistd.h>  // For access/W_OK (MC_LOG_DIR validation)
+
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
@@ -963,8 +966,31 @@ int main(int argc, char* argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (!FLAGS_log_dir.empty()) {
+    // The master does not go through the transfer engine's globalConfig(),
+    // which is where MC_LOG_DIR is normally applied. Without this, master logs
+    // ignore MC_LOG_DIR and only go to stderr. Honor it here, mirroring
+    // config.cpp: validate the directory and fall back to stderr if it is
+    // missing or unwritable. --log_dir (if passed) takes precedence.
+    const char* mc_log_dir =
+        FLAGS_log_dir.empty() ? std::getenv("MC_LOG_DIR") : nullptr;
+    // Init glog if either --log_dir was passed or MC_LOG_DIR is set. The guard
+    // against IsGoogleLoggingInitialized avoids a double init.
+    if ((!FLAGS_log_dir.empty() || mc_log_dir) &&
+        !google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(argv[0]);
+    }
+    if (mc_log_dir) {
+        if (opendir(mc_log_dir) == nullptr) {
+            LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
+                         << "] is not a valid directory. Logging to stderr.";
+        } else if (access(mc_log_dir, W_OK) != 0) {
+            LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
+                         << "] is not writable. Logging to stderr.";
+        } else {
+            FLAGS_log_dir = mc_log_dir;
+            FLAGS_logtostderr = 0;
+            FLAGS_stop_logging_if_full_disk = true;
+        }
     }
     mooncake::logging::ApplyMooncakeLogEnableToGlog();
 

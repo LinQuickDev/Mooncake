@@ -1765,11 +1765,15 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
-        MC_LOG(INFO) << "put_result key[" << key << "] rc[" << static_cast<int>(put_result.error()) << "] size[" << value.size_bytes() << "]";
+        if (mooncake::logging::ShouldSampleHiFreqLog()) {
+            MC_LOG(INFO) << "put_result key[" << key << "] rc[" << static_cast<int>(put_result.error()) << "] size[" << value.size_bytes() << "]";
+        }
         return tl::unexpected(put_result.error());
     }
 
-    MC_LOG(INFO) << "put_result key[" << key << "] rc[0] size[" << value.size_bytes() << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_result key[" << key << "] rc[0] size[" << value.size_bytes() << "]";
+    }
     return {};
 }
 
@@ -1790,8 +1794,10 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_start key[" << key << "] size[" << value.size_bytes()
-                 << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_start key[" << key << "] size["
+                     << value.size_bytes() << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_internal(key, value, config, client_buffer_allocator_);
@@ -1884,7 +1890,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             num_failed++;
         }
     }
-    MC_LOG(INFO) << "batch_put_result num_keys[" << keys.size() << "] num_failed[" << num_failed << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "batch_put_result num_keys[" << keys.size() << "] num_failed[" << num_failed << "]";
+    }
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
@@ -1914,8 +1922,10 @@ int RealClient::put_batch(const std::vector<std::string> &keys,
                           const std::vector<std::span<const char>> &values,
                           const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_batch_start num_keys[" << keys.size()
-                 << "] total_size[" << sum_value_sizes(values) << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_batch_start num_keys[" << keys.size()
+                     << "] total_size[" << sum_value_sizes(values) << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
@@ -2012,8 +2022,10 @@ int RealClient::put_parts(const std::string &key,
                           std::vector<std::span<const char>> values,
                           const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_parts_start key[" << key << "] total_size["
-                 << sum_value_sizes(values) << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_parts_start key[" << key << "] total_size["
+                     << sum_value_sizes(values) << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_parts_internal(key, values, config,
@@ -3045,6 +3057,10 @@ RealClient::batch_get_buffer_internal(
     std::vector<KeyOp> valid_ops;
     std::vector<DiskKeyOp> disk_ops;
     valid_ops.reserve(keys.size());
+    // Accumulates "<key>=<replica_type> " per key for a single aggregated
+    // breakdown line emitted after the loop. Gated by breakdown_log so it
+    // costs nothing when INFO logging is not sampled.
+    std::string replica_types_log;
 
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -3081,6 +3097,29 @@ RealClient::batch_get_buffer_internal(
         uint64_t total_size = calculate_total_size(replica);
         if (total_size == 0) {
             continue;
+        }
+
+        // Per-key replica type. Accumulate into one string and emit a single
+        // aggregated line after the loop. Gated by breakdown_log.
+        if (breakdown_log) {
+            std::string rtype;
+            if (replica.is_memory_replica()) {
+                const auto &ep = replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_;
+                rtype = local_endpoints.count(ep) > 0 ? "memory_local"
+                                                      : "memory_remote";
+            } else if (replica.is_local_disk_replica()) {
+                const auto &ld = replica.get_local_disk_descriptor();
+                rtype = (ld.client_id == client_->getClientId())
+                            ? "local_disk_local"
+                            : "local_disk_remote";
+            } else {
+                rtype = "disk";
+            }
+            replica_types_log += key;
+            replica_types_log += '=';
+            replica_types_log += rtype;
+            replica_types_log += ' ';
         }
 
         auto &allocator = client_buffer_allocator ? client_buffer_allocator
@@ -3243,7 +3282,7 @@ RealClient::batch_get_buffer_internal(
                   << "] read_us[" << read_us << "] total_us[" << total_us
                   << "] batch_get_ops[" << valid_ops.size()
                   << "] ssd_offload_ops[" << disk_ops.size() << "] success["
-                  << success_count << "]";
+                  << success_count << "] replicas[" << replica_types_log << "]";
     }
 
     return final_results;
@@ -3860,8 +3899,10 @@ std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "batch_put_from_start num_keys[" << keys.size()
-                 << "] total_size[" << sum_sizes(sizes) << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "batch_put_from_start num_keys[" << keys.size()
+                     << "] total_size[" << sum_sizes(sizes) << "]";
+    }
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -4028,7 +4069,12 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "put_from_start key[" << key << "] size[" << size << "]";
+    // High-frequency put entry log: gate by the hi-freq sample rate
+    // (MC_HIFREQ_LOG_SAMPLE_RATE) in addition to MC_LOG_ENABLE.
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "put_from_start key[" << key << "] size[" << size
+                     << "]";
+    }
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return put_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
@@ -4771,6 +4817,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
+    // Accumulates "<key>=<replica_type> " per key for a single aggregated
+    // breakdown line emitted after the loop. Gated by breakdown_log so it
+    // costs nothing when INFO logging is not sampled.
+    std::string replica_types_log;
 
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
@@ -4814,6 +4864,29 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         // Calculate required buffer size
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
+
+        // Per-key replica type. Accumulate into one string and emit a single
+        // aggregated line after the loop. Gated by breakdown_log.
+        if (breakdown_log) {
+            std::string rtype;
+            if (replica.is_memory_replica()) {
+                const auto &ep = replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_;
+                rtype = local_endpoints.count(ep) > 0 ? "memory_local"
+                                                      : "memory_remote";
+            } else if (replica.is_local_disk_replica()) {
+                const auto &ld = replica.get_local_disk_descriptor();
+                rtype = (ld.client_id == client_->getClientId())
+                            ? "local_disk_local"
+                            : "local_disk_remote";
+            } else {
+                rtype = "disk";
+            }
+            replica_types_log += key;
+            replica_types_log += '=';
+            replica_types_log += rtype;
+            replica_types_log += ' ';
+        }
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
@@ -4886,7 +4959,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                       << "] start_time[" << FormatWallClock(t0_wall)
                       << "] query_us[" << query_us << "] prep_us[" << prep_us
                       << "] read_us[0] total_us[" << total_us
-                      << "] mem_ops[0] disk_ops[0] ssd_offload_ops[0] success[0]";
+                      << "] mem_ops[0] disk_ops[0] ssd_offload_ops[0] success[0]"
+                      << " replicas[" << replica_types_log << "]";
         }
         return results;
     }
@@ -5095,7 +5169,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                   << "] mem_ops[" << valid_operations.size() << "] disk_ops["
                   << disk_operations.size() << "] ssd_offload_ops["
                   << offload_object_count << "] success[" << success_count
-                  << "]";
+                  << "] replicas[" << replica_types_log << "]";
     }
 
     return results;
@@ -5178,9 +5252,11 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
-    MC_LOG(INFO) << "batch_put_from_multi_buffers_start num_keys["
-                 << keys.size() << "] total_size[" << sum_nested_sizes(sizes)
-                 << "]";
+    if (mooncake::logging::ShouldSampleHiFreqLog()) {
+        MC_LOG(INFO) << "batch_put_from_multi_buffers_start num_keys["
+                     << keys.size() << "] total_size[" << sum_nested_sizes(sizes)
+                     << "]";
+    }
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
