@@ -328,8 +328,9 @@ endif()
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
 # Go's build.sh already does this; CI workflows must do the same.
-
-find_package(CUDAToolkit QUIET)
+if(USE_CUDA)
+    find_package(CUDAToolkit QUIET)
+endif()
 if(CUDAToolkit_FOUND)
     message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
     target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
