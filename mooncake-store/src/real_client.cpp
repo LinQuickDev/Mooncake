@@ -876,11 +876,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        // For UB, when NUMA affinity is enabled, mount ONE segment per
-        // NIC-NUMA node (each bound to its node, location="cpu:N"). This lets
-        // the master allocate across NUMA via its per-segment load balancing,
-        // and lets the transfer engine pick the NUMA-local NIC. Independent of
-        // urma_bonding_multipath; gated by MC_UB_NUMA_AFFINITY_ENABLE.
+        // For UB, mount ONE segment per NIC-NUMA node (each bound to its node,
+        // location="cpu:N"). This is the UB NIC-affinity placement: the master
+        // load-balances allocations across NUMA via its per-segment strategy,
+        // and the transfer engine picks the NUMA-local NIC. It is automatic
+        // (no env switch) whenever UB has more than one NIC-NUMA node, and is
+        // independent of both MC_UB_NUMA_AFFINITY_ENABLE (chip-id computation)
+        // and MC_URMA_BONDING_MULTIPATH_ENABLE (bonding submission).
         std::vector<int> ub_numa_nodes;
         if (protocol == "ub") {
             ub_numa_nodes = client_->GetNicNumaNodes();

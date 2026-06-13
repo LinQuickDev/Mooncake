@@ -1010,7 +1010,9 @@ int UrmaEndpoint::submitPostSend(
         std::min(int(globalConfig().max_jfc_e) - *jfc_outstanding_, wr_count);
     if (wr_count <= 0) return 0;
 
-    const bool multipath = context_->multipath(); 
+    // chip 亲和(用 bondp_jfs_wr_t 带 src/dst_chip_id)由 NUMA 亲和开关控制；
+    // bonding 模式本身(设备级)由 multipath 在 openDevice 设置。
+    const bool numa_affinity = context_->numa_affinity();
     urma_sge_t l_sge_list[wr_count];
     urma_sge_t r_sge_list[wr_count];
 
@@ -1039,7 +1041,7 @@ int UrmaEndpoint::submitPostSend(
     urma_jfs_wr_t* bad_wr = nullptr;
     int rc;
 
-    if (multipath) {
+    if (numa_affinity) {
         // —— 分支一：chip 亲和，用 bondp_jfs_wr_t 链 ——
         bondp_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(bondp_jfs_wr_t) * wr_count);
