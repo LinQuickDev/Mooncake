@@ -288,7 +288,8 @@ void loadGlobalConfig(GlobalConfig& config) {
     }
     FLAGS_minloglevel = config.log_level;
     // MC_LOG_ENABLE only controls MC_LOG macros via ShouldLog().
-    // Do not suppress FLAGS_minloglevel here to avoid affecting other LOG() calls.
+    // Do not suppress FLAGS_minloglevel here to avoid affecting other LOG()
+    // calls.
 
     const char* slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
     if (slice_timeout_env) {
@@ -458,15 +459,17 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_URMA_TRANS_MODE, it should be RM|RC|UM";
     }
 
-    const char* urma_bonding_multipath_enable = std::getenv("MC_URMA_BONDING_MULTIPATH_ENABLE");
+    const char* urma_bonding_multipath_enable =
+        std::getenv("MC_URMA_BONDING_MULTIPATH_ENABLE");
     if (urma_bonding_multipath_enable && *urma_bonding_multipath_enable) {
         std::string val(urma_bonding_multipath_enable);
-        if (val == "true" || val == "1" || val == "on"){
+        if (val == "true" || val == "1" || val == "on") {
             config.urma_bonding_multipath = true;
             LOG(WARNING) << "MC_URMA_BONDING_MULTIPATH_ENABLE is " << val;
         } else
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                   "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
     }
 
     const char* mlx5_qp_lag_port_balance_env =
@@ -552,7 +555,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
     LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
-    LOG(INFO) << "urma_bonding_balance = " << (config.urma_bonding_balance ? "true" : "false");
+    LOG(INFO) << "urma_bonding_balance = "
+              << (config.urma_bonding_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

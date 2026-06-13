@@ -444,8 +444,8 @@ void UbWorkerPool::performPoll(int thread_id) {
                 context_.set_active(false);
             }
             slice->ub.retry_cnt++;
-                if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
-                    context_.deleteEndpoint(slice->peer_nic_path);
+            if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
+                context_.deleteEndpoint(slice->peer_nic_path);
                 failed_slices.push_back(slice);
             } else {
                 collective_slice_queue_[thread_id][slice->peer_nic_path]

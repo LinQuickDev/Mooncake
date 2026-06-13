@@ -3399,10 +3399,11 @@ RealClient::get_into_ranges_internal(
     } else {
         resolved_buffer_capacities.resize(buffer_count, 0);
         for (size_t i = 0; i < buffer_count; ++i) {
-            auto it = registered_buffer_sizes_.find(buffers[i]);
-            if (it == registered_buffer_sizes_.end()) {
+            auto region = resolve_writable_buffer_region(buffers[i]);
+            if (!region.has_value()) {
                 LOG(ERROR)
-                    << "get_into_ranges: buffer is not registered at index "
+                    << "get_into_ranges: buffer is not Store-managed writable "
+                       "memory at index "
                     << i;
                 continue;
             }

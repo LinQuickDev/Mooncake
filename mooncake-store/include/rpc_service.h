@@ -68,14 +68,12 @@ class WrappedMasterService {
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default",
-        uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default",
-        uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
@@ -92,8 +90,7 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default",
-        uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,

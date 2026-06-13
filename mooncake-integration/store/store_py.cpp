@@ -405,7 +405,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::bytes get(const std::string &key) {
-        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET, UbDiag::PerfLevel::SUB_SYSTEM);
+        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET,
+                             UbDiag::PerfLevel::SUB_SYSTEM);
         pt.Start();
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";

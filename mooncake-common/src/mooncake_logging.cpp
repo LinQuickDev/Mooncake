@@ -85,9 +85,8 @@ class AsyncLogQueue {
     void Flush() {
         EnsureStarted();
         std::unique_lock<std::mutex> lock(mutex_);
-        queue_empty_.wait(lock, [this] {
-            return queue_.empty() && active_writes_ == 0;
-        });
+        queue_empty_.wait(
+            lock, [this] { return queue_.empty() && active_writes_ == 0; });
         google::FlushLogFiles(google::INFO);
     }
 
@@ -119,9 +118,8 @@ class AsyncLogQueue {
             LogEntry entry;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                queue_not_empty_.wait(lock, [this] {
-                    return stopped_ || !queue_.empty();
-                });
+                queue_not_empty_.wait(
+                    lock, [this] { return stopped_ || !queue_.empty(); });
                 if (queue_.empty()) {
                     queue_empty_.notify_all();
                     if (stopped_) return;
@@ -152,7 +150,8 @@ class AsyncLogQueue {
             stream << "trace_id[none] ";
         }
         stream << entry.message;
-        if (entry.severity == google::FATAL) google::FlushLogFiles(google::INFO);
+        if (entry.severity == google::FATAL)
+            google::FlushLogFiles(google::INFO);
     }
 
     std::once_flag start_once_;
