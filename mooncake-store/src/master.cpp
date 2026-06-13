@@ -963,7 +963,9 @@ int main(int argc, char* argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (!FLAGS_log_dir.empty()) {
+    // Guard against double init: globalConfig() (transfer engine) may already
+    // have called InitGoogleLogging and populated FLAGS_log_dir from MC_LOG_DIR.
+    if (!FLAGS_log_dir.empty() && !google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(argv[0]);
     }
     mooncake::logging::ApplyMooncakeLogEnableToGlog();

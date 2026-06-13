@@ -29,6 +29,24 @@ const uint64_t kMetricReportIntervalSeconds = 10;
 
 namespace {
 
+std::string ResolveClientHost(MasterService& svc, const UUID& client_id) {
+    if (client_id == UUID{}) {
+        return "unknown";
+    }
+    auto ips = svc.QueryIp(client_id);
+    if (ips.has_value() && !ips->empty()) {
+        std::string out;
+        for (const auto& ip : *ips) {
+            if (!out.empty()) {
+                out += ",";
+            }
+            out += ip;
+        }
+        return out;
+    }
+    return "unknown";
+}
+
 std::string EscapeJson(std::string_view input) {
     std::string escaped;
     escaped.reserve(input.size());
@@ -894,13 +912,17 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
 
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
+                                     const UUID& client_id,
                                      uint64_t client_trace_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
             client_trace_id);
     }
-    return execute_rpc(
+    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "GetReplicaList", PerfKey::MASTER_RPC_GET_REPLICA_LIST,
         [&] { return master_service_.GetReplicaList(key); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
@@ -908,17 +930,32 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
         });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        LOG(INFO) << "GetReplicaList host="
+                  << ResolveClientHost(master_service_, client_id)
+                  << " key=" << key << " latency_us=" << latency_us << " status="
+                  << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(
     const std::vector<std::string>& keys,
+    const UUID& client_id,
     uint64_t client_trace_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ = std::make_unique<mooncake::logging::ScopedTraceId>(
             client_trace_id);
     }
+    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
     UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
                          UbDiag::PerfLevel::SUB_SYSTEM);
     pt.Start();
@@ -962,6 +999,18 @@ WrappedMasterService::BatchGetReplicaList(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        LOG(INFO) << "BatchGetReplicaList host="
+                  << ResolveClientHost(master_service_, client_id)
+                  << " keys_count=" << total_keys
+                  << " success=" << (results.size() - failure_count)
+                  << " failures=" << failure_count
+                  << " latency_us=" << latency_us;
+    }
     pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
