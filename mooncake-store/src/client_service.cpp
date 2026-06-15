@@ -2321,6 +2321,20 @@ std::vector<int> Client::GetNicNumaNodes() const {
     return {nodes.begin(), nodes.end()};
 }
 
+int Client::GetNumaNodeCount() const {
+    if (!transfer_engine_) return 0;
+    auto topo = transfer_engine_->getLocalTopology();
+    if (!topo) return 0;
+    // discoverCpuTopology emits one "cpu:N" entry per NUMA node (regardless of
+    // whether it hosts a NIC), so counting them gives the NUMA node count.
+    int count = 0;
+    for (auto& [name, entry] : topo->getMatrix()) {
+        (void)entry;
+        if (name.rfind("cpu:", 0) == 0) ++count;
+    }
+    return count;
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {

@@ -876,26 +876,28 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        // For UB, mount ONE segment per NIC-NUMA node (each bound to its node,
-        // location="cpu:N"). This is the UB NIC-affinity placement: the master
-        // load-balances allocations across NUMA via its per-segment strategy,
-        // and the transfer engine picks the NUMA-local NIC. It is automatic
-        // (no env switch) whenever UB has more than one NIC-NUMA node, and is
-        // independent of both MC_UB_NUMA_AFFINITY_ENABLE (chip-id computation)
-        // and MC_URMA_BONDING_MULTIPATH_ENABLE (bonding submission).
+        // For UB, mount ONE segment per NUMA node (each bound to its node,
+        // location="cpu:N"). Memory is spread across ALL NUMA nodes by count,
+        // not just NIC-bearing ones: this works even with a single bonded
+        // device (e.g. bonding_dev_0, NUMA=-1) where NIC-NUMA discovery would
+        // be empty, and it relies only on the (decimal) NUMA count, so it is
+        // unaffected by the hex "numa" attribute. Each segment then drives
+        // selectDevice (cpu:N -> local NIC, else any) and chip affinity
+        // (cpu:N -> chip via numaNodeToChipId). Automatic whenever UB has more
+        // than one NUMA node; independent of both MC_UB_NUMA_AFFINITY_ENABLE
+        // and MC_URMA_BONDING_MULTIPATH_ENABLE.
         std::vector<int> ub_numa_nodes;
         if (protocol == "ub") {
-            ub_numa_nodes = client_->GetNicNumaNodes();
-            if (ub_numa_nodes.size() > 1) {
+            int numa_count = client_->GetNumaNodeCount();
+            if (numa_count > 1) {
                 std::string nodes_str;
-                for (size_t i = 0; i < ub_numa_nodes.size(); ++i) {
+                for (int i = 0; i < numa_count; ++i) {
+                    ub_numa_nodes.push_back(i);
                     if (i) nodes_str += ",";
-                    nodes_str += std::to_string(ub_numa_nodes[i]);
+                    nodes_str += std::to_string(i);
                 }
-                MC_LOG(INFO) << "UB per-NUMA mode: NIC NUMA nodes=[" << nodes_str
-                          << "]";
-            } else {
-                ub_numa_nodes.clear();
+                MC_LOG(INFO) << "UB per-NUMA mode: NUMA node count=" << numa_count
+                          << ", nodes=[" << nodes_str << "]";
             }
         }
 
