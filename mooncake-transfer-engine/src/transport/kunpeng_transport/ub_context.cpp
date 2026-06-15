@@ -260,14 +260,19 @@ int UbWorkerPool::submitPostSend(
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
         if (context_.numa_affinity()) {
             const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+            uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
             if (peer_buf.chip_id >= 0) {
                 slice->ub.dst_chip_id = (uint8_t)peer_buf.chip_id;
             } else {
-                uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
-                int numa = resolveBufferNumaNode(peer_buf.name, peer_buf.length,
-                                                 in_buf_off);
-                slice->ub.dst_chip_id = numaNodeToChipId(numa);
+                slice->ub.dst_chip_id = numaNodeToChipId(resolveBufferNumaNode(
+                    peer_buf.name, peer_buf.length, in_buf_off));
             }
+            VLOG(2) << "[numa_affinity] remote trace_id=" << slice->trace_id
+                    << " target_id=" << slice->target_id << " data_numa="
+                    << resolveBufferNumaNode(peer_buf.name, peer_buf.length,
+                                             in_buf_off)
+                    << " name=" << peer_buf.name
+                    << " dst_chip=" << (int)slice->ub.dst_chip_id;
         }
         if (!slice->ub.r_seg) {
             LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
@@ -482,14 +487,19 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
             slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
             if (context_.numa_affinity()) {
                 const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+                uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
                 if (peer_buf.chip_id >= 0) {
                     slice->ub.dst_chip_id = (uint8_t)peer_buf.chip_id;
                 } else {
-                    uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
-                    int numa = resolveBufferNumaNode(peer_buf.name,
-                                                     peer_buf.length, in_buf_off);
-                    slice->ub.dst_chip_id = numaNodeToChipId(numa);
+                    slice->ub.dst_chip_id = numaNodeToChipId(resolveBufferNumaNode(
+                        peer_buf.name, peer_buf.length, in_buf_off));
                 }
+                VLOG(2) << "[numa_affinity] remote trace_id=" << slice->trace_id
+                        << " target_id=" << slice->target_id << " data_numa="
+                        << resolveBufferNumaNode(peer_buf.name, peer_buf.length,
+                                                 in_buf_off)
+                        << " name=" << peer_buf.name
+                        << " dst_chip=" << (int)slice->ub.dst_chip_id;
             }
             auto peer_nic_path =
                 MakeNicPath(peer_segment_desc->name,

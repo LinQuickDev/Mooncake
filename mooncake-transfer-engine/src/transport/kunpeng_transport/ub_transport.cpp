@@ -303,15 +303,21 @@ Status UbTransport::submitTransferTask(
             slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
             if (context->numa_affinity()) {
                 const auto& local_buf = local_segment_desc->buffers[buffer_id];
+                uint64_t off = (uint64_t)slice->source_addr - local_buf.addr;
                 if (local_buf.chip_id >= 0) {
                     // Use the chip_id published at registration (single-NUMA buf)
                     slice->ub.src_chip_id = (uint8_t)local_buf.chip_id;
                 } else {
-                    int numa = resolveBufferNumaNode(local_buf.name,
-                        local_buf.length,
-                        (uint64_t)slice->source_addr - local_buf.addr);
-                    slice->ub.src_chip_id = numaNodeToChipId(numa);
+                    slice->ub.src_chip_id = numaNodeToChipId(
+                        resolveBufferNumaNode(local_buf.name, local_buf.length,
+                                              off));
                 }
+                VLOG(2) << "[numa_affinity] local trace_id=" << slice->trace_id
+                        << " target_id=" << slice->target_id << " data_numa="
+                        << resolveBufferNumaNode(local_buf.name,
+                                                 local_buf.length, off)
+                        << " name=" << local_buf.name
+                        << " src_chip=" << (int)slice->ub.src_chip_id;
             }
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;

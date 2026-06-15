@@ -42,6 +42,20 @@ static const char* transModeToString(urma_transport_mode_t mode) {
         default:         return "UNKNOWN";
     }
 }
+
+static const char* bondingModeToString(int mode) {
+    switch (mode) {
+        case BONDP_BONDING_MODE_BALANCE: return "BALANCE";
+        default:                         return "UNKNOWN";
+    }
+}
+
+static const char* bondingLevelToString(int level) {
+    switch (level) {
+        case BONDP_BONDING_LEVEL_PORT: return "PORT";
+        default:                       return "UNKNOWN";
+    }
+}
 static int isNullEid(urma_eid_t* eid) {
     for (int i = 0; i < URMA_EID_SIZE; ++i) {
         if (eid->raw[i] != 0) return 0;
@@ -447,6 +461,12 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
                 LOG(ERROR) << "Failed to set bonding balance mode, ret = " << ret;
                 return ERR_CONTEXT;
             }
+            LOG(INFO) << "[multipath ON] bonding mode set on " << device_name
+                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
+                      << " bonding_level="
+                      << bondingLevelToString(mode.bonding_level);
+        } else {
+            LOG(INFO) << "[multipath OFF] skip bonding mode on " << device_name;
         }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
@@ -1043,6 +1063,12 @@ int UrmaEndpoint::submitPostSend(
 
     if (numa_affinity) {
         // —— 分支一：chip 亲和，用 bondp_jfs_wr_t 链 ——
+        VLOG(2) << "[numa_affinity] bondp WR nic=" << peer_nic_path_
+                << " trace_id=" << slice_list[0]->trace_id
+                << " target_id=" << slice_list[0]->target_id
+                << " src_chip=" << (int)slice_list[0]->ub.src_chip_id
+                << " dst_chip=" << (int)slice_list[0]->ub.dst_chip_id
+                << " wr_count=" << wr_count;
         bondp_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(bondp_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {
@@ -1064,6 +1090,9 @@ int UrmaEndpoint::submitPostSend(
         }
     } else {
         // —— 分支二：非亲和，保持 Mooncake 现状（urma_jfs_wr_t 链）——
+        VLOG(2) << "[numa_affinity OFF] plain WR nic=" << peer_nic_path_
+                << " trace_id=" << slice_list[0]->trace_id
+                << " wr_count=" << wr_count;
         urma_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(urma_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {
