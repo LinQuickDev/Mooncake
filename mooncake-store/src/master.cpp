@@ -990,22 +990,12 @@ int main(int argc, char* argv[]) {
     // missing or unwritable. --log_dir (if passed) takes precedence.
     const char* mc_log_dir =
         FLAGS_log_dir.empty() ? std::getenv("MC_LOG_DIR") : nullptr;
-    // Init glog if either --log_dir was passed or MC_LOG_DIR is set. The guard
-    // against IsGoogleLoggingInitialized avoids a double init.
-    if ((!FLAGS_log_dir.empty() || mc_log_dir) &&
-        !google::IsGoogleLoggingInitialized()) {
-        google::InitGoogleLogging(argv[0]);
-        // Merge all master logs into a single journal file in --log_dir,
-        // reusing glog: every record is already written to its own severity
-        // file and all lower ones, so the INFO sink is a complete journal.
-        // Disable the higher-severity files so everything lands in one file.
-        const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
-        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
-        google::SetLogDestination(google::GLOG_WARNING, "");
-        google::SetLogDestination(google::GLOG_ERROR, "");
-        google::SetLogDestination(google::GLOG_FATAL, "");
-        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
-    }
+    // Resolve the log directory BEFORE initializing glog: SetLogDestination
+    // below builds the journal path from FLAGS_log_dir, so FLAGS_log_dir must
+    // already hold the MC_LOG_DIR value at that point. Validate the directory
+    // and fall back to stderr if it is missing or unwritable. These early
+    // LOG(WARNING)s run before InitGoogleLogging and therefore go to stderr,
+    // which is the intended fallback sink anyway.
     if (mc_log_dir) {
         if (opendir(mc_log_dir) == nullptr) {
             LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
@@ -1018,6 +1008,22 @@ int main(int argc, char* argv[]) {
             FLAGS_logtostderr = 0;
             FLAGS_stop_logging_if_full_disk = true;
         }
+    }
+    // Init glog if either --log_dir was passed or MC_LOG_DIR resolved to a
+    // valid directory above. The guard against IsGoogleLoggingInitialized
+    // avoids a double init.
+    if (!FLAGS_log_dir.empty() && !google::IsGoogleLoggingInitialized()) {
+        google::InitGoogleLogging(argv[0]);
+        // Merge all master logs into a single journal file in FLAGS_log_dir,
+        // reusing glog: every record is already written to its own severity
+        // file and all lower ones, so the INFO sink is a complete journal.
+        // Disable the higher-severity files so everything lands in one file.
+        const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
+        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
+        google::SetLogDestination(google::GLOG_WARNING, "");
+        google::SetLogDestination(google::GLOG_ERROR, "");
+        google::SetLogDestination(google::GLOG_FATAL, "");
+        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
     mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
