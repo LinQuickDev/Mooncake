@@ -8,10 +8,10 @@
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
-#include <queue>
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <process.h>
@@ -68,6 +68,29 @@ std::chrono::milliseconds ParseFlushIntervalMs() {
     return std::chrono::milliseconds(static_cast<long long>(secs * 1000.0));
 }
 
+// Ring buffer capacity (messages).  Default 65536; tunable via
+// MC_LOG_QUEUE_SIZE.  Floored at 64 so the buffer stays usable.
+size_t ParseQueueSize() {
+    const char* value = std::getenv("MC_LOG_QUEUE_SIZE");
+    if (value == nullptr || *value == '\0') return 65536;
+    long parsed = std::strtol(value, nullptr, 10);
+    if (parsed < 64) return 64;
+    return static_cast<size_t>(parsed);
+}
+
+// Number of background writer threads.  Default 2; tunable via MC_LOG_WORKERS,
+// clamped to [1, 16].  Note glog serializes the actual file write internally,
+// so extra workers mostly overlap message formatting with IO and keep the ring
+// drained rather than parallelizing disk writes.
+size_t ParseWorkerCount() {
+    const char* value = std::getenv("MC_LOG_WORKERS");
+    if (value == nullptr || *value == '\0') return 2;
+    long parsed = std::strtol(value, nullptr, 10);
+    if (parsed < 1) return 1;
+    if (parsed > 16) return 16;
+    return static_cast<size_t>(parsed);
+}
+
 struct LogEntry {
     const char* file;
     int line;
@@ -76,6 +99,20 @@ struct LogEntry {
     std::string message;
 };
 
+// Async log pipeline backing MC_LOG().
+//
+// Hot path (Enqueue): take the mutex, move the entry into a PRE-ALLOCATED ring
+// buffer, release.  No per-message heap allocation for queue nodes and no
+// blocking: when the ring is full the OLDEST entry is overwritten (overrun) and
+// a counter is bumped.  This bounds producer latency -- a hot business thread is
+// never stalled waiting on slow log IO -- at the cost of dropping the oldest
+// pending lines under sustained overload.  The dropped count is reported
+// periodically as a WARNING so loss is never silent.
+//
+// Background: ParseWorkerCount() writer threads drain the ring via glog.  One of
+// them also performs the periodic FlushLogFiles (coordinated by an atomic so it
+// runs once per interval regardless of worker count) and the overrun report --
+// both off the hot path.
 class AsyncLogQueue {
    public:
     static AsyncLogQueue& Instance() {
@@ -86,35 +123,38 @@ class AsyncLogQueue {
     void Enqueue(LogEntry entry) {
         EnsureStarted();
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            queue_not_full_.wait(lock, [this] {
-                return stopped_ || queue_.size() < kMaxQueueSize;
-            });
+            std::lock_guard<std::mutex> lock(mutex_);
             if (stopped_) {
                 WriteSync(entry);
                 return;
             }
-            queue_.push(std::move(entry));
+            RingPush(std::move(entry));  // overruns oldest if full
         }
         queue_not_empty_.notify_one();
     }
 
     void Flush() {
         EnsureStarted();
-        std::unique_lock<std::mutex> lock(mutex_);
-        queue_empty_.wait(
-            lock, [this] { return queue_.empty() && active_writes_ == 0; });
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            queue_empty_.wait(
+                lock, [this] { return RingEmpty() && active_writes_ == 0; });
+        }
         google::FlushLogFiles(google::INFO);
     }
 
    private:
-    static constexpr size_t kMaxQueueSize = 8192;
-
-    AsyncLogQueue() = default;
+    AsyncLogQueue()
+        : capacity_(ParseQueueSize() + 1),  // +1 slot reserved as full marker
+          worker_count_(ParseWorkerCount()),
+          flush_interval_(ParseFlushIntervalMs()),
+          ring_(capacity_) {}
 
     void EnsureStarted() {
         std::call_once(start_once_, [this] {
-            worker_ = std::thread([this] { WorkerLoop(); });
+            for (size_t i = 0; i < worker_count_; ++i) {
+                workers_.emplace_back([this] { WorkerLoop(); });
+            }
             std::atexit([] { AsyncLogQueue::Instance().Stop(); });
         });
     }
@@ -125,33 +165,32 @@ class AsyncLogQueue {
             stopped_ = true;
         }
         queue_not_empty_.notify_all();
-        queue_not_full_.notify_all();
-        if (worker_.joinable()) worker_.join();
+        for (auto& w : workers_) {
+            if (w.joinable()) w.join();
+        }
+        ReportOverruns();
         google::FlushLogFiles(google::INFO);
     }
 
     void WorkerLoop() {
-        // The periodic flush runs here, on the worker thread, off the hot path:
-        // log producers never pay a flush cost.  google::FlushLogFiles drains
-        // glog's file buffer, which covers BOTH the async MC_LOG output written
-        // below AND synchronous LOG()/MC_LOG emitted on business threads (they
-        // share the same glog file).  This is what keeps the tail of the log
-        // (e.g. get_into_breakdown / put_result) from being lost when the host
-        // process is torn down without running atexit/static destructors
-        // (Go's os.Exit, SIGKILL under k8s, ...).
-        const auto flush_interval = ParseFlushIntervalMs();
-        auto last_flush = std::chrono::steady_clock::now();
+        // The periodic flush runs here, off the hot path: log producers never
+        // pay a flush cost.  google::FlushLogFiles drains glog's file buffer,
+        // covering BOTH the async MC_LOG output written below AND synchronous
+        // LOG()/MC_LOG emitted on business threads (they share the same glog
+        // file).  This keeps the tail of the log (e.g. get_into_breakdown /
+        // put_result) from being lost when the host process is torn down without
+        // running atexit/static destructors (Go's os.Exit, SIGKILL under k8s).
         while (true) {
             LogEntry entry;
             bool have_entry = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                queue_not_empty_.wait_for(lock, flush_interval, [this] {
-                    return stopped_ || !queue_.empty();
+                queue_not_empty_.wait_for(lock, flush_interval_, [this] {
+                    return stopped_ || !RingEmpty();
                 });
-                if (!queue_.empty()) {
-                    entry = std::move(queue_.front());
-                    queue_.pop();
+                if (!RingEmpty()) {
+                    entry = std::move(ring_[head_]);
+                    head_ = (head_ + 1) % capacity_;
                     ++active_writes_;
                     have_entry = true;
                 } else {
@@ -160,22 +199,64 @@ class AsyncLogQueue {
                 }
             }
             if (have_entry) {
-                queue_not_full_.notify_one();
                 WriteSync(entry);
                 std::lock_guard<std::mutex> lock(mutex_);
                 --active_writes_;
-                if (queue_.empty() && active_writes_ == 0) {
+                if (RingEmpty() && active_writes_ == 0) {
                     queue_empty_.notify_all();
                 }
             }
-            // Flush at most once per interval, whether we just drained an entry
-            // or timed out idle.  Bounds the worst-case loss window (on hard
-            // kill) to one interval, with no per-message flush overhead.
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_flush >= flush_interval) {
-                google::FlushLogFiles(google::INFO);
-                last_flush = now;
-            }
+            MaybePeriodicFlush();
+        }
+    }
+
+    // Flush + overrun report, gated by an atomic so it runs at most once per
+    // interval across all workers.  Bounds the worst-case loss window on a hard
+    // kill to one interval, with no per-message flush overhead.
+    void MaybePeriodicFlush() {
+        const int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        const int64_t interval_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(flush_interval_)
+                .count();
+        int64_t last = last_flush_ns_.load(std::memory_order_relaxed);
+        if (now_ns - last < interval_ns) return;
+        if (!last_flush_ns_.compare_exchange_strong(
+                last, now_ns, std::memory_order_relaxed)) {
+            return;  // another worker won this interval
+        }
+        google::FlushLogFiles(google::INFO);
+        ReportOverruns();
+    }
+
+    // Emit one synchronous WARNING if entries were overrun since the last
+    // report, so dropped logs are never silent.  The counter is read+reset under
+    // the queue mutex; the WriteSync itself does not touch the ring.
+    void ReportOverruns() {
+        uint64_t dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            dropped = overrun_count_;
+            overrun_count_ = 0;
+        }
+        if (dropped > 0) {
+            google::LogMessage(__FILE__, __LINE__, google::WARNING).stream()
+                << "trace_id[none] async log ring overran, dropped " << dropped
+                << " message(s); raise MC_LOG_QUEUE_SIZE or MC_LOG_WORKERS";
+        }
+    }
+
+    // --- ring buffer, all access guarded by mutex_ ---
+    bool RingEmpty() const { return head_ == tail_; }
+
+    void RingPush(LogEntry&& entry) {
+        ring_[tail_] = std::move(entry);
+        tail_ = (tail_ + 1) % capacity_;
+        if (tail_ == head_) {  // full: overwrite oldest
+            head_ = (head_ + 1) % capacity_;
+            ++overrun_count_;
         }
     }
 
@@ -192,15 +273,25 @@ class AsyncLogQueue {
             google::FlushLogFiles(google::INFO);
     }
 
+    const size_t capacity_;
+    const size_t worker_count_;
+    const std::chrono::milliseconds flush_interval_;
+
     std::once_flag start_once_;
-    std::thread worker_;
+    std::vector<std::thread> workers_;
+
     std::mutex mutex_;
     std::condition_variable queue_not_empty_;
-    std::condition_variable queue_not_full_;
     std::condition_variable queue_empty_;
-    std::queue<LogEntry> queue_;
+
+    std::vector<LogEntry> ring_;
+    size_t head_ = 0;
+    size_t tail_ = 0;
+    uint64_t overrun_count_ = 0;
     size_t active_writes_ = 0;
     bool stopped_ = false;
+
+    std::atomic<int64_t> last_flush_ns_{0};
 };
 
 }  // namespace
