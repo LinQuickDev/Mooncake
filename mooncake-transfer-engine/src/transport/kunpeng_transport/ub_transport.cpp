@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
 #include <future>
 #include "config.h"
 #include "memory_location.h"
@@ -23,6 +24,10 @@
 #include "mooncake_logging.h"
 
 namespace mooncake {
+namespace {
+constexpr uint64_t kNumaAffinitySampleInterval = 10000;
+}  // namespace
+
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
     : endpoint_type_(endpoint_type) {}
 
@@ -304,20 +309,30 @@ Status UbTransport::submitTransferTask(
             if (context->numa_affinity()) {
                 const auto& local_buf = local_segment_desc->buffers[buffer_id];
                 uint64_t off = (uint64_t)slice->source_addr - local_buf.addr;
+                int data_numa =
+                    resolveBufferNumaNode(local_buf.name, local_buf.length, off);
                 if (local_buf.chip_id >= 0) {
                     // Use the chip_id published at registration (single-NUMA buf)
                     slice->ub.src_chip_id = (uint8_t)local_buf.chip_id;
                 } else {
-                    slice->ub.src_chip_id = numaNodeToChipId(
-                        resolveBufferNumaNode(local_buf.name, local_buf.length,
-                                              off));
+                    slice->ub.src_chip_id = numaNodeToChipId(data_numa);
                 }
-                VLOG(2) << "[numa_affinity] local trace_id=" << slice->trace_id
-                        << " target_id=" << slice->target_id << " data_numa="
-                        << resolveBufferNumaNode(local_buf.name,
-                                                 local_buf.length, off)
-                        << " name=" << local_buf.name
-                        << " src_chip=" << (int)slice->ub.src_chip_id;
+                static std::atomic<uint64_t> numa_log_counter{0};
+                if (VLOG_IS_ON(2) &&
+                    numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
+                            kNumaAffinitySampleInterval ==
+                        0) {
+                    VLOG(2)
+                        << "[numa_affinity] local_sample trace_id="
+                        << slice->trace_id << " target_id=" << slice->target_id
+                        << " opcode="
+                        << (slice->opcode == Transport::TransferRequest::READ
+                                ? "READ"
+                                : "WRITE")
+                        << " local_data_numa=" << data_numa
+                        << " src_chip=" << (int)slice->ub.src_chip_id
+                        << " local_name=" << local_buf.name;
+                }
             }
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;

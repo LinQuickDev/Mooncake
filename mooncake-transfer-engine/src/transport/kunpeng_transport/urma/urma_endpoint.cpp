@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <glog/logging.h>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -24,6 +25,10 @@
 #include "ubdiag/auto_perf.h"
 
 namespace mooncake {
+
+namespace {
+constexpr uint64_t kNumaAffinitySampleInterval = 10000;
+}  // namespace
 
 static urma_transport_mode_t parseTransMode(const std::string& mode) {
     if (mode == "RC") return URMA_TM_RC;
@@ -1063,12 +1068,23 @@ int UrmaEndpoint::submitPostSend(
 
     if (numa_affinity) {
         // —— 分支一：chip 亲和，用 bondp_jfs_wr_t 链 ——
-        VLOG(2) << "[numa_affinity] bondp WR nic=" << peer_nic_path_
-                << " trace_id=" << slice_list[0]->trace_id
-                << " target_id=" << slice_list[0]->target_id
-                << " src_chip=" << (int)slice_list[0]->ub.src_chip_id
-                << " dst_chip=" << (int)slice_list[0]->ub.dst_chip_id
-                << " wr_count=" << wr_count;
+        static std::atomic<uint64_t> numa_log_counter{0};
+        if (VLOG_IS_ON(2) &&
+            numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
+                    kNumaAffinitySampleInterval ==
+                0) {
+            VLOG(2) << "[numa_affinity] wr_sample nic=" << peer_nic_path_
+                    << " trace_id=" << slice_list[0]->trace_id
+                    << " target_id=" << slice_list[0]->target_id
+                    << " opcode="
+                    << (slice_list[0]->opcode ==
+                                Transport::TransferRequest::READ
+                            ? "READ"
+                            : "WRITE")
+                    << " wr_count=" << wr_count
+                    << " src_chip=" << (int)slice_list[0]->ub.src_chip_id
+                    << " dst_chip=" << (int)slice_list[0]->ub.dst_chip_id;
+        }
         bondp_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(bondp_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {
@@ -1090,9 +1106,14 @@ int UrmaEndpoint::submitPostSend(
         }
     } else {
         // —— 分支二：非亲和，保持 Mooncake 现状（urma_jfs_wr_t 链）——
-        VLOG(2) << "[numa_affinity OFF] plain WR nic=" << peer_nic_path_
-                << " trace_id=" << slice_list[0]->trace_id
-                << " wr_count=" << wr_count;
+        static std::atomic<bool> disabled_logged{false};
+        bool expected = false;
+        if (VLOG_IS_ON(2) &&
+            disabled_logged.compare_exchange_strong(
+                expected, true, std::memory_order_relaxed)) {
+            VLOG(2) << "[numa_affinity] disabled, plain urma_jfs_wr_t "
+                       "will be used";
+        }
         urma_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(urma_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {

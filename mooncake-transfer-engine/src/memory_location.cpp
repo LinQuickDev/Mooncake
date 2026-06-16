@@ -133,8 +133,16 @@ class NumaChipMap {
         for (const auto& [node, pkg] : node_to_pkg)
             node_to_chip_[node] = pkg_to_chip[pkg];
 
-        LOG(INFO) << "NumaChipMap built from sysfs: " << node_to_chip_.size()
-                  << " NUMA nodes, " << packages.size() << " chips";
+        std::string mapping;
+        for (const auto& [node, pkg] : node_to_pkg) {
+            if (!mapping.empty()) mapping += ", ";
+            mapping += "numa:" + std::to_string(node) +
+                       " package:" + std::to_string(pkg) +
+                       " chip:" + std::to_string(pkg_to_chip[pkg]);
+        }
+        LOG(INFO) << "[numa_affinity] numa_chip_map nodes="
+                  << node_to_chip_.size() << " chips=" << packages.size()
+                  << " mapping={" << mapping << "}";
     }
 
     std::unordered_map<int, uint8_t> node_to_chip_;
