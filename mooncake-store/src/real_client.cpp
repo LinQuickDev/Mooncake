@@ -1801,6 +1801,7 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 
 int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_internal(key, value, config, client_buffer_allocator_);
@@ -1954,6 +1955,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
 int RealClient::put_batch(const std::vector<std::string> &keys,
                           const std::vector<std::span<const char>> &values,
                           const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
@@ -2046,6 +2048,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
 int RealClient::put_parts(const std::string &key,
                           std::vector<std::span<const char>> values,
                           const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_parts_internal(key, values, config,
@@ -2841,6 +2844,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
         [&]() {
             UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL_FULL,
@@ -3325,6 +3329,7 @@ RealClient::batch_get_buffer_internal(
 // Implementation of batch_get_buffer method
 std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
         [&]() {
             UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL_FULL,
@@ -3769,6 +3774,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
             UbDiag::PerfPoint pt_full(PerfKey::GET_INTO_INTERNAL,
@@ -4006,6 +4012,7 @@ std::string RealClient::get_hostname() const { return local_hostname; }
 std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -4235,6 +4242,7 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
 
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return put_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
@@ -4668,6 +4676,7 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
@@ -5399,6 +5408,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
