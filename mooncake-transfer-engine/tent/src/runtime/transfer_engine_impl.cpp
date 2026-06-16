@@ -26,7 +26,6 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
-#include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -43,6 +42,11 @@
 
 namespace mooncake {
 namespace tent {
+
+namespace {
+constexpr uint8_t kRedisMaxDbIndex = 255;
+constexpr uint8_t kRedisDefaultDbIndex = 0;
+}  // namespace
 
 struct Batch {
     Batch() : max_size(0) { sub_batch.fill(nullptr); }
@@ -273,32 +277,6 @@ Status TransferEngineImpl::construct() {
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
-    // Get Redis password from environment variable for security
-    std::string redis_password;
-    const char* env_password = std::getenv("MC_REDIS_PASSWORD");
-    if (env_password && *env_password) {
-        redis_password = env_password;
-    }
-
-    std::string redis_username;
-    const char* env_username = std::getenv("MC_REDIS_USERNAME");
-    if (env_username && *env_username) {
-        redis_username = env_username;
-    }
-
-    // Get Redis DB index from environment variable or config
-    int redis_db_index_config = conf_->get("redis_db_index", 0);
-    const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (env_db_index && *env_db_index) {
-        try {
-            redis_db_index_config = std::stoi(env_db_index);
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Invalid REDIS_DB_INDEX environment variable: "
-                         << env_db_index
-                         << ", using config value: " << redis_db_index_config;
-        }
-    }
-
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
@@ -317,20 +295,8 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->discover({loader}));
 
-    // Validate redis_db_index range (0-255)
-    uint8_t db_index = REDIS_DEFAULT_DB_INDEX;
-    if (redis_db_index_config >= 0 &&
-        redis_db_index_config <= REDIS_MAX_DB_INDEX) {
-        db_index = static_cast<uint8_t>(redis_db_index_config);
-    } else {
-        LOG(WARNING) << "Invalid Redis DB index: " << redis_db_index_config
-                     << ", using default "
-                     << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
-    }
-
-    metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, redis_username, redis_password,
-        db_index, this);
+    metadata_ =
+        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -838,6 +804,25 @@ static MemoryType getTypeEnum(const std::string& type) {
     return MTYPE_UNKNOWN;
 }
 
+Status TransferEngineImpl::validateTransportHint(const Request& req,
+                                                 size_t request_index) {
+    if (req.transport_hint == UNSPEC) return Status::OK();
+    if ((int)req.transport_hint < 0 ||
+        (int)req.transport_hint >= kSupportedTransportTypes) {
+        return Status::InvalidArgument(
+            "transport_hint out of range for request[" +
+            std::to_string(request_index) + "]" LOC_MARK);
+    }
+    if (!transport_list_[req.transport_hint]) {
+        return Status::InvalidArgument(
+            "transport_hint=" +
+            TransportSelector::transportTypeName(req.transport_hint) +
+            " is not enabled in config (request[" +
+            std::to_string(request_index) + "])" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
     SegmentDesc* desc;
@@ -850,16 +835,17 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     }
     auto local_mtype = Platform::getLoader().getMemoryType(request.source);
 
+    const TransportType hint = request.transport_hint;
+
     // Legacy mode: use original logic (before TransportSelector)
     if (transport_selector_ && transport_selector_->isLegacyMode()) {
         SelectionResult result;
+        std::vector<TransportType> raw;
         if (desc->type == SegmentType::File) {
-            if (checkAvailability(transport_list_[GDS], local_mtype)) {
-                if (transport_index-- == 0) result.transport = GDS;
-            }
-            if (checkAvailability(transport_list_[IOURING], local_mtype)) {
-                if (transport_index-- == 0) result.transport = IOURING;
-            }
+            if (checkAvailability(transport_list_[GDS], local_mtype))
+                raw.push_back(GDS);
+            if (checkAvailability(transport_list_[IOURING], local_mtype))
+                raw.push_back(IOURING);
         } else {
             auto entry =
                 desc->findBuffer(request.target_offset, request.length);
@@ -878,23 +864,30 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                         continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
-                        if (transport_index-- == 0) {
-                            result.transport = type;
-                            break;
-                        }
+                        raw.push_back(type);
                     }
                 }
             }
         }
+
+        auto candidates = TransportSelector::reorderWithHint(raw, hint);
+        if (!candidates) {
+            return result;  // UNSPEC: hint not authorized for this req
+        }
+        if (transport_index >= 0 &&
+            (size_t)transport_index < candidates->size()) {
+            result.transport = (*candidates)[transport_index];
+        }
         return result;
     }
 
-    // New TransportSelector-based logic
-    // Build selection context
+    // Selector mode: build ctx, then defer everything to
+    // TransportSelector::select().
     SelectionContext ctx;
     ctx.transfer_size = request.length;
     ctx.priority_level =
         request.priority;  // Use request priority for selection
+    ctx.policy_name = request.policy_name;  // Optional: bind to specific policy
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
@@ -903,9 +896,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = MTYPE_CPU;
         ctx.buffer_transports = nullptr;  // Empty - use policy priority
-
-        return transport_selector_->select(ctx, transport_list_,
-                                           transport_index);
     } else {
         // Memory segment
         auto entry = desc->findBuffer(request.target_offset, request.length);
@@ -920,14 +910,16 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = remote_mtype;
         ctx.buffer_transports = &entry->transports;
-
-        return transport_selector_->select(ctx, transport_list_,
-                                           transport_index);
     }
+
+    return transport_selector_->select(ctx, transport_list_, transport_index,
+                                       hint);
 }
 
 static const char* transportTypeName(TransportType type) {
     switch (type) {
+        case UNSPEC:
+            return "UNSPEC";
         case RDMA:
             return "RDMA";
         case MNNVL:
@@ -944,16 +936,18 @@ static const char* transportTypeName(TransportType type) {
             return "TCP";
         case AscendDirect:
             return "AscendDirect";
-        default:
-            return "UNSPEC";
+        case SUNRISE_LINK:
+            return "SUNRISE_LINK";
     }
+    return "UNKNOWN";
 }
 
 std::string printRequest(const Request& request) {
     std::stringstream ss;
     ss << "opcode " << request.opcode << " source " << request.source
        << " target_id " << request.target_id << " target_offset "
-       << (void*)request.target_offset << " length " << request.length;
+       << (void*)request.target_offset << " length " << request.length
+       << " transport_hint " << transportTypeName(request.transport_hint);
     return ss.str();
 }
 
@@ -1022,6 +1016,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
         if (a.req.target_id != b.req.target_id)
             return a.req.target_id < b.req.target_id;
+        if (a.req.transport_hint != b.req.transport_hint)
+            return a.req.transport_hint < b.req.transport_hint;
         if (a.req.target_offset != b.req.target_offset)
             return a.req.target_offset < b.req.target_offset;
         return requestSourceAddr(a.req) < requestSourceAddr(b.req);
@@ -1030,6 +1026,10 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     auto can_merge = [](const Item& last, const Item& curr) {
         if (last.req.opcode != curr.req.opcode ||
             last.req.target_id != curr.req.target_id) {
+            return false;
+        }
+        // Mixed transport_hint inside one batch must not be merged.
+        if (last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
@@ -1202,6 +1202,11 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
+
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        auto st = validateTransportHint(request_list[i], i);
+        if (!st.ok()) return st;
+    }
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];

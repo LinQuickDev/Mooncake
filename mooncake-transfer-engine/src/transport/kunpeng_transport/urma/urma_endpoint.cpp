@@ -36,10 +36,14 @@ static urma_transport_mode_t parseTransMode(const std::string& mode) {
 
 static const char* transModeToString(urma_transport_mode_t mode) {
     switch (mode) {
-        case URMA_TM_RM: return "RM";
-        case URMA_TM_RC: return "RC";
-        case URMA_TM_UM: return "UM";
-        default:         return "UNKNOWN";
+        case URMA_TM_RM:
+            return "RM";
+        case URMA_TM_RC:
+            return "RC";
+        case URMA_TM_UM:
+            return "UM";
+        default:
+            return "UNKNOWN";
     }
 }
 static int isNullEid(urma_eid_t* eid) {
@@ -435,16 +439,18 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
         }
         if (globalConfig().urma_bonding_multipath) {
             LOG(INFO) << "Try change binding mode balance";
-            bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_STANDALONE,
-                                              .bonding_level = BONDP_BONDING_LEVEL_IODIE };
-            urma_user_ctl_in_t in{ .addr = reinterpret_cast<uint64_t>(&mode),
-                                   .len = sizeof(mode),
-                                   .opcode = BONDP_USER_CTL_SET_BONDING_MODE };
+            bondp_set_bonding_mode_in_t mode{
+                .bonding_mode = BONDP_BONDING_MODE_STANDALONE,
+                .bonding_level = BONDP_BONDING_LEVEL_IODIE};
+            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
+                                  .len = sizeof(mode),
+                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
             urma_user_ctl_out_t out;
             memset(&out, 0, sizeof(out));
             auto ret = urma_user_ctl(context, &in, &out);
             if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding balance mode, ret = " << ret;
+                LOG(ERROR) << "Failed to set bonding balance mode, ret = "
+                           << ret;
                 return ERR_CONTEXT;
             }
         }
@@ -555,8 +561,11 @@ bool UrmaContext::transEidFromString(const std::string& eid_str,
     return index == URMA_EID_SIZE;
 }
 
-int UrmaContext::poll(int num_entries, Transport::Slice** slices,
+int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
+                      int& num_failed,
+                      std::unordered_map<volatile int*, int>& jetty_depth_set,
                       int jfc_index) {
+    num_failed = 0;
     urma_cr_t cr[num_entries];
     int nr_poll = urma_poll_jfc(jfc_list_[jfc_index].native, num_entries, cr);
     if (nr_poll < 0) {
@@ -564,17 +573,29 @@ int UrmaContext::poll(int num_entries, Transport::Slice** slices,
                    << device_name_;
         return ERR_CONTEXT;
     }
-    Transport::Slice s[nr_poll];
     for (int i = 0; i < nr_poll; ++i) {
         auto slice = (Transport::Slice*)cr[i].user_ctx;
         if (!slice) {
             continue;
         }
-        slices[i] = slice;
+
+        // All deref of `slice` (including the jetty_depth aggregation below)
+        // MUST happen before markSuccess(): once that publishes completion,
+        // the submitting thread may recycle the slice immediately.
+        auto* depth = slice->ub.jetty_depth;
+        auto it = jetty_depth_set.find(depth);
+        if (it != jetty_depth_set.end())
+            it->second++;
+        else
+            jetty_depth_set[depth] = 1;
+
         if (cr[i].status == URMA_CR_SUCCESS) {
+            // Safe to publish here — we are done with this slice and do not
+            // return it to the caller, so no one else will deref it.
             slice->markSuccess();
             continue;
         }
+
         if (cr[i].status != URMA_CR_WR_FLUSH_ERR ||
             show_work_request_flushed_error_)
             LOG(ERROR) << "Worker: Process failed for slice (opcode: "
@@ -592,6 +613,11 @@ int UrmaContext::poll(int num_entries, Transport::Slice** slices,
                        << ", comp_events_acked: "
                        << jfc_list_[jfc_index].native->comp_events_acked << " "
                        << jfc_list_[jfc_index].native->async_events_acked;
+
+        // Failed: hand the slice back so the caller can decide retry vs
+        // final markFailed(). Slice is NOT published, so the caller may
+        // safely deref it.
+        failed_slices[num_failed++] = slice;
     }
     return nr_poll;
 }
@@ -659,12 +685,13 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
         return ERR_MEMORY;
     }
     urma_jfs_cfg_t jfs_cfg = {
-        .depth = 2048,            // DEFAULT_DEPTH (512)
-        .trans_mode = context_->transMode(), /* override via MC_URMA_TRANS_MODE */
-        .priority = 15,           // URMA_MAX_PRIORITY 15
-        .max_sge = 5,             // SGE_NUM_MAX 5
-        .rnr_retry = 7,           // URMA_TYPICAL_RNR_RETRY    7
-        .err_timeout = 17,        // URMA_TYPICAL_ERR_TIMEOUT   17
+        .depth = 2048,  // DEFAULT_DEPTH (512)
+        .trans_mode =
+            context_->transMode(), /* override via MC_URMA_TRANS_MODE */
+        .priority = 15,            // URMA_MAX_PRIORITY 15
+        .max_sge = 5,              // SGE_NUM_MAX 5
+        .rnr_retry = 7,            // URMA_TYPICAL_RNR_RETRY    7
+        .err_timeout = 17,         // URMA_TYPICAL_ERR_TIMEOUT   17
         .user_ctx = 0,
     };
     urma_jetty_flag_t jetty_flag = {};
@@ -695,9 +722,9 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
             return ERR_ENDPOINT;
         }
         LOG(INFO) << "Create jetty success, jetty id = "
-                     << jetty_list_[i]->jetty_id.id << " ,jetty jfc id = "
-                     << jetty_list_[i]->jetty_cfg.jfs_cfg.jfc->jfc_id.id
-                     << " : " << jfc->jfc_id.id;
+                  << jetty_list_[i]->jetty_id.id << " ,jetty jfc id = "
+                  << jetty_list_[i]->jetty_cfg.jfs_cfg.jfc->jfc_id.id << " : "
+                  << jfc->jfc_id.id;
         MC_LOG(INFO) << "urma_create_jetty_breakdown index[" << i
                      << "] jetty_id[" << jetty_list_[i]->jetty_id.id
                      << "] jfc_id["
@@ -792,13 +819,12 @@ int UrmaEndpoint::setupConnectionsByActive() {
                         std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
-                    MC_LOG(INFO)
-                        << "urma_active_setup_breakdown local_nic["
-                        << context_->nicPath() << "] peer_nic["
-                        << peer_nic_path_ << "] local_peer[1]"
-                        << " handshake_us[0] do_setup_us[" << total_us
-                        << "] total_us[" << total_us << "] status[" << rc
-                        << "]";
+                    MC_LOG(INFO) << "urma_active_setup_breakdown local_nic["
+                                 << context_->nicPath() << "] peer_nic["
+                                 << peer_nic_path_ << "] local_peer[1]"
+                                 << " handshake_us[0] do_setup_us[" << total_us
+                                 << "] total_us[" << total_us << "] status["
+                                 << rc << "]";
                     pt_active.End(rc == 0 ? 0 : -1);
                     return rc;
                 }
@@ -830,10 +856,10 @@ int UrmaEndpoint::setupConnectionsByActive() {
     pt_handshake.Start();
     int rc = context_->engine().sendHandshake(peer_server_name, local_desc,
                                               peer_desc);
-    auto handshake_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() -
-                            t_handshake_start)
-                            .count();
+    auto handshake_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_handshake_start)
+            .count();
     pt_handshake.End(rc == 0 ? 0 : -1);
     if (rc) {
         auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -976,10 +1002,10 @@ int UrmaEndpoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
-                MC_LOG(INFO) << "urma_passive_setup_breakdown local_nic["
-                             << context_->nicPath() << "] peer_nic["
-                             << peer_nic_path_ << "] total_us[" << total_us
-                             << "] status[" << rc << "]";
+                MC_LOG(INFO)
+                    << "urma_passive_setup_breakdown local_nic["
+                    << context_->nicPath() << "] peer_nic[" << peer_nic_path_
+                    << "] total_us[" << total_us << "] status[" << rc << "]";
                 pt_passive.End(rc == 0 ? 0 : -1);
                 return rc;
             }
@@ -1054,6 +1080,8 @@ int UrmaEndpoint::submitPostSend(
         slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
         slice->ub.jetty_depth = &wr_depth_list_[jetty_index];
+        // Set endpoint pointer for each slice before submitting
+        slice->ub.endpoint = this;
     }
     __sync_fetch_and_add(&wr_depth_list_[jetty_index], wr_count);
     __sync_fetch_and_add(jfc_outstanding_, wr_count);
@@ -1151,8 +1179,8 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     urma_target_jetty_t* imported_jetty =
         urma_import_jetty(context_->urma_context_, &rjetty, &urma_token);
     auto import_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t_import_start)
-                .count();
+                         std::chrono::steady_clock::now() - t_import_start)
+                         .count();
     pt_import.End(imported_jetty ? 0 : -1);
     MC_LOG(INFO) << "urma_import_jetty_breakdown index[" << jetty_index
                  << "] peer_jetty_id[" << peer_jetty_num << "] import_us["
@@ -1163,27 +1191,25 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
         return ERR_ENDPOINT;
     }
     if (context_->transMode() == URMA_TM_RC) {
-
         auto t_bind_start = std::chrono::steady_clock::now();
         UbDiag::PerfPoint pt_bind(PerfKey::UB_ENDPOINT_BIND_JETTY,
-                                UbDiag::PerfLevel::DEBUG);
+                                  UbDiag::PerfLevel::DEBUG);
         pt_bind.Start();
         urma_status_t ret = urma_bind_jetty(jetty, imported_jetty);
         auto bind_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - t_bind_start)
-                    .count();
+                           std::chrono::steady_clock::now() - t_bind_start)
+                           .count();
         pt_bind.End(ret == URMA_SUCCESS || ret == URMA_EEXIST ? 0 : -1);
         if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
-                std::string message = "Failed to bind jetty";
-                PLOG(ERROR) << "[Handshake] " << message;
-                if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-                urma_unimport_jetty(imported_jetty);
-                return ERR_ENDPOINT;
-            }
-        LOG(INFO) << "Bind jetty success, local jetty id:"
-                << jetty->jetty_id.id
-                    << ", remote jetty id:" << peer_jetty_num
-                    << "] bind_us[" << bind_us;
+            std::string message = "Failed to bind jetty";
+            PLOG(ERROR) << "[Handshake] " << message;
+            if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+            urma_unimport_jetty(imported_jetty);
+            return ERR_ENDPOINT;
+        }
+        LOG(INFO) << "Bind jetty success, local jetty id:" << jetty->jetty_id.id
+                  << ", remote jetty id:" << peer_jetty_num << "] bind_us["
+                  << bind_us;
     }
     imported_jetty_map_[jetty] = imported_jetty;
     MC_LOG(INFO) << "urma_bind_jetty_breakdown index[" << jetty_index

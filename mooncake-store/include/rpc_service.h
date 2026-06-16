@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -30,13 +31,15 @@ class WrappedMasterService {
 
     ~WrappedMasterService();
 
-    tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
+    tl::expected<bool, ErrorCode> ExistKey(
+        const std::string& key, const std::string& tenant_id = "default");
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
 
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
@@ -50,80 +53,94 @@ class WrappedMasterService {
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
-    GetReplicaListByRegex(const std::string& str);
+    GetReplicaListByRegex(const std::string& str,
+                          const std::string& tenant_id = "default");
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const UUID& client_id = UUID{},
+        const std::string& key, const std::string& tenant_id = "default",
         uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const UUID& client_id = UUID{},
+                        const std::string& tenant_id = "default",
                         uint64_t client_trace_id = 0);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config,
+                  const std::string& tenant_id = "default",
                   uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
-        const uint64_t slice_length, const ReplicateConfig& config);
+        const uint64_t slice_length, const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
 
-    tl::expected<void, ErrorCode> UpsertEnd(const UUID& client_id,
-                                            const std::string& key,
-                                            ReplicaType replica_type);
+    tl::expected<void, ErrorCode> UpsertEnd(
+        const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
 
-    tl::expected<void, ErrorCode> UpsertRevoke(const UUID& client_id,
-                                               const std::string& key,
-                                               ReplicaType replica_type);
+    tl::expected<void, ErrorCode> UpsertRevoke(
+        const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
                      const std::vector<std::string>& keys,
                      const std::vector<uint64_t>& slice_lengths,
-                     const ReplicateConfig& config);
+                     const ReplicateConfig& config,
+                     const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
 
-    tl::expected<void, ErrorCode> Remove(const std::string& key,
-                                         bool force = false);
+    tl::expected<void, ErrorCode> Remove(
+        const std::string& key, bool force = false,
+        const std::string& tenant_id = "default");
 
-    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
-                                                bool force = false);
+    tl::expected<long, ErrorCode> RemoveByRegex(
+        const std::string& str, bool force = false,
+        const std::string& tenant_id = "default");
 
-    long RemoveAll(bool force = false);
+    long RemoveAll(bool force = false,
+                   const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
-        const std::vector<std::string>& keys, bool force = false);
+        const std::vector<std::string>& keys, bool force = false,
+        const std::string& tenant_id = "default");
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
@@ -165,35 +182,41 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
+    tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+    GetSegmentsDetailForAdmin();
+
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
-    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
     // Promotion-on-hit RPCs.
-    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
-        const UUID& client_id, const std::string& key, uint64_t size,
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t size,
         const std::vector<std::string>& preferred_segments);
 
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
-        const UUID& client_id, const std::string& key);
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
-        const UUID& client_id, const std::string& key);
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
@@ -207,9 +230,11 @@ class WrappedMasterService {
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
-        const std::string& key, const std::vector<std::string>& targets);
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
 
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& tenant_id,
                                                  const std::string& source,
                                                  const std::string& target);
 
@@ -223,32 +248,38 @@ class WrappedMasterService {
 
     tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
-        const std::string& src_segment,
+        const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
-                                          const std::string& key);
+                                          const std::string& key,
+                                          const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
-                                             const std::string& key);
+                                             const std::string& key,
+                                             const std::string& tenant_id);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
-        const std::string& src_segment, const std::string& tgt_segment);
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::string& tgt_segment);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
-                                          const std::string& key);
+                                          const std::string& key,
+                                          const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
-                                             const std::string& key);
+                                             const std::string& key,
+                                             const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
                                                    const std::string& key,
+                                                   const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type);
+        const std::string& tenant_id, ReplicaType replica_type);
 
    private:
     MasterService master_service_;
@@ -299,6 +330,7 @@ class MasterAdminServer {
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
+    std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};

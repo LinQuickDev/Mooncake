@@ -28,13 +28,13 @@ size_t remove_store_memory_range(void* ptr) {
         return 0;
     }
 
-    size_t sz = it->size;             // 先保存 size
-    g_ub_store_mem_ranges.erase(it);  // 再删除
+    size_t sz = it->size;
+    g_ub_store_mem_ranges.erase(it);
     return sz;
 }
 
 void* ub_allocate_memory(size_t alignment, size_t total_size) {
-    void* ptr = numa_alloc_onnode(total_size, 0);
+    void* ptr = numa_alloc_local(total_size);
     if (!ptr) {
         LOG(ERROR) << "failed for UB protocol, size=" << total_size
                    << ", alignment : " << alignment;

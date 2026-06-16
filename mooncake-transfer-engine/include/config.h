@@ -50,7 +50,14 @@ struct GlobalConfig {
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
     int retry_cnt = 9;
+    int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Connect timeout (seconds) for outbound handshake-port RPCs (QP
+    // handshake, probe, notify, metadata exchange). A plain blocking
+    // connect() has no deadline: to an unroutable address (e.g. a
+    // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
+    // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
+    int handshake_connect_timeout = 5;
     bool metacache = true;
     int log_level = google::INFO;
     bool trace = false;
@@ -85,11 +92,14 @@ struct GlobalConfig {
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
-    // urma transport mode: "RM" (default), "RC", "UM"; override via MC_URMA_TRANS_MODE
+    // urma transport mode: "RM" (default), "RC", "UM"; override via
+    // MC_URMA_TRANS_MODE
     std::string urma_trans_mode = "RM";
-        // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via MC_URMA_BONDING_BALANCE
+    // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_BALANCE
     bool urma_bonding_balance = false;
-    // enable bonding multipath mode; default off (STANDALONE); override via MC_URMA_BONDING_MULTIPATH_ENABLE
+    // enable bonding multipath mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_MULTIPATH_ENABLE
     bool urma_bonding_multipath = false;
 };
 

@@ -4,6 +4,7 @@
 #include <dirent.h>  // For opendir (MC_LOG_DIR validation)
 #include <unistd.h>  // For access/W_OK (MC_LOG_DIR validation)
 
+#include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
@@ -14,6 +15,7 @@
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+
 #include "http_metadata_server.h"
 #include "mooncake_logging.h"
 #include "rpc_service.h"
@@ -142,6 +144,12 @@ DEFINE_uint32(promotion_admission_threshold, 2,
               "(set 1 to disable second-touch gating)");
 DEFINE_uint32(promotion_queue_limit, 50000,
               "Max in-flight promotion tasks across all shards");
+DEFINE_uint32(promotion_max_per_heartbeat, 1,
+              "Max promotion tasks returned to a single client per "
+              "PromotionObjectHeartbeat call. Each task is a synchronous "
+              "SSD-read + RDMA-write on the client; serializing them avoids "
+              "blocking past the client-liveness window. Default 1 is "
+              "conservative.");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -373,6 +381,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_queue_limit",
                              &master_config.promotion_queue_limit,
                              FLAGS_promotion_queue_limit);
+    default_config.GetUInt32("promotion_max_per_heartbeat",
+                             &master_config.promotion_max_per_heartbeat,
+                             FLAGS_promotion_max_per_heartbeat);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -655,6 +666,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.promotion_queue_limit = FLAGS_promotion_queue_limit;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_max_per_heartbeat", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_max_per_heartbeat =
+            FLAGS_promotion_max_per_heartbeat;
     }
     // Clamp promotion_admission_threshold into the sketch counter's
     // representable range. The CountMinSketch uses 8-bit saturating
@@ -978,6 +995,16 @@ int main(int argc, char* argv[]) {
     if ((!FLAGS_log_dir.empty() || mc_log_dir) &&
         !google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(argv[0]);
+        // Merge all master logs into a single journal file in --log_dir,
+        // reusing glog: every record is already written to its own severity
+        // file and all lower ones, so the INFO sink is a complete journal.
+        // Disable the higher-severity files so everything lands in one file.
+        const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
+        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
+        google::SetLogDestination(google::GLOG_WARNING, "");
+        google::SetLogDestination(google::GLOG_ERROR, "");
+        google::SetLogDestination(google::GLOG_FATAL, "");
+        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
     if (mc_log_dir) {
         if (opendir(mc_log_dir) == nullptr) {
@@ -1164,6 +1191,32 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceAvailable(true);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
-        return server.start();
+
+        static std::atomic<bool> shutdown_requested{false};
+        auto signal_handler = [](int /* signum */) {
+            shutdown_requested.store(true);
+        };
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+
+        int server_result = 0;
+        std::atomic<bool> server_done{false};
+        std::thread server_thread([&server, &server_result, &server_done]() {
+            server_result = server.start();
+            server_done.store(true);
+        });
+
+        while (!shutdown_requested.load() && !server_done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        server.stop();
+        server_thread.join();
+
+        if (shutdown_requested.load()) {
+            LOG(INFO) << "Shutdown signal received, exiting gracefully";
+            return 0;
+        }
+        return server_result;
     }
 }
