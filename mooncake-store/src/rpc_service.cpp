@@ -996,7 +996,8 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
                                      const std::string& tenant_id,
-                                     uint64_t client_trace_id) {
+                                     uint64_t client_trace_id,
+                                     const UUID& client_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ =
@@ -1018,11 +1019,11 @@ WrappedMasterService::GetReplicaList(const std::string& key,
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0)
                 .count();
-        LOG(INFO) << "GetReplicaList host="
-                  << "ResolveClientHost(master_service_, client_id)"
-                  << " key=" << key << " latency_us=" << latency_us
-                  << " status="
-                  << (result.has_value() ? "ok" : toString(result.error()));
+        MC_LOG(INFO) << "GetReplicaList host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
     }
     return result;
 }
@@ -1030,7 +1031,8 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id,
-                                          uint64_t client_trace_id) {
+                                          uint64_t client_trace_id,
+                                          const UUID& client_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ =
@@ -1087,12 +1089,12 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0)
                 .count();
-        LOG(INFO) << "BatchGetReplicaList host="
-                  << "ResolveClientHost(master_service_, client_id)"
-                  << " keys_count=" << total_keys
-                  << " success=" << (results.size() - failure_count)
-                  << " failures=" << failure_count
-                  << " latency_us=" << latency_us;
+        MC_LOG(INFO) << "BatchGetReplicaList host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " tenant=" << tenant_id << " keys_count=" << total_keys
+                     << " success=" << (results.size() - failure_count)
+                     << " failures=" << failure_count
+                     << " latency_us=" << latency_us;
     }
     pt.End(failure_count == total_keys ? -1 : 0);
     return results;
@@ -1109,7 +1111,10 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    return execute_rpc(
+    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "PutStart", PerfKey::MASTER_RPC_PUT_START,
         [&] {
             return master_service_.PutStart(client_id, key, tenant_id,
@@ -1121,6 +1126,19 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "PutStart host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " size=" << slice_length << " latency_us=" << latency_us
+                     << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
@@ -1131,7 +1149,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    return execute_rpc(
+    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "PutEnd", PerfKey::MASTER_RPC_PUT_END,
         [&] {
             return master_service_.PutEnd(client_id, key, tenant_id,
@@ -1143,6 +1164,19 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "PutEnd host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " replica_type=" << replica_type
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(

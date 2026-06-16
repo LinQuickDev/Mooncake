@@ -41,11 +41,11 @@ uint64_t SteadyClockNs() {
 
 double ParseHiFreqLogSampleRate() {
     const char* value = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
-    if (value == nullptr || *value == '\0') return 0.1;
+    if (value == nullptr || *value == '\0') return 1.0;  // default: full sampling
     errno = 0;
     char* end = nullptr;
     double rate = std::strtod(value, &end);
-    if (end == value || errno != 0) return 0.1;  // non-numeric / overflow
+    if (end == value || errno != 0) return 1.0;  // non-numeric / overflow
     if (rate < 0.0) return 0.0;
     if (rate > 1.0) return 1.0;
     return rate;

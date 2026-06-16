@@ -527,7 +527,8 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id, 0);
+                             GetReplicaListResponse>(object_key, tenant_id,
+                                                     trace_id, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -547,7 +548,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id, 0);
+        object_keys.size(), object_keys, tenant_id, trace_id, client_id_);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
