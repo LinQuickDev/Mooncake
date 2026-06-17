@@ -58,12 +58,13 @@ class WrappedMasterService {
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default",
-        uint64_t client_trace_id = 0);
+        uint64_t client_trace_id = 0, const UUID& client_id = {});
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default",
-                        uint64_t client_trace_id = 0);
+                        uint64_t client_trace_id = 0,
+                        const UUID& client_id = {});
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,

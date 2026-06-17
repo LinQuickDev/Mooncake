@@ -13,12 +13,17 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <cstdio>   // for snprintf (t0 wall-clock formatting)
+#include <ctime>    // for localtime_r / strftime (t0 wall-clock formatting)
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <vector>
+
+#include "mooncake_logging.h"
 
 #include "real_client.h"
 #include "client_buffer.hpp"
@@ -33,6 +38,9 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -49,6 +57,26 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+// Format a wall-clock time_point as "YYYY-MM-DD HH:MM:SS.ffffff" for the
+// request-start (t0) field in the *_breakdown logs.  Only called at log
+// emission time (guarded by breakdown_log); the cheap system_clock::now() that
+// captures t0 happens at request start, so this formatting cost stays out of
+// the measured latency window.
+std::string FormatWallClock(std::chrono::system_clock::time_point tp) {
+    auto t = std::chrono::system_clock::to_time_t(tp);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  tp.time_since_epoch())
+                  .count() %
+              1000000;
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    char out[48];
+    std::snprintf(out, sizeof(out), "%s.%06lld", buf,
+                  static_cast<long long>(us));
+    return out;
+}
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -1764,22 +1792,65 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_alloc = t0;
+    UbDiag::PerfPoint pt_alloc(PerfKey::PUT_INTERNAL_ALLOC_BUFFER,
+                               UbDiag::PerfLevel::MODULE);
+    pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
+    pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
                    << key << ", value size: " << value.size();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
+    UbDiag::PerfPoint pt_memcpy(PerfKey::PUT_INTERNAL_MEM_COPY,
+                                UbDiag::PerfLevel::MODULE);
+    pt_memcpy.Start();
     memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+    pt_memcpy.End(0);
 
+    UbDiag::PerfPoint pt_split(PerfKey::PUT_INTERNAL_SPLIT_SLICES,
+                               UbDiag::PerfLevel::MODULE);
+    pt_split.Start();
     std::vector<Slice> slices = split_into_slices(buffer_handle);
+    pt_split.End(0);
+    if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
 
     auto put_result = client_->Put(key, slices, config);
+
+    auto log_put = [&](const char *status) {
+        if (!breakdown_log) return;
+        auto now = std::chrono::steady_clock::now();
+        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_alloc - t0)
+                            .count();
+        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t_alloc)
+                            .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t0)
+                            .count();
+        MC_LOG(INFO) << "put_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] alloc_us[" << alloc_us
+                     << "] write_us[" << write_us << "] total_us[" << total_us
+                     << "] size[" << value.size_bytes() << "] status[" << status
+                     << "]";
+    };
+
     if (!put_result) {
+        log_put(toString(put_result.error()).c_str());
         return tl::unexpected(put_result.error());
     }
 
+    log_put("ok");
     return {};
 }
 
@@ -1799,6 +1870,7 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 
 int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_internal(key, value, config, client_buffer_allocator_);
@@ -1833,6 +1905,15 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_prep = t0;
+    uint64_t total_bytes = 0;
     std::vector<BufferHandle> buffer_handles;
     std::unordered_map<std::string, std::vector<Slice>> batched_slices;
     batched_slices.reserve(keys.size());
@@ -1840,8 +1921,13 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto &key = keys[i];
         auto &value = values[i];
+        total_bytes += value.size_bytes();
+        UbDiag::PerfPoint pt_alloc(PerfKey::PUT_BATCH_INTERNAL_ALLOC_BUFFER,
+                                   UbDiag::PerfLevel::MODULE);
+        pt_alloc.Start();
         auto alloc_result =
             client_buffer_allocator->allocate(value.size_bytes());
+        pt_alloc.End(alloc_result ? 0 : -1);
         if (!alloc_result) {
             LOG(ERROR)
                 << "Failed to allocate buffer for put_batch operation, key: "
@@ -1849,8 +1935,16 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
+        UbDiag::PerfPoint pt_memcpy(PerfKey::PUT_BATCH_INTERNAL_MEM_COPY,
+                                    UbDiag::PerfLevel::MODULE);
+        pt_memcpy.Start();
         memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        pt_memcpy.End(0);
+        UbDiag::PerfPoint pt_split(PerfKey::PUT_BATCH_INTERNAL_SPLIT_SLICES,
+                                   UbDiag::PerfLevel::MODULE);
+        pt_split.Start();
         auto slices = split_into_slices(buffer_handle);
+        pt_split.End(0);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
     }
@@ -1868,13 +1962,45 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         }
     }
 
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
+
     auto results = client_->BatchPut(keys, ordered_batched_slices, config);
 
     // Check if any operations failed
+    ErrorCode first_error = ErrorCode::OK;
+    size_t success_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i]) {
-            return tl::unexpected(results[i].error());
+        if (results[i]) {
+            ++success_count;
+        } else if (first_error == ErrorCode::OK) {
+            first_error = results[i].error();
         }
+    }
+
+    if (breakdown_log) {
+        auto now = std::chrono::steady_clock::now();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_prep - t0)
+                           .count();
+        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t_prep)
+                            .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t0)
+                            .count();
+        const char *status = success_count == results.size() ? "ok"
+                             : success_count == 0             ? "err"
+                                                              : "partial";
+        MC_LOG(INFO) << "batch_put_breakdown num_keys[" << keys.size()
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] prep_us[" << prep_us << "] write_us[" << write_us
+                     << "] total_us[" << total_us << "] size[" << total_bytes
+                     << "] success[" << success_count << "] status[" << status
+                     << "]";
+    }
+
+    if (first_error != ErrorCode::OK) {
+        return tl::unexpected(first_error);
     }
     return {};
 }
@@ -1898,6 +2024,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
 int RealClient::put_batch(const std::vector<std::string> &keys,
                           const std::vector<std::span<const char>> &values,
                           const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
@@ -1990,6 +2117,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
 int RealClient::put_parts(const std::string &key,
                           std::vector<std::span<const char>> values,
                           const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_parts_internal(key, values, config,
@@ -2615,8 +2743,23 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_query = t0, t_select = t0, t_alloc = t0;
+    std::string replica_type;
+
     // Query the object info
+    UbDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY,
+                               UbDiag::PerfLevel::MODULE);
+    pt_query.Start();
     auto query_result = client_->Query(key);
+    if (breakdown_log) t_query = std::chrono::steady_clock::now();
+    pt_query.End(query_result ? 0 : -1);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -2638,8 +2781,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // then LOCAL_DISK, then DISK.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
+    UbDiag::PerfPoint pt_select(PerfKey::GET_INTERNAL_SELECT_REPLICA,
+                                UbDiag::PerfLevel::MODULE);
+    pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    if (breakdown_log) t_select = std::chrono::steady_clock::now();
+    pt_select.End(best_replica ? 0 : -1);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
@@ -2648,12 +2796,32 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
 
+    // Set replica_type for breakdown log
+    if (replica.is_memory_replica()) {
+        const auto &endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        bool is_local = local_endpoints.count(endpoint) > 0;
+        replica_type = is_local ? "memory_local" : "memory_remote";
+    } else if (replica.is_local_disk_replica()) {
+        const auto &ld_desc = replica.get_local_disk_descriptor();
+        bool is_local_holder = (ld_desc.client_id == client_->getClientId());
+        replica_type =
+            is_local_holder ? "local_disk_local" : "local_disk_remote";
+    } else {
+        replica_type = "disk";
+    }
+
     if (total_length == 0) {
         return nullptr;
     }
 
     // Allocate buffer
+    UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTERNAL_ALLOC_BUFFER,
+                               UbDiag::PerfLevel::MODULE);
+    pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(total_length);
+    if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
+    pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
         return nullptr;
@@ -2662,8 +2830,37 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
 
+    auto log_breakdown = [&](const char *status) {
+        if (!breakdown_log) return;
+        auto now = std::chrono::steady_clock::now();
+        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_query - t0)
+                            .count();
+        auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             t_select - t_query)
+                             .count();
+        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_alloc - t_select)
+                            .count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           now - t_alloc)
+                           .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t0)
+                            .count();
+        MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] query_us[" << query_us
+                     << "] select_us[" << select_us << "] alloc_us[" << alloc_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] type[" << replica_type << "] status[" << status
+                     << "]";
+    };
+
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
+        UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTERNAL_SSD_READ,
+                                 UbDiag::PerfLevel::MODULE);
+        pt_ssd.Start();
         const auto &endpoint =
             best_replica->get_local_disk_descriptor().transport_endpoint;
         std::unordered_map<std::string, std::vector<Slice>> objects;
@@ -2671,11 +2868,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
             key, std::vector<Slice>{{buffer_handle->ptr(), total_length}});
         auto read_result =
             batch_get_into_offload_object_internal(endpoint, objects);
+        pt_ssd.End(read_result ? 0 : -1);
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
+            log_breakdown("ssd_fail");
             return nullptr;
         }
+        log_breakdown("ssd_ok");
         return buffer_handle;
     }
 
@@ -2690,23 +2890,39 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                      << "Ensure client_buffer_allocator_ returns host memory.";
     }
 
+    const PerfKey read_key = replica.is_memory_replica()
+                                 ? PerfKey::GET_INTERNAL_MEM_READ
+                                 : PerfKey::GET_INTERNAL_DISK_READ;
+    UbDiag::PerfPoint pt_read(read_key, UbDiag::PerfLevel::MODULE);
+    pt_read.Start();
     std::vector<Slice> slices;
     allocateSlices(slices, replica, buffer_handle->ptr());
     auto filtered_qr = FilterQueryResult(query_result.value(), replica);
     auto get_result = client_->Get(key, filtered_qr, slices);
+    pt_read.End(get_result ? 0 : -1);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
+        log_breakdown("read_fail");
         return nullptr;
     }
 
+    log_breakdown("read_ok");
     return buffer_handle;
 }
 
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
-        [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
+        [&]() {
+            UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL_FULL,
+                                      UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
+            auto result = get_buffer_internal(key, client_buffer_allocator_);
+            pt_full.End(result ? 0 : -1);
+            return result;
+        },
         [](const auto &buffer) { return buffer != nullptr; },
         [&](uint64_t latency_us, const auto &buffer) {
             client_->ObserveTransferOperation(TransferOperationKind::kRead,
@@ -2905,8 +3121,25 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_query = t0, t_prep = t0, t_read = t0;
+    // Per-key replica types, accumulated into one string for a single
+    // aggregated breakdown line after the prep loop.
+    std::string replica_types_log;
+
     // 1. Query metadata for all keys
+    UbDiag::PerfPoint pt_bquery(PerfKey::GET_BATCH_INTERNAL_QUERY,
+                                UbDiag::PerfLevel::MODULE);
+    pt_bquery.Start();
     auto query_results = client_->BatchQuery(keys);
+    if (breakdown_log) t_query = std::chrono::steady_clock::now();
+    pt_bquery.End(0);
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
@@ -2948,8 +3181,12 @@ RealClient::batch_get_buffer_internal(
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
+        UbDiag::PerfPoint pt_bsel(PerfKey::GET_BATCH_INTERNAL_SELECT_REPLICA,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_bsel.Start();
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
+        pt_bsel.End(best_replica ? 0 : -1);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             continue;
@@ -2960,9 +3197,36 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
+        // Per-key replica type. Accumulate into one string and emit a single
+        // aggregated line after the loop. Gated by breakdown_log.
+        if (breakdown_log) {
+            std::string rtype;
+            if (replica.is_memory_replica()) {
+                const auto &ep = replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_;
+                rtype = local_endpoints.count(ep) > 0 ? "memory_local"
+                                                      : "memory_remote";
+            } else if (replica.is_local_disk_replica()) {
+                const auto &ld = replica.get_local_disk_descriptor();
+                rtype = (ld.client_id == client_->getClientId())
+                            ? "local_disk_local"
+                            : "local_disk_remote";
+            } else {
+                rtype = "disk";
+            }
+            replica_types_log += key;
+            replica_types_log += '=';
+            replica_types_log += rtype;
+            replica_types_log += ' ';
+        }
+
         auto &allocator = client_buffer_allocator ? client_buffer_allocator
                                                   : client_buffer_allocator_;
+        UbDiag::PerfPoint pt_balloc(PerfKey::GET_BATCH_INTERNAL_ALLOC_BUFFER,
+                                    UbDiag::PerfLevel::MODULE);
+        pt_balloc.Start();
         auto alloc_result = allocator->allocate(total_size);
+        pt_balloc.End(alloc_result ? 0 : -1);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate buffer for key: " << key;
             continue;
@@ -3004,12 +3268,17 @@ RealClient::batch_get_buffer_internal(
             .slices = std::move(slices)});
     }
 
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
+
     if (valid_ops.empty() && disk_ops.empty()) {
         return final_results;
     }
 
     // 3. Execute batch get for memory/disk replicas
     if (!valid_ops.empty()) {
+        UbDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_bget.Start();
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
@@ -3037,10 +3306,14 @@ RealClient::batch_get_buffer_internal(
                            << "': " << toString(batch_get_results[i].error());
             }
         }
+        pt_bget.End(0);
     }
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
     if (!disk_ops.empty()) {
+        UbDiag::PerfPoint pt_bssd(PerfKey::GET_BATCH_INTERNAL_SSD_READ,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_bssd.Start();
         // Group by transport endpoint
         std::unordered_map<std::string,
                            std::unordered_map<std::string, std::vector<Slice>>>
@@ -3088,6 +3361,35 @@ RealClient::batch_get_buffer_internal(
                 }
             }
         }
+        pt_bssd.End(0);
+    }
+
+    if (breakdown_log) {
+        t_read = std::chrono::steady_clock::now();
+        size_t success_count = 0;
+        for (const auto &result : final_results) {
+            if (result) success_count++;
+        }
+        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_query - t0)
+                            .count();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_prep - t_query)
+                           .count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_read - t_prep)
+                           .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_read - t0)
+                            .count();
+        MC_LOG(INFO) << "batch_get_breakdown num_keys[" << keys.size()
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] query_us[" << query_us << "] prep_us[" << prep_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] batch_get_ops[" << valid_ops.size()
+                     << "] ssd_offload_ops[" << disk_ops.size() << "] success["
+                     << success_count << "] replicas[" << replica_types_log
+                     << "]";
     }
 
     return final_results;
@@ -3096,8 +3398,16 @@ RealClient::batch_get_buffer_internal(
 // Implementation of batch_get_buffer method
 std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
-        [&]() { return batch_get_buffer_internal(keys); },
+        [&]() {
+            UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL_FULL,
+                                      UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
+            auto result = batch_get_buffer_internal(keys);
+            pt_full.End(0);
+            return result;
+        },
         [](const auto &) { return true; },
         [&](uint64_t latency_us, const auto &buffers) {
             client_->ObserveTransferOperation(
@@ -3192,7 +3502,13 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto t0 = std::chrono::steady_clock::now();
+    UbDiag::PerfPoint pt_query(PerfKey::GET_INTO_INTERNAL_QUERY,
+                               UbDiag::PerfLevel::MODULE);
+    pt_query.Start();
     auto query_result = client_->Query(key);
+    auto t_query = std::chrono::steady_clock::now();
+    pt_query.End(query_result ? 0 : -1);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -3211,8 +3527,13 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
 
     // Select best replica: prefer local MEMORY, then any MEMORY,
     // then LOCAL_DISK, then DISK.
+    UbDiag::PerfPoint pt_select(PerfKey::GET_INTO_INTERNAL_SELECT_REPLICA,
+                                UbDiag::PerfLevel::MODULE);
+    pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    auto t_select = std::chrono::steady_clock::now();
+    pt_select.End(best_replica ? 0 : -1);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -3220,9 +3541,33 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
 
     auto query_value = std::move(query_result.value());
     auto replica = *best_replica;
-    return RangedReadMetadata{.query_result = std::move(query_value),
-                              .replica = std::move(replica),
-                              .total_size = calculate_total_size(replica)};
+    auto total_size = calculate_total_size(replica);
+    std::string replica_type;
+    if (replica.is_memory_replica()) {
+        const auto &endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        bool is_local = local_endpoints.count(endpoint) > 0;
+        replica_type = is_local ? "memory_local" : "memory_remote";
+    } else if (replica.is_local_disk_replica()) {
+        const auto &ld_desc = replica.get_local_disk_descriptor();
+        bool is_local_holder = (ld_desc.client_id == client_->getClientId());
+        replica_type =
+            is_local_holder ? "local_disk_local" : "local_disk_remote";
+    } else {
+        replica_type = "disk";
+    }
+
+    return RangedReadMetadata{
+        .query_result = std::move(query_value),
+        .replica = std::move(replica),
+        .total_size = total_size,
+        .query_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_query - t0)
+                        .count(),
+        .select_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         t_select - t_query)
+                         .count(),
+        .replica_type = std::move(replica_type)};
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -3251,6 +3596,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // directly to SSD RPC (same pattern as single-buffer batch_get_into;
         // GPU buffers are pre-registered by vLLM via register_buffer).
         if (replica.is_local_disk_replica()) {
+            UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTO_INTERNAL_SSD_READ,
+                                     UbDiag::PerfLevel::MODULE);
+            pt_ssd.Start();
             const auto &endpoint =
                 replica.get_local_disk_descriptor().transport_endpoint;
             std::unordered_map<std::string, std::vector<Slice>> objects;
@@ -3259,6 +3607,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                          {static_cast<char *>(buffer) + dst_offset, size}});
             auto result =
                 batch_get_into_offload_object_internal(endpoint, objects);
+            pt_ssd.End(result ? 0 : -1);
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(total_size);
         }
@@ -3266,7 +3615,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         if (replica.is_disk_replica()) {
             // DISK full read: local file I/O (vector_read) cannot write to
             // GPU memory. Use temp CPU buffer, then scatter to dst.
+            UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTO_INTERNAL_ALLOC_BUFFER,
+                                       UbDiag::PerfLevel::MODULE);
+            pt_alloc.Start();
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            pt_alloc.End(alloc_result ? 0 : -1);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK full "
                            << "read, key: " << key << ", size: " << total_size;
@@ -3276,7 +3629,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             std::vector<mooncake::Slice> tmp_slices;
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
             auto filtered_qr = FilterQueryResult(query_result, replica);
+            UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_DISK_READ,
+                                      UbDiag::PerfLevel::MODULE);
+            pt_read.Start();
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            pt_read.End(get_result ? 0 : -1);
             if (!get_result) {
                 LOG(ERROR) << "DISK Get failed for key: " << key
                            << " with error: " << toString(get_result.error());
@@ -3297,7 +3654,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                        static_cast<char *>(buffer) + dst_offset);
 
         auto filtered_qr = FilterQueryResult(query_result, replica);
+        UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_read.Start();
         auto get_result = client_->Get(key, filtered_qr, slices);
+        pt_read.End(get_result ? 0 : -1);
         if (!get_result) {
             LOG(ERROR) << "Get failed for key: " << key
                        << " with error: " << toString(get_result.error());
@@ -3316,7 +3677,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
+        UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTO_INTERNAL_ALLOC_BUFFER,
+                                   UbDiag::PerfLevel::MODULE);
+        pt_alloc.Start();
         auto alloc_result = client_buffer_allocator_->allocate(buf_size);
+        pt_alloc.End(alloc_result ? 0 : -1);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate temp buffer for ranged disk "
                        << "read, key: " << key << ", size: " << buf_size;
@@ -3341,14 +3706,19 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
+                UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTO_INTERNAL_SSD_READ,
+                                         UbDiag::PerfLevel::MODULE);
+                pt_ssd.Start();
                 const auto &endpoint =
                     replica.get_local_disk_descriptor().transport_endpoint;
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(
                     key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
                                              src_offset + size}});
-                return batch_get_into_offload_object_internal(endpoint,
-                                                              objects);
+                auto r = batch_get_into_offload_object_internal(endpoint,
+                                                                objects);
+                pt_ssd.End(r ? 0 : -1);
+                return r;
             },
             src_offset + size);
     }
@@ -3361,7 +3731,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 std::vector<mooncake::Slice> tmp_slices;
                 allocateSlices(tmp_slices, replica, tmp_buf);
                 auto filtered_qr = FilterQueryResult(query_result, replica);
+                UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_DISK_READ,
+                                          UbDiag::PerfLevel::MODULE);
+                pt_read.Start();
                 auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+                pt_read.End(get_result ? 0 : -1);
                 if (!get_result) {
                     LOG(ERROR)
                         << "DISK Get failed for key: " << key
@@ -3381,7 +3755,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     std::vector<Slice> slices;
     slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
 
+    UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
+                              UbDiag::PerfLevel::MODULE);
+    pt_read.Start();
     auto get_result = client_->Get(key, query_result, slices, src_offset);
+    pt_read.End(get_result ? 0 : -1);
     if (!get_result) {
         return tl::unexpected(get_result.error());
     }
@@ -3391,6 +3769,13 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity) {
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -3398,19 +3783,76 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
             src_offset == 0) {
             VLOG(1) << "Object not found for key: " << key;
         }
+        if (breakdown_log) {
+            auto now = std::chrono::steady_clock::now();
+            auto total_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                    .count();
+            MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
+                         << FormatWallClock(t0_wall)
+                         << "] query_us[0] select_us[0] read_us[0] total_us["
+                         << total_us << "] type[unknown] mode[unknown] status["
+                         << toString(metadata_result.error()) << "]";
+        }
         return tl::unexpected(metadata_result.error());
     }
 
-    return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
-                               metadata_result.value(),
-                               size_is_buffer_capacity);
+    const auto &metadata = metadata_result.value();
+    auto read_start = breakdown_log ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    auto read_result =
+        execute_ranged_read(key, buffer, dst_offset, src_offset, size, metadata,
+                            size_is_buffer_capacity);
+
+    if (breakdown_log) {
+        auto read_end = std::chrono::steady_clock::now();
+        const auto actual_size =
+            size_is_buffer_capacity ? metadata.total_size : size;
+        const char *mode =
+            (src_offset == 0 && actual_size == metadata.total_size) ? "full"
+                                                                    : "range";
+        std::string status = "read_ok";
+        if (!read_result) {
+            if (metadata.replica.is_local_disk_replica()) {
+                status = "ssd_fail";
+            } else if (metadata.replica.is_disk_replica()) {
+                status = "disk_fail";
+            } else if (metadata.replica.is_memory_replica()) {
+                status = "mem_fail";
+            } else {
+                status = toString(read_result.error());
+            }
+        }
+
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           read_end - read_start)
+                           .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            read_end - t0)
+                            .count();
+        MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] query_us["
+                     << metadata.query_us << "] select_us[" << metadata.select_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] type[" << metadata.replica_type << "] mode[" << mode
+                     << "] status[" << status << "]";
+    }
+
+    return read_result;
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
-            return get_into_range_internal(key, buffer, 0, 0, size, true);
+            UbDiag::PerfPoint pt_full(PerfKey::GET_INTO_INTERNAL,
+                                      UbDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
+            auto result =
+                get_into_range_internal(key, buffer, 0, 0, size, true);
+            pt_full.End(result ? 0 : -1);
+            return result;
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &ret) {
@@ -3639,6 +4081,7 @@ std::string RealClient::get_hostname() const { return local_hostname; }
 std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -3719,6 +4162,16 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_prep = t0;
+    uint64_t total_bytes = 0;
+
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
 
     // Create slices from user buffers
@@ -3726,6 +4179,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         const std::string &key = keys[i];
         void *buffer = buffers[i];
         size_t size = sizes[i];
+        total_bytes += size;
 
         std::vector<mooncake::Slice> slices;
         uint64_t offset = 0;
@@ -3752,9 +4206,38 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
     }
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
 
-    // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    // Call client BatchPut
+    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+
+    if (breakdown_log) {
+        auto now = std::chrono::steady_clock::now();
+        size_t success_count = 0;
+        for (const auto &r : results) {
+            if (r.has_value()) success_count++;
+        }
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_prep - t0)
+                           .count();
+        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t_prep)
+                            .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t0)
+                            .count();
+        const char *status = success_count == results.size() ? "ok"
+                             : success_count == 0             ? "err"
+                                                              : "partial";
+        MC_LOG(INFO) << "batch_put_into_breakdown num_keys[" << keys.size()
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] prep_us[" << prep_us << "] write_us[" << write_us
+                     << "] total_us[" << total_us << "] size[" << total_bytes
+                     << "] success[" << success_count << "] status[" << status
+                     << "]";
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
@@ -3776,6 +4259,15 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         return {};
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_prep = t0;
+
     // Create slices directly from the user buffer
     std::vector<mooncake::Slice> slices;
     uint64_t offset = 0;
@@ -3786,17 +4278,40 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         slices.emplace_back(Slice{chunk_ptr, chunk_size});
         offset += chunk_size;
     }
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
 
     auto put_result = client_->Put(key, slices, config);
+
+    auto log_put = [&](const char *status) {
+        if (!breakdown_log) return;
+        auto now = std::chrono::steady_clock::now();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_prep - t0)
+                           .count();
+        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t_prep)
+                            .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - t0)
+                            .count();
+        MC_LOG(INFO) << "put_into_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] prep_us[" << prep_us
+                     << "] write_us[" << write_us << "] total_us[" << total_us
+                     << "] size[" << size << "] status[" << status << "]";
+    };
+
     if (!put_result) {
+        log_put(toString(put_result.error()).c_str());
         return tl::unexpected(put_result.error());
     }
 
+    log_put("ok");
     return {};
 }
 
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return put_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
@@ -4230,9 +4745,17 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
-            [&]() { return batch_get_into_internal(keys, buffers, sizes); },
+            [&]() {
+                UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_INTO_INTERNAL,
+                                          UbDiag::PerfLevel::KEY_MODULE);
+                pt_full.Start();
+                auto result = batch_get_into_internal(keys, buffers, sizes);
+                pt_full.End(0);
+                return result;
+            },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
@@ -4476,6 +4999,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
     auto start_time = std::chrono::steady_clock::now();
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_query = start_time, t_prep = start_time;
+    std::string replica_types_log;
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -4499,7 +5029,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     // Query metadata for all keys
+    UbDiag::PerfPoint pt_query(PerfKey::GET_BATCH_INTO_INTERNAL_QUERY,
+                               UbDiag::PerfLevel::MODULE);
+    pt_query.Start();
     const auto query_results = client_->BatchQuery(keys);
+    if (breakdown_log) t_query = std::chrono::steady_clock::now();
+    pt_query.End(0);
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
@@ -4548,8 +5083,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
+        UbDiag::PerfPoint pt_select(
+            PerfKey::GET_BATCH_INTO_INTERNAL_SELECT_REPLICA,
+            UbDiag::PerfLevel::MODULE);
+        pt_select.Start();
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
+        pt_select.End(best_replica ? 0 : -1);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4559,6 +5099,29 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         // Calculate required buffer size
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
+
+        // Per-key replica type. Accumulate into one string and emit a single
+        // aggregated line after the loop. Gated by breakdown_log.
+        if (breakdown_log) {
+            std::string rtype;
+            if (replica.is_memory_replica()) {
+                const auto &ep = replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_;
+                rtype = local_endpoints.count(ep) > 0 ? "memory_local"
+                                                      : "memory_remote";
+            } else if (replica.is_local_disk_replica()) {
+                const auto &ld = replica.get_local_disk_descriptor();
+                rtype = (ld.client_id == client_->getClientId())
+                            ? "local_disk_local"
+                            : "local_disk_remote";
+            } else {
+                rtype = "disk";
+            }
+            replica_types_log += key;
+            replica_types_log += '=';
+            replica_types_log += rtype;
+            replica_types_log += ' ';
+        }
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
@@ -4608,9 +5171,31 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         results[i] = static_cast<int64_t>(total_size);
     }
 
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
+
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
         disk_operations.empty()) {
+        if (breakdown_log) {
+            auto query_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    t_query - start_time)
+                    .count();
+            auto prep_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    t_prep - t_query)
+                    .count();
+            auto total_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    t_prep - start_time)
+                    .count();
+            MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
+                         << "] start_time[" << FormatWallClock(t0_wall)
+                         << "] query_us[" << query_us << "] prep_us[" << prep_us
+                         << "] read_us[0] total_us[" << total_us
+                         << "] mem_ops[0] disk_ops[0] ssd_offload_ops[0]"
+                         << " success[0] replicas[" << replica_types_log << "]";
+        }
         return results;
     }
 
@@ -4629,10 +5214,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
+        UbDiag::PerfPoint pt_mem_read(PerfKey::GET_BATCH_INTO_INTERNAL_MEM_READ,
+                                      UbDiag::PerfLevel::MODULE);
+        pt_mem_read.Start();
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
         // Process transfer results
+        bool batch_get_success = true;
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[j];
 
@@ -4641,8 +5230,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                batch_get_success = false;
             }
         }
+        pt_mem_read.End(batch_get_success ? 0 : -1);
     }
 
     // ---- DISK replicas: BatchGet into CPU temp buffers, then scatter ----
@@ -4670,8 +5261,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     tl::unexpected(ErrorCode::INVALID_REPLICA);
                 continue;
             }
+            UbDiag::PerfPoint pt_alloc(
+                PerfKey::GET_BATCH_INTO_INTERNAL_ALLOC_BUFFER,
+                UbDiag::PerfLevel::MODULE);
+            pt_alloc.Start();
             auto alloc_result =
                 client_buffer_allocator_->allocate(op.total_size);
+            pt_alloc.End(alloc_result ? 0 : -1);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK "
                            << "read, key: " << op.key
@@ -4693,9 +5289,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         }
 
         if (!disk_batch_keys.empty()) {
+            UbDiag::PerfPoint pt_disk_read(
+                PerfKey::GET_BATCH_INTO_INTERNAL_DISK_READ,
+                UbDiag::PerfLevel::MODULE);
+            pt_disk_read.Start();
             auto disk_results = client_->BatchGet(
                 disk_batch_keys, disk_batch_qrs, disk_batch_slices);
 
+            bool disk_read_success = true;
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
                 auto &op = disk_operations[disk_batch_indices[di]];
@@ -4705,6 +5306,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                << "': " << toString(disk_results[di].error());
                     results[op.original_index] =
                         tl::unexpected(disk_results[di].error());
+                    disk_read_success = false;
                     continue;
                 }
                 if (auto r = scatter_host_to_maybe_device(
@@ -4713,8 +5315,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                         op.total_size, "DISK read, key: " + key);
                     !r) {
                     results[op.original_index] = tl::make_unexpected(r.error());
+                    disk_read_success = false;
                 }
             }
+            pt_disk_read.End(disk_read_success ? 0 : -1);
         }
     }
 
@@ -4745,11 +5349,15 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     size_t offload_object_count = 0;
-    auto start_read_store_time = std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
+        UbDiag::PerfPoint pt_ssd_read(
+            PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
+            UbDiag::PerfLevel::MODULE);
+        pt_ssd_read.Start();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
             offload_objects_it.first, offload_objects_it.second);
+        pt_ssd_read.End(batch_get_offload_result ? 0 : -1);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
@@ -4762,17 +5370,33 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
+
+    if (breakdown_log) {
+        size_t success_count = 0;
+        for (const auto &r : results) {
+            if (r.has_value()) success_count++;
+        }
+        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_query - start_time)
+                            .count();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_prep - t_query)
+                           .count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           end_time - t_prep)
+                           .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
-    auto read_store_time =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            end_time - start_read_store_time)
-            .count();
-    // LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
-    //           << "us, read store: " << read_store_time
-    //           << "us, with memory key count: " << valid_operations.size()
-    //           << ", offload key count: " << offload_object_count;
+        MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] query_us[" << query_us << "] prep_us[" << prep_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] mem_ops[" << valid_operations.size() << "] disk_ops["
+                     << disk_operations.size() << "] ssd_offload_ops["
+                     << offload_object_count << "] success[" << success_count
+                     << "] replicas[" << replica_types_log << "]";
+    }
 
     return results;
 }
@@ -4853,6 +5477,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -5705,8 +6330,12 @@ RealClient::batch_get_into_offload_object_internal(
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
     }
+    UbDiag::PerfPoint pt_rpc(PerfKey::GET_SSD_OFFLOAD_RPC,
+                             UbDiag::PerfLevel::MODULE);
+    pt_rpc.Start();
     auto batchGetResp = client_requester_->batch_get_offload_object(
         target_rpc_service_addr, keys, sizes);
+    pt_rpc.End(batchGetResp ? 0 : -1);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
                    << batchGetResp.error();
@@ -5717,9 +6346,13 @@ RealClient::batch_get_into_offload_object_internal(
                    << keys.size() << ", got=" << batchGetResp->pointers.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    UbDiag::PerfPoint pt_transfer(PerfKey::GET_SSD_TRANSFER_DATA,
+                                  UbDiag::PerfLevel::MODULE);
+    pt_transfer.Start();
     auto result =
         client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
                                        batchGetResp->pointers, objects);
+    pt_transfer.End(result ? 0 : -1);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
@@ -5734,8 +6367,12 @@ RealClient::batch_get_into_offload_object_internal(
 
     // Release buffer immediately after transfer completion (fire-and-forget)
     // This allows early buffer reclamation instead of waiting for GC lease
+    UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_RELEASE_BUFFER,
+                                 UbDiag::PerfLevel::MODULE);
+    pt_release.Start();
     client_requester_->release_offload_buffer(target_rpc_service_addr,
                                               batchGetResp->batch_id);
+    pt_release.End(0);
 
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "
