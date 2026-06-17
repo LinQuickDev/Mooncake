@@ -388,15 +388,6 @@ int UrmaContext::doProcessContextEvents() {
 }
 
 void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
-    // Fast path: shared read lock for the common cache hit.
-    {
-        RWSpinlock::ReadGuard guard(import_lock_);
-        auto ret = import_tseg_map.find(remoteSegmentStr);
-        if (ret != import_tseg_map.end()) return ret->second;
-    }
-    // Slow path: exclusive lock, re-check (another thread may have imported
-    // it while we waited), then import once and publish atomically.
-    RWSpinlock::WriteGuard guard(import_lock_);
     auto ret = import_tseg_map.find(remoteSegmentStr);
     if (ret != import_tseg_map.end()) return ret->second;
     std::vector<unsigned char> output_buffer;
@@ -404,6 +395,7 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
     urma_seg_t* handle;
     handle = (urma_seg_t*)malloc(sizeof(urma_seg_t));
     memcpy(handle, output_buffer.data(), sizeof(urma_seg_t));
+    remote_seg_list_.push_back(handle);
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
     if (import_tseg == NULL) {
@@ -411,7 +403,6 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
         free(handle);
         return nullptr;
     }
-    remote_seg_list_.push_back(handle);
     imported_seg_list_.push_back(import_tseg);
     import_tseg_map[remoteSegmentStr] = import_tseg;
     return import_tseg;
@@ -1091,7 +1082,7 @@ int UrmaEndpoint::submitPostSend(
         slice->ub.jetty_depth = &wr_depth_list_[jetty_index];
         // Set endpoint pointer for each slice before submitting
         slice->ub.endpoint = this;
-    };
+    }
     __sync_fetch_and_add(&wr_depth_list_[jetty_index], wr_count);
     __sync_fetch_and_add(jfc_outstanding_, wr_count);
     urma_jfs_wr_t* bad_wr = nullptr;

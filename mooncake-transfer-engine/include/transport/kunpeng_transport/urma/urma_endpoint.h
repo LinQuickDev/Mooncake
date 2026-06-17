@@ -147,9 +147,6 @@ class UrmaContext : public UbContext {
     std::vector<urma_jfc_t*> jfc_r_list_;
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
-    // Protects import_tseg_map / remote_seg_list_ / imported_seg_list_ against
-    // concurrent retrieveRemoteSeg() from multiple submitting threads.
-    RWSpinlock import_lock_;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
 
     urma_transport_mode_t trans_mode_ = URMA_TM_RM;
