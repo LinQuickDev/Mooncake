@@ -93,6 +93,11 @@ class InProcMaster {
             if (value && std::string_view(value) == "rdma") {
                 server_->init_ibv();
             }
+#ifdef YLT_ENABLE_URMA
+            else if (value && std::string_view(value) == "urma") {
+                server_->init_urma();
+            }
+#endif
 
             uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
             if (config.default_kv_lease_ttl.has_value()) {

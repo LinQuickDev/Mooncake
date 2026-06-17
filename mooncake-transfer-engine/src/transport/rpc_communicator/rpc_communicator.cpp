@@ -7,6 +7,9 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/coro_io.hpp>
+#ifdef YLT_ENABLE_URMA
+#include <ylt/coro_io/urma/urma_socket.hpp>
+#endif
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
@@ -51,16 +54,21 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     // Initialize client pools with proper configuration
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char* value = std::getenv("MC_RPC_PROTOCOL");
+#ifdef YLT_ENABLE_URMA
+    bool use_urma_transport = false;
+#endif
     if (value && std::string_view(value) == "rdma") {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
-    client_pools_ =
-        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf);
+#ifdef YLT_ENABLE_URMA
+    else if (value && std::string_view(value) == "urma") {
+        pool_conf.client_config.socket_config =
+            coro_io::urma_socket_t::config_t{};
+        use_urma_transport = true;
+    }
+#endif
 
-    LOG(INFO) << "create coro_rpc_client_pool with " << config.pool_size
-              << " threads";
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
 
@@ -88,15 +96,54 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
                 LOG(WARNING) << "Falling back to TCP mode";
             }
         }
+#ifdef YLT_ENABLE_URMA
+        else if (value && std::string_view(value) == "urma") {
+            if (server_) {
+                try {
+                    server_->init_urma();
+                    LOG(INFO) << "URMA initialized successfully";
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "URMA initialization failed: " << e.what();
+                    LOG(WARNING) << "Falling back to TCP mode";
+                    pool_conf = {};
+                    use_urma_transport = false;
+                } catch (...) {
+                    LOG(ERROR)
+                        << "URMA initialization failed with unknown error";
+                    LOG(WARNING) << "Falling back to TCP mode";
+                    pool_conf = {};
+                    use_urma_transport = false;
+                }
+            } else {
+                LOG(ERROR) << "Server pointer is null, cannot initialize URMA";
+                LOG(WARNING) << "Falling back to TCP mode";
+                pool_conf = {};
+                use_urma_transport = false;
+            }
+        }
+#endif
 
         server_->register_handler<&RpcCommunicator::handleDataTransfer,
                                   &RpcCommunicator::handleTensorTransfer>(this);
     }
+
+    client_pools_ =
+        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+            pool_conf);
+
+    LOG(INFO) << "create coro_rpc_client_pool with " << config.pool_size
+              << " threads";
     LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
               << (value ? value : "not set");
     if (value && std::string_view(value) == "rdma") {
         LOG(INFO) << "Using RDMA transport for RPC communication";
-    } else {
+    }
+#ifdef YLT_ENABLE_URMA
+    else if (use_urma_transport) {
+        LOG(INFO) << "Using URMA transport for RPC communication";
+    }
+#endif
+    else {
         LOG(INFO) << "Using TCP transport for RPC communication";
     }
 

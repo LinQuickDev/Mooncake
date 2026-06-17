@@ -5,7 +5,8 @@ import threading
 from mooncake.store import MooncakeDistributedStore
 
 # how to test: start mooncake_master and http_metadata_server.
-# Default is tcp, if you want to use rdma, should set MC_RPC_PROTOCOL=rdma and DEVICE_NAME=rdma_xxx at first.
+# Default is tcp. Set MC_RPC_PROTOCOL=rdma with DEVICE_NAME=rdma_xxx for RDMA,
+# or set MC_RPC_PROTOCOL=urma on builds with USE_YLT_URMA_RPC=ON for URMA RPC.
 # ./mooncake_master
 # python mooncake-wheel/mooncake/http_metadata_server.py --port 8080
 # python mooncake-wheel/tests/test_meta_server.py 127.0.0.1 8
@@ -21,8 +22,12 @@ master_host = "master.mooncake.dc" if len(sys.argv) < 2 else sys.argv[1]
 num_thread = 1 if len(sys.argv) < 3 else int(sys.argv[2])
 # Initialize the store
 store = MooncakeDistributedStore()
-# Use TCP protocol by default for testing, also support rdma
-protocol = os.getenv("MC_RPC_PROTOCOL", "tcp")
+# Use TCP data-plane protocol by default. Keep the historical
+# MC_RPC_PROTOCOL=rdma shortcut, but do not pass control-plane-only URMA to
+# store.setup(). Set MOONCAKE_PROTOCOL to choose the data-plane explicitly.
+protocol = os.getenv("MOONCAKE_PROTOCOL")
+if protocol is None:
+    protocol = "rdma" if os.getenv("MC_RPC_PROTOCOL") == "rdma" else "tcp"
 device_name = os.getenv("DEVICE_NAME", "eth0")
 local_hostname = os.getenv("LOCAL_HOSTNAME", "127.0.0.1")
 metadata_server = os.getenv("METADATA_ADDR", f"http://{master_host}:8080/metadata")

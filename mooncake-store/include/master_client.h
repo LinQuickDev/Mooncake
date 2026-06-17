@@ -11,6 +11,9 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
+#ifdef YLT_ENABLE_URMA
+#include <ylt/coro_io/urma/urma_socket.hpp>
+#endif
 
 #include "client_metric.h"
 #include "replica.h"
@@ -45,6 +48,16 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
     }
 }
 
+#ifdef YLT_ENABLE_URMA
+template <typename SocketConfigVariant>
+inline void MaybeEnableUrmaSocketConfig(SocketConfigVariant& socket_config) {
+    if constexpr (variant_contains_v<SocketConfigVariant,
+                                     coro_io::urma_socket_t::config_t>) {
+        socket_config = coro_io::urma_socket_t::config_t{};
+    }
+}
+#endif
+
 }  // namespace detail
 
 /**
@@ -70,6 +83,12 @@ class MasterClient {
             detail::MaybeEnableRdmaSocketConfig(
                 pool_conf.client_config.socket_config);
         }
+#ifdef YLT_ENABLE_URMA
+        else if (value && std::string_view(value) == "urma") {
+            detail::MaybeEnableUrmaSocketConfig(
+                pool_conf.client_config.socket_config);
+        }
+#endif
         client_pools_ =
             std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
                 pool_conf);

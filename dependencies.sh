@@ -237,7 +237,17 @@ cd build
 check_success "Failed to change to build directory"
 
 echo "Configuring yalantinglibs..."
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+ylt_cmake_args=(
+    -DBUILD_EXAMPLES=OFF
+    -DBUILD_BENCHMARK=OFF
+    -DBUILD_UNIT_TESTS=OFF
+)
+
+if [ "${USE_YLT_URMA_RPC:-OFF}" = "ON" ] || [ "${USE_YLT_URMA_RPC:-OFF}" = "1" ]; then
+    ylt_cmake_args+=( -DYLT_ENABLE_URMA=ON )
+fi
+
+cmake .. "${ylt_cmake_args[@]}"
 check_success "Failed to configure yalantinglibs"
 
 echo "Building yalantinglibs (using $(nproc) cores)..."

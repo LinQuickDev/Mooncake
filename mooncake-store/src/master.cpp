@@ -1081,6 +1081,11 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
+#ifdef YLT_ENABLE_URMA
+    else if (value && std::string_view(value) == "urma") {
+        protocol = "urma";
+    }
+#endif
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -1181,6 +1186,11 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
+#ifdef YLT_ENABLE_URMA
+        else if (value && std::string_view(value) == "urma") {
+            server.init_urma();
+        }
+#endif
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version));

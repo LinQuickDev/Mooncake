@@ -348,6 +348,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (protocol && std::string_view(protocol) == "rdma") {
             server.init_ibv();
         }
+#ifdef YLT_ENABLE_URMA
+        else if (protocol && std::string_view(protocol) == "urma") {
+            server.init_urma();
+        }
+#endif
 
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             mooncake::WrappedMasterServiceConfig(

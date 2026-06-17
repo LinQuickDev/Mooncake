@@ -1,6 +1,11 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <cstdlib>
+#include <string_view>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#ifdef YLT_ENABLE_URMA
+#include <ylt/coro_io/urma/urma_socket.hpp>
+#endif
 
 #include "client_service.h"
 #include "config.h"
@@ -129,6 +134,12 @@ int main(int argc, char *argv[]) {
     }
 
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
+#ifdef YLT_ENABLE_URMA
+    const char *rpc_protocol = std::getenv("MC_RPC_PROTOCOL");
+    if (rpc_protocol && std::string_view(rpc_protocol) == "urma") {
+        server.init_urma();
+    }
+#endif
     RegisterClientRpcService(server, *client_inst);
 
     LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"

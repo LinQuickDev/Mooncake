@@ -24,6 +24,9 @@
 #include <vector>
 
 #include "mooncake_logging.h"
+#ifdef YLT_ENABLE_URMA
+#include <ylt/coro_io/urma/urma_socket.hpp>
+#endif
 
 #include "real_client.h"
 #include "client_buffer.hpp"
@@ -925,6 +928,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // Use port 0 to let the OS auto-allocate an available port.
         offload_rpc_server_ =
             std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+#ifdef YLT_ENABLE_URMA
+        const char *rpc_protocol = std::getenv("MC_RPC_PROTOCOL");
+        if (rpc_protocol && std::string_view(rpc_protocol) == "urma") {
+            offload_rpc_server_->init_urma();
+        }
+#endif
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
@@ -6323,6 +6332,12 @@ ClientRequester::ClientRequester() {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
+#ifdef YLT_ENABLE_URMA
+    else if (value && std::string_view(value) == "urma") {
+        pool_conf.client_config.socket_config =
+            coro_io::urma_socket_t::config_t{};
+    }
+#endif
     // Configure reasonable retry limits for SSD offload RPC connections.
     // - connect_retry_count: Maximum connection retry attempts (default: 3)
     // - reconnect_wait_time: Wait time between retries (default: 1000ms)
