@@ -25,6 +25,7 @@
 #include "glog/logging.h"
 
 #include "master_client.h"
+#include "rpc_transport_config.h"
 
 // Size units for better readability
 static constexpr size_t KiB = 1024;
@@ -369,6 +370,16 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
 
     gflags::ParseCommandLineFlags(&argc, &argv, false);
+
+    LOG(INFO) << "master_bench RPC transport: "
+              << mooncake::GetRpcProtocolFromEnv();
+#ifdef YLT_ENABLE_URMA
+    if (mooncake::IsUrmaRpcProtocol()) {
+        auto urma_config = mooncake::MakeUrmaRpcConfigFromEnv();
+        LOG(INFO) << "master_bench URMA RPC config: "
+                  << mooncake::FormatUrmaRpcConfig(urma_config);
+    }
+#endif
 
     ping_thread = std::jthread([&](std::stop_token stop_token) {
         static const auto OneSecond = std::chrono::seconds(1);

@@ -19,6 +19,7 @@
 #include "http_metadata_server.h"
 #include "mooncake_logging.h"
 #include "rpc_service.h"
+#include "rpc_transport_config.h"
 #include "types.h"
 #include "utils.h"
 
@@ -1076,16 +1077,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
-        protocol = "rdma";
-    }
-#ifdef YLT_ENABLE_URMA
-    else if (value && std::string_view(value) == "urma") {
-        protocol = "urma";
-    }
-#endif
+    auto protocol = mooncake::GetRpcProtocolFromEnv();
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -1188,7 +1180,10 @@ int main(int argc, char* argv[]) {
         }
 #ifdef YLT_ENABLE_URMA
         else if (value && std::string_view(value) == "urma") {
-            server.init_urma();
+            auto urma_config = mooncake::MakeUrmaRpcConfigFromEnv();
+            LOG(INFO) << "Master service using URMA RPC transport: "
+                      << mooncake::FormatUrmaRpcConfig(urma_config);
+            server.init_urma(urma_config);
         }
 #endif
         auto wrapped_master_service =

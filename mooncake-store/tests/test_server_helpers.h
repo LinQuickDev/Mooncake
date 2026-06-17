@@ -14,6 +14,7 @@
 #include "http_metadata_server.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "rpc_transport_config.h"
 #include "types.h"
 #include <ylt/util/tl/expected.hpp>
 #include "utils.h"
@@ -95,7 +96,8 @@ class InProcMaster {
             }
 #ifdef YLT_ENABLE_URMA
             else if (value && std::string_view(value) == "urma") {
-                server_->init_urma();
+                auto urma_config = MakeUrmaRpcConfigFromEnv();
+                server_->init_urma(urma_config);
             }
 #endif
 

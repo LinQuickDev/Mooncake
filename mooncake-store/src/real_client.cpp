@@ -36,6 +36,7 @@
 #include "types.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "rpc_transport_config.h"
 #include "file_storage.h"
 #include "gpu_staging_utils.h"
 #include "default_config.h"
@@ -931,7 +932,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef YLT_ENABLE_URMA
         const char *rpc_protocol = std::getenv("MC_RPC_PROTOCOL");
         if (rpc_protocol && std::string_view(rpc_protocol) == "urma") {
-            offload_rpc_server_->init_urma();
+            auto urma_config = MakeUrmaRpcConfigFromEnv();
+            LOG(INFO) << "Offload RPC server using URMA RPC transport: "
+                      << FormatUrmaRpcConfig(urma_config);
+            offload_rpc_server_->init_urma(urma_config);
         }
 #endif
         offload_rpc_server_
@@ -6334,8 +6338,10 @@ ClientRequester::ClientRequester() {
     }
 #ifdef YLT_ENABLE_URMA
     else if (value && std::string_view(value) == "urma") {
-        pool_conf.client_config.socket_config =
-            coro_io::urma_socket_t::config_t{};
+        auto urma_config = MakeUrmaRpcConfigFromEnv();
+        pool_conf.client_config.socket_config = urma_config;
+        LOG(INFO) << "ClientRequester using URMA RPC transport: "
+                  << FormatUrmaRpcConfig(urma_config);
     }
 #endif
     // Configure reasonable retry limits for SSD offload RPC connections.

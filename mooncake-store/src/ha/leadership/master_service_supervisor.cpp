@@ -14,6 +14,7 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/standby_controller.h"
 #include "rpc_service.h"
+#include "rpc_transport_config.h"
 
 namespace mooncake {
 namespace ha {
@@ -350,7 +351,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 #ifdef YLT_ENABLE_URMA
         else if (protocol && std::string_view(protocol) == "urma") {
-            server.init_urma();
+            auto urma_config = MakeUrmaRpcConfigFromEnv();
+            LOG(INFO) << "HA master service using URMA RPC transport: "
+                      << FormatUrmaRpcConfig(urma_config);
+            server.init_urma(urma_config);
         }
 #endif
 

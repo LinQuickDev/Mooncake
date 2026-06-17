@@ -542,6 +542,11 @@ rpc_port: 50051
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp`, `rdma`, or `urma`. `urma` requires `USE_YLT_URMA_RPC=ON`, yalantinglibs built with `YLT_ENABLE_URMA=ON`, and URMA/UMDK development and runtime libraries on the host. |
+| `MC_RPC_URMA_DEVICE` | `bonding_dev_0` | URMA device used when `MC_RPC_PROTOCOL=urma`. |
+| `MC_RPC_URMA_EID_INDEX` | `0` | URMA EID index used when `MC_RPC_PROTOCOL=urma`. |
+| `MC_RPC_URMA_QUEUE_DEPTH` | `64` | URMA send/receive queue depth used when `MC_RPC_PROTOCOL=urma`; also controls completion queue sizing. |
+| `MC_RPC_URMA_BUFFER_SIZE` | `4096` | URMA per-buffer size in bytes used when `MC_RPC_PROTOCOL=urma`. |
+| `MC_RPC_URMA_MAX_MEMORY_MIB` | `256` | URMA RPC buffer pool memory limit in MiB used when `MC_RPC_PROTOCOL=urma`. |
 | `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
 

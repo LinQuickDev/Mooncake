@@ -21,6 +21,7 @@
 #include "types.h"
 #include "default_config.h"
 #include "config.h"
+#include "rpc_transport_config.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "ascend_allocator.h"
@@ -230,8 +231,10 @@ DummyClient::DummyClient()
     }
 #ifdef YLT_ENABLE_URMA
     else if (value && std::string_view(value) == "urma") {
-        pool_conf.client_config.socket_config =
-            coro_io::urma_socket_t::config_t{};
+        auto urma_config = MakeUrmaRpcConfigFromEnv();
+        pool_conf.client_config.socket_config = urma_config;
+        LOG(INFO) << "DummyClient using URMA RPC transport: "
+                  << FormatUrmaRpcConfig(urma_config);
     }
 #endif
     client_pools_ =

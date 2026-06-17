@@ -329,6 +329,13 @@ export MC_RPC_PROTOCOL=rdma
 # yalantinglibs built with YLT_ENABLE_URMA=ON, and URMA/UMDK development
 # and runtime libraries available on the host.
 export MC_RPC_PROTOCOL=urma
+
+# Optional URMA RPC tuning. Defaults match the yalantinglibs URMA benchmark.
+export MC_RPC_URMA_DEVICE=bonding_dev_0
+export MC_RPC_URMA_EID_INDEX=0
+export MC_RPC_URMA_QUEUE_DEPTH=64
+export MC_RPC_URMA_BUFFER_SIZE=4096
+export MC_RPC_URMA_MAX_MEMORY_MIB=256
 ```
 
 ## Choosing the Right Protocol

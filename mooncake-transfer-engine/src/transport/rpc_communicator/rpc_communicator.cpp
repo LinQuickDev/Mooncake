@@ -14,6 +14,7 @@
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
 #include "default_config.h"
+#include "rpc_transport_config.h"
 
 namespace mooncake {
 namespace py = pybind11;
@@ -63,9 +64,11 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     }
 #ifdef YLT_ENABLE_URMA
     else if (value && std::string_view(value) == "urma") {
-        pool_conf.client_config.socket_config =
-            coro_io::urma_socket_t::config_t{};
+        auto urma_config = MakeUrmaRpcConfigFromEnv();
+        pool_conf.client_config.socket_config = urma_config;
         use_urma_transport = true;
+        LOG(INFO) << "RpcCommunicator client pool using URMA RPC transport: "
+                  << FormatUrmaRpcConfig(urma_config);
     }
 #endif
 
@@ -100,7 +103,11 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
         else if (value && std::string_view(value) == "urma") {
             if (server_) {
                 try {
-                    server_->init_urma();
+                    auto urma_config = MakeUrmaRpcConfigFromEnv();
+                    LOG(INFO) << "RpcCommunicator server using URMA RPC "
+                              << "transport: "
+                              << FormatUrmaRpcConfig(urma_config);
+                    server_->init_urma(urma_config);
                     LOG(INFO) << "URMA initialized successfully";
                 } catch (const std::exception& e) {
                     LOG(ERROR) << "URMA initialization failed: " << e.what();
