@@ -286,10 +286,10 @@ class BenchmarkStats {
 
     double MeanLatencyUs() const {
         if (merged_latencies_ns_.empty()) return 0.0;
-        int64_t sum = std::accumulate(merged_latencies_ns_.begin(),
-                                      merged_latencies_ns_.end(), int64_t(0));
-        return NanosToUs(sum /
-                         static_cast<int64_t>(merged_latencies_ns_.size()));
+        double sum = static_cast<double>(std::accumulate(
+            merged_latencies_ns_.begin(), merged_latencies_ns_.end(),
+            int64_t(0)));
+        return NanosToUs(sum / static_cast<double>(merged_latencies_ns_.size()));
     }
 
     double ThroughputMBps() const {
