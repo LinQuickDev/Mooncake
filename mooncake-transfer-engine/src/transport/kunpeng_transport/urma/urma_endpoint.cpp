@@ -1082,7 +1082,7 @@ int UrmaEndpoint::submitPostSend(
         slice->ub.jetty_depth = &wr_depth_list_[jetty_index];
         // Set endpoint pointer for each slice before submitting
         slice->ub.endpoint = this;
-    }
+    };
     __sync_fetch_and_add(&wr_depth_list_[jetty_index], wr_count);
     __sync_fetch_and_add(jfc_outstanding_, wr_count);
     urma_jfs_wr_t* bad_wr = nullptr;
