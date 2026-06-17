@@ -23,6 +23,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <set>
@@ -32,6 +33,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/efa_transport/efa_context.h"
@@ -43,7 +45,6 @@ namespace mooncake {
 // roughly 24 million PTEs per NIC, but we use 22M as a conservative default.
 // With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
 // With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
-// Override via MC_EFA_MAX_PTE_ENTRIES environment variable.
 static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
 
 // Detect the kernel page size backing the memory at `addr` by reading
@@ -75,20 +76,7 @@ static size_t detectBufferPageSize(void* addr) {
     return fallback;
 }
 
-static size_t getMaxPteEntries() {
-    static size_t cached = []() {
-        const char* env = std::getenv("MC_EFA_MAX_PTE_ENTRIES");
-        if (env) {
-            size_t val = std::stoull(env);
-            if (val > 0) {
-                LOG(INFO) << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
-                return val;
-            }
-        }
-        return kDefaultMaxPteEntries;
-    }();
-    return cached;
-}
+static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
 EfaTransport::EfaTransport() {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
@@ -105,8 +93,12 @@ void EfaTransport::startWorkerThreads() {
     if (worker_running_) return;
 
     worker_running_ = true;
-    // One poller thread per context for responsive CQ draining under load
+    // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
+    int cq_cap = Environ::Get().GetEfaCqThreads();
+    if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
+        num_threads = static_cast<size_t>(cq_cap);
+    }
     for (size_t i = 0; i < num_threads; i++) {
         worker_threads_.emplace_back(&EfaTransport::workerThreadFunc, this, i);
     }

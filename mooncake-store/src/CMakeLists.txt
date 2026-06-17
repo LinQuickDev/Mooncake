@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
+    storage/distributed/distributed_storage_backend.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -57,6 +58,7 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     memory_alloc.cpp
+    ssd_register_client.cpp
     engram/engram_store.cpp
 )
 
@@ -116,6 +118,7 @@ endif()
 if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SOURCES ${HF3FS_SOURCES})
+  list(APPEND MOONCAKE_STORE_SOURCES storage/distributed/hf3fs_adapter.cpp)
   find_library(
     HF3FS_API_LIB hf3fs_api_shared
     PATHS /usr/lib
@@ -328,8 +331,9 @@ endif()
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
 # Go's build.sh already does this; CI workflows must do the same.
-
-find_package(CUDAToolkit QUIET)
+if(USE_CUDA)
+    find_package(CUDAToolkit QUIET)
+endif()
 if(CUDAToolkit_FOUND)
     message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
     target_compile_definitions(mooncake_store PRIVATE USE_CUDA)

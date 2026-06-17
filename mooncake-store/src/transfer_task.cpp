@@ -193,7 +193,7 @@ constexpr int kDefaultFilereadWorkers = 10;
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
     MC_VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
-            << " workers";
+               << " workers";
 
     // Start worker threads
     workers_.reserve(kDefaultFilereadWorkers);
@@ -273,7 +273,7 @@ void FilereadWorkerPool::workerThread() {
                     task.file_path, task.slices, task.object_size);
                 if (load_result) {
                     MC_VLOG(2) << "Fileread task completed successfully with "
-                            << task.file_path;
+                               << task.file_path;
                     task.state->set_completed(ErrorCode::OK);
                 } else {
                     MC_LOG(ERROR)
@@ -282,7 +282,8 @@ void FilereadWorkerPool::workerThread() {
                     task.state->set_completed(ErrorCode::TRANSFER_FAIL);
                 }
             } catch (const std::exception& e) {
-                MC_LOG(ERROR) << "Exception during async fileread: " << e.what();
+                MC_LOG(ERROR)
+                    << "Exception during async fileread: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             }
         }
@@ -597,7 +598,7 @@ constexpr int kDefaultMemcpyWorkers = 1;
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     MC_VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+               << " workers";
 
     // Start worker threads
     workers_.reserve(kDefaultMemcpyWorkers);
@@ -690,8 +691,8 @@ void MemcpyWorkerPool::workerThread() {
                 }
 
                 MC_VLOG(2) << "Memcpy task completed with "
-                        << task.operations.size() << " operations"
-                        << (ok ? "" : " (with GPU copy failure)");
+                           << task.operations.size() << " operations"
+                           << (ok ? "" : " (with GPU copy failure)");
                 task.state->set_completed(ok ? ErrorCode::OK
                                              : ErrorCode::TRANSFER_FAIL);
             } catch (const std::exception& e) {
@@ -734,8 +735,8 @@ void TransferEngineOperationState::check_task_status() {
         Status s = engine_.getTransferStatus(batch_id_, i, status);
         if (!s.ok()) {
             MC_LOG(ERROR) << "Failed to get transfer status for batch "
-                       << batch_id_ << " task " << i << " with error "
-                       << s.message();
+                          << batch_id_ << " task " << i << " with error "
+                          << s.message();
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -748,8 +749,9 @@ void TransferEngineOperationState::check_task_status() {
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
 #ifndef USE_ASCEND_DIRECT
-                MC_VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
-                        << i << " with status " << static_cast<int>(status.s);
+                MC_VLOG(1) << "Transfer failed for batch " << batch_id_
+                           << " task " << i << " with status "
+                           << static_cast<int>(status.s);
 #endif
                 failed_task_ids.push_back(i);
                 break;
@@ -775,8 +777,8 @@ void TransferEngineOperationState::check_task_status() {
             oss << failed_task_ids[j];
         }
         MC_LOG(ERROR) << "Batch " << batch_id_
-                   << " completed with task failures: task_ids=[" << oss.str()
-                   << "]";
+                      << " completed with task failures: task_ids=["
+                      << oss.str() << "]";
         ec = ErrorCode::TRANSFER_FAIL;
     }
 
@@ -787,15 +789,16 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     [[maybe_unused]] auto trace = RestoreTraceIfMissing(trace_id());
     if (result_.has_value()) {
         MC_LOG(ERROR) << "Attempting to set result multiple times for batch "
-                   << batch_id_
-                   << ". Previous result: " << static_cast<int>(result_.value())
-                   << ", attempted new result: " << static_cast<int>(error_code)
-                   << ". This indicates a race condition or logic error.";
+                      << batch_id_ << ". Previous result: "
+                      << static_cast<int>(result_.value())
+                      << ", attempted new result: "
+                      << static_cast<int>(error_code)
+                      << ". This indicates a race condition or logic error.";
         return;  // Don't crash, just return early
     }
 
     MC_VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
-            << static_cast<int>(error_code);
+               << static_cast<int>(error_code);
     result_.emplace(error_code);
 }
 
@@ -809,7 +812,8 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    MC_VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+    MC_VLOG(1) << "Waiting for transfer engine completion for batch "
+               << batch_id_;
 
     // Wait directly on BatchDesc's condition variable.
     auto& batch_desc = Transport::toBatchDesc(batch_id_);
@@ -855,12 +859,13 @@ void TransferEngineOperationState::wait_for_completion() {
     }
 
     if (completed) {
-        MC_VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
+        MC_VLOG(1) << "Transfer engine operation completed for batch "
+                   << batch_id_
+                   << " with result: " << static_cast<int>(error_code);
     } else {
         MC_LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
+                      << timeout_milliseconds << " milliseconds for batch "
+                      << batch_id_;
     }
 #else
     MC_VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
@@ -868,8 +873,8 @@ void TransferEngineOperationState::wait_for_completion() {
     while (true) {
         if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
             MC_LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
+                          << timeout_milliseconds << " milliseconds for batch "
+                          << batch_id_;
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -878,13 +883,13 @@ void TransferEngineOperationState::wait_for_completion() {
         check_task_status();
         if (result_.has_value()) {
             MC_VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
+                       << batch_id_
+                       << " with result: " << static_cast<int>(result_.value());
             break;
         }
         // Continue polling
         MC_VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+                   << batch_id_;
     }
 #endif
 }
@@ -944,14 +949,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     if (env_value == nullptr) {
         memcpy_enabled_ = engine_.isTcpOnly();
         MC_LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
-                  << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
-                                      : "non-TCP transport available, memcpy "
-                                        "disabled");
+                     << (memcpy_enabled_
+                             ? "TCP-only environment, memcpy enabled"
+                             : "non-TCP transport available, memcpy "
+                               "disabled");
     } else {
         std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
         std::transform(env_str.begin(), env_str.end(), env_str.begin(),
-                       ::tolower);
+                       [](unsigned char c) { return std::tolower(c); });
         if (env_str == "false" || env_str == "0" || env_str == "no" ||
             env_str == "off") {
             memcpy_enabled_ = false;
@@ -960,13 +966,13 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             memcpy_enabled_ = true;
         } else {
             MC_LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
-                         << ", defaulting to enabled";
+                            << ", defaulting to enabled";
             memcpy_enabled_ = true;
         }
     }
 
     MC_VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
-            << memcpy_enabled_;
+               << memcpy_enabled_;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -1044,7 +1050,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             MC_LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
+                          << handle.transport_endpoint_;
             return std::nullopt;
         }
         for (auto slice : slices) {
@@ -1146,8 +1152,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
 
-    MC_VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
-            << " operations";
+    MC_VLOG(1) << "Memcpy transfer submitted to worker pool with "
+               << slices.size() << " operations";
 
     return TransferFuture(state);
 }
@@ -1166,7 +1172,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     Status s = engine_.submitTransfer(batch_id, requests);
     if (!s.ok()) {
         MC_LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
+                      << s.code();
         // Note: batch_id will be freed by TransferEngineOperationState
         // destructor if we create the state object, otherwise we need to free
         // it here
@@ -1192,14 +1198,14 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
     if (handle.transport_endpoint_.empty()) {
         MC_LOG(ERROR) << "Transport endpoint is empty for handle with address "
-                   << handle.buffer_address_;
+                      << handle.buffer_address_;
         return std::nullopt;
     }
     SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
 
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
         MC_LOG(ERROR) << "Failed to open segment for endpoint='"
-                   << handle.transport_endpoint_ << "'";
+                      << handle.transport_endpoint_ << "'";
         return std::nullopt;
     }
 
@@ -1241,7 +1247,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     }
 
     MC_LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
-               << strategy;
+                  << strategy;
     return std::nullopt;
 }
 
@@ -1258,8 +1264,8 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
         for (const auto& s : slices) slices_size += s.size;
         if (src_offset + slices_size > handle.size_) {
             MC_LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
-                       << " + slices_size=" << slices_size
-                       << " > handle.size_=" << handle.size_;
+                          << " + slices_size=" << slices_size
+                          << " > handle.size_=" << handle.size_;
             return std::nullopt;
         }
 
@@ -1333,7 +1339,8 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     FilereadTask task(file_path, file_length, slices, state, trace_id);
     fileread_pool_->submitTask(std::move(task));
 
-    MC_VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;
+    MC_VLOG(1) << "Fileread transfer submitted to worker pool with "
+               << file_path;
 
     return TransferFuture(state);
 }
@@ -1343,8 +1350,9 @@ TransferStrategy TransferSubmitter::selectStrategy(
     const std::vector<Slice>& slices) const {
     // Check if memcpy operations are enabled via environment variable
     if (!memcpy_enabled_) {
-        MC_VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
-                   "variable";
+        MC_VLOG(2)
+            << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
+               "variable";
         return TransferStrategy::TRANSFER_ENGINE;
     }
 
@@ -1404,8 +1412,8 @@ bool TransferSubmitter::isSameProcessEndpoint(
     const std::string local_ip = extractIpAddress(local_endpoint);
     if (!handle_ip.empty() && handle_ip == local_ip) {
         MC_VLOG(2) << "Disabling local memcpy for same-host endpoints with "
-                   "different process endpoints: handle="
-                << handle_endpoint << ", local=" << local_endpoint;
+                      "different process endpoints: handle="
+                   << handle_endpoint << ", local=" << local_endpoint;
     }
 
     return false;
@@ -1426,7 +1434,7 @@ bool TransferSubmitter::validateTransferParams(
     }
     if (handle.size_ != all_slice_len) {
         MC_LOG(ERROR) << "handles len:" << handle.size_
-                   << ", all_slice_len:" << all_slice_len;
+                      << ", all_slice_len:" << all_slice_len;
         return false;
     }
     return true;

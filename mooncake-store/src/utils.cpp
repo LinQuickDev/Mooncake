@@ -118,6 +118,11 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return ascend_allocate_memory(total_size, protocol);
     }
 #endif
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        return mooncake::ub_allocate_memory(alignment, total_size);
+    }
+#endif
 #ifdef USE_NOF
     if (use_spdk_dma && total_size > 0) {
         return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
@@ -559,8 +564,9 @@ static std::string SanitizeKey(const std::string &key) {
 
     for (char c : key) {
         // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+        const bool invalid =
+            c == '\0' || kInvalidChars.find(c) != std::string_view::npos;
+        sanitized_key.push_back(invalid ? '_' : c);
     }
     return sanitized_key;
 }

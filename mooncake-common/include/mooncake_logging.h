@@ -10,7 +10,6 @@ namespace mooncake::logging {
 
 uint64_t NewTraceId();
 uint64_t CurrentTraceId();
-bool IsMooncakeLogEnabled();
 bool ShouldLog(google::LogSeverity severity);
 bool ShouldVLog(int level);
 void ApplyMooncakeLogEnableToGlog();
@@ -58,13 +57,13 @@ void FlushAsyncLogs();
 
 }  // namespace mooncake::logging
 
-#define MC_LOG(severity)                                                      \
-    mooncake::logging::AsyncLogMessage(                                       \
-        __FILE__, __LINE__, google::severity,                                 \
-        mooncake::logging::ShouldLog(google::severity))                       \
+#define MC_LOG(severity)                                \
+    mooncake::logging::AsyncLogMessage(                 \
+        __FILE__, __LINE__, google::severity,           \
+        mooncake::logging::ShouldLog(google::severity)) \
         .stream()
 
-#define MC_VLOG(level)                                                        \
-    mooncake::logging::AsyncLogMessage(                                       \
-        __FILE__, __LINE__, google::INFO, mooncake::logging::ShouldVLog(level)) \
+#define MC_VLOG(level)                                                       \
+    mooncake::logging::AsyncLogMessage(__FILE__, __LINE__, google::INFO,     \
+                                       mooncake::logging::ShouldVLog(level)) \
         .stream()

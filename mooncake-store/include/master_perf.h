@@ -6,5 +6,5 @@
 // The program name "mooncake_master" keeps master shards separate from the
 // client-side "mooncake_store" shards in the shared-memory region.
 #define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME  "mooncake_master"
+#define UBDIAG_PROGRAM_NAME "mooncake_master"
 #include "ubdiag/auto_perf.h"
