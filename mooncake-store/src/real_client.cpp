@@ -6265,7 +6265,7 @@ RealClient::batch_get_into_offload_object_internal(
                              UbDiag::PerfLevel::MODULE);
     pt_rpc.Start();
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, keys, sizes);
+        target_rpc_service_addr, storage_keys, sizes);
     pt_rpc.End(batchGetResp ? 0 : -1);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
