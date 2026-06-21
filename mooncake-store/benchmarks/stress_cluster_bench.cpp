@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <cstdlib>
 
@@ -158,12 +159,14 @@ static std::vector<std::string> DiscoverSegmentsFromMaster(
     std::string body = response.substr(header_end + 4);
     std::istringstream iss(body);
     std::string line;
+    // Use an unordered_set to track already-seen segments and avoid duplicates
+    std::unordered_set<std::string> seen;
     while (std::getline(iss, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
                                  line.back() == ' ' || line.back() == '\t')) {
             line.pop_back();
         }
-        if (!line.empty()) {
+        if (!line.empty() && seen.insert(line).second) {
             segments.push_back(line);
         }
     }
@@ -809,8 +812,8 @@ class StressBenchmark {
         if (buf_ret != 0) return buf_ret;
 
         std::vector<std::string> all_keys;
-        for (size_t s = 0; s < read_segments.size(); ++s) {
-            for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < read_segments.size(); ++s) {
                 all_keys.push_back(MakeSegmentKey(read_segments[s], i));
             }
         }
