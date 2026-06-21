@@ -192,20 +192,23 @@ int UrmaContext::deconstruct() {
     }
     seg_region_list_.clear();
 
-    for (auto& seg : imported_seg_list_) {
-        int ret = urma_unimport_seg(seg);
-        if (ret) {
-            PLOG(ERROR) << "Failed to unimport segment";
+    {
+        std::unique_lock<std::shared_mutex> lock(import_tseg_mutex_);
+        for (auto& seg : imported_seg_list_) {
+            int ret = urma_unimport_seg(seg);
+            if (ret) {
+                PLOG(ERROR) << "Failed to unimport segment";
+            }
         }
-    }
-    imported_seg_list_.clear();
+        imported_seg_list_.clear();
 
-    for (auto& seg : remote_seg_list_) {
-        free(seg);
-    }
-    remote_seg_list_.clear();
+        for (auto& seg : remote_seg_list_) {
+            free(seg);
+        }
+        remote_seg_list_.clear();
 
-    import_tseg_map.clear();
+        import_tseg_map.clear();
+    }
 
     for (size_t i = 0; i < jfr_list_.size(); i++) {
         if (!jfr_list_[i].native) continue;
@@ -373,14 +376,25 @@ int UrmaContext::doProcessContextEvents() {
 }
 
 void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
+    {
+        std::shared_lock<std::shared_mutex> lock(import_tseg_mutex_);
+        auto ret = import_tseg_map.find(remoteSegmentStr);
+        if (ret != import_tseg_map.end()) return ret->second;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(import_tseg_mutex_);
     auto ret = import_tseg_map.find(remoteSegmentStr);
     if (ret != import_tseg_map.end()) return ret->second;
+
     std::vector<unsigned char> output_buffer;
     deserializeBinaryData(remoteSegmentStr, output_buffer);
-    urma_seg_t* handle;
-    handle = (urma_seg_t*)malloc(sizeof(urma_seg_t));
+    auto* handle = static_cast<urma_seg_t*>(malloc(sizeof(urma_seg_t)));
+    if (!handle) {
+        LOG(ERROR) << "Allocate remote segment handle failed";
+        return nullptr;
+    }
     memcpy(handle, output_buffer.data(), sizeof(urma_seg_t));
-    remote_seg_list_.push_back(handle);
+
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
     if (import_tseg == NULL) {
@@ -388,6 +402,8 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
         free(handle);
         return nullptr;
     }
+
+    remote_seg_list_.push_back(handle);
     imported_seg_list_.push_back(import_tseg);
     import_tseg_map[remoteSegmentStr] = import_tseg;
     return import_tseg;

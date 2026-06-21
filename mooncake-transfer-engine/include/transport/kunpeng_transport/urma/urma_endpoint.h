@@ -16,6 +16,8 @@
 #define URMA_ENDPOINT_H
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -131,6 +133,7 @@ class UrmaContext : public UbContext {
     std::vector<urma_target_seg_t*> local_tseg_list_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;
+    std::shared_mutex import_tseg_mutex_;
 
     std::vector<UrmaJFR> jfr_list_;
 
