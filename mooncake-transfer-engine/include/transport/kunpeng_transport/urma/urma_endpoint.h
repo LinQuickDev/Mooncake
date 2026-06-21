@@ -88,7 +88,7 @@ class UrmaContext : public UbContext {
    private:
     int construct(GlobalConfig& config) override;
     int deconstruct() override;
-    int openDevice(const std::string& device_name, uint8_t port,
+    int openDevice(const std::string& device_name, int8_t port,
                    int& eid_index) override;
 
     urma_target_seg_t* seg(uint64_t addr);

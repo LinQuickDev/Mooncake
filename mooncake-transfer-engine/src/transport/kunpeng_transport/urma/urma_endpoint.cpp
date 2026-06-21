@@ -100,9 +100,9 @@ int UrmaContext::construct(GlobalConfig& config) {
     //     auto-scan port_attr to find the first active port.
     //   - If config.urma_active_port >= 0 (set via MC_URMA_ACTIVE_PORT),
     //     openDevice will use the specified port index directly.
-    uint8_t active_port = static_cast<uint8_t>(-1);
-    if (config.urma_active_port >= 0) {
-        active_port = static_cast<uint8_t>(config.urma_active_port);
+    int8_t active_port = -1;
+    if (config.urma_active_port >= 0 && config.urma_active_port <= 127) {
+        active_port = static_cast<int8_t>(config.urma_active_port);
         LOG(INFO) << "Using active port " << static_cast<int>(active_port)
                   << " from config (MC_URMA_ACTIVE_PORT)";
     } else {
@@ -422,7 +422,7 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
     return import_tseg;
 }
 
-int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
+int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                             int& eid_index) {
     int num_devices = 0;
     urma_context_t* context = nullptr;
@@ -493,7 +493,7 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        if (port <= static_cast<uint8_t>(-1) || port >= MAX_PORT_CNT){
+        if (port < 0 || port >= MAX_PORT_CNT){
             for (int p = 0; p < MAX_PORT_CNT; p++) {
                 auto port_attr = dev_attr_.port_attr[p];
                 if (port_attr.state == URMA_PORT_ACTIVE ||
@@ -508,7 +508,8 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
                 LOG(WARNING) << "Device " << device_name
                             << " not found active port";
                 if (urma_delete_context(context)) {
-                    PLOG(ERROR) << "urma_delete_context(" << device_name << ") failed";
+                    PLOG(ERROR)
+                        << "urma_delete_context(" << device_name << ") failed";
                 }
                 urma_free_device_list(devices);
                 return ERR_CONTEXT;
@@ -516,7 +517,7 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
         } else {
             LOG(WARNING) << "Device " << device_name
                             << " manually specified port: " << static_cast<int>(port);
-            port_ = port;
+            port_ = static_cast<uint8_t>(port);
         }
 
         updateUrmaGlobalConfig(dev_attr_);
