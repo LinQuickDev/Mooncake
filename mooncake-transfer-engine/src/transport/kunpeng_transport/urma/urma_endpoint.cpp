@@ -110,7 +110,20 @@ int UrmaContext::construct(GlobalConfig& config) {
     // urma: Here, num_jfc_list and num_jfces use the same value,
     // meaning one JFC is bound to one JFCE.
     // max_jfc_e uses the default value DEFAULT_DEPTH.
-    if (openDevice(device_name_, port_, eid_index)) {
+    // Determine the active port:
+    //   - If config.urma_active_port is -1 (default), openDevice will
+    //     auto-scan port_attr to find the first active port.
+    //   - If config.urma_active_port >= 0 (set via MC_URMA_ACTIVE_PORT),
+    //     openDevice will use the specified port index directly.
+    int8_t active_port = -1;
+    if (config.urma_active_port >= 0 && config.urma_active_port <= 127) {
+        active_port = static_cast<int8_t>(config.urma_active_port);
+        LOG(INFO) << "Using active port " << static_cast<int>(active_port)
+                  << " from config (MC_URMA_ACTIVE_PORT)";
+    } else {
+        LOG(INFO) << "Auto-selecting active port (MC_URMA_ACTIVE_PORT not set)";
+    }
+    if (openDevice(device_name_, active_port, eid_index)) {
         LOG(ERROR) << "Failed to open device : " << device_name_
                    << " with EID index : " << eid_index;
         return ERR_CONTEXT;
@@ -207,20 +220,23 @@ int UrmaContext::deconstruct() {
     }
     seg_region_list_.clear();
 
-    for (auto& seg : imported_seg_list_) {
-        int ret = urma_unimport_seg(seg);
-        if (ret) {
-            PLOG(ERROR) << "Failed to unimport segment";
+    {
+        std::unique_lock<std::shared_mutex> lock(import_tseg_mutex_);
+        for (auto& seg : imported_seg_list_) {
+            int ret = urma_unimport_seg(seg);
+            if (ret) {
+                PLOG(ERROR) << "Failed to unimport segment";
+            }
         }
-    }
-    imported_seg_list_.clear();
+        imported_seg_list_.clear();
 
-    for (auto& seg : remote_seg_list_) {
-        free(seg);
-    }
-    remote_seg_list_.clear();
+        for (auto& seg : remote_seg_list_) {
+            free(seg);
+        }
+        remote_seg_list_.clear();
 
-    import_tseg_map.clear();
+        import_tseg_map.clear();
+    }
 
     for (size_t i = 0; i < jfr_list_.size(); i++) {
         if (!jfr_list_[i].native) continue;
@@ -388,14 +404,25 @@ int UrmaContext::doProcessContextEvents() {
 }
 
 void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
+    {
+        std::shared_lock<std::shared_mutex> lock(import_tseg_mutex_);
+        auto ret = import_tseg_map.find(remoteSegmentStr);
+        if (ret != import_tseg_map.end()) return ret->second;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(import_tseg_mutex_);
     auto ret = import_tseg_map.find(remoteSegmentStr);
     if (ret != import_tseg_map.end()) return ret->second;
+
     std::vector<unsigned char> output_buffer;
     deserializeBinaryData(remoteSegmentStr, output_buffer);
-    urma_seg_t* handle;
-    handle = (urma_seg_t*)malloc(sizeof(urma_seg_t));
+    auto* handle = static_cast<urma_seg_t*>(malloc(sizeof(urma_seg_t)));
+    if (!handle) {
+        LOG(ERROR) << "Allocate remote segment handle failed";
+        return nullptr;
+    }
     memcpy(handle, output_buffer.data(), sizeof(urma_seg_t));
-    remote_seg_list_.push_back(handle);
+
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
     if (import_tseg == NULL) {
@@ -403,12 +430,14 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
         free(handle);
         return nullptr;
     }
+
+    remote_seg_list_.push_back(handle);
     imported_seg_list_.push_back(import_tseg);
     import_tseg_map[remoteSegmentStr] = import_tseg;
     return import_tseg;
 }
 
-int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
+int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                             int& eid_index) {
     int num_devices = 0;
     urma_context_t* context = nullptr;
@@ -484,25 +513,31 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        for (int p = 0; p < MAX_PORT_CNT; p++) {
-            auto port_attr = dev_attr_.port_attr[p];
-            if (port_attr.state == URMA_PORT_ACTIVE ||
-                port_attr.state == URMA_PORT_ACTIVE_DEFER) {
-                port_ = p;
-                break;
+        if (port < 0 || port >= MAX_PORT_CNT){
+            for (int p = 0; p < MAX_PORT_CNT; p++) {
+                auto port_attr = dev_attr_.port_attr[p];
+                if (port_attr.state == URMA_PORT_ACTIVE ||
+                    port_attr.state == URMA_PORT_ACTIVE_DEFER) {
+                    port_ = p;
+                    break;
+                }
             }
-        }
-        if (dev_attr_.port_cnt != 0 &&
-            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE &&
-            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER) {
+            if (dev_attr_.port_cnt != 0 &&
+                dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE &&
+                dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER) {
+                LOG(WARNING) << "Device " << device_name
+                            << " not found active port";
+                if (urma_delete_context(context)) {
+                    PLOG(ERROR)
+                        << "urma_delete_context(" << device_name << ") failed";
+                }
+                urma_free_device_list(devices);
+                return ERR_CONTEXT;
+            }
+        } else {
             LOG(WARNING) << "Device " << device_name
-                         << " not found active port";
-            if (urma_delete_context(context)) {
-                PLOG(ERROR)
-                    << "urma_delete_context(" << device_name << ") failed";
-            }
-            urma_free_device_list(devices);
-            return ERR_CONTEXT;
+                            << " manually specified port: " << static_cast<int>(port);
+            port_ = static_cast<uint8_t>(port);
         }
 
         updateUrmaGlobalConfig(dev_attr_);

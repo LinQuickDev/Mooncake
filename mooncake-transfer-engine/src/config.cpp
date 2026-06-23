@@ -459,6 +459,26 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_URMA_TRANS_MODE, it should be RM|RC|UM";
     }
 
+    const char* urma_active_port_env = std::getenv("MC_URMA_ACTIVE_PORT");
+    if (urma_active_port_env && *urma_active_port_env) {
+        try {
+            int val = std::stoi(urma_active_port_env);
+            if (val >= 0) {
+                config.urma_active_port = val;
+                LOG(INFO) << "MC_URMA_ACTIVE_PORT is " << val;
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable "
+                       "MC_URMA_ACTIVE_PORT, it should be >= 0; "
+                       "using auto-selection (scan active ports)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to parse MC_URMA_ACTIVE_PORT='"
+                         << urma_active_port_env << "': " << e.what()
+                         << "; using auto-selection (scan active ports)";
+        }
+    }
+
     const char* urma_bonding_multipath_enable =
         std::getenv("MC_URMA_BONDING_MULTIPATH_ENABLE");
     if (urma_bonding_multipath_enable && *urma_bonding_multipath_enable) {

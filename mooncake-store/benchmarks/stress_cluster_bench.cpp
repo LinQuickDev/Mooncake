@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <cstdlib>
 
@@ -158,12 +159,14 @@ static std::vector<std::string> DiscoverSegmentsFromMaster(
     std::string body = response.substr(header_end + 4);
     std::istringstream iss(body);
     std::string line;
+    // Use an unordered_set to track already-seen segments and avoid duplicates
+    std::unordered_set<std::string> seen;
     while (std::getline(iss, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
                                  line.back() == ' ' || line.back() == '\t')) {
             line.pop_back();
         }
-        if (!line.empty()) {
+        if (!line.empty() && seen.insert(line).second) {
             segments.push_back(line);
         }
     }
@@ -230,9 +233,10 @@ inline double NanosToMs(int64_t ns) {
 inline double NanosToSec(int64_t ns) { return static_cast<double>(ns) / 1e9; }
 
 struct ThreadResult {
-    std::vector<int64_t> latencies_ns;
+    std::vector<int64_t> latencies_ns;  // per-query latency
     size_t total_bytes = 0;
-    size_t total_ops = 0;
+    size_t total_keys = 0;     // number of keys processed
+    size_t total_queries = 0;  // number of API calls (get_into / batch_get_into)
     size_t failed_ops = 0;
 };
 
@@ -255,7 +259,8 @@ class BenchmarkStats {
     void Finalize() {
         merged_latencies_ns_.clear();
         total_bytes_ = 0;
-        total_ops_ = 0;
+        total_keys_ = 0;
+        total_queries_ = 0;
         total_failed_ = 0;
 
         for (auto& tr : thread_results_) {
@@ -263,7 +268,8 @@ class BenchmarkStats {
                                         tr.latencies_ns.begin(),
                                         tr.latencies_ns.end());
             total_bytes_ += tr.total_bytes;
-            total_ops_ += tr.total_ops;
+            total_keys_ += tr.total_keys;
+            total_queries_ += tr.total_queries;
             total_failed_ += tr.failed_ops;
         }
         std::sort(merged_latencies_ns_.begin(), merged_latencies_ns_.end());
@@ -283,10 +289,10 @@ class BenchmarkStats {
 
     double MeanLatencyUs() const {
         if (merged_latencies_ns_.empty()) return 0.0;
-        int64_t sum = std::accumulate(merged_latencies_ns_.begin(),
-                                      merged_latencies_ns_.end(), int64_t(0));
-        return NanosToUs(sum /
-                         static_cast<int64_t>(merged_latencies_ns_.size()));
+        double sum = static_cast<double>(std::accumulate(
+            merged_latencies_ns_.begin(), merged_latencies_ns_.end(),
+            int64_t(0)));
+        return NanosToUs(sum / static_cast<double>(merged_latencies_ns_.size()));
     }
 
     double ThroughputMBps() const {
@@ -294,9 +300,14 @@ class BenchmarkStats {
         return (wall > 0) ? (static_cast<double>(total_bytes_) / MB) / wall : 0;
     }
 
-    double OpsPerSec() const {
+    double KeysPerSec() const {
         double wall = WallSeconds();
-        return (wall > 0) ? static_cast<double>(total_ops_) / wall : 0;
+        return (wall > 0) ? static_cast<double>(total_keys_) / wall : 0;
+    }
+
+    double QueriesPerSec() const {
+        double wall = WallSeconds();
+        return (wall > 0) ? static_cast<double>(total_queries_) / wall : 0;
     }
 
     void Print(const std::string& title) const {
@@ -310,8 +321,9 @@ class BenchmarkStats {
 
         double wall = WallSeconds();
         std::cout << "  Wall time:        " << wall << " s\n";
-        std::cout << "  Total ops:        " << total_ops_
+        std::cout << "  Total queries:    " << total_queries_
                   << " (failed: " << total_failed_ << ")\n";
+        std::cout << "  Total keys:       " << total_keys_ << "\n";
         std::cout << "  Total data:       " << FormatBytes(total_bytes_)
                   << "\n";
         std::cout << "  Throughput:       " << ThroughputMBps() << " MB/s";
@@ -319,14 +331,15 @@ class BenchmarkStats {
             std::cout << " (" << ThroughputMBps() / 1024 << " GB/s)";
         }
         std::cout << "\n";
-        std::cout << "  Ops/sec:          " << OpsPerSec() << "\n";
+        std::cout << "  Keys/sec:         " << KeysPerSec() << "\n";
+        std::cout << "  Queries/sec:      " << QueriesPerSec() << "\n";
 
         if (!merged_latencies_ns_.empty()) {
             size_t n = merged_latencies_ns_.size();
-            std::cout << "\n  Latency (us)      [n=" << n << "]\n";
+            std::cout << "\n  Latency (us)      [n=" << n << ", per-query]\n";
             std::cout << "    Min:   " << std::setw(12)
                       << NanosToUs(merged_latencies_ns_.front()) << "\n";
-            std::cout << "    Mean:  " << std::setw(12) << MeanLatencyUs()
+            std::cout << "    Avg:   " << std::setw(12) << MeanLatencyUs()
                       << "\n";
             std::cout << "    P50:   " << std::setw(12) << PercentileUs(50)
                       << "\n";
@@ -346,14 +359,16 @@ class BenchmarkStats {
     }
 
     size_t total_bytes() const { return total_bytes_; }
-    size_t total_ops() const { return total_ops_; }
+    size_t total_keys() const { return total_keys_; }
+    size_t total_queries() const { return total_queries_; }
     size_t total_failed() const { return total_failed_; }
 
    private:
     std::vector<ThreadResult> thread_results_;
     std::vector<int64_t> merged_latencies_ns_;
     size_t total_bytes_ = 0;
-    size_t total_ops_ = 0;
+    size_t total_keys_ = 0;
+    size_t total_queries_ = 0;
     size_t total_failed_ = 0;
     size_t expected_per_thread_ = 0;
     Clock::time_point start_;
@@ -797,8 +812,8 @@ class StressBenchmark {
         if (buf_ret != 0) return buf_ret;
 
         std::vector<std::string> all_keys;
-        for (size_t s = 0; s < read_segments.size(); ++s) {
-            for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < read_segments.size(); ++s) {
                 all_keys.push_back(MakeSegmentKey(read_segments[s], i));
             }
         }
@@ -863,11 +878,15 @@ class StressBenchmark {
         std::vector<int64_t> latencies_ns;
         int64_t min_latency_ns = std::numeric_limits<int64_t>::max();
         int64_t max_latency_ns = 0;
+        double p50_latency_ns = 0;
+        double p90_latency_ns = 0;
         double p99_latency_ns = 0;
         double p999_latency_ns = 0;
         double p9999_latency_ns = 0;
         double avg_latency_ns = 0;
         double throughput_mbps = 0;
+        double keys_per_sec = 0;
+        double queries_per_sec = 0;
 
         void Finalize() {
             if (latencies_ns.empty()) return;
@@ -878,6 +897,13 @@ class StressBenchmark {
             avg_latency_ns =
                 std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) /
                 n;
+            auto percentile = [&](double p) -> double {
+                if (n == 0) return 0;
+                size_t idx = static_cast<size_t>(p / 100.0 * (n - 1));
+                return static_cast<double>(latencies_ns[idx]);
+            };
+            p50_latency_ns = percentile(50);
+            p90_latency_ns = percentile(90);
             if (n >= 100) {
                 p99_latency_ns = latencies_ns[static_cast<size_t>(n * 0.99)];
             }
@@ -893,15 +919,28 @@ class StressBenchmark {
         void Aggregate(const IntervalLatencyStats& other) {
             min_latency_ns = std::min(min_latency_ns, other.min_latency_ns);
             max_latency_ns = std::max(max_latency_ns, other.max_latency_ns);
+            p50_latency_ns = std::max(p50_latency_ns, other.p50_latency_ns);
+            p90_latency_ns = std::max(p90_latency_ns, other.p90_latency_ns);
             p99_latency_ns = std::max(p99_latency_ns, other.p99_latency_ns);
             p999_latency_ns = std::max(p999_latency_ns, other.p999_latency_ns);
             p9999_latency_ns =
                 std::max(p9999_latency_ns, other.p9999_latency_ns);
             throughput_mbps += other.throughput_mbps;
+            keys_per_sec += other.keys_per_sec;
+            queries_per_sec += other.queries_per_sec;
+            // Weighted average: accumulate sum and count
+            total_latency_sum_ns +=
+                other.avg_latency_ns *
+                static_cast<double>(other.latencies_ns.size());
             total_samples += other.latencies_ns.size();
+            if (total_samples > 0) {
+                avg_latency_ns =
+                    total_latency_sum_ns / static_cast<double>(total_samples);
+            }
         }
 
         size_t total_samples = 0;
+        double total_latency_sum_ns = 0;
     };
 
     int RunSegmentReadDuration(const std::vector<std::string>& read_segments,
@@ -911,7 +950,8 @@ class StressBenchmark {
                   << FLAGS_statis_interval << "s";
 
         std::atomic<bool> stop_flag{false};
-        std::atomic<size_t> global_ops{0};
+        std::atomic<size_t> global_keys{0};
+        std::atomic<size_t> global_queries{0};
         std::atomic<size_t> global_bytes{0};
         std::atomic<size_t> global_failed{0};
 
@@ -957,7 +997,8 @@ class StressBenchmark {
                             global_bytes.fetch_add(static_cast<size_t>(ret),
                                                    std::memory_order_relaxed);
                         }
-                        global_ops.fetch_add(1, std::memory_order_relaxed);
+                        global_keys.fetch_add(1, std::memory_order_relaxed);
+                        global_queries.fetch_add(1, std::memory_order_relaxed);
                         ++key_idx;
                     }
                 } else {
@@ -988,10 +1029,7 @@ class StressBenchmark {
                         {
                             std::lock_guard<std::mutex> lock(
                                 latency_mutexes[t]);
-                            for (size_t k = 0; k < results.size(); ++k) {
-                                thread_latencies[t].push_back(latency_ns /
-                                                              FLAGS_batch_size);
-                            }
+                            thread_latencies[t].push_back(latency_ns);
                         }
 
                         for (size_t k = 0; k < results.size(); ++k) {
@@ -1003,8 +1041,9 @@ class StressBenchmark {
                                     static_cast<size_t>(results[k]),
                                     std::memory_order_relaxed);
                             }
-                            global_ops.fetch_add(1, std::memory_order_relaxed);
+                            global_keys.fetch_add(1, std::memory_order_relaxed);
                         }
+                        global_queries.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             });
@@ -1015,7 +1054,8 @@ class StressBenchmark {
         auto next_statis =
             bench_start + std::chrono::seconds(FLAGS_statis_interval);
 
-        size_t prev_ops = 0;
+        size_t prev_keys = 0;
+        size_t prev_queries = 0;
         size_t prev_bytes = 0;
         size_t prev_failed = 0;
         auto prev_time = bench_start;
@@ -1034,13 +1074,16 @@ class StressBenchmark {
         while (Clock::now() < bench_end) {
             auto now = Clock::now();
             if (now >= next_statis) {
-                size_t cur_ops = global_ops.load(std::memory_order_relaxed);
+                size_t cur_keys = global_keys.load(std::memory_order_relaxed);
+                size_t cur_queries =
+                    global_queries.load(std::memory_order_relaxed);
                 size_t cur_bytes = global_bytes.load(std::memory_order_relaxed);
                 size_t cur_failed =
                     global_failed.load(std::memory_order_relaxed);
 
                 double interval_sec = NanosToSec(ElapsedNanos(prev_time, now));
-                size_t interval_ops = cur_ops - prev_ops;
+                size_t interval_keys = cur_keys - prev_keys;
+                size_t interval_queries = cur_queries - prev_queries;
                 size_t interval_bytes = cur_bytes - prev_bytes;
                 size_t interval_failed = cur_failed - prev_failed;
 
@@ -1049,13 +1092,19 @@ class StressBenchmark {
                         ? (static_cast<double>(interval_bytes) / MB) /
                               interval_sec
                         : 0;
-                double interval_ops_per_sec =
+                double interval_keys_per_sec =
                     (interval_sec > 0)
-                        ? static_cast<double>(interval_ops) / interval_sec
+                        ? static_cast<double>(interval_keys) / interval_sec
+                        : 0;
+                double interval_queries_per_sec =
+                    (interval_sec > 0)
+                        ? static_cast<double>(interval_queries) / interval_sec
                         : 0;
 
                 IntervalLatencyStats interval_stats;
                 interval_stats.throughput_mbps = interval_throughput_mbps;
+                interval_stats.keys_per_sec = interval_keys_per_sec;
+                interval_stats.queries_per_sec = interval_queries_per_sec;
                 for (size_t t = 0; t < FLAGS_num_threads; ++t) {
                     std::lock_guard<std::mutex> lock(latency_mutexes[t]);
                     interval_stats.latencies_ns.insert(
@@ -1071,28 +1120,34 @@ class StressBenchmark {
                     (total_sec > 0)
                         ? (static_cast<double>(cur_bytes) / MB) / total_sec
                         : 0;
-                double total_ops_per_sec =
-                    (total_sec > 0) ? static_cast<double>(cur_ops) / total_sec
+                double total_keys_per_sec =
+                    (total_sec > 0) ? static_cast<double>(cur_keys) / total_sec
                                     : 0;
+                double total_queries_per_sec =
+                    (total_sec > 0)
+                        ? static_cast<double>(cur_queries) / total_sec
+                        : 0;
 
                 std::cout << "  [t=" << std::setw(6) << total_sec << "s]"
                           << "  interval: " << interval_throughput_mbps
-                          << " MB/s, " << interval_ops_per_sec << " ops/s"
+                          << " MB/s, " << interval_keys_per_sec << " keys/s, "
+                          << interval_queries_per_sec << " qps"
                           << " (failed=" << interval_failed << ")"
-                          << "  lat[us]: min="
-                          << NanosToUs(interval_stats.min_latency_ns)
-                          << ", max="
-                          << NanosToUs(interval_stats.max_latency_ns)
-                          << ", avg="
+                          << "  lat[us]: avg="
                           << NanosToUs(interval_stats.avg_latency_ns)
+                          << ", P50=" << NanosToUs(interval_stats.p50_latency_ns)
+                          << ", P90=" << NanosToUs(interval_stats.p90_latency_ns)
                           << ", P99="
                           << NanosToUs(interval_stats.p99_latency_ns)
-                          << "  total: " << cur_ops << " ops, "
+                          << "  total: " << cur_queries << " queries, "
+                          << cur_keys << " keys, "
                           << total_throughput_mbps << " MB/s, "
-                          << total_ops_per_sec << " ops/s"
+                          << total_keys_per_sec << " keys/s, "
+                          << total_queries_per_sec << " qps"
                           << " (failed=" << cur_failed << ")\n";
 
-                prev_ops = cur_ops;
+                prev_keys = cur_keys;
+                prev_queries = cur_queries;
                 prev_bytes = cur_bytes;
                 prev_failed = cur_failed;
                 prev_time = now;
@@ -1108,7 +1163,8 @@ class StressBenchmark {
 
         auto final_time = Clock::now();
         double total_sec = NanosToSec(ElapsedNanos(bench_start, final_time));
-        size_t final_ops = global_ops.load(std::memory_order_relaxed);
+        size_t final_keys = global_keys.load(std::memory_order_relaxed);
+        size_t final_queries = global_queries.load(std::memory_order_relaxed);
         size_t final_bytes = global_bytes.load(std::memory_order_relaxed);
         size_t final_failed = global_failed.load(std::memory_order_relaxed);
 
@@ -1116,8 +1172,11 @@ class StressBenchmark {
             (total_sec > 0)
                 ? (static_cast<double>(final_bytes) / MB) / total_sec
                 : 0;
-        double final_ops_per_sec =
-            (total_sec > 0) ? static_cast<double>(final_ops) / total_sec : 0;
+        double final_keys_per_sec =
+            (total_sec > 0) ? static_cast<double>(final_keys) / total_sec : 0;
+        double final_queries_per_sec =
+            (total_sec > 0) ? static_cast<double>(final_queries) / total_sec
+                            : 0;
 
         IntervalLatencyStats overall;
         for (const auto& stats : interval_stats_list) {
@@ -1131,8 +1190,9 @@ class StressBenchmark {
 
         std::cout << "\n  FINAL SUMMARY\n";
         std::cout << "  Total time:       " << total_sec << " s\n";
-        std::cout << "  Total ops:        " << final_ops
+        std::cout << "  Total queries:    " << final_queries
                   << " (failed: " << final_failed << ")\n";
+        std::cout << "  Total keys:       " << final_keys << "\n";
         std::cout << "  Total data:       " << FormatBytes(final_bytes) << "\n";
         std::cout << "  Throughput:       " << final_throughput_mbps
                   << " MB/s (avg: " << avg_throughput_mbps << " MB/s)";
@@ -1140,15 +1200,20 @@ class StressBenchmark {
             std::cout << " (" << final_throughput_mbps / 1024 << " GB/s)";
         }
         std::cout << "\n";
-        std::cout << "  Ops/sec:          " << final_ops_per_sec << "\n";
+        std::cout << "  Keys/sec:         " << final_keys_per_sec << "\n";
+        std::cout << "  Queries/sec:      " << final_queries_per_sec << "\n";
 
         if (total_latency_samples > 0) {
             std::cout << "\n  Latency (us)      [n=" << total_latency_samples
-                      << "]\n";
+                      << ", per-query]\n";
             std::cout << "    Min:   " << std::setw(12)
                       << NanosToUs(overall.min_latency_ns) << "\n";
-            std::cout << "    Max:   " << std::setw(12)
-                      << NanosToUs(overall.max_latency_ns) << "\n";
+            std::cout << "    Avg:   " << std::setw(12)
+                      << NanosToUs(overall.avg_latency_ns) << "\n";
+            std::cout << "    P50:   " << std::setw(12)
+                      << NanosToUs(overall.p50_latency_ns) << "\n";
+            std::cout << "    P90:   " << std::setw(12)
+                      << NanosToUs(overall.p90_latency_ns) << "\n";
             std::cout << "    P99:   " << std::setw(12)
                       << NanosToUs(overall.p99_latency_ns);
             if (total_latency_samples < 100) std::cout << "  (n<100)";
@@ -1161,6 +1226,8 @@ class StressBenchmark {
                       << NanosToUs(overall.p9999_latency_ns);
             if (total_latency_samples < 10000) std::cout << "  (n<10000)";
             std::cout << "\n";
+            std::cout << "    Max:   " << std::setw(12)
+                      << NanosToUs(overall.max_latency_ns) << "\n";
         }
 
         std::cout << "========================================"
@@ -1294,7 +1361,8 @@ class StressBenchmark {
 
         start_latch.arrive_and_wait();
 
-        size_t ops = 0;
+        size_t keys = 0;
+        size_t queries = 0;
         size_t failed = 0;
         size_t bytes = 0;
 
@@ -1317,29 +1385,30 @@ class StressBenchmark {
                     bytes += static_cast<size_t>(ret);
                 }
                 result.latencies_ns.push_back(lat_ns);
-                ++ops;
+                ++keys;
+                ++queries;
             }
         } else {
             size_t per_key_buf = FLAGS_value_size;
             size_t i = 0;
             while (i < my_keys) {
-                std::vector<std::string> keys;
+                std::vector<std::string> key_list;
                 std::vector<void*> bufs;
                 std::vector<size_t> sizes;
                 size_t batch_end = std::min(i + FLAGS_batch_size, my_keys);
-                keys.reserve(batch_end - i);
+                key_list.reserve(batch_end - i);
                 bufs.reserve(batch_end - i);
                 sizes.reserve(batch_end - i);
 
                 for (size_t j = i; j < batch_end; ++j) {
                     size_t key_idx = key_offset + j;
-                    keys.push_back(key_func(key_idx));
+                    key_list.push_back(key_func(key_idx));
                     bufs.push_back(my_buf + (j - i) * per_key_buf);
                     sizes.push_back(FLAGS_value_size);
                 }
 
                 auto t0 = Clock::now();
-                auto results = client_->batch_get_into(keys, bufs, sizes);
+                auto results = client_->batch_get_into(key_list, bufs, sizes);
                 auto t1 = Clock::now();
 
                 int64_t lat_ns = ElapsedNanos(t0, t1);
@@ -1351,15 +1420,17 @@ class StressBenchmark {
                     } else {
                         bytes += static_cast<size_t>(results[k]);
                     }
-                    ++ops;
+                    ++keys;
                 }
+                ++queries;
 
                 i = batch_end;
             }
         }
 
         result.total_bytes = bytes;
-        result.total_ops = ops;
+        result.total_keys = keys;
+        result.total_queries = queries;
         result.failed_ops = failed;
 
         done_latch.arrive_and_wait();

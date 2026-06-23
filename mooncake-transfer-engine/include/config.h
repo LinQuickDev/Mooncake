@@ -95,6 +95,10 @@ struct GlobalConfig {
     // urma transport mode: "RM" (default), "RC", "UM"; override via
     // MC_URMA_TRANS_MODE
     std::string urma_trans_mode = "RM";
+    // urma active port: -1 (default) for auto-selection by scanning port
+    // attributes, >=0 for user-specified port index; override via
+    // MC_URMA_ACTIVE_PORT
+    int urma_active_port = -1;
     // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via
     // MC_URMA_BONDING_BALANCE
     bool urma_bonding_balance = false;
