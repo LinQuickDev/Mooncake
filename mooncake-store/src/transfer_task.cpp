@@ -1114,6 +1114,46 @@ TransferSubmitter::submit_batch_get_offload_object(
     return submitTransfer(requests);
 }
 
+std::optional<TransferFuture>
+TransferSubmitter::submit_batch_push_offload_object(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    if (keys.size() != src_pointers.size() ||
+        keys.size() != dst_slices.size()) {
+        MC_LOG(ERROR) << "submit_batch_push_offload_object size mismatch: keys="
+                      << keys.size() << ", src_pointers=" << src_pointers.size()
+                      << ", dst_slices=" << dst_slices.size();
+        return std::nullopt;
+    }
+    std::vector<TransferRequest> requests;
+    // Open the requester's segment once — all keys share requester_te_addr.
+    SegmentHandle seg = engine_.openSegment(requester_te_addr);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        MC_LOG(ERROR) << "Failed to open segment " << requester_te_addr;
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        // src is the owner's local ClientBuffer blob for this key (contiguous,
+        // registered via FileStorage::RegisterLocalMemory). It is split across
+        // the requester's possibly non-contiguous destination slices.
+        const uint64_t src = src_pointers[i];
+        uint64_t offset = 0;
+        for (const auto& dst : dst_slices[i]) {
+            TransferRequest request;
+            request.opcode = TransferRequest::WRITE;
+            request.source = reinterpret_cast<char*>(src + offset);
+            request.target_id = seg;
+            request.target_offset = dst.addr;
+            request.length = dst.size;
+            requests.emplace_back(request);
+            offset += dst.size;
+        }
+    }
+    return submitTransfer(requests);
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {

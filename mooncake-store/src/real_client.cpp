@@ -928,6 +928,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object_push>(this);
+        offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
@@ -6235,6 +6237,65 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
+async_simple::coro::Lazy<
+    tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+RealClient::batch_get_offload_object_push(
+    const BatchGetOffloadObjectPushRequest &req) {
+    if (!file_storage_) {
+        LOG(ERROR)
+            << "batch_get_offload_object_push called but file_storage_ is null";
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (req.keys.size() != req.sizes.size() ||
+        req.keys.size() != req.dst_slices.size()) {
+        LOG(ERROR) << "batch_get_offload_object_push size mismatch: keys="
+                   << req.keys.size() << ", sizes=" << req.sizes.size()
+                   << ", dst_slices=" << req.dst_slices.size();
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Do the SSD read, the one-sided WRITE and the buffer release on the
+    // dedicated thread pool so the coro_rpc IO thread stays free. Same
+    // heap-owned state pattern as batch_get_offload_object: the lambda captures
+    // only a raw pointer.
+    struct CallState {
+        BatchGetOffloadObjectPushRequest req;
+        std::shared_ptr<FileStorage> file_storage;
+        Client *client;
+    };
+    auto state = std::make_unique<CallState>();
+    state->req = req;
+    state->file_storage = file_storage_;
+    state->client = client_.get();
+    auto *s = state.get();
+    auto try_result =
+        co_await coro_io::post([s]() -> tl::expected<void, ErrorCode> {
+            // Stage the on-disk blobs into the local ClientBuffer.
+            auto result = s->file_storage->BatchGet(s->req.keys, s->req.sizes);
+            if (!result) {
+                LOG(ERROR) << "Push offload BatchGet failed, err_code = "
+                           << result.error();
+                return tl::make_unexpected(result.error());
+            }
+            const uint64_t batch_id = result.value().batch_id;
+            // WRITE the staged blobs straight into the requester's memory.
+            auto write_result = s->client->BatchPushOffloadObject(
+                s->req.requester_te_addr, s->req.keys, result.value().pointers,
+                s->req.dst_slices);
+            // The WRITE has completed (BatchPushOffloadObject blocks on the
+            // transfer future), so the ClientBuffer can be reclaimed
+            // immediately instead of waiting for the GC lease.
+            s->file_storage->ReleaseBuffer(batch_id);
+            return write_result;
+        });
+    auto pushed = try_result.value();
+    if (!pushed) {
+        LOG(ERROR) << "Push offload transfer failed, err_code = "
+                   << pushed.error();
+        co_return tl::make_unexpected(pushed.error());
+    }
+    co_return BatchGetOffloadObjectPushResponse(ErrorCode::OK);
+}
+
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
     if (!file_storage_) {
         LOG(WARNING)
@@ -6253,14 +6314,69 @@ RealClient::batch_get_into_offload_object_internal(
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
+    // Per-key destination slices, kept in lockstep with storage_keys so the
+    // push path can hand the owner positionally-aligned (key, dst) pairs.
+    std::vector<std::vector<OffloadDstSlice>> dst_slices;
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
         storage_keys.emplace_back(
             MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
         int64_t total = 0;
-        for (const auto &s : object_it.second) total += s.size;
+        std::vector<OffloadDstSlice> key_dst;
+        key_dst.reserve(object_it.second.size());
+        for (const auto &s : object_it.second) {
+            total += s.size;
+            key_dst.emplace_back(reinterpret_cast<uint64_t>(s.ptr), s.size);
+        }
         sizes.emplace_back(total);
+        dst_slices.emplace_back(std::move(key_dst));
     }
+
+    // Push mode (MC_OFFLOAD_PUSH=true): the owner WRITEs the SSD data straight
+    // into our destination slices, so a single RPC replaces the pull path's
+    // get-pointers + READ + release_offload_buffer sequence. Falls back to the
+    // pull path otherwise (and for transports without one-sided WRITE).
+    static const bool kOffloadPush = []() {
+        const char *v = std::getenv("MC_OFFLOAD_PUSH");
+        return v && (std::string_view(v) == "true" ||
+                     std::string_view(v) == "1");
+    }();
+    if (kOffloadPush) {
+        BatchGetOffloadObjectPushRequest push_req;
+        push_req.keys = storage_keys;
+        push_req.sizes = sizes;
+        push_req.requester_te_addr = client_->GetSegmentEndpoint();
+        push_req.dst_slices = std::move(dst_slices);
+
+        UbDiag::PerfPoint pt_push(PerfKey::GET_SSD_OFFLOAD_RPC,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_push.Start();
+        auto pushResp = client_requester_->batch_get_offload_object_push(
+            target_rpc_service_addr, push_req);
+        pt_push.End(pushResp ? 0 : -1);
+        if (!pushResp) {
+            LOG(ERROR) << "Push offload failed with error: "
+                       << pushResp.error();
+            return tl::make_unexpected(pushResp.error());
+        }
+        if (pushResp->error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Push offload owner-side error: "
+                       << pushResp->error_code;
+            return tl::make_unexpected(pushResp->error_code);
+        }
+        auto end_time = std::chrono::steady_clock::now();
+        auto elapsed_time = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
+                                                                  start_time)
+                .count());
+        LOG(INFO) << "Time taken for batch_get_into_offload_object_internal "
+                     "(push): "
+                  << elapsed_time << "ms, with target_rpc_service_addr: "
+                  << target_rpc_service_addr
+                  << ", key size: " << objects.size();
+        return {};
+    }
+
     UbDiag::PerfPoint pt_rpc(PerfKey::GET_SSD_OFFLOAD_RPC,
                              UbDiag::PerfLevel::MODULE);
     pt_rpc.Start();
@@ -6350,6 +6466,21 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
     if (!result) {
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
+            << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
+tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
+ClientRequester::batch_get_offload_object_push(
+    const std::string &client_addr,
+    const BatchGetOffloadObjectPushRequest &req) {
+    auto result = invoke_rpc<&RealClient::batch_get_offload_object_push,
+                             BatchGetOffloadObjectPushResponse>(client_addr,
+                                                                req);
+    if (!result) {
+        LOG(ERROR)
+            << "Failed to invoke batch_get_offload_object_push, client_addr = "
             << client_addr << ", error is: " << result.error();
     }
     return result;

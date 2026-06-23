@@ -154,6 +154,18 @@ class ClientRequester {
                              const std::vector<int64_t> &sizes);
 
     /**
+     * @brief Push-mode offload: invoke the owner's push handler, which WRITEs
+     * the data straight into our destination slices. A single RPC replaces the
+     * pull path's get-pointers + READ + release_offload_buffer sequence.
+     * @param client_addr Network address of the remote FileStorage owner.
+     * @param req keys/sizes plus our TE endpoint and destination slices.
+     */
+    tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
+    batch_get_offload_object_push(
+        const std::string &client_addr,
+        const BatchGetOffloadObjectPushRequest &req);
+
+    /**
      * @brief Notifies remote FileStorage to release buffer after transfer
      * completion. This is a fire-and-forget call - errors are logged but not
      * propagated.

@@ -683,6 +683,20 @@ class RealClient : public PyClient {
                              const std::vector<int64_t> &sizes);
 
     /**
+     * @brief Push-mode offload handler, run on the data owner. Reads the
+     * requested keys from SSD into the local ClientBuffer, WRITEs them
+     * directly into the requester's destination slices over the transfer
+     * engine, then releases the ClientBuffer locally. The requester therefore
+     * needs no follow-up READ nor a separate release_offload_buffer RPC.
+     * @param req keys/sizes plus the requester's TE endpoint and dst slices.
+     * @return per-batch result; data already landed in requester memory.
+     */
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+    batch_get_offload_object_push(
+        const BatchGetOffloadObjectPushRequest &req);
+
+    /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
      * @param batch_id The unique identifier of the batch to release

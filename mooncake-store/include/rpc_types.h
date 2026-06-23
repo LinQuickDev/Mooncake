@@ -273,4 +273,42 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// One destination slice on the requester side. In push mode the data owner
+// writes (one-sided) the on-disk blob of a key directly into these addresses.
+struct OffloadDstSlice {
+    uint64_t addr;
+    uint64_t size;
+
+    OffloadDstSlice() : addr(0), size(0) {}
+    OffloadDstSlice(uint64_t addr_param, uint64_t size_param)
+        : addr(addr_param), size(size_param) {}
+};
+YLT_REFL(OffloadDstSlice, addr, size);
+
+// Push-mode offload request. Unlike the pull path (where the requester gets
+// back ClientBuffer pointers and issues the RDMA READ itself), here the
+// requester hands the owner its own transfer engine endpoint and destination
+// slice addresses. The owner reads SSD into its registered ClientBuffer and
+// then WRITEs straight into the requester's memory, so the requester needs no
+// follow-up READ nor a separate release_offload_buffer RPC.
+struct BatchGetOffloadObjectPushRequest {
+    std::vector<std::string> keys;  // tenant-scoped storage keys
+    std::vector<int64_t> sizes;     // total bytes per key (for FileStorage)
+    std::string requester_te_addr;  // requester's transfer engine endpoint
+    std::vector<std::vector<OffloadDstSlice>> dst_slices;  // per-key dst slices
+
+    BatchGetOffloadObjectPushRequest() = default;
+};
+YLT_REFL(BatchGetOffloadObjectPushRequest, keys, sizes, requester_te_addr,
+         dst_slices);
+
+struct BatchGetOffloadObjectPushResponse {
+    ErrorCode error_code;  // overall result; data is already in requester memory
+
+    BatchGetOffloadObjectPushResponse() : error_code(ErrorCode::OK) {}
+    explicit BatchGetOffloadObjectPushResponse(ErrorCode error_code_param)
+        : error_code(error_code_param) {}
+};
+YLT_REFL(BatchGetOffloadObjectPushResponse, error_code);
+
 }  // namespace mooncake

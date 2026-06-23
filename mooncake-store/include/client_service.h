@@ -498,6 +498,21 @@ class Client {
             batch_slices);
 
     /**
+     * @brief Push counterpart of BatchGetOffloadObject, run on the data owner.
+     * WRITEs each key's staged ClientBuffer blob (src_pointers[i]) directly
+     * into the requester's destination slices over the transfer engine.
+     * @param requester_te_addr The requester's Transfer Engine endpoint.
+     * @param keys List of keys (one per src pointer / dst slice group).
+     * @param src_pointers Owner-local ClientBuffer addresses, one per key.
+     * @param dst_slices Per-key destination slices on the requester.
+     */
+    tl::expected<void, ErrorCode> BatchPushOffloadObject(
+        const std::string& requester_te_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& src_pointers,
+        const std::vector<std::vector<OffloadDstSlice>>& dst_slices);
+
+    /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
      * @param keys         A list of object keys (names) that were successfully
