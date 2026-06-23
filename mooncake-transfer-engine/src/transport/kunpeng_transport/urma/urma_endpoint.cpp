@@ -50,15 +50,17 @@ static const char* transModeToString(urma_transport_mode_t mode) {
 
 static const char* bondingModeToString(int mode) {
     switch (mode) {
-        case BONDP_BONDING_MODE_BALANCE: return "BALANCE";
-        default:                         return "UNKNOWN";
+        case BONDP_BONDING_MODE_STANDALONE: return "STANDALONE";
+        case BONDP_BONDING_MODE_BALANCE:    return "BALANCE";
+        default:                            return "UNKNOWN";
     }
 }
 
 static const char* bondingLevelToString(int level) {
     switch (level) {
-        case BONDP_BONDING_LEVEL_PORT: return "PORT";
-        default:                       return "UNKNOWN";
+        case BONDP_BONDING_LEVEL_PORT:  return "PORT";
+        case BONDP_BONDING_LEVEL_IODIE: return "IODIE";
+        default:                        return "UNKNOWN";
     }
 }
 static int isNullEid(urma_eid_t* eid) {
@@ -482,17 +484,18 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             return ERR_CONTEXT;
         }
         if (multipath()) {
-            LOG(INFO) << "Try change binding mode balance";
-            bondp_set_bonding_mode_in_t mode{ .bonding_mode = BONDP_BONDING_MODE_BALANCE,
-                                              .bonding_level = BONDP_BONDING_LEVEL_PORT };
-            urma_user_ctl_in_t in{ .addr = reinterpret_cast<uint64_t>(&mode),
-                                   .len = sizeof(mode),
-                                   .opcode = BONDP_USER_CTL_SET_BONDING_MODE };
+            // multipath on: BALANCE mode at IODIE level (chip-aware bonding).
+            bondp_set_bonding_mode_in_t mode{
+                .bonding_mode = BONDP_BONDING_MODE_BALANCE,
+                .bonding_level = BONDP_BONDING_LEVEL_IODIE};
+            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
+                                  .len = sizeof(mode),
+                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
             urma_user_ctl_out_t out;
             memset(&out, 0, sizeof(out));
             auto ret = urma_user_ctl(context, &in, &out);
             if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding balance mode, ret = "
+                LOG(ERROR) << "Failed to set bonding BALANCE/IODIE mode, ret = "
                            << ret;
                 return ERR_CONTEXT;
             }
@@ -501,7 +504,26 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);
         } else {
-            LOG(INFO) << "[multipath OFF] skip bonding mode on " << device_name;
+            // multipath off: explicitly set the bondp default (STANDALONE/PORT)
+            // instead of leaving it implicit.
+            bondp_set_bonding_mode_in_t mode{
+                .bonding_mode = BONDP_BONDING_MODE_STANDALONE,
+                .bonding_level = BONDP_BONDING_LEVEL_PORT};
+            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
+                                  .len = sizeof(mode),
+                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
+            urma_user_ctl_out_t out;
+            memset(&out, 0, sizeof(out));
+            auto ret = urma_user_ctl(context, &in, &out);
+            if (ret != URMA_SUCCESS) {
+                LOG(ERROR) << "Failed to set bonding STANDALONE/PORT mode, ret = "
+                           << ret;
+                return ERR_CONTEXT;
+            }
+            LOG(INFO) << "[multipath OFF] bonding mode set on " << device_name
+                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
+                      << " bonding_level="
+                      << bondingLevelToString(mode.bonding_level);
         }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
@@ -1148,7 +1170,10 @@ int UrmaEndpoint::submitPostSend(
             fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
             wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
             wr_list[i].src_chip_id = slice_list[i]->ub.src_chip_id;   // 本地 chip，不随 opcode 换
-            wr_list[i].dst_chip_id = slice_list[i]->ub.dst_chip_id;   // 远端 chip
+            // 强制 dst_chip == src_chip：本机两端 chip_id 不同无法跨 chip 传输，
+            // 这里把远端 chip 钉成本地 chip（slice->ub.dst_chip_id 仍保留真实远端
+            // chip 仅用于日志/观测）。
+            wr_list[i].dst_chip_id = slice_list[i]->ub.src_chip_id;
         }
         rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
         if (rc) {
