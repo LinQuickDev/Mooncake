@@ -12,6 +12,14 @@
 #include "file_interface.h"
 #endif
 
+// ubdiag perf points for the offload owner-side SSD path. UBDIAG_PROGRAM_NAME
+// must match the other TUs (store_py/real_client/client_service); each TU's
+// static initializer writes the shared detail::AutoProgramName(), and leaving
+// it nullptr here could clobber the program name depending on init order.
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+
 namespace mooncake {
 
 using gpu_staging::CopyDeviceToHost;
@@ -323,13 +331,28 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
+    // Owner-side SSD read total (OwnerSsdRead); broken down into buffer
+    // allocation (OwnerAllocBuffer) and disk load (OwnerDiskLoad). End() is on
+    // the success path only — the error early-returns let the dtor Abandon the
+    // unfinished total sample.
+    UbDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
+                              UbDiag::PerfLevel::MODULE);
+    pt_read.Start();
+    UbDiag::PerfPoint pt_alloc(PerfKey::GET_SSD_OWNER_ALLOC,
+                               UbDiag::PerfLevel::MODULE);
+    pt_alloc.Start();
     auto allocate_res = AllocateBatch(keys, sizes);
+    pt_alloc.End(allocate_res ? 0 : -1);
     if (!allocate_res) {
         LOG(ERROR) << "Failed to allocate batch objects";
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = allocate_res.value();
+    UbDiag::PerfPoint pt_load(PerfKey::GET_SSD_OWNER_LOAD,
+                              UbDiag::PerfLevel::MODULE);
+    pt_load.Start();
     auto result = BatchLoad(allocated_batch->slices);
+    pt_load.End(result ? 0 : -1);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
         return tl::make_unexpected(result.error());
@@ -358,6 +381,7 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
+    pt_read.End(0);
     return batch_result;
 }
 
@@ -1010,16 +1034,23 @@ void FileStorage::ClientBufferGCThreadFunc() {
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
+    // Owner-side ClientBuffer release (OwnerReleaseBuffer); shared by the pull
+    // path (release_offload_buffer RPC) and the push path (inline after WRITE).
+    UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
+                                 UbDiag::PerfLevel::MODULE);
+    pt_release.Start();
     MutexLocker locker(&client_buffer_mutex_);
     auto it = client_buffer_allocated_batches_.find(batch_id);
     if (it != client_buffer_allocated_batches_.end()) {
         VLOG(1) << "Releasing buffer for batch_id: " << batch_id
                 << " (transfer completed)";
         client_buffer_allocated_batches_.erase(it);
+        pt_release.End(0);
         return true;
     }
     VLOG(1) << "batch_id " << batch_id
             << " not found (may have been GC'd already)";
+    pt_release.End(-1);
     return false;
 }
 

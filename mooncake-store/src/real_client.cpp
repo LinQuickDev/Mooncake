@@ -6223,15 +6223,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->sizes = sizes;
     state->file_storage = file_storage_;
     auto *s = state.get();
-    auto try_result = co_await coro_io::post([s]() {
-        // Owner-side SSD -> ClientBuffer read (pull path).
-        UbDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
-                                  UbDiag::PerfLevel::MODULE);
-        pt_read.Start();
-        auto r = s->file_storage->BatchGet(s->keys, s->sizes);
-        pt_read.End(r ? 0 : -1);
-        return r;
-    });
+    auto try_result = co_await coro_io::post(
+        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -6276,12 +6269,9 @@ RealClient::batch_get_offload_object_push(
     auto *s = state.get();
     auto try_result =
         co_await coro_io::post([s]() -> tl::expected<void, ErrorCode> {
-            // Owner-side SSD -> ClientBuffer read (push path).
-            UbDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
-                                      UbDiag::PerfLevel::MODULE);
-            pt_read.Start();
+            // Stage the on-disk blobs into the local ClientBuffer
+            // (FileStorage::BatchGet carries the OwnerSsdRead breakdown).
             auto result = s->file_storage->BatchGet(s->req.keys, s->req.sizes);
-            pt_read.End(result ? 0 : -1);
             if (!result) {
                 LOG(ERROR) << "Push offload BatchGet failed, err_code = "
                            << result.error();
@@ -6298,12 +6288,9 @@ RealClient::batch_get_offload_object_push(
             pt_write.End(write_result ? 0 : -1);
             // The WRITE has completed (BatchPushOffloadObject blocks on the
             // transfer future), so the ClientBuffer can be reclaimed
-            // immediately instead of waiting for the GC lease.
-            UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
-                                         UbDiag::PerfLevel::MODULE);
-            pt_release.Start();
+            // immediately instead of waiting for the GC lease
+            // (FileStorage::ReleaseBuffer carries OwnerReleaseBuffer).
             s->file_storage->ReleaseBuffer(batch_id);
-            pt_release.End(0);
             return write_result;
         });
     auto pushed = try_result.value();
@@ -6322,12 +6309,8 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
         return false;
     }
     // Owner-side buffer release triggered by the requester's RPC (pull path).
-    UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
-                                 UbDiag::PerfLevel::MODULE);
-    pt_release.Start();
-    bool released = file_storage_->ReleaseBuffer(batch_id);
-    pt_release.End(released ? 0 : -1);
-    return released;
+    // FileStorage::ReleaseBuffer carries the OwnerReleaseBuffer perf point.
+    return file_storage_->ReleaseBuffer(batch_id);
 }
 
 tl::expected<void, ErrorCode>
