@@ -6223,8 +6223,15 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->sizes = sizes;
     state->file_storage = file_storage_;
     auto *s = state.get();
-    auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+    auto try_result = co_await coro_io::post([s]() {
+        // Owner-side SSD -> ClientBuffer read (pull path).
+        UbDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_read.Start();
+        auto r = s->file_storage->BatchGet(s->keys, s->sizes);
+        pt_read.End(r ? 0 : -1);
+        return r;
+    });
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -6269,8 +6276,12 @@ RealClient::batch_get_offload_object_push(
     auto *s = state.get();
     auto try_result =
         co_await coro_io::post([s]() -> tl::expected<void, ErrorCode> {
-            // Stage the on-disk blobs into the local ClientBuffer.
+            // Owner-side SSD -> ClientBuffer read (push path).
+            UbDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
+                                      UbDiag::PerfLevel::MODULE);
+            pt_read.Start();
             auto result = s->file_storage->BatchGet(s->req.keys, s->req.sizes);
+            pt_read.End(result ? 0 : -1);
             if (!result) {
                 LOG(ERROR) << "Push offload BatchGet failed, err_code = "
                            << result.error();
@@ -6278,13 +6289,21 @@ RealClient::batch_get_offload_object_push(
             }
             const uint64_t batch_id = result.value().batch_id;
             // WRITE the staged blobs straight into the requester's memory.
+            UbDiag::PerfPoint pt_write(PerfKey::GET_SSD_OWNER_PUSH_WRITE,
+                                       UbDiag::PerfLevel::MODULE);
+            pt_write.Start();
             auto write_result = s->client->BatchPushOffloadObject(
                 s->req.requester_te_addr, s->req.keys, result.value().pointers,
                 s->req.dst_slices);
+            pt_write.End(write_result ? 0 : -1);
             // The WRITE has completed (BatchPushOffloadObject blocks on the
             // transfer future), so the ClientBuffer can be reclaimed
             // immediately instead of waiting for the GC lease.
+            UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
+                                         UbDiag::PerfLevel::MODULE);
+            pt_release.Start();
             s->file_storage->ReleaseBuffer(batch_id);
+            pt_release.End(0);
             return write_result;
         });
     auto pushed = try_result.value();
@@ -6302,7 +6321,13 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
             << "release_offload_buffer called but file_storage_ is null";
         return false;
     }
-    return file_storage_->ReleaseBuffer(batch_id);
+    // Owner-side buffer release triggered by the requester's RPC (pull path).
+    UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
+                                 UbDiag::PerfLevel::MODULE);
+    pt_release.Start();
+    bool released = file_storage_->ReleaseBuffer(batch_id);
+    pt_release.End(released ? 0 : -1);
+    return released;
 }
 
 tl::expected<void, ErrorCode>
