@@ -209,20 +209,25 @@ static std::vector<UBDevice> listUBDevices(
     std::vector<UBDevice> devices;
 
     urma_init_attr_t init_attr = {};
-    if (urma_init(&init_attr) != URMA_SUCCESS) {
-        LOG(WARNING) << "Failed to urma init";
+    auto ret = urma_init(&init_attr);
+    if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
+        LOG(WARNING) << "Failed to urma init, ret=" << ret;
         return {};
     }
-    LOG(INFO) << "URMA module init success";
+    const bool need_uninit = (ret == URMA_SUCCESS);
+    LOG(INFO) << "URMA module init success, ret=" << ret
+              << ", need_uninit=" << need_uninit;
+
     urma_device_t **device_list = urma_get_device_list(&num_devices);
     if (!device_list) {
         LOG(WARNING) << "No UB devices found, check your device installation";
-        urma_uninit();
+        if (need_uninit) urma_uninit();
         return {};
     }
-    if (device_list && num_devices <= 0) {
+    if (num_devices <= 0) {
         LOG(WARNING) << "No UB devices found, check your device installation";
         urma_free_device_list(device_list);
+        if (need_uninit) urma_uninit();
         return {};
     }
 
@@ -258,7 +263,7 @@ static std::vector<UBDevice> listUBDevices(
                                    .numa_node = numa_node});
     }
     urma_free_device_list(device_list);
-    urma_uninit();
+    if (need_uninit) urma_uninit();
     return devices;
 }
 

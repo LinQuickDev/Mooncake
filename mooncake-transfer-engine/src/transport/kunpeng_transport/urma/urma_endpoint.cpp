@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <glog/logging.h>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -24,6 +25,11 @@
 #include "ubdiag/auto_perf.h"
 
 namespace mooncake {
+
+namespace {
+std::atomic<int> g_urma_runtime_init_depth{0};
+std::atomic<bool> g_urma_runtime_owned{false};
+}
 
 static urma_transport_mode_t parseTransMode(const std::string& mode) {
     if (mode == "RC") return URMA_TM_RC;
@@ -65,8 +71,10 @@ UrmaContext::~UrmaContext() {
     auto thisString = toString();
     worker_pool_.reset();
     LOG(INFO) << "destroy worker pool done.";
-    endpoint_store_->destroy();
-    LOG(INFO) << "destroy endpoint store done.";
+    if (endpoint_store_) {
+        endpoint_store_->destroy();
+        LOG(INFO) << "destroy endpoint store done.";
+    }
     if (urma_context_) deconstruct();
     LOG(WARNING) << "finished destroy context : " << thisString;
 }
@@ -79,7 +87,9 @@ std::string UrmaContext::toString() {
     return ss.str();
 }
 
-int UrmaContext::getAsyncFd() { return urma_context_->async_fd; }
+int UrmaContext::getAsyncFd() {
+    return urma_context_ ? urma_context_->async_fd : -1;
+}
 
 int UrmaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
@@ -274,7 +284,6 @@ int UrmaContext::deconstruct() {
         urma_context_ = nullptr;
     }
 
-    urma_uninit();
     return 0;
 }
 
@@ -679,7 +688,16 @@ urma_jfce_t* UrmaContext::JFCE() {
 int UrmaContext::jfcCount() { return jfc_list_.size(); }
 
 bool UrmaContext::uninit() {
-    urma_uninit();
+    const int old_depth = g_urma_runtime_init_depth.fetch_sub(1);
+    if (old_depth <= 0) {
+        g_urma_runtime_init_depth.fetch_add(1);
+        LOG(WARNING) << "URMA module uninit requested without a matching init";
+        return true;
+    }
+
+    if (old_depth == 1 && g_urma_runtime_owned.exchange(false)) {
+        urma_uninit();
+    }
     return true;
 }
 
@@ -690,7 +708,14 @@ bool UrmaContext::init() {
         LOG(ERROR) << "Failed to urma init, ret = " << ret;
         return false;
     }
-    LOG(INFO) << "URMA module init success";
+
+    const int old_depth = g_urma_runtime_init_depth.fetch_add(1);
+    if (old_depth == 0) {
+        g_urma_runtime_owned.store(ret == URMA_SUCCESS);
+    }
+    LOG(INFO) << "URMA module init success, ret=" << ret
+              << ", owned=" << g_urma_runtime_owned.load()
+              << ", depth=" << old_depth + 1;
     return true;
 }
 
