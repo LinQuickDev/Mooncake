@@ -20,7 +20,6 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
-option(USE_YLT_URMA_RPC "Enable yalantinglibs URMA RPC support" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
@@ -90,10 +89,6 @@ if (WITH_STORE_RUST)
   endif()
   message(STATUS "Mooncake Store Rust bindings will be built")
   add_subdirectory(mooncake-store/rust)
-endif()
-
-if (USE_YLT_URMA_RPC)
-  add_compile_definitions(YLT_ENABLE_URMA)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
