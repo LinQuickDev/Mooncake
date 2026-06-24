@@ -44,6 +44,9 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+#ifdef USE_UB
+#include "ub_allocator.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -861,6 +864,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // (cpu:N -> chip via numaNodeToChipId). Automatic whenever UB has more
         // than one NUMA node; independent of both MC_UB_NUMA_AFFINITY_ENABLE
         // and MC_URMA_BONDING_MULTIPATH_ENABLE.
+#ifdef USE_UB
         std::vector<int> ub_numa_nodes;
         if (protocol == "ub") {
             int numa_count = client_->GetNumaNodeCount();
@@ -875,6 +879,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                           << ", nodes=[" << nodes_str << "]";
             }
         }
+#endif  // USE_UB
 
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
@@ -886,6 +891,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             // UB NUMA affinity: split this chunk into one segment per NIC-NUMA
             // node, each physically bound to its node and registered with
             // location "cpu:N" (so selectDevice picks the NUMA-local NIC).
+#ifdef USE_UB
             if (!ub_numa_nodes.empty()) {
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
@@ -898,19 +904,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 }
                 for (int node : ub_numa_nodes) {
-                    // Reuse allocate_buffer_numa_segments with a single-element
-                    // vector: one mmap'd region mbind'd to this node.
-                    std::vector<int> one_node{node};
-                    void *ptr = allocate_buffer_numa_segments(per_node_size,
-                                                              one_node, page_sz);
+                    // Use UB's own allocator bound to this node: numa_alloc_onnode
+                    // via libnuma, registered in the store-memory table, so URMA
+                    // can register it. (A raw mmap+mbind buffer cannot be
+                    // registered by urma_register_seg -- it fails with error
+                    // 2048 because the VMA has no backing pages at reg time.)
+                    void *ptr = mooncake::ub_allocate_memory_onnode(
+                        /*alignment=*/page_sz, per_node_size, node);
                     if (!ptr) {
                         MC_LOG(ERROR) << "UB per-NUMA: failed to allocate "
                                          "segment for node " << node;
                         return tl::unexpected(ErrorCode::INVALID_PARAMS);
                     }
-                    // mmap-backed => track for munmap cleanup.
-                    hugepage_segment_ptrs_.emplace_back(
-                        ptr, HugepageSegmentDeleter{per_node_size});
+                    // numa_alloc-backed => free via ub_free_memory/numa_free,
+                    // NOT munmap. Track with UbSegmentDeleter accordingly.
+                    ub_segment_ptrs_.emplace_back(
+                        ptr, UbSegmentDeleter{per_node_size});
 
                     std::string loc = genCpuNodeName(node);  // "cpu:<node>"
                     MC_LOG(INFO) << "Mounting UB per-NUMA segment: node=" << node
@@ -925,6 +934,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 }
                 continue;  // this chunk fully mounted across NUMA nodes
             }
+#endif  // USE_UB
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
