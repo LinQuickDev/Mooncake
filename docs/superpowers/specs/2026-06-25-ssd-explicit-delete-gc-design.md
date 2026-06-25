@@ -108,13 +108,38 @@ hot cache，不删除 offload 到 SSD 的 bucket 文件。被删除 key 的数�
   回收。
 
 **关键约束**：`BatchOffload` 现有无条件调用
-`PrepareEviction(required_size)`（`storage_backend.cpp:1297`）。当
-`eviction_policy == NONE`（默认）时，`PrepareEviction` 在入口即返回空
-（`storage_backend.cpp:2193`），是 no-op，安全。因此新设计要求
-`MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` **必须保持 `none`（默认）**，
-不能配 `lru`/`fifo`；否则 `PrepareEviction` 会在空间不足时删整 bucket
-（含未删除 key），违反约束 1。GC 是独立于 `PrepareEviction` 的新机制，
-不通过它回收空间。
+`PrepareEviction(required_size)`（`storage_backend.cpp:1297`）。新设计
+通过 **`eviction_policy=LRU` + `disable_ssd_eviction=true`** 的组合让
+`PrepareEviction` 成为 no-op（`storage_backend.cpp:2193`，
+`disable_ssd_eviction` 短路返回空 `result`），从而不会删任何 bucket
+（含未删除 key），满足约束 1。
+
+这个组合的关键好处是 **复用现有 LRU 排序逻辑**：
+
+- `last_access_ns_` 在 `BatchLoad` 里门控条件是
+  `eviction_policy == LRU`（`storage_backend.cpp:1430`），**不看**
+  `disable_ssd_eviction`。所以 `LRU + disable_ssd_eviction=true` 下
+  `last_access_ns_` 照常更新，冷热信号有效。
+- `lru_index_` 在 `BatchOffload` 里无条件 `emplace(0, bucket_id)`
+  （`storage_backend.cpp:1354`），照常维护。
+- `SelectEvictionCandidate()` 的 LRU 分支（`storage_backend.cpp:2151`）
+  可被 GC 复用来选最冷 bucket。
+
+因此 GC **不需要新增** `gc_last_read_ns_` 字段，直接复用 `last_access_ns_`
+和 `lru_index_`，减少改动。
+
+空间不足时的行为也由现有代码正确处理：`disable_ssd_eviction=true` 下
+`IsEnableOffloading()`（`storage_backend.cpp:1748`）不走"eviction 兜底"
+分支，而是走 keys/size 限额检查，空间不足时返回 false，`BatchOffload`
+入口（`storage_backend.cpp:998`）直接返回错误，**不写盘、不删 key**。
+GC 是独立于 `PrepareEviction` 的新机制，不通过它回收空间。
+
+> 不使用 `eviction_policy=NONE`：那样 `last_access_ns_` 永不更新（门控
+> 失效），GC 没有冷热信号；且失去了复用 `lru_index_`/`SelectEvictionCandidate`
+> 的机会。
+> 不使用 `eviction_policy=LRU` 但不设 `disable_ssd_eviction=true`：
+> `PrepareEviction` 会在空间不足时删整 bucket（含未删除 key），违反
+> 约束 1。
 
 ### 3.5 读路径并发保护
 
@@ -214,6 +239,18 @@ std::atomic<bool>    compacting_{false};  // 是否正在 compact，防重入
 
 候选条件：`deleted_bytes_ > 0 && !compacting_`。
 
+**冷热信号复用现有 `last_access_ns_` / `lru_index_`，不新增字段。**
+前提是配置 `eviction_policy=LRU + disable_ssd_eviction=true`（见 3.4）：
+`disable_ssd_eviction` 让 `PrepareEviction` 不删 bucket（满足约束 1），
+`eviction_policy=LRU` 让 `BatchLoad` 照常更新 `last_access_ns_`、
+`BatchOffload` 照常维护 `lru_index_`，GC 候选排序直接复用。详见 3.4。
+
+> 不做 key 级冷热分流：GC 是 copy-on-write 整 bucket 重写，一个 bucket
+> 的 live key 要么全搬要么不搬；key 级分流需引入"热/冷 bucket 分类"和
+> key 级访问频率统计（当前没有），改动大且超出本次范围。对象级热度已由
+> master 侧 Count-Min Sketch promotion admission（`master_service.cpp:3421`）
+> 处理，与 bucket SSD GC 是两层，不耦合。
+
 不持久化 tombstone 的理由（取舍点 A，第一版）：
 - `MarkRemoved` 已从 `object_bucket_map_` 删除，重启后这些 key 在本地
   本就不可见。
@@ -259,10 +296,15 @@ std::atomic<bool>    compacting_{false};  // 是否正在 compact，防重入
 没有 tombstone 可回收时，GC 不做任何事；offload 路径若仍空间不足，
 返回错误（`KEYS_ULTRA_LIMIT` / `INTERNAL_ERROR`），**绝不删未删除 key**。
 
-候选排序（第一版简单策略）：
+候选排序（bucket 间冷热分流，复用现有 LRU，第一版简单策略）：
 
-1. `deleted_ratio` 高的优先；
-2. 相同 ratio 时 `last_access_ns_` 小的优先（冷 bucket 先 compact）。
+1. `deleted_ratio` 高的优先（主信号：回收收益大）；
+2. 相同 ratio 时 `last_access_ns_` 小的优先（冷 bucket 先 compact，
+   减少与前台读冲突）。冷 bucket 选择复用
+   `SelectEvictionCandidate()`（`storage_backend.cpp:2151`）的 LRU 分支
+   逻辑，但**语义不同**：不是选来删，而是选来 compact，且必须叠加
+   `deleted_bytes_ > 0` 过滤——`deleted_bytes_==0` 的 bucket 即使最冷
+   也不碰。
 
 新增配置（环境变量，默认值保守）：
 
@@ -308,8 +350,12 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
   - 仍成立 → 把 mapping 切到新 bucket，更新 metadata。
   - 不成立（compaction 期间该 key 被 `MarkRemoved` 或被新 offload 覆盖）
     → 不切，跳过该 key。
-- 新 bucket 加入 `buckets_` 和 `lru_index_`（LRU 仅用于排序候选，不再
-  用于 eviction 删除）。
+- 新 bucket 加入 `buckets_` 和 `lru_index_`。新 bucket 的
+  `last_access_ns_` 继承旧 bucket 的值（冷热度延续，避免 compact 后
+  立刻被再次选中）；`deleted_bytes_` 置 0，`compacting_` 置 false。
+  `lru_index_` 在 `BatchOffload` 无条件 `emplace(0, id)`
+  （`storage_backend.cpp:1354`）时已维护，此处保持兼容；GC 复用它做
+  候选排序，不再用于 eviction 删除。
 - 旧 bucket 从 `buckets_` 删除。
 - 更新 `total_size_`（新 bucket 减去 live key 后的净大小）。
 - 释放锁。
@@ -361,6 +407,9 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
 - `MarkRemoved`、GC Step 1/Step 4 用独占锁；`BatchLoad` 用共享锁。
 - 文件 IO 一律在锁外完成，复用 `BucketReadGuard`/`inflight_reads_`
   保护文件生命周期。
+- 冷热信号无需新增更新点：`last_access_ns_` 由现有 `BatchLoad` 在
+  `eviction_policy=LRU` 下更新（`storage_backend.cpp:1430`），共享锁下
+  relaxed store，无额外锁开销。新设计不动该更新点。
 
 ## 7. Scope
 
@@ -370,10 +419,14 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
    空实现。
 2. `BucketStorageBackend` 实现 `MarkRemoved` / `BatchMarkRemoved`。
 3. `BucketMetadata` 加 runtime-only `deleted_bytes_` / `compacting_`。
-4. `BucketStorageBackend` 后台 GC 线程 + compaction。
+4. `BucketStorageBackend` 后台 GC 线程 + compaction；候选排序复用现有
+   `last_access_ns_` / `lru_index_`（`SelectEvictionCandidate` LRU 逻辑
+   + `deleted_bytes_>0` 过滤），不新增冷热字段。
 5. `FileStorage` 转发 `MarkRemoved` / `BatchMarkRemoved`。
 6. `RealClient::remove_internal` / `batchRemove_internal` 接入。
-7. 新增 GC 配置环境变量。
+7. 新增 GC 配置环境变量；部署文档明确要求
+   `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru` +
+   `MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION=true`。
 8. 单元测试：见第 8 节。
 
 ### 7.2 第一版不做
@@ -389,7 +442,8 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
 ### 7.3 非目标（明确排除）
 
 - 不删除任何未经 `Remove`/`BatchRemove` 且 master 未确认删除的 key。
-- 不用现有 LRU/FIFO `PrepareEviction` 作为空间回收手段。
+- 不用现有 LRU/FIFO `PrepareEviction` 作为空间回收手段（`disable_ssd_eviction=true`
+  使其 no-op；LRU 仅复用于 GC 候选排序，不用于 eviction 删除）。
 
 ## 8. Testing
 
@@ -408,6 +462,15 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
    检查生效。
 9. GC 线程不删 `deleted_bytes_==0` 的 bucket（验证约束 1）。
 10. 空间不足且无 tombstone → offload 返回错误，不删任何 live bucket。
+11. `eviction_policy=LRU + disable_ssd_eviction=true` 下，`BatchLoad` 仍
+    更新 `last_access_ns_`（回归点：验证冷热信号有效，`PrepareEviction`
+    是 no-op）。
+12. 两个 bucket 相同 `deleted_ratio`，未读的（`last_access_ns_` 小）优先
+    被选中 compact（验证冷热分流复用 LRU）。
+13. compaction 后新 bucket 的 `last_access_ns_` 继承旧 bucket，且
+    `deleted_bytes_==0`、`compacting_==false`。
+14. `PrepareEviction` 在 `disable_ssd_eviction=true` 下不删任何 bucket，
+    即使空间超 `max_total_size`（验证约束 1 的前提）。
 
 ### 8.2 集成测试
 
@@ -428,8 +491,10 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
   `ScanMeta` + master `ExistKey` 对账。
 - **空间不足降级**：无 tombstone 可回收时 offload 失败。这是约束 1 的
   必然结果，非 bug；需在文档/日志中明确。
-- **`lru_index_` 复用语义变化**：LRU 仍维护，但只用于 GC 候选排序，
-  不再用于 eviction 删除。需在代码注释中说明，避免误用。
+- **`lru_index_` 复用语义变化**：`lru_index_` 仍由 `BatchOffload` 维护，
+  GC 复用它选冷 bucket 做 compaction 候选；但 `PrepareEviction` 因
+  `disable_ssd_eviction=true` 成为 no-op，不再用 `lru_index_` 做 eviction
+  删除。需在代码注释中说明，避免误用 `SelectEvictionCandidate` 做删除。
 
 ## 10. Open questions
 
