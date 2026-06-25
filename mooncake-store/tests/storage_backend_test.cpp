@@ -2763,18 +2763,22 @@ TEST_F(StorageBackendTest,
        BucketStorageBackend_DisableEvictionNoopUnderPressure) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
+    // Set global size limit smaller than a single bucket's reservation so
+    // IsEnableOffloading's quota check rejects the offload.
+    config.total_size_limit = 512;
     BucketBackendConfig bucket_config;
     bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
     bucket_config.disable_ssd_eviction = true;
-    bucket_config.max_total_size = 1024;  // tiny, forces pressure
+    // bucket_size_limit (default 256MB) >> total_size_limit (512), so the
+    // quota check in IsEnableOffloading rejects without eviction.
     BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
 
-    // disable_ssd_eviction=true means PrepareEviction is a no-op, so
-    // under space pressure no bucket is deleted. IsEnableOffloading
-    // rejects via quota check instead.
+    // disable_ssd_eviction=true means PrepareEviction is a no-op, so under
+    // space pressure no bucket is deleted. IsEnableOffloading rejects via
+    // the quota check instead.
     std::string k = "pressure_k";
-    std::string v(2048, 'z');  // exceeds max_total_size
+    std::string v(2048, 'z');
     auto buf = std::make_unique<char[]>(v.size());
     std::memcpy(buf.get(), v.data(), v.size());
     std::unordered_map<std::string, std::vector<Slice>> batch;

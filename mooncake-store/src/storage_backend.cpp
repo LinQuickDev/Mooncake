@@ -2551,10 +2551,8 @@ bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
             }
         }
     }
-    // BucketReadGuard on old_bucket protects old file during reads.
-    BucketReadGuard guard(old_bucket);
-
     // If no live keys, just delete the old bucket entirely.
+    // No BucketReadGuard needed here — we don't read the old file.
     if (live_keys.empty()) {
         {
             SharedMutexLocker lock(&mutex_);
@@ -2572,36 +2570,42 @@ bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
         return true;
     }
 
-    // Step 2: read live key data from old bucket (lock-free IO)
-    // Uses the same vector_read pattern as BatchLoad (storage_backend.cpp).
+    // Step 2: read live key data from old bucket (lock-free IO).
+    // BucketReadGuard protects the old file from deletion while we read it.
+    // The guard is scoped to this block so it releases (decrementing
+    // inflight_reads_) BEFORE Step 5's WaitForInflightReads — otherwise we
+    // would self-deadlock waiting for our own inflight read to drain.
     std::unordered_map<std::string, std::vector<Slice>> live_batch;
     std::unordered_map<std::string, std::string> live_data_buffers;
-    auto data_path = GetBucketDataPath(bucket_id);
-    if (!data_path) return false;
-    auto file_result = OpenFile(data_path.value(), FileMode::Read);
-    if (!file_result) return false;
-    auto& file = file_result.value();
-    for (size_t i = 0; i < live_keys.size(); ++i) {
-        const auto& key = live_keys[i];
-        const auto& meta = live_metas[i];
-        std::string data;
-        data.resize(meta.data_size);
-        int64_t actual_offset = meta.offset + meta.key_size;
-        iovec iov{data.data(), static_cast<size_t>(meta.data_size)};
-        auto read_res = file->vector_read(&iov, 1, actual_offset);
-        if (!read_res ||
-            read_res.value() != static_cast<size_t>(meta.data_size)) {
-            LOG(ERROR) << "CompactBucket: read failed for key: " << key
-                       << ", bucket_id=" << bucket_id;
-            // Reset compacting_ so a later round can retry.
-            old_bucket->compacting_.store(false, std::memory_order_relaxed);
-            return false;
+    {
+        BucketReadGuard guard(old_bucket);
+        auto data_path = GetBucketDataPath(bucket_id);
+        if (!data_path) return false;
+        auto file_result = OpenFile(data_path.value(), FileMode::Read);
+        if (!file_result) return false;
+        auto& file = file_result.value();
+        for (size_t i = 0; i < live_keys.size(); ++i) {
+            const auto& key = live_keys[i];
+            const auto& meta = live_metas[i];
+            std::string data;
+            data.resize(meta.data_size);
+            int64_t actual_offset = meta.offset + meta.key_size;
+            iovec iov{data.data(), static_cast<size_t>(meta.data_size)};
+            auto read_res = file->vector_read(&iov, 1, actual_offset);
+            if (!read_res ||
+                read_res.value() != static_cast<size_t>(meta.data_size)) {
+                LOG(ERROR) << "CompactBucket: read failed for key: " << key
+                           << ", bucket_id=" << bucket_id;
+                old_bucket->compacting_.store(false,
+                                              std::memory_order_relaxed);
+                return false;
+            }
+            live_data_buffers[key] = std::move(data);
+            live_batch.emplace(key, std::vector<Slice>{Slice{
+                                        live_data_buffers[key].data(),
+                                        live_data_buffers[key].size()}});
         }
-        live_data_buffers[key] = std::move(data);
-        live_batch.emplace(key, std::vector<Slice>{Slice{
-                                    live_data_buffers[key].data(),
-                                    live_data_buffers[key].size()}});
-    }
+    }  // guard released here: inflight_reads_ decremented.
 
     // Step 3: write live keys into a new bucket (lock-free IO)
     int64_t new_bucket_id = bucket_id_generator_->NextId();
@@ -2631,27 +2635,32 @@ bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
         return false;
     }
 
-    // Step 4: atomic swap under lock with re-validation
+    // Step 4: atomic swap under lock with re-validation.
+    // NOTE: new_metas is positionally aligned with build_result->keys (both
+    // built in the same BuildBucket iteration), NOT with live_keys, because
+    // BuildBucket iterates an unordered_map in its own order.
+    auto& new_bucket = build_result.value();
     {
         SharedMutexLocker lock(&mutex_);
-        // Re-validate each live key: still points at old bucket?
-        for (size_t i = 0; i < live_keys.size(); ++i) {
-            const auto& key = live_keys[i];
+        // Re-validate each new-bucket key: still points at old bucket?
+        for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
+            const auto& key = new_bucket->keys[i];
             auto map_it = object_bucket_map_.find(key);
             if (map_it != object_bucket_map_.end() &&
                 map_it->second.bucket_id == bucket_id) {
                 // Still live at old bucket -> remap to new bucket.
                 map_it->second = new_metas[i];
             }
-            // else: key was removed or remapped during compaction -> skip.
+            // else: key was removed or remapped during compaction -> skip
+            // (it remains absent from object_bucket_map_, so it won't be
+            // readable even though its bytes are in the new bucket file).
         }
         // Insert new bucket into maps.
-        auto& new_bucket = build_result.value();
         total_size_ += new_bucket->data_size + new_bucket->meta_size;
         new_bucket->last_access_ns_.store(
             old_last_access_ns, std::memory_order_relaxed);
         // deleted_bytes_ and compacting_ already 0 (fresh object).
-        buckets_.emplace(new_bucket_id, std::move(new_bucket));
+        buckets_.emplace(new_bucket_id, new_bucket);
         lru_index_.emplace(old_last_access_ns, new_bucket_id);
 
         // Remove old bucket from maps.
