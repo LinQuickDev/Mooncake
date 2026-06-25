@@ -2073,6 +2073,11 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
+    // Mark SSD tombstone for explicit-delete GC (bucket backend only;
+    // other backends no-op). Does not change Remove semantics.
+    if (file_storage_) {
+        file_storage_->MarkRemoved(key);
+    }
     return {};
 }
 
@@ -2112,7 +2117,20 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    return client_->BatchRemove(keys, force);
+    auto results = client_->BatchRemove(keys, force);
+    // Mark SSD tombstone only for successfully removed keys.
+    if (file_storage_) {
+        std::vector<std::string> removed;
+        for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                removed.push_back(keys[i]);
+            }
+        }
+        if (!removed.empty()) {
+            file_storage_->BatchMarkRemoved(removed);
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batchRemove(const std::vector<std::string> &keys,

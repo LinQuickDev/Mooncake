@@ -579,6 +579,14 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     return enable_offloading;
 }
 
+void FileStorage::MarkRemoved(const std::string& key) {
+    storage_backend_->MarkRemoved(key);
+}
+
+void FileStorage::BatchMarkRemoved(const std::vector<std::string>& keys) {
+    storage_backend_->BatchMarkRemoved(keys);
+}
+
 tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
