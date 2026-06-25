@@ -89,14 +89,14 @@ class GCE2ETest : public ::testing::Test {
         // eviction_policy=LRU keeps last_access_ns_ updated for GC candidate
         // coldness; disable_ssd_eviction=true makes PrepareEviction a no-op
         // so no live bucket is ever evicted.
-        saved_policy_ = getenv("MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY");
+        saved_policy_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY");
         setenv("MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY", "lru", 1);
-        saved_disable_ = getenv("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION");
+        saved_disable_ = GetEnvOpt("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION");
         setenv("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", "true", 1);
         // Tighten GC so compaction runs quickly in tests.
-        saved_gc_interval_ = getenv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS");
+        saved_gc_interval_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS");
         setenv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS", "200", 1);
-        saved_gc_ratio_ = getenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
+        saved_gc_ratio_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
         setenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO", "0.1", 1);
     }
 
@@ -122,6 +122,13 @@ class GCE2ETest : public ::testing::Test {
         } else {
             unsetenv(name);
         }
+    }
+
+    // Safely capture an env var as optional (getenv may return nullptr).
+    static std::optional<std::string> GetEnvOpt(const char* name) {
+        const char* val = getenv(name);
+        if (val) return std::string(val);
+        return std::nullopt;
     }
 
     bool StartMasterWithOffload() {
