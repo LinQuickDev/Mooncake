@@ -49,6 +49,12 @@ class FileStorage {
      */
     bool ReleaseBuffer(uint64_t batch_id);
 
+    // Forward explicit-delete tombstone to the storage backend.
+    // For BucketStorageBackend: marks tombstone + enables GC.
+    // For other backends: no-op (default in StorageBackendInterface).
+    void MarkRemoved(const std::string& key);
+    void BatchMarkRemoved(const std::vector<std::string>& keys);
+
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
@@ -102,12 +108,6 @@ class FileStorage {
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
-
-    // Forward explicit-delete tombstone to the storage backend.
-    // For BucketStorageBackend: marks tombstone + enables GC.
-    // For other backends: no-op (default in StorageBackendInterface).
-    void MarkRemoved(const std::string& key);
-    void BatchMarkRemoved(const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
