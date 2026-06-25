@@ -13,6 +13,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -84,6 +85,21 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
 
     config.disable_ssd_eviction =
         GetEnvOr<bool>("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", false);
+
+    config.gc_enable = GetEnvOr<bool>("MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE",
+                                       config.gc_enable);
+    config.gc_interval_ms =
+        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS",
+                          config.gc_interval_ms);
+    config.gc_deleted_ratio =
+        GetEnvOr<double>("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO",
+                         config.gc_deleted_ratio);
+    config.gc_high_watermark_ratio = GetEnvOr<double>(
+        "MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO",
+        config.gc_high_watermark_ratio);
+    config.gc_max_buckets_per_round = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND",
+        config.gc_max_buckets_per_round);
 
     return config;
 }
@@ -2407,6 +2423,86 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
               << ", keys_removed=" << keys_to_remove.size();
     return {};
 }
+
+// --- Explicit-delete-only GC ---
+void BucketStorageBackend::MarkRemoved(const std::string& key) {
+    SharedMutexLocker lock(&mutex_);
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return;  // not in local storage or already removed — idempotent
+    }
+    int64_t bucket_id = it->second.bucket_id;
+    int64_t freed = it->second.data_size + it->second.key_size;
+    object_bucket_map_.erase(it);
+
+    auto bucket_it = buckets_.find(bucket_id);
+    if (bucket_it != buckets_.end()) {
+        bucket_it->second->deleted_bytes_.fetch_add(
+            freed, std::memory_order_relaxed);
+    }
+}
+
+void BucketStorageBackend::BatchMarkRemoved(
+    const std::vector<std::string>& keys) {
+    SharedMutexLocker lock(&mutex_);
+    for (const auto& key : keys) {
+        auto it = object_bucket_map_.find(key);
+        if (it == object_bucket_map_.end()) continue;
+        int64_t bucket_id = it->second.bucket_id;
+        int64_t freed = it->second.data_size + it->second.key_size;
+        object_bucket_map_.erase(it);
+
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it != buckets_.end()) {
+            bucket_it->second->deleted_bytes_.fetch_add(
+                freed, std::memory_order_relaxed);
+        }
+    }
+}
+
+std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
+BucketStorageBackend::SelectGCCandidate() {
+    // Must be called with mutex_ held (exclusive).
+    // Find bucket with highest deleted_ratio; tie-break by coldest
+    // last_access_ns_ (smallest). Skip buckets with deleted_bytes_==0
+    // or compacting_==true.
+    auto best_it = buckets_.end();
+    double best_ratio = 0.0;
+    int64_t best_ts = std::numeric_limits<int64_t>::max();
+
+    for (auto it = buckets_.begin(); it != buckets_.end(); ++it) {
+        const auto& bucket = it->second;
+        int64_t deleted =
+            bucket->deleted_bytes_.load(std::memory_order_relaxed);
+        if (deleted <= 0) continue;
+        if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
+
+        int64_t data_size = bucket->data_size;
+        if (data_size <= 0) continue;
+        double ratio =
+            static_cast<double>(deleted) / static_cast<double>(data_size);
+
+        int64_t ts = bucket->last_access_ns_.load(std::memory_order_relaxed);
+
+        if (ratio > best_ratio || (ratio == best_ratio && ts < best_ts)) {
+            best_ratio = ratio;
+            best_ts = ts;
+            best_it = it;
+        }
+    }
+    return best_it;
+}
+
+bool BucketStorageBackend::CompactBucket(int64_t /*bucket_id*/) {
+    return true;
+}
+
+void BucketStorageBackend::GCThreadFunc() {}
+
+void BucketStorageBackend::WaitForInflightReads(
+    std::shared_ptr<BucketMetadata> /*bucket*/) {}
+
+void BucketStorageBackend::DeleteBucketFiles(int64_t /*bucket_id*/) {}
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
