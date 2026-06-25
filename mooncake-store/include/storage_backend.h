@@ -882,6 +882,13 @@ class BucketStorageBackend : public StorageBackendInterface {
     void MarkRemoved(const std::string& key) override;
     void BatchMarkRemoved(const std::vector<std::string>& keys) override;
 
+    // Compact a single bucket: copy-on-write live keys to a new bucket,
+    // atomically swap mappings, delete old bucket file after reads drain.
+    // Returns true on success (or no-op), false on transient failure
+    // (will retry next round). Public to allow explicit compaction and
+    // testing (analogous to DeleteBucket).
+    bool CompactBucket(int64_t bucket_id);
+
    private:
     // --- Background GC ---
     // Select the best GC candidate bucket: deleted_bytes_>0, not compacting,
@@ -890,12 +897,6 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Returns buckets_.end() if no candidate.
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
     SelectGCCandidate();
-
-    // Compact a single bucket: copy-on-write live keys to a new bucket,
-    // atomically swap mappings, delete old bucket file after reads drain.
-    // Returns true on success (or no-op), false on transient failure
-    // (will retry next round).
-    bool CompactBucket(int64_t bucket_id);
 
     // Background GC thread entry point.
     void GCThreadFunc();
