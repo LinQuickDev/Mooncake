@@ -81,3 +81,18 @@ target_link_libraries(storage_backend_e2e_test PUBLIC
 )
 
 add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)
+
+add_executable(gc_e2e_test gc_e2e_test.cpp)
+target_include_directories(gc_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+target_link_libraries(gc_e2e_test PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+add_test(NAME gc_e2e_test COMMAND gc_e2e_test)
