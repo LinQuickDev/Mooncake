@@ -504,183 +504,149 @@ MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND=1
 
 ### 10.1 Remove / BatchRemove → tombstone 标记
 
-```
-Client          Master          FS              BB                Disk
-  |                |             |               |                 |
-  | Remove(key)    |             |               |                 |
-  |--------------->|             |               |                 |
-  |                | lease/replica/task 检查    |                 |
-  |                | EraseMetadata              |                 |
-  |  ok            |             |               |                 |
-  |<---------------|             |               |                 |
-  | MarkRemoved(key)             |               |                 |
-  |------------------------------->|             |                 |
-  |                              | MarkRemoved   |                 |
-  |                              |-------------->|                 |
-  |                              |               | [mutex_ 独占]   |
-  |                              |               | 查 object_bucket_map_
-  |                              |               | 删除 key mapping
-  |                              |               | deleted_bytes_ += size
-  |                              |               | bucket 入 GC 候选集
-  |                              |               | [解锁]           |
-  |                              |  done         |                 |
-  |                              |<-------------|                 |
-  |  done                         |             |                 |
-  |<-------------------------------------------|                 |
-  |                |             |               |   (无磁盘 IO)    |
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Master
+    participant FS as FileStorage
+    participant BB as BucketBackend
+    participant Disk
 
-注: BatchLoad 此时已找不到该 key (mapping 已删)
-    但旧 .bucket 文件中数据仍在, 等 GC 回收
+    Client->>Master: Remove(key)
+    Master->>Master: lease/replica/task 检查
+    Master->>Master: EraseMetadata
+    Master-->>Client: ok
+    Client->>FS: MarkRemoved(key)
+    FS->>BB: MarkRemoved(key)
+    BB->>BB: [mutex_ 独占] 查 object_bucket_map_
+    BB->>BB: 删除 key mapping
+    BB->>BB: deleted_bytes_ += size
+    BB->>BB: bucket 入 GC 候选集 [解锁]
+    BB-->>FS: done
+    FS-->>Client: done
+    Note over Client,Disk: 无磁盘 IO; 旧 .bucket 数据仍在, 等 GC 回收
+    Note over Client,Disk: BatchLoad 此时已找不到该 key (mapping 已删)
 ```
 
 ### 10.2 GC Compaction（含并发读 + 二次校验）
 
-```
-GC              BB(mutex_)         BB(锁外)        Disk           Reader
- |                |                  |              |               |
-| [触发: 定时/阈值/ratio]           |              |               |
-| 选候选: deleted_ratio 高 +        |              |               |
-|         last_access_ns_ 小        |              |               |
-| (SelectEvictionCandidate LRU     |              |               |
-|  + deleted_bytes_>0 过滤)         |              |               |
-|                |                  |              |               |
-| === Step1: 锁内快照 live keys ===|              |               |
-| 请求独占锁      |                  |              |               |
-|--------------->|                  |              |               |
-|                | compacting_? true→跳过          |               |
-|                | 置 compacting_=true             |               |
-|                | 遍历 keys 查 object_bucket_map_ |               |
-|                |   live: key1,key3               |               |
-|                |   deleted: key2,key4(不搬)      |               |
-|                | 复制 read plan{key1,key3}       |               |
-|                | 建 BucketReadGuard(inflight_++)|               |
-| 释放锁          |                  |              |               |
-|<---------------|                  |              |               |
-|                |                  |              |               |
-| --- 并发: Reader 发起 BatchLoad(key1) ---        |               |
-|                |                  |              |       Reader  |
-|                |                  |              |       (共享锁) |
-|                |                  |              |       查 object_bucket_map_
-|                |                  |              |       key1 仍指向【旧 bucket】
-|                |                  |              |       建 BucketReadGuard
-|                |                  |              |       inflight_++ (旧bucket)
-|                |                  |              |       释放锁, 锁外读旧 .bucket
-|                |                  |              |<------| 读 key1 数据
-|                |                  |              |       (读到正确数据, 不阻塞)
-|                |                  |              |               |
-| === Step2: 锁外读旧 bucket live 数据 ===        |               |
-|--------------------------------->|              |               |
-|                |                  | 读 key1,key3 |               |
-|                |                  |------------->|               |
-|                |                  |  data        |               |
-|                |                  |<------------|               |
-|                |                  |              |               |
-| === Step3: 锁外写新 bucket ===   |              |               |
-| 申请新 bucket_id |                |              |               |
-| BuildBucket+WriteBucket          |              |               |
-|--------------------------------->|              |               |
-|                |                  | 写新 .bucket/.meta           |
-|                |                  |------------->|               |
-|                |                  |  done        |               |
-|                |                  |              |               |
-| === Step4: 锁内原子切换(二次校验) ===          |               |
-| 请求独占锁      |                  |              |               |
-|--------------->|                  |              |               |
-|                | 对 key1,key3 二次校验:          |               |
-|                |   object_bucket_map_[key].bucket_id == 旧bucket?|
-|                |   key1 ✓→切到新bucket           |               |
-|                |   key3 ✓→切到新bucket           |               |
-|                |  (若某 key 期间被 Remove →      |               |
-|                |   mapping 已不在旧bucket →跳过) |               |
-|                | 新bucket加入 buckets_/lru_index_|               |
-|                |   last_access_ns_ 继承旧值      |               |
-|                |   deleted_bytes_=0,compacting_=false            |
-|                | 旧bucket从buckets_删除          |               |
-|                | total_size_ 更新                |               |
-| 释放锁          |                  |              |               |
-|<---------------|                  |              |               |
-|                |                  |              |               |
-| --- 并发: Reader 读旧 bucket 完成, inflight_ 归零 ---            |
-|                |                  |              |       Reader  |
-|                |                  |              |       guard析构, inflight_--
-|                |                  |              |       (旧bucket文件仍受保护)
-|                |                  |              |               |
-| === Step5: 锁外删旧 bucket 文件 ===            |               |
-| 等旧bucket inflight_==0 (复用FinalizeEviction)|               |
-|--------------------------------->|              |               |
-|                |                  | (等待Reader读完)             |
-|                |                  | inflight_==0 |               |
-| 删旧 .bucket/.meta                |              |               |
-|--------------------------------->|------------->|               |
-|                |                  |  deleted     |               |
-|                |                  |              |               |
-|  done           |                  |              |               |
-|<---------------|                  |              |               |
+```mermaid
+sequenceDiagram
+    participant GC
+    participant BB as BucketBackend
+    participant Disk
+    participant Reader
 
-结果: key1,key3 在新bucket可读; key2,key4 空间已回收; 旧文件已删
+    Note over GC: 触发: 定时/阈值/ratio<br/>选候选: deleted_ratio 高 + last_access_ns_ 小<br/>(SelectEvictionCandidate LRU + deleted_bytes_>0 过滤)
+
+    rect rgb(230, 245, 255)
+    Note over GC,BB: Step1: 锁内快照 live keys
+    GC->>BB: 请求独占锁
+    BB->>BB: compacting_? true→跳过; 否则置 compacting_=true
+    BB->>BB: 遍历 keys 查 object_bucket_map_
+    Note over BB: live: key1,key3 / deleted: key2,key4(不搬)
+    BB->>BB: 复制 read plan{key1,key3}
+    BB->>BB: 建 BucketReadGuard (inflight_++)
+    BB-->>GC: 释放锁
+    end
+
+    Note over Reader: 并发: Reader 发起 BatchLoad(key1)
+    Reader->>BB: (共享锁) 查 object_bucket_map_
+    Note over Reader: key1 仍指向【旧 bucket】
+    Reader->>BB: 建 BucketReadGuard, inflight_++ (旧bucket)
+    Reader->>BB: 释放锁, 锁外读旧 .bucket
+    BB-->>Reader: 读 key1 数据 (正确, 不阻塞)
+
+    rect rgb(255, 245, 230)
+    Note over GC,Disk: Step2: 锁外读旧 bucket live 数据
+    GC->>Disk: 读 key1, key3
+    Disk-->>GC: data
+    end
+
+    rect rgb(255, 245, 230)
+    Note over GC,Disk: Step3: 锁外写新 bucket
+    GC->>GC: 申请新 bucket_id, BuildBucket+WriteBucket
+    GC->>Disk: 写新 .bucket/.meta
+    Disk-->>GC: done
+    end
+
+    rect rgb(230, 255, 230)
+    Note over GC,BB: Step4: 锁内原子切换 (二次校验)
+    GC->>BB: 请求独占锁
+    loop 对 key1, key3 二次校验
+        BB->>BB: object_bucket_map_[key].bucket_id == 旧bucket?
+        Note over BB: key1 ✓→切到新bucket; key3 ✓→切到新bucket
+        Note over BB: 若某 key 期间被 Remove → mapping 已不在旧bucket → 跳过
+    end
+    BB->>BB: 新bucket加入 buckets_/lru_index_<br/>last_access_ns_ 继承旧值<br/>deleted_bytes_=0, compacting_=false
+    BB->>BB: 旧bucket从buckets_删除, total_size_ 更新
+    BB-->>GC: 释放锁
+    end
+
+    Note over Reader: 并发: Reader 读旧 bucket 完成
+    Reader->>Reader: guard 析构, inflight_-- (旧bucket文件仍受保护)
+
+    rect rgb(255, 230, 230)
+    Note over GC,Disk: Step5: 锁外删旧 bucket 文件
+    GC->>BB: 等旧bucket inflight_==0 (复用 FinalizeEviction)
+    Note over GC: inflight_==0
+    GC->>Disk: 删旧 .bucket/.meta
+    Disk-->>GC: deleted
+    end
+
+    Note over GC,Disk: 结果: key1,key3 在新bucket可读; key2,key4 空间已回收; 旧文件已删
 ```
 
 ### 10.3 空间不足 + 无 tombstone（offload 失败，不删 key）
 
-```
-Client          BB                              GC              Disk
-  |               |                               |               |
-  | BatchOffload  |                               |               |
-  |-------------->|                               |               |
-  |               | IsEnableOffloading()?        |               |
-  |               | (disable_ssd_eviction=true   |               |
-  |               |  → 走限额检查分支)            |               |
-  |               | total_size + bucket_size > limit?            |
-  |               | → true: 空间不足              |               |
-  |               | 返回 false                    |               |
-  |  error        |                               |               |
-  |<--------------|                               |               |
-  |               |                               |               |
-  |               | PrepareEviction(required_size)|               |
-  |               | (disable_ssd_eviction → no-op,不删bucket)    |
-  |               |                               |               |
-  |               |          GC 尝试回收 tombstone|               |
-  |               |<------------------------------|               |
-  |               | 扫描候选: deleted_bytes_>0 ?  |               |
-  |               | → 无 tombstone bucket         |               |
-  |               | GC 不做任何事                 |               |
-  |               |------------------------------->|               |
-  |               |                               | (无可回收空间) |
-  |               |                               |               |
-  |  (offload 失败, master 保留内存 replica)      |               |
-  |  (没有任何未删除 key 被删)                     |               |
+```mermaid
+sequenceDiagram
+    participant Client
+    participant BB as BucketBackend
+    participant GC
+    participant Disk
+
+    Client->>BB: BatchOffload
+    BB->>BB: IsEnableOffloading()?
+    Note over BB: disable_ssd_eviction=true<br/>→ 走限额检查分支
+    BB->>BB: total_size + bucket_size > limit?<br/>→ true: 空间不足
+    BB-->>Client: error (返回 false)
+    Note over BB: PrepareEviction(required_size)<br/>disable_ssd_eviction → no-op, 不删 bucket
+
+    BB->>GC: GC 尝试回收 tombstone
+    GC->>GC: 扫描候选: deleted_bytes_>0 ?
+    Note over GC: 无 tombstone bucket → GC 不做任何事
+    GC-->>BB: 无可回收空间
+
+    Note over Client,Disk: offload 失败, master 保留内存 replica<br/>没有任何未删除 key 被删
 ```
 
 ### 10.4 GC vs 并发 Remove（二次校验保证不丢不漏）
 
-```
-GC              BB(Step4 二次校验, 持独占锁)     Client
- |                |                               |
-| 此时 live = {key1, key3}        |               |
-| (Step1 快照时 key3 还在)        |               |
-|                |                               |
-| --- 并发: Client Remove(key3) ---              | Remove(key3)
-|                |                               |-------------->|(Master)
-|                |                               |  MarkRemoved(key3)
-|                |                               |-------------->|
-|                | [mutex_ 独占]                 |  删 object_bucket_map_[key3]
-|                |  (Remove 先抢到锁)            |  deleted_bytes_ += size3
-|                |                               |  [解锁]
-|                |                               |<-------------|
-|                |                               |               |
-| === Step4 GC 拿到锁, 二次校验 ===             |               |
-|--------------->|                               |               |
-|                | 校验 key3:                    |               |
-|                |  object_bucket_map_[key3] ?   |               |
-|                |  → 已不在 (被Remove删了)      |               |
-|                |  → bucket_id != 旧bucket      |               |
-|                |  → 跳过 key3, 不搬入新bucket  |               |
-|                |                               |               |
-|                | 只切 key1 → 新bucket          |               |
-|                | (key3 不丢: 已被Remove正确删除)|              |
-|                | (key3 不漏: 不进新bucket)     |               |
-|  done          |                               |               |
-|<---------------|                               |               |
+```mermaid
+sequenceDiagram
+    participant GC
+    participant BB as BucketBackend
+    participant Client
+    participant Master
+
+    Note over GC: live = {key1, key3} (Step1 快照时 key3 还在)
+
+    Note over Client: 并发: Client Remove(key3)
+    Client->>Master: Remove(key3)
+    Client->>BB: MarkRemoved(key3)
+    Note over BB: [mutex_ 独占] (Remove 先抢到锁)
+    BB->>BB: 删 object_bucket_map_[key3]
+    BB->>BB: deleted_bytes_ += size3 [解锁]
+    BB-->>Client: done
+
+    Note over GC: Step4 GC 拿到锁, 二次校验
+    GC->>BB: 请求独占锁
+    BB->>BB: 校验 key3: object_bucket_map_[key3] ?
+    Note over BB: → 已不在 (被 Remove 删了)<br/>→ bucket_id != 旧bucket<br/>→ 跳过 key3, 不搬入新bucket
+    BB->>BB: 只切 key1 → 新bucket
+    Note over BB: key3 不丢: 已被 Remove 正确删除<br/>key3 不漏: 不进新bucket
+    BB-->>GC: done
 ```
 
 ## 11. Open questions
