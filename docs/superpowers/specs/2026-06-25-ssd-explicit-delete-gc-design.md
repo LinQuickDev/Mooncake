@@ -518,14 +518,15 @@ sequenceDiagram
     Master-->>Client: ok
     Client->>FS: MarkRemoved(key)
     FS->>BB: MarkRemoved(key)
-    BB->>BB: [mutex_ 独占] 查 object_bucket_map_
+    Note over BB: mutex_ 独占
+    BB->>BB: 查 object_bucket_map_
     BB->>BB: 删除 key mapping
     BB->>BB: deleted_bytes_ += size
-    BB->>BB: bucket 入 GC 候选集 [解锁]
+    BB->>BB: bucket 入 GC 候选集 后解锁
     BB-->>FS: done
     FS-->>Client: done
-    Note over Client,Disk: 无磁盘 IO; 旧 .bucket 数据仍在, 等 GC 回收
-    Note over Client,Disk: BatchLoad 此时已找不到该 key (mapping 已删)
+    Note over Client,Disk: 无磁盘 IO。旧 .bucket 数据仍在 等 GC 回收
+    Note over Client,Disk: BatchLoad 此时已找不到该 key（mapping 已删）
 ```
 
 ### 10.2 GC Compaction（含并发读 + 二次校验）
@@ -537,64 +538,71 @@ sequenceDiagram
     participant Disk
     participant Reader
 
-    Note over GC: 触发: 定时/阈值/ratio<br/>选候选: deleted_ratio 高 + last_access_ns_ 小<br/>(SelectEvictionCandidate LRU + deleted_bytes_>0 过滤)
+    Note over GC: 触发 定时/阈值/ratio
+    Note over GC: 选候选 deleted_ratio 高 且 last_access_ns_ 小
+    Note over GC: SelectEvictionCandidate LRU 叠加 deleted_bytes_>0 过滤
 
     rect rgb(230, 245, 255)
-    Note over GC,BB: Step1: 锁内快照 live keys
+    Note over GC,BB: Step1 锁内快照 live keys
     GC->>BB: 请求独占锁
-    BB->>BB: compacting_? true→跳过; 否则置 compacting_=true
+    Note over BB: compacting_ 为 true 则跳过 否则置 true
     BB->>BB: 遍历 keys 查 object_bucket_map_
-    Note over BB: live: key1,key3 / deleted: key2,key4(不搬)
-    BB->>BB: 复制 read plan{key1,key3}
-    BB->>BB: 建 BucketReadGuard (inflight_++)
+    Note over BB: live key1 key3 / deleted key2 key4 不搬
+    BB->>BB: 复制 read plan key1 key3
+    BB->>BB: 建 BucketReadGuard inflight_++
     BB-->>GC: 释放锁
     end
 
-    Note over Reader: 并发: Reader 发起 BatchLoad(key1)
-    Reader->>BB: (共享锁) 查 object_bucket_map_
-    Note over Reader: key1 仍指向【旧 bucket】
-    Reader->>BB: 建 BucketReadGuard, inflight_++ (旧bucket)
-    Reader->>BB: 释放锁, 锁外读旧 .bucket
-    BB-->>Reader: 读 key1 数据 (正确, 不阻塞)
+    Note over Reader: 并发 Reader 发起 BatchLoad key1
+    Reader->>BB: 共享锁 查 object_bucket_map_
+    Note over Reader: key1 仍指向旧 bucket
+    Reader->>BB: 建 BucketReadGuard inflight_++ 旧bucket
+    Reader->>BB: 释放锁 锁外读旧 .bucket
+    BB-->>Reader: 读 key1 数据 正确 不阻塞
 
     rect rgb(255, 245, 230)
-    Note over GC,Disk: Step2: 锁外读旧 bucket live 数据
-    GC->>Disk: 读 key1, key3
+    Note over GC,Disk: Step2 锁外读旧 bucket live 数据
+    GC->>Disk: 读 key1 key3
     Disk-->>GC: data
     end
 
     rect rgb(255, 245, 230)
-    Note over GC,Disk: Step3: 锁外写新 bucket
-    GC->>GC: 申请新 bucket_id, BuildBucket+WriteBucket
-    GC->>Disk: 写新 .bucket/.meta
+    Note over GC,Disk: Step3 锁外写新 bucket
+    GC->>GC: 申请新 bucket_id
+    GC->>GC: BuildBucket + WriteBucket
+    GC->>Disk: 写新 .bucket .meta
     Disk-->>GC: done
     end
 
     rect rgb(230, 255, 230)
-    Note over GC,BB: Step4: 锁内原子切换 (二次校验)
+    Note over GC,BB: Step4 锁内原子切换 二次校验
     GC->>BB: 请求独占锁
-    loop 对 key1, key3 二次校验
-        BB->>BB: object_bucket_map_[key].bucket_id == 旧bucket?
-        Note over BB: key1 ✓→切到新bucket; key3 ✓→切到新bucket
-        Note over BB: 若某 key 期间被 Remove → mapping 已不在旧bucket → 跳过
+    loop 对 key1 key3 二次校验
+        BB->>BB: object_bucket_map_[key].bucket_id 是否等于旧bucket
+        Note over BB: key1 成立则切到新bucket
+        Note over BB: key3 成立则切到新bucket
+        Note over BB: 若 key 期间被 Remove 则 mapping 已不在旧bucket 跳过
     end
-    BB->>BB: 新bucket加入 buckets_/lru_index_<br/>last_access_ns_ 继承旧值<br/>deleted_bytes_=0, compacting_=false
-    BB->>BB: 旧bucket从buckets_删除, total_size_ 更新
+    BB->>BB: 新bucket加入 buckets_ 与 lru_index_
+    Note over BB: last_access_ns_ 继承旧值
+    Note over BB: deleted_bytes_=0 且 compacting_=false
+    BB->>BB: 旧bucket从buckets_删除
+    BB->>BB: total_size_ 更新
     BB-->>GC: 释放锁
     end
 
-    Note over Reader: 并发: Reader 读旧 bucket 完成
-    Reader->>Reader: guard 析构, inflight_-- (旧bucket文件仍受保护)
+    Note over Reader: 并发 Reader 读旧 bucket 完成
+    Note over Reader: guard 析构 inflight_-- 旧bucket文件仍受保护
 
     rect rgb(255, 230, 230)
-    Note over GC,Disk: Step5: 锁外删旧 bucket 文件
-    GC->>BB: 等旧bucket inflight_==0 (复用 FinalizeEviction)
+    Note over GC,Disk: Step5 锁外删旧 bucket 文件
+    GC->>BB: 等旧bucket inflight_==0 复用 FinalizeEviction
     Note over GC: inflight_==0
-    GC->>Disk: 删旧 .bucket/.meta
+    GC->>Disk: 删旧 .bucket .meta
     Disk-->>GC: deleted
     end
 
-    Note over GC,Disk: 结果: key1,key3 在新bucket可读; key2,key4 空间已回收; 旧文件已删
+    Note over GC,Disk: 结果 key1 key3 在新bucket可读 key2 key4 空间已回收 旧文件已删
 ```
 
 ### 10.3 空间不足 + 无 tombstone（offload 失败，不删 key）
@@ -607,18 +615,23 @@ sequenceDiagram
     participant Disk
 
     Client->>BB: BatchOffload
-    BB->>BB: IsEnableOffloading()?
-    Note over BB: disable_ssd_eviction=true<br/>→ 走限额检查分支
-    BB->>BB: total_size + bucket_size > limit?<br/>→ true: 空间不足
-    BB-->>Client: error (返回 false)
-    Note over BB: PrepareEviction(required_size)<br/>disable_ssd_eviction → no-op, 不删 bucket
+    BB->>BB: IsEnableOffloading
+    Note over BB: disable_ssd_eviction=true
+    Note over BB: 走限额检查分支
+    BB->>BB: total_size + bucket_size 是否大于 limit
+    Note over BB: 是 则空间不足
+    BB-->>Client: error 返回 false
+    Note over BB: PrepareEviction(required_size)
+    Note over BB: disable_ssd_eviction 为 no-op 不删 bucket
 
     BB->>GC: GC 尝试回收 tombstone
-    GC->>GC: 扫描候选: deleted_bytes_>0 ?
-    Note over GC: 无 tombstone bucket → GC 不做任何事
+    GC->>GC: 扫描候选 deleted_bytes_>0
+    Note over GC: 无 tombstone bucket
+    Note over GC: GC 不做任何事
     GC-->>BB: 无可回收空间
 
-    Note over Client,Disk: offload 失败, master 保留内存 replica<br/>没有任何未删除 key 被删
+    Note over Client,Disk: offload 失败 master 保留内存 replica
+    Note over Client,Disk: 没有任何未删除 key 被删
 ```
 
 ### 10.4 GC vs 并发 Remove（二次校验保证不丢不漏）
@@ -630,22 +643,25 @@ sequenceDiagram
     participant Client
     participant Master
 
-    Note over GC: live = {key1, key3} (Step1 快照时 key3 还在)
+    Note over GC: live 为 key1 key3（Step1 快照时 key3 还在）
 
-    Note over Client: 并发: Client Remove(key3)
+    Note over Client: 并发 Client Remove key3
     Client->>Master: Remove(key3)
     Client->>BB: MarkRemoved(key3)
-    Note over BB: [mutex_ 独占] (Remove 先抢到锁)
+    Note over BB: mutex_ 独占（Remove 先抢到锁）
     BB->>BB: 删 object_bucket_map_[key3]
-    BB->>BB: deleted_bytes_ += size3 [解锁]
+    BB->>BB: deleted_bytes_ += size3 后解锁
     BB-->>Client: done
 
-    Note over GC: Step4 GC 拿到锁, 二次校验
+    Note over GC: Step4 GC 拿到锁 二次校验
     GC->>BB: 请求独占锁
-    BB->>BB: 校验 key3: object_bucket_map_[key3] ?
-    Note over BB: → 已不在 (被 Remove 删了)<br/>→ bucket_id != 旧bucket<br/>→ 跳过 key3, 不搬入新bucket
-    BB->>BB: 只切 key1 → 新bucket
-    Note over BB: key3 不丢: 已被 Remove 正确删除<br/>key3 不漏: 不进新bucket
+    BB->>BB: 校验 key3 object_bucket_map_[key3]
+    Note over BB: 已不在（被 Remove 删了）
+    Note over BB: bucket_id 不等于旧bucket
+    Note over BB: 跳过 key3 不搬入新bucket
+    BB->>BB: 只切 key1 到新bucket
+    Note over BB: key3 不丢 已被 Remove 正确删除
+    Note over BB: key3 不漏 不进新bucket
     BB-->>GC: done
 ```
 
