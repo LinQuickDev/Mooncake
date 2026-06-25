@@ -159,18 +159,26 @@ class GCE2ETest : public ::testing::Test {
         return ret == 0;
     }
 
-    // Put a key via RealClient and wait until it is readable (offload
-    // completed). Returns false on timeout.
-    bool PutAndWaitReadable(const std::string& key,
-                            const std::string& value) {
+    // Put a key via RealClient and wait until it has been offloaded to the
+    // BucketStorageBackend (a .bucket file appears on SSD). Returns false on
+    // timeout. Waiting on memory reads is insufficient — offload is async
+    // (PutEnd queues, heartbeat drains) and MarkRemoved is a no-op until the
+    // key lands in object_bucket_map_.
+    bool PutAndWaitOffloaded(const std::string& key,
+                             const std::string& value,
+                             const fs::path& ssd_dir) {
         std::span<const char> span(value.data(), value.size());
         ReplicateConfig config;
         config.replica_num = 1;
         if (real_client_->put(key, span, config) != 0) return false;
-        // Wait for offload + get to succeed with matching data.
-        for (int i = 0; i < 100; ++i) {
-            auto got = ReadKey(real_client_, key);
-            if (got.has_value() && got.value() == value) return true;
+        // Wait for offload: a .bucket file must appear in ssd_dir, AND the
+        // key must be readable via get_buffer (confirms data integrity).
+        for (int i = 0; i < 150; ++i) {  // up to 15s
+            int buckets = CountFilesWithSuffix(ssd_dir, ".bucket");
+            if (buckets > 0) {
+                auto got = ReadKey(real_client_, key);
+                if (got.has_value() && got.value() == value) return true;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return false;
@@ -201,10 +209,12 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     const std::string v1(4 * kMB, 'A');
     const std::string v2(4 * kMB, 'B');
 
-    ASSERT_TRUE(PutAndWaitReadable(k1, v1)) << "k1 offload timed out";
-    ASSERT_TRUE(PutAndWaitReadable(k2, v2)) << "k2 offload timed out";
-
     fs::path ssd_dir = tmp_dir_ / "ssd_offload";
+    ASSERT_TRUE(PutAndWaitOffloaded(k1, v1, ssd_dir))
+        << "k1 offload timed out";
+    ASSERT_TRUE(PutAndWaitOffloaded(k2, v2, ssd_dir))
+        << "k2 offload timed out";
+
     int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
 
     // Remove k1. This marks a tombstone; GC should compact the bucket.
@@ -264,16 +274,31 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     const std::string v2(4 * kMB, 'Y');
     const std::string v3(4 * kMB, 'Z');
 
-    ASSERT_TRUE(PutAndWaitReadable(k1, v1));
-    ASSERT_TRUE(PutAndWaitReadable(k2, v2));
-    ASSERT_TRUE(PutAndWaitReadable(k3, v3));
+    fs::path ssd_dir = tmp_dir_ / "ssd_offload";
+    ASSERT_TRUE(PutAndWaitOffloaded(k1, v1, ssd_dir));
+    ASSERT_TRUE(PutAndWaitOffloaded(k2, v2, ssd_dir));
+    ASSERT_TRUE(PutAndWaitOffloaded(k3, v3, ssd_dir));
 
     // Remove the middle key (force=true to bypass lease).
     ASSERT_EQ(real_client_->remove(k2, /*force=*/true), 0);
 
-    // Wait for GC to compact, then verify survivors.
-    // Give GC a few rounds to run.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // Wait for GC to compact, then verify survivors. Poll for bucket file
+    // count change AND data integrity.
+    int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
+    bool compacted = false;
+    for (int i = 0; i < 100; ++i) {
+        auto got1 = ReadKey(real_client_, k1);
+        auto got3 = ReadKey(real_client_, k3);
+        if (got1.has_value() && got1.value() == v1 &&
+            got3.has_value() && got3.value() == v3) {
+            int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
+            if (buckets_now != buckets_before) {
+                compacted = true;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 
     // k1 and k3 must survive with correct data.
     auto got1 = ReadKey(real_client_, k1);
@@ -287,6 +312,9 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     auto got2 = ReadKey(real_client_, k2);
     EXPECT_FALSE(got2.has_value())
         << "Removed key k2 should not be readable";
+
+    LOG(INFO) << "Test2 compaction "
+              << (compacted ? "detected" : "not detected (timeout)");
 }
 
 // -------------------------------------------------------------------
@@ -301,7 +329,8 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
 
     const std::string k1 = "gc_batch_k1";
     const std::string v1(4 * kMB, 'Q');
-    ASSERT_TRUE(PutAndWaitReadable(k1, v1));
+    fs::path ssd_dir = tmp_dir_ / "ssd_offload";
+    ASSERT_TRUE(PutAndWaitOffloaded(k1, v1, ssd_dir));
 
     // Batch remove: k1 exists, k_absent does not. force=true bypasses lease.
     std::vector<std::string> keys{k1, "gc_batch_absent"};
