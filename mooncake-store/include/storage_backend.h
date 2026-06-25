@@ -200,6 +200,10 @@ struct BucketBackendConfig {
                 // eviction_policy. Set via
                 // MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION.
 
+    int64_t tail_flush_heartbeat_threshold =
+        3;  // Flush a partial tail bucket after this many consecutive
+            // grouping rounds without new keys.
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
@@ -785,7 +789,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param offloading_objects Input map of object keys and their sizes
      * (bytes).
      * @param buckets_keys Output: bucketized keys; each inner vector is a
-     * bucket.
+     * bucket. Full buckets are returned immediately. The final partial bucket
+     * is retained briefly for aggregation and flushed after consecutive idle
+     * heartbeats so pending offloads cannot wait forever for more keys.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
@@ -980,6 +986,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+    int64_t tail_idle_heartbeats_ GUARDED_BY(offloading_mutex_) = 0;
 
     // File handle cache for UringFile to avoid repeated open/close overhead
     mutable Mutex file_cache_mutex_;

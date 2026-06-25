@@ -30,6 +30,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_TAIL_FLUSH_HEARTBEATS");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
@@ -182,13 +183,23 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
     buckets_keys.clear();
+    offloading_objects.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
-    ASSERT_EQ(buckets_keys.size(), 4);
-    for (const auto& bucket_keys : buckets_keys) {
-        ASSERT_EQ(bucket_keys.size(), 10);
-    }
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 5);
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
@@ -209,13 +220,23 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
     buckets_keys.clear();
+    offloading_objects.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
-    ASSERT_EQ(buckets_keys.size(), 4);
-    for (const auto& bucket_keys : buckets_keys) {
-        ASSERT_EQ(bucket_keys.size(), 10);
-    }
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 5);
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
@@ -247,7 +268,7 @@ TEST_F(FileStorageTest,
 }
 
 TEST_F(FileStorageTest,
-       GroupOffloadingKeysByBucket_ungrouped_offloading_objects) {
+       GroupOffloadingKeysByBucket_flushes_tail_bucket) {
     std::unordered_map<std::string, int64_t> offloading_objects;
     for (size_t i = 0; i < 1; i++) {
         offloading_objects.emplace("test" + std::to_string(i), 1);
@@ -258,14 +279,48 @@ TEST_F(FileStorageTest,
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+
+    buckets_keys.clear();
     offloading_objects.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 1);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+
     for (size_t i = 0; i < 7; i++) {
         offloading_objects.emplace("test" + std::to_string(i), 1);
     }
+    buckets_keys.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 7);
+
+    offloading_objects.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 7);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
@@ -277,6 +332,7 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
     EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
     EXPECT_EQ(bucket_backend_config.bucket_size_limit, 256 * 1024 * 1024);
+    EXPECT_EQ(bucket_backend_config.tail_flush_heartbeat_threshold, 3);
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
