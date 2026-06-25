@@ -909,7 +909,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     // GC thread lifecycle members
     std::atomic<bool> gc_running_{false};
     std::thread gc_thread_;
-    mutable Mutex gc_mutex_;
+    std::mutex gc_mutex_;
     std::condition_variable gc_cv_;
 
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(

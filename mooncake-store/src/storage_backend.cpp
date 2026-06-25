@@ -1267,6 +1267,12 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    // Stop background GC thread first, before clearing any state it touches.
+    if (gc_running_.load(std::memory_order_acquire)) {
+        gc_running_.store(false, std::memory_order_release);
+        gc_cv_.notify_all();
+        if (gc_thread_.joinable()) gc_thread_.join();
+    }
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -1742,6 +1748,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
                    << std::endl;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Start background GC thread if enabled.
+    if (bucket_backend_config_.gc_enable) {
+        gc_running_.store(true, std::memory_order_release);
+        gc_thread_ = std::thread(&BucketStorageBackend::GCThreadFunc, this);
     }
 
     return {};
@@ -2691,8 +2703,80 @@ void BucketStorageBackend::DeleteBucketFiles(int64_t bucket_id) {
     }
 }
 
-// GCThreadFunc stub (implemented in Task 8).
-void BucketStorageBackend::GCThreadFunc() {}
+// GCThreadFunc: background tombstone compaction loop.
+void BucketStorageBackend::GCThreadFunc() {
+    LOG(INFO) << "[GC] background compaction thread started";
+    while (gc_running_.load(std::memory_order_acquire)) {
+        // Sleep for gc_interval_ms or until woken for shutdown.
+        {
+            std::unique_lock<std::mutex> lock(gc_mutex_);
+            gc_cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(
+                    bucket_backend_config_.gc_interval_ms),
+                [this]() {
+                    return !gc_running_.load(std::memory_order_relaxed);
+                });
+        }
+        if (!gc_running_.load(std::memory_order_acquire)) break;
+
+        if (!bucket_backend_config_.gc_enable) continue;
+
+        // Check space pressure under shared lock (total_size_ is
+        // GUARDED_BY(mutex_)).
+        bool space_pressure = false;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            if (bucket_backend_config_.max_total_size > 0) {
+                double used_ratio =
+                    static_cast<double>(total_size_) /
+                    static_cast<double>(
+                        bucket_backend_config_.max_total_size);
+                space_pressure = used_ratio >=
+                                 bucket_backend_config_
+                                     .gc_high_watermark_ratio;
+            }
+        }
+
+        int64_t compacted = 0;
+        while (compacted < bucket_backend_config_.gc_max_buckets_per_round) {
+            int64_t target_bucket_id = -1;
+            {
+                SharedMutexLocker lock(&mutex_);
+                auto candidate = SelectGCCandidate();
+                if (candidate == buckets_.end()) break;
+                // Check deleted ratio threshold (unless space pressure
+                // forces compaction of any tombstone bucket).
+                int64_t deleted = candidate->second->deleted_bytes_.load(
+                    std::memory_order_relaxed);
+                int64_t data_size = candidate->second->data_size;
+                double ratio =
+                    (data_size > 0)
+                        ? static_cast<double>(deleted) /
+                              static_cast<double>(data_size)
+                        : 0.0;
+                if (!space_pressure &&
+                    ratio < bucket_backend_config_.gc_deleted_ratio) {
+                    break;  // no candidate meets ratio threshold
+                }
+                target_bucket_id = candidate->first;
+            }
+            if (target_bucket_id < 0) break;
+            if (CompactBucket(target_bucket_id)) {
+                ++compacted;
+            } else {
+                LOG(WARNING) << "[GC] CompactBucket failed for bucket "
+                             << target_bucket_id
+                             << ", will retry next round";
+                break;  // avoid hot-looping on a failing bucket
+            }
+        }
+        if (compacted > 0) {
+            LOG(INFO) << "[GC] compacted " << compacted << " bucket(s)";
+        }
+    }
+    LOG(INFO) << "[GC] background compaction thread stopped";
+}
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
