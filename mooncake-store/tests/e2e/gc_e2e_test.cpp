@@ -208,7 +208,9 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
 
     // Remove k1. This marks a tombstone; GC should compact the bucket.
-    ASSERT_EQ(real_client_->remove(k1), 0);
+    // force=true bypasses the object lease (PutEnd sets a lease that would
+    // otherwise reject Remove with OBJECT_HAS_LEASE = -706).
+    ASSERT_EQ(real_client_->remove(k1, /*force=*/true), 0);
 
     // Wait for GC to run (interval=200ms, ratio=0.1). Poll for the
     // surviving key to remain readable AND bucket file reclamation.
@@ -266,8 +268,8 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     ASSERT_TRUE(PutAndWaitReadable(k2, v2));
     ASSERT_TRUE(PutAndWaitReadable(k3, v3));
 
-    // Remove the middle key.
-    ASSERT_EQ(real_client_->remove(k2), 0);
+    // Remove the middle key (force=true to bypass lease).
+    ASSERT_EQ(real_client_->remove(k2, /*force=*/true), 0);
 
     // Wait for GC to compact, then verify survivors.
     // Give GC a few rounds to run.
@@ -301,9 +303,9 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
     const std::string v1(4 * kMB, 'Q');
     ASSERT_TRUE(PutAndWaitReadable(k1, v1));
 
-    // Batch remove: k1 exists, k_absent does not.
+    // Batch remove: k1 exists, k_absent does not. force=true bypasses lease.
     std::vector<std::string> keys{k1, "gc_batch_absent"};
-    auto results = real_client_->batchRemove(keys);
+    auto results = real_client_->batchRemove(keys, /*force=*/true);
     ASSERT_EQ(results.size(), 2u);
     // k1 should succeed (0); absent key may succeed or fail depending on
     // master semantics, but k1 must be gone either way.
