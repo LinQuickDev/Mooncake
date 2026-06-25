@@ -42,6 +42,11 @@ bool BucketBackendConfig::Validate() const {
         LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
         return false;
     }
+    if (tail_flush_heartbeat_threshold <= 0) {
+        LOG(ERROR)
+            << "BucketBackendConfig: tail_flush_heartbeat_threshold must > 0";
+        return false;
+    }
     return true;
 }
 
@@ -65,6 +70,10 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
 
     config.bucket_size_limit = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
+
+    config.tail_flush_heartbeat_threshold = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_TAIL_FLUSH_HEARTBEATS",
+        config.tail_flush_heartbeat_threshold);
 
     config.max_total_size =
         GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
@@ -1836,6 +1845,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
+    tail_idle_heartbeats_ = 0;
 }
 
 size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
@@ -1847,92 +1857,108 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
-    auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
-    auto it = offloading_objects.cbegin();
-    int64_t residue_count = static_cast<int64_t>(
-        offloading_objects.size() + ungrouped_offloading_objects.size());
-    int64_t total_count = residue_count;
+    int64_t new_key_count = 0;
+    for (const auto& [key, size] : offloading_objects) {
+        auto [_, inserted] = ungrouped_offloading_objects_.emplace(key, size);
+        if (inserted) {
+            ++new_key_count;
+        }
+    }
+    if (ungrouped_offloading_objects_.empty()) {
+        tail_idle_heartbeats_ = 0;
+        return {};
+    }
+    if (new_key_count > 0) {
+        tail_idle_heartbeats_ = 0;
+    } else {
+        ++tail_idle_heartbeats_;
+    }
+
+    int64_t grouped_count = 0;
+    const int64_t total_count =
+        static_cast<int64_t>(ungrouped_offloading_objects_.size());
+    std::vector<std::string> grouped_keys;
 
     auto is_exist_func =
         [this](const std::string& key) -> tl::expected<bool, ErrorCode> {
         return IsExist(key);
     };
 
-    while (it != offloading_objects.cend()) {
-        std::vector<std::string> bucket_keys;
-        std::unordered_map<std::string, int64_t> bucket_objects;
-        int64_t bucket_data_size = 0;
+    std::vector<std::string> bucket_keys;
+    int64_t bucket_data_size = 0;
 
-        if (!ungrouped_offloading_objects.empty()) {
-            for (const auto& ungrouped_it : ungrouped_offloading_objects) {
-                bucket_data_size += ungrouped_it.second;
-                bucket_keys.push_back(ungrouped_it.first);
-                bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
-            }
-            VLOG(1) << "Ungrouped offloading objects have been processed and "
-                       "cleared; count="
-                    << ungrouped_offloading_objects.size();
-            ungrouped_offloading_objects.clear();
+    auto flush_bucket = [&]() {
+        if (bucket_keys.empty()) {
+            return;
         }
-
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
-             i < bucket_backend_config_.bucket_keys_limit; ++i) {
-            if (it == offloading_objects.cend()) {
-                for (const auto& bucket_object : bucket_objects) {
-                    ungrouped_offloading_objects.emplace(bucket_object.first,
-                                                         bucket_object.second);
-                }
-                VLOG(1) << "Add offloading objects to ungrouped pool. "
-                        << "Total ungrouped count: "
-                        << ungrouped_offloading_objects.size();
-                return {};
-            }
-
-            if (it->second > bucket_backend_config_.bucket_size_limit) {
-                LOG(ERROR) << "Object size exceeds bucket size limit: "
-                           << "key=" << it->first
-                           << ", object_size=" << it->second << ", limit="
-                           << bucket_backend_config_.bucket_size_limit;
-                ++it;
-                continue;
-            }
-
-            auto is_exist_result = is_exist_func(it->first);
-            if (!is_exist_result) {
-                LOG(ERROR) << "Failed to check existence in storage backend: "
-                           << "key=" << it->first
-                           << ", error=" << is_exist_result.error();
-            }
-            if (is_exist_result && is_exist_result.value()) {
-                ++it;
-                continue;
-            }
-
-            if (bucket_data_size + it->second >
-                bucket_backend_config_.bucket_size_limit) {
-                break;
-            }
-
-            bucket_data_size += it->second;
-            bucket_keys.push_back(it->first);
-            bucket_objects.emplace(it->first, it->second);
-            ++it;
-
-            if (bucket_data_size == bucket_backend_config_.bucket_size_limit) {
-                break;
-            }
-        }
-
-        auto bucket_keys_count = static_cast<int64_t>(bucket_keys.size());
-        residue_count -= bucket_keys_count;
+        const auto bucket_keys_count = static_cast<int64_t>(bucket_keys.size());
+        grouped_count += bucket_keys_count;
+        grouped_keys.insert(grouped_keys.end(), bucket_keys.begin(),
+                            bucket_keys.end());
         buckets_keys.push_back(std::move(bucket_keys));
         VLOG(1) << "Group objects with total object count: " << total_count
                 << ", current bucket object count: " << bucket_keys_count
                 << ", current bucket data size: " << bucket_data_size
                 << ", grouped bucket count: " << buckets_keys.size()
-                << ", residue object count: " << residue_count;
+                << ", residue object count: "
+                << (total_count - grouped_count);
+        bucket_keys.clear();
+        bucket_data_size = 0;
+    };
+
+    for (const auto& [key, size] : ungrouped_offloading_objects_) {
+        if (size > bucket_backend_config_.bucket_size_limit) {
+            LOG(ERROR) << "Object size exceeds bucket size limit: "
+                       << "key=" << key << ", object_size=" << size
+                       << ", limit="
+                       << bucket_backend_config_.bucket_size_limit;
+            continue;
+        }
+
+        auto is_exist_result = is_exist_func(key);
+        if (!is_exist_result) {
+            LOG(ERROR) << "Failed to check existence in storage backend: "
+                       << "key=" << key
+                       << ", error=" << is_exist_result.error();
+        }
+        if (is_exist_result && is_exist_result.value()) {
+            grouped_keys.push_back(key);
+            continue;
+        }
+
+        if (!bucket_keys.empty() &&
+            (static_cast<int64_t>(bucket_keys.size()) >=
+                 bucket_backend_config_.bucket_keys_limit ||
+             bucket_data_size + size >
+                 bucket_backend_config_.bucket_size_limit)) {
+            flush_bucket();
+        }
+
+        bucket_data_size += size;
+        bucket_keys.push_back(key);
+
+        if (static_cast<int64_t>(bucket_keys.size()) >=
+                bucket_backend_config_.bucket_keys_limit ||
+            bucket_data_size == bucket_backend_config_.bucket_size_limit) {
+            flush_bucket();
+        }
     }
 
+    if (!bucket_keys.empty() &&
+        tail_idle_heartbeats_ >=
+            bucket_backend_config_.tail_flush_heartbeat_threshold) {
+        VLOG(1) << "Flush partial offload bucket after idle heartbeats: "
+                << tail_idle_heartbeats_
+                << ", tail_key_count=" << bucket_keys.size();
+        flush_bucket();
+        tail_idle_heartbeats_ = 0;
+    }
+    for (const auto& key : grouped_keys) {
+        ungrouped_offloading_objects_.erase(key);
+    }
+    if (ungrouped_offloading_objects_.empty()) {
+        tail_idle_heartbeats_ = 0;
+    }
     return {};
 }
 
