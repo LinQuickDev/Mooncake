@@ -2493,16 +2493,206 @@ BucketStorageBackend::SelectGCCandidate() {
     return best_it;
 }
 
-bool BucketStorageBackend::CompactBucket(int64_t /*bucket_id*/) {
+bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
+    // Step 1: lock-snapshot live keys
+    std::shared_ptr<BucketMetadata> old_bucket;
+    std::vector<std::string> live_keys;
+    std::vector<BucketObjectMetadata> live_metas;
+    int64_t old_last_access_ns = 0;
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto it = buckets_.find(bucket_id);
+        if (it == buckets_.end()) return true;  // gone, nothing to do
+        old_bucket = it->second;
+        if (old_bucket->compacting_.load(std::memory_order_relaxed))
+            return true;  // already being compacted
+        old_bucket->compacting_.store(true, std::memory_order_relaxed);
+        old_last_access_ns =
+            old_bucket->last_access_ns_.load(std::memory_order_relaxed);
+
+        // Collect live keys: present in object_bucket_map_ pointing at this
+        // bucket. Deleted keys (removed from map) are skipped.
+        for (size_t i = 0; i < old_bucket->keys.size(); ++i) {
+            const auto& key = old_bucket->keys[i];
+            auto map_it = object_bucket_map_.find(key);
+            if (map_it != object_bucket_map_.end() &&
+                map_it->second.bucket_id == bucket_id) {
+                live_keys.push_back(key);
+                live_metas.push_back(old_bucket->metadatas[i]);
+            }
+        }
+    }
+    // BucketReadGuard on old_bucket protects old file during reads.
+    BucketReadGuard guard(old_bucket);
+
+    // If no live keys, just delete the old bucket entirely.
+    if (live_keys.empty()) {
+        {
+            SharedMutexLocker lock(&mutex_);
+            auto it = buckets_.find(bucket_id);
+            if (it != buckets_.end()) {
+                total_size_ -=
+                    it->second->data_size + it->second->meta_size;
+                // deleted keys already removed from object_bucket_map_
+                buckets_.erase(it);
+                lru_index_.erase({old_last_access_ns, bucket_id});
+            }
+        }
+        WaitForInflightReads(old_bucket);
+        DeleteBucketFiles(bucket_id);
+        return true;
+    }
+
+    // Step 2: read live key data from old bucket (lock-free IO)
+    // Uses the same vector_read pattern as BatchLoad (storage_backend.cpp).
+    std::unordered_map<std::string, std::vector<Slice>> live_batch;
+    std::unordered_map<std::string, std::string> live_data_buffers;
+    auto data_path = GetBucketDataPath(bucket_id);
+    if (!data_path) return false;
+    auto file_result = OpenFile(data_path.value(), FileMode::Read);
+    if (!file_result) return false;
+    auto& file = file_result.value();
+    for (size_t i = 0; i < live_keys.size(); ++i) {
+        const auto& key = live_keys[i];
+        const auto& meta = live_metas[i];
+        std::string data;
+        data.resize(meta.data_size);
+        int64_t actual_offset = meta.offset + meta.key_size;
+        iovec iov{data.data(), static_cast<size_t>(meta.data_size)};
+        auto read_res = file->vector_read(&iov, 1, actual_offset);
+        if (!read_res ||
+            read_res.value() != static_cast<size_t>(meta.data_size)) {
+            LOG(ERROR) << "CompactBucket: read failed for key: " << key
+                       << ", bucket_id=" << bucket_id;
+            // Reset compacting_ so a later round can retry.
+            old_bucket->compacting_.store(false, std::memory_order_relaxed);
+            return false;
+        }
+        live_data_buffers[key] = std::move(data);
+        live_batch.emplace(key, std::vector<Slice>{Slice{
+                                    live_data_buffers[key].data(),
+                                    live_data_buffers[key].size()}});
+    }
+
+    // Step 3: write live keys into a new bucket (lock-free IO)
+    int64_t new_bucket_id = bucket_id_generator_->NextId();
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> new_metas;
+    auto build_result = BuildBucket(new_bucket_id, live_batch, iovs, new_metas);
+    if (!build_result) {
+        LOG(ERROR) << "CompactBucket: BuildBucket failed, bucket_id="
+                   << bucket_id;
+        old_bucket->compacting_.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    auto write_result =
+        WriteBucket(new_bucket_id, build_result.value(), iovs);
+    if (!write_result) {
+        LOG(ERROR) << "CompactBucket: WriteBucket failed, bucket_id="
+                   << bucket_id;
+        old_bucket->compacting_.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    auto store_meta_result =
+        StoreBucketMetadata(new_bucket_id, build_result.value());
+    if (!store_meta_result) {
+        LOG(ERROR) << "CompactBucket: StoreBucketMetadata failed, bucket_id="
+                   << bucket_id;
+        old_bucket->compacting_.store(false, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Step 4: atomic swap under lock with re-validation
+    {
+        SharedMutexLocker lock(&mutex_);
+        // Re-validate each live key: still points at old bucket?
+        for (size_t i = 0; i < live_keys.size(); ++i) {
+            const auto& key = live_keys[i];
+            auto map_it = object_bucket_map_.find(key);
+            if (map_it != object_bucket_map_.end() &&
+                map_it->second.bucket_id == bucket_id) {
+                // Still live at old bucket -> remap to new bucket.
+                map_it->second = new_metas[i];
+            }
+            // else: key was removed or remapped during compaction -> skip.
+        }
+        // Insert new bucket into maps.
+        auto& new_bucket = build_result.value();
+        total_size_ += new_bucket->data_size + new_bucket->meta_size;
+        new_bucket->last_access_ns_.store(
+            old_last_access_ns, std::memory_order_relaxed);
+        // deleted_bytes_ and compacting_ already 0 (fresh object).
+        buckets_.emplace(new_bucket_id, std::move(new_bucket));
+        lru_index_.emplace(old_last_access_ns, new_bucket_id);
+
+        // Remove old bucket from maps.
+        auto old_it = buckets_.find(bucket_id);
+        if (old_it != buckets_.end()) {
+            total_size_ -=
+                old_it->second->data_size + old_it->second->meta_size;
+            buckets_.erase(old_it);
+            lru_index_.erase({old_last_access_ns, bucket_id});
+        }
+    }
+
+    // Step 5: wait for in-flight reads on old bucket, then delete files.
+    WaitForInflightReads(old_bucket);
+    DeleteBucketFiles(bucket_id);
     return true;
 }
 
-void BucketStorageBackend::GCThreadFunc() {}
-
 void BucketStorageBackend::WaitForInflightReads(
-    std::shared_ptr<BucketMetadata> /*bucket*/) {}
+    std::shared_ptr<BucketMetadata> bucket) {
+    constexpr int kMaxSpinIterations = 1000;
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+    int spin_count = 0;
+    auto wait_start = std::chrono::steady_clock::now();
+    while (bucket->inflight_reads_.load(std::memory_order_acquire) > 0) {
+        if (++spin_count > kMaxSpinIterations) {
+            std::this_thread::yield();
+            spin_count = 0;
+            if (std::chrono::steady_clock::now() - wait_start >
+                kMaxWaitTime) {
+                LOG(ERROR) << "CompactBucket: timed out waiting for "
+                              "in-flight reads, inflight_reads="
+                           << bucket->inflight_reads_.load(
+                                  std::memory_order_relaxed);
+                break;
+            }
+        } else {
+            PAUSE();
+        }
+    }
+}
 
-void BucketStorageBackend::DeleteBucketFiles(int64_t /*bucket_id*/) {}
+void BucketStorageBackend::DeleteBucketFiles(int64_t bucket_id) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto data_path = GetBucketDataPath(bucket_id);
+    if (data_path) {
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path.value());
+        }
+        fs::remove(data_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "CompactBucket: failed to remove data file: "
+                       << data_path.value() << ", error: " << ec.message();
+        }
+    }
+    auto meta_path = GetBucketMetadataPath(bucket_id);
+    if (meta_path) {
+        ec.clear();
+        fs::remove(meta_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "CompactBucket: failed to remove meta file: "
+                       << meta_path.value() << ", error: " << ec.message();
+        }
+    }
+}
+
+// GCThreadFunc stub (implemented in Task 8).
+void BucketStorageBackend::GCThreadFunc() {}
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
