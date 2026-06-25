@@ -91,12 +91,29 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     config.gc_interval_ms =
         GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS",
                           config.gc_interval_ms);
-    config.gc_deleted_ratio =
-        GetEnvOr<double>("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO",
-                         config.gc_deleted_ratio);
-    config.gc_high_watermark_ratio = GetEnvOr<double>(
-        "MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO",
-        config.gc_high_watermark_ratio);
+    // Parse doubles manually: GetEnvOr uses std::stoll which cannot parse
+    // fractional values like "0.25".
+    {
+        const char* ratio_env =
+            std::getenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
+        if (ratio_env && !std::string(ratio_env).empty()) {
+            try {
+                config.gc_deleted_ratio = std::stod(std::string(ratio_env));
+            } catch (...) {
+                // keep default
+            }
+        }
+        const char* wm_env = std::getenv(
+            "MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO");
+        if (wm_env && !std::string(wm_env).empty()) {
+            try {
+                config.gc_high_watermark_ratio =
+                    std::stod(std::string(wm_env));
+            } catch (...) {
+                // keep default
+            }
+        }
+    }
     config.gc_max_buckets_per_round = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND",
         config.gc_max_buckets_per_round);
