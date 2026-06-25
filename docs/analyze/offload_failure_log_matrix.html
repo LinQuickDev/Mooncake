@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mooncake Offload Failure Log Matrix</title>
+  <style>
+    body {
+      margin: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      color: #1f2933;
+      background: #f7f8fa;
+      line-height: 1.5;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      font-weight: 700;
+    }
+    p {
+      margin: 0 0 16px;
+      color: #52616f;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      background: #ffffff;
+      border: 1px solid #d8dee6;
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1180px;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid #e5e9ef;
+      border-right: 1px solid #e5e9ef;
+      vertical-align: top;
+      text-align: left;
+      font-size: 14px;
+    }
+    th:last-child, td:last-child {
+      border-right: none;
+    }
+    thead th {
+      position: sticky;
+      top: 0;
+      background: #eef2f6;
+      color: #243447;
+      font-weight: 700;
+      z-index: 1;
+    }
+    tbody tr:nth-child(even) {
+      background: #fbfcfd;
+    }
+    code {
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: #eef2f6;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+    }
+    .yes {
+      color: #9f1239;
+      font-weight: 700;
+    }
+    .no {
+      color: #166534;
+      font-weight: 700;
+    }
+    .mixed {
+      color: #92400e;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <h1>enable_offload=true, offload_on_evict=false 场景下 offload 失败路径与日志矩阵</h1>
+  <p>说明：“是否有 ERROR 日志”按代码里的 <code>LOG(ERROR)</code> / <code>MC_LOG(ERROR)</code> 统计；<code>WARNING</code>/<code>INFO</code> 在备注中单独标注。</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>阶段</th>
+          <th>失败路径 / 条件</th>
+          <th>错误码 / 结果</th>
+          <th>是否有 ERROR 日志</th>
+          <th>日志位置 / 备注</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Client 初始化</td><td><code>RegisterLocalMemory()</code> 失败</td><td>返回底层错误</td><td class="yes">有</td><td><code>FileStorage::Init()</code> 打印 <code>Failed to register local memory</code></td></tr>
+        <tr><td>Client 初始化</td><td>storage backend <code>Init()</code> 失败</td><td>返回底层错误</td><td class="yes">有</td><td><code>FileStorage::Init()</code> 打印 <code>Failed to init storage backend</code></td></tr>
+        <tr><td>Client 初始化</td><td><code>IsEnableOffloading()</code> 返回错误</td><td>返回底层错误</td><td class="yes">有</td><td><code>FileStorage::Init()</code> 打印 <code>Failed to get enable persist result</code></td></tr>
+        <tr><td>Client 初始化</td><td><code>IsEnableOffloading()</code> 返回 <code>false</code></td><td>挂载成功但 <code>enable_offloading_=false</code></td><td class="no">无 ERROR</td><td>只有 INFO：<code>IsEnableOffloading result: false</code></td></tr>
+        <tr><td>Client 初始化</td><td><code>MountLocalDiskSegment()</code> 失败</td><td>返回底层错误</td><td class="yes">有</td><td>Client 打印 <code>Failed to mount file storage</code>；Master 未启用 offload 时也有 ERROR</td></tr>
+
+        <tr><td>PutEnd 入队</td><td>MEMORY replica 没有 segment name</td><td><code>PushOffloadingQueue()</code> 返回 OK 但不入队</td><td class="no">无</td><td>静默跳过</td></tr>
+        <tr><td>PutEnd 入队</td><td>segment name 找不到 client</td><td><code>SEGMENT_NOT_FOUND</code></td><td class="yes">有</td><td><code>PushOffloadingQueue()</code> 打印 <code>Segment ... not found</code>；<code>PutEnd()</code> 不再额外打印</td></tr>
+        <tr><td>PutEnd 入队</td><td>client local disk segment 不存在</td><td><code>UNABLE_OFFLOADING</code></td><td class="no">无</td><td><code>PutEnd()</code> 忽略返回值</td></tr>
+        <tr><td>PutEnd 入队</td><td>local disk segment <code>enable_offloading=false</code></td><td><code>UNABLE_OFFLOADING</code></td><td class="no">无</td><td><code>PutEnd()</code> 忽略返回值</td></tr>
+        <tr><td>PutEnd 入队</td><td>offloading queue 达到 <code>offloading_queue_limit_</code></td><td><code>KEYS_ULTRA_LIMIT</code></td><td class="no">无</td><td><code>PutEnd()</code> 忽略返回值</td></tr>
+        <tr><td>PutEnd 入队</td><td>同一个 tenant/key 已在 queue 中</td><td><code>OBJECT_ALREADY_EXISTS</code></td><td class="no">无</td><td><code>PutEnd()</code> 忽略返回值</td></tr>
+
+        <tr><td>Heartbeat 下发</td><td>Master 找不到 client local disk segment</td><td><code>SEGMENT_NOT_FOUND</code></td><td class="yes">有</td><td>Master 打印 <code>Local disk segment not found</code>；Client 先 WARNING 并尝试 remount</td></tr>
+        <tr><td>Heartbeat 下发</td><td>remount 后 heartbeat 仍失败</td><td>返回 heartbeat 错误</td><td class="yes">有</td><td>Client 打印 <code>Heartbeat failed after re-registration</code></td></tr>
+        <tr><td>Heartbeat 下发</td><td>remount local disk segment 失败</td><td>返回 remount 错误</td><td class="yes">有</td><td>Client 打印 <code>Failed to re-register local disk segment</code></td></tr>
+        <tr><td>Heartbeat 下发</td><td>Client 传 <code>enable_offloading=false</code></td><td>Master 清空 pending queue</td><td class="no">无 ERROR</td><td>代码路径无 ERROR；会清理 task/refcnt</td></tr>
+        <tr><td>Heartbeat 下发</td><td>RPC / Master 其他错误</td><td>返回底层错误</td><td class="yes">有</td><td>Client 打印 <code>Failed to send heartbeat with error</code></td></tr>
+
+        <tr><td>源数据查询</td><td><code>BatchQuery()</code> 返回空</td><td><code>INVALID_REPLICA</code></td><td class="yes">上层有</td><td>本函数无 ERROR；调用方打印 <code>BatchQuerySlices failed</code></td></tr>
+        <tr><td>源数据查询</td><td>key 不存在 / metadata 查询失败</td><td>原始错误码</td><td class="yes">有</td><td><code>BatchQuerySegmentSlices()</code> 打印 <code>Key not found</code>；调用方也打印 ERROR</td></tr>
+        <tr><td>源数据查询</td><td>找不到本地 MEMORY replica</td><td><code>INVALID_KEY</code></td><td class="yes">有</td><td><code>BatchQuerySegmentSlices()</code> 打印 <code>Key not found</code>；调用方也打印 ERROR</td></tr>
+
+        <tr><td>Bucket 分组</td><td>object size 大于 <code>bucket_size_limit</code></td><td>跳过该 object</td><td class="yes">有</td><td><code>GroupOffloadingKeysByBucket()</code> 打印 <code>Object size exceeds bucket size limit</code></td></tr>
+        <tr><td>Bucket 分组</td><td><code>IsExist()</code> 检查失败</td><td>记录错误但继续</td><td class="yes">有</td><td>打印 <code>Failed to check existence in storage backend</code></td></tr>
+        <tr><td>Bucket 分组</td><td>key 已存在于 SSD backend</td><td>跳过</td><td class="no">无</td><td>静默跳过</td></tr>
+        <tr><td>Bucket 分组</td><td>凑不满 bucket</td><td>放入 <code>ungrouped_offloading_objects_</code></td><td class="no">无 ERROR</td><td>只有 VLOG</td></tr>
+        <tr><td>Bucket 分组</td><td><code>AllocateOffloadingBuckets()</code> 返回错误</td><td>返回错误</td><td class="yes">有</td><td><code>OffloadObjects()</code> 打印 <code>AllocateOffloadingBuckets failed</code></td></tr>
+
+        <tr><td>GPU 源数据</td><td>device slice D2H copy 失败</td><td>跳过该 object</td><td class="yes">有</td><td><code>OffloadObjects()</code> 打印 <code>D2H staging failed for key</code></td></tr>
+        <tr><td>GPU 源数据</td><td>D2H 后整批为空</td><td>调用 backend 后可能 <code>INVALID_KEY</code></td><td class="yes">有</td><td>backend 打印 empty batch；Client 打印 <code>Failed to store objects</code></td></tr>
+
+        <tr><td>Backend 通用</td><td><code>BatchOffload()</code> 收到空 batch</td><td><code>INVALID_KEY</code></td><td class="yes">有</td><td>各 backend 均有 empty batch ERROR</td></tr>
+        <tr><td>Backend 通用</td><td><code>IsEnableOffloading()</code> 出错</td><td>返回底层错误</td><td class="mixed">视 backend</td><td>Bucket 有 <code>Failed to get store metadata</code>；Offset 未初始化有 ERROR；File-per-key meta 未加载有 ERROR</td></tr>
+        <tr><td>Backend 容量</td><td><code>IsEnableOffloading()</code> 返回 false</td><td><code>KEYS_ULTRA_LIMIT</code></td><td class="yes">上层有</td><td>backend 本身无 ERROR；Client 打印 <code>Failed to store objects with error</code>，并置 <code>enable_offloading_=false</code></td></tr>
+
+        <tr><td>Bucket backend</td><td>backend 未初始化</td><td><code>INTERNAL_ERROR</code></td><td class="yes">有</td><td><code>Storage backend is not initialized</code></td></tr>
+        <tr><td>Bucket backend</td><td><code>BuildBucket()</code> object slice 为空</td><td><code>INVALID_KEY</code></td><td class="yes">有</td><td><code>Failed to create bucket, object is empty</code>；调用方再打印 <code>Failed to build bucket</code></td></tr>
+        <tr><td>Bucket backend</td><td>获取 bucket data path 失败</td><td><code>INTERNAL_ERROR</code></td><td class="yes">有</td><td><code>Failed to get bucket data path</code></td></tr>
+        <tr><td>Bucket backend</td><td>打开 bucket 文件失败</td><td><code>FILE_OPEN_FAIL</code></td><td class="yes">有</td><td><code>Failed to open file for bucket writing</code></td></tr>
+        <tr><td>Bucket backend</td><td>aligned buffer 分配失败</td><td><code>INTERNAL_ERROR</code></td><td class="yes">有</td><td><code>Failed to allocate aligned buffer for WriteBucket</code></td></tr>
+        <tr><td>Bucket backend</td><td><code>write_aligned()</code> 失败</td><td>底层错误码</td><td class="yes">有</td><td><code>write_aligned failed</code></td></tr>
+        <tr><td>Bucket backend</td><td><code>vector_write()</code> 失败</td><td>底层错误码</td><td class="yes">有</td><td><code>vector_write failed</code></td></tr>
+        <tr><td>Bucket backend</td><td>写入字节数不匹配</td><td><code>FILE_WRITE_FAIL</code></td><td class="yes">有</td><td><code>Write size mismatch</code></td></tr>
+        <tr><td>Bucket backend</td><td><code>datasync()</code> 失败</td><td><code>FILE_WRITE_FAIL</code></td><td class="yes">有</td><td><code>datasync failed for bucket</code></td></tr>
+        <tr><td>Bucket backend</td><td>写 bucket metadata 失败</td><td><code>FILE_WRITE_FAIL</code></td><td class="yes">有</td><td><code>Failed to store bucket metadata</code>；清理 orphan 失败也会 ERROR</td></tr>
+        <tr><td>Bucket backend</td><td><code>NotifyOffloadSuccess()</code> 失败</td><td>Master 错误码</td><td class="yes">有</td><td>Client 打印 <code>NotifyOffloadSuccess failed</code>；backend 打印 <code>Complete handler failed</code></td></tr>
+        <tr><td>Bucket backend</td><td>commit metadata 前发现 duplicate key</td><td><code>OBJECT_ALREADY_EXISTS</code></td><td class="no">无 ERROR</td><td>只有 WARNING：<code>Duplicate key detected</code></td></tr>
+
+        <tr><td>File-per-key backend</td><td>单 key <code>StoreObject()</code> 失败</td><td>跳过该 key</td><td class="yes">有</td><td><code>Failed to store object for key</code></td></tr>
+        <tr><td>File-per-key backend</td><td>complete handler 失败</td><td>Master 错误码</td><td class="yes">有</td><td><code>Complete handler failed</code></td></tr>
+        <tr><td>File-per-key backend</td><td>test failure predicate 命中</td><td>跳过该 key</td><td class="no">无 ERROR</td><td>只有 INFO：<code>[TEST] Injecting failure</code></td></tr>
+
+        <tr><td>Offset allocator backend</td><td>backend 未初始化</td><td><code>INTERNAL_ERROR</code></td><td class="yes">有</td><td><code>Storage backend is not initialized</code></td></tr>
+        <tr><td>Offset allocator backend</td><td>slice 为空</td><td>跳过该 key</td><td class="no">无</td><td>静默跳过</td></tr>
+        <tr><td>Offset allocator backend</td><td>test failure predicate 命中</td><td>跳过该 key</td><td class="no">无 ERROR</td><td>只有 INFO</td></tr>
+        <tr><td>Offset allocator backend</td><td>allocator 分配空间失败</td><td>停止处理本 batch</td><td class="yes">有</td><td><code>Failed to allocate ... bytes for key</code></td></tr>
+        <tr><td>Offset allocator backend</td><td><code>vector_write()</code> 失败</td><td>跳过该 key</td><td class="yes">有</td><td><code>Failed to write record for key</code></td></tr>
+        <tr><td>Offset allocator backend</td><td>写入字节数不匹配</td><td>跳过该 key</td><td class="yes">有</td><td><code>Write size mismatch for key</code></td></tr>
+        <tr><td>Offset allocator backend</td><td>complete handler 失败</td><td>Master 错误码</td><td class="yes">有</td><td><code>Complete handler failed</code></td></tr>
+
+        <tr><td>Notify Master</td><td><code>tasks.size() != metadatas.size()</code></td><td><code>INVALID_PARAMS</code></td><td class="yes">上层有</td><td>Master 本函数无 ERROR；Client complete handler 打印 <code>NotifyOffloadSuccess failed</code></td></tr>
+        <tr><td>Notify Master</td><td><code>AddReplica()</code> 失败，且不是 <code>OBJECT_NOT_FOUND</code></td><td>返回 AddReplica 错误</td><td class="yes">有</td><td>Master 打印 <code>Failed to add replica</code></td></tr>
+        <tr><td>Notify Master</td><td>object 已不存在</td><td><code>OBJECT_NOT_FOUND</code> 被忽略</td><td class="no">无</td><td>Master 显式忽略该错误</td></tr>
+
+        <tr><td>任务超时</td><td><code>offloading_tasks</code> 超过 <code>put_start_release_timeout_sec_</code></td><td>清理 task 并 dec refcnt</td><td class="no">无 ERROR</td><td>只有 WARNING：<code>Offloading task expired for key</code></td></tr>
+        <tr><td>Client 失活</td><td>Master 清理 stale handles / unmount local disk segment</td><td>metadata / offloading task 被清理</td><td class="mixed">视具体路径</td><td>相关清理路径不一定有 ERROR；后续 heartbeat 找不到 segment 时会有 ERROR</td></tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
