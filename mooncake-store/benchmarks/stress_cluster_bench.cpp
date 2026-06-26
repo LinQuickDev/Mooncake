@@ -1236,55 +1236,98 @@ class StressBenchmark {
         return 0;
     }
 
-    int RunRemove() {
-        LOG(INFO) << "=== REMOVE BENCHMARK ===";
-        LOG(INFO) << "Scenario: " << FLAGS_scenario;
-        LOG(INFO) << "Removing " << FLAGS_num_keys << " keys with "
-                  << FLAGS_num_threads << " threads, batch_size="
-                  << FLAGS_batch_size;
+    int RunSegmentRemove(bool use_batch) {
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
+        if (segments.empty()) {
+            return -1;
+        }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
 
-        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
-        if (buf_ret != 0) return buf_ret;
+        size_t remove_segment_nums = FLAGS_read_segment_nums;
+        if (remove_segment_nums == 0 ||
+            remove_segment_nums > segments.size()) {
+            remove_segment_nums = segments.size();
+        }
+        std::vector<std::string> remove_segments(
+            segments.begin(), segments.begin() + remove_segment_nums);
 
-        mooncake::ReplicateConfig config;
-        config.replica_num = FLAGS_replica_num;
-        config.with_hard_pin = FLAGS_hard_pin;
+        LOG(INFO) << "=== SEGMENT REMOVE MODE ==="
+                  << (use_batch ? " (batch)" : " (single key)");
+        LOG(INFO) << "Removing from " << remove_segment_nums << " segments ("
+                  << remove_segment_nums << " nodes)";
+        for (size_t s = 0; s < remove_segments.size(); ++s) {
+            LOG(INFO) << "  Segment [" << s << "]: " << remove_segments[s];
+        }
+        LOG(INFO) << "Keys per segment: " << FLAGS_num_keys;
+        LOG(INFO) << "Batch size: " << FLAGS_batch_size;
 
-        // LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
-        //           << " keys before removal...";
-        // for (size_t i = 0; i < FLAGS_num_keys; ++i) {
-        //     std::string key = MakeKey(i);
-        //     FillBuffer(i);
-        //     int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
-        //     if (ret != 0) {
-        //         LOG(ERROR) << "put_from failed for key=" << key;
-        //         return ret;
-        //     }
-        //     if ((i + 1) % 50 == 0) {
-        //         LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
-        //     }
-        // }
-        // LOG(INFO) << "Prefill phase complete";
-
-        int warmup_ret = DoWarmup();
-        if (warmup_ret != 0) {
-            LOG(WARNING) << "Warmup had errors, continuing anyway";
+        if (FLAGS_duration > 0) {
+            LOG(WARNING) << "--duration is ignored for remove scenarios: "
+                         << "removal is not idempotent, a single pass is used";
         }
 
-        LOG(INFO) << "Phase 2: Concurrent removes with " << FLAGS_num_threads
-                  << " threads";
+        // Phase 1: prefill each segment. Key layout and preferred_segments
+        // pinning mirror RunSegmentWrite exactly.
+        std::vector<mooncake::ReplicateConfig> configs(remove_segments.size());
+        for (size_t s = 0; s < remove_segments.size(); ++s) {
+            configs[s].replica_num = FLAGS_replica_num;
+            configs[s].with_hard_pin = FLAGS_hard_pin;
+            configs[s].preferred_segments = {remove_segments[s]};
+        }
+
+        LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
+                  << " keys to " << remove_segment_nums
+                  << " segments (interleaved), each "
+                  << FLAGS_value_size / MB << " MB";
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < remove_segments.size(); ++s) {
+                const auto& segment = remove_segments[s];
+                std::string key = MakeSegmentKey(segment, i);
+                FillBuffer(i);
+                int ret = client_->put_from(key, buffer_, FLAGS_value_size,
+                                            configs[s]);
+                if (ret != 0) {
+                    LOG(ERROR) << "put_from failed for key=" << key
+                               << " segment=" << segment << " ret=" << ret;
+                    return ret;
+                }
+            }
+            if ((i + 1) % 10 == 0 || i == FLAGS_num_keys - 1) {
+                LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys
+                          << " keys to all " << remove_segment_nums
+                          << " segments";
+            }
+        }
+        LOG(INFO) << "Prefill phase complete";
+
+        // Phase 2: assemble the full key list in the same order as
+        // RunSegmentRead (outer key index, inner segment).
+        std::vector<std::string> all_keys;
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < remove_segments.size(); ++s) {
+                all_keys.push_back(MakeSegmentKey(remove_segments[s], i));
+            }
+        }
+        LOG(INFO) << "Total keys to remove: " << all_keys.size();
+
+        // Phase 3: concurrent remove (single pass, mirrors segment_read).
+        LOG(INFO) << "Phase 3: Concurrent " << (use_batch ? "batch " : "")
+                  << "remove with " << FLAGS_num_threads << " threads";
 
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
-                          FLAGS_num_keys / FLAGS_num_threads);
+                          all_keys.size() / FLAGS_num_threads);
         stats.StartTimer();
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         auto threads = LaunchRemoveWorkers(
-            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
-            /*use_batch*/ false,
-            [](size_t idx) { return MakeKey(idx); });
+            FLAGS_num_threads, all_keys.size(), stats, start_latch, done_latch,
+            use_batch, [&all_keys](size_t idx) {
+                return all_keys[idx % all_keys.size()];
+            });
 
         done_latch.wait();
         stats.StopTimer();
@@ -1294,76 +1337,8 @@ class StressBenchmark {
         }
 
         stats.Finalize();
-        stats.Print("REMOVE BENCHMARK");
-
-        return 0;
-    }
-
-    int RunBatchRemove() {
-        LOG(INFO) << "=== BATCH REMOVE BENCHMARK ===";
-        LOG(INFO) << "Scenario: " << FLAGS_scenario;
-        LOG(INFO) << "Removing " << FLAGS_num_keys << " keys with "
-                  << FLAGS_num_threads << " threads, batch_size="
-                  << FLAGS_batch_size;
-
-        if (FLAGS_batch_size <= 1) {
-            LOG(WARNING) << "batch_remove scenario requires batch_size > 1; "
-                         << "falling back to single-key removes would defeat "
-                         << "the purpose. Using batch_size=32.";
-        }
-
-        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
-        if (buf_ret != 0) return buf_ret;
-
-        mooncake::ReplicateConfig config;
-        config.replica_num = FLAGS_replica_num;
-        config.with_hard_pin = FLAGS_hard_pin;
-
-        // LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
-        //           << " keys before removal...";
-        // for (size_t i = 0; i < FLAGS_num_keys; ++i) {
-        //     std::string key = MakeKey(i);
-        //     FillBuffer(i);
-        //     int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
-        //     if (ret != 0) {
-        //         LOG(ERROR) << "put_from failed for key=" << key;
-        //         return ret;
-        //     }
-        //     if ((i + 1) % 50 == 0) {
-        //         LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
-        //     }
-        // }
-        // LOG(INFO) << "Prefill phase complete";
-
-        int warmup_ret = DoWarmup();
-        if (warmup_ret != 0) {
-            LOG(WARNING) << "Warmup had errors, continuing anyway";
-        }
-
-        LOG(INFO) << "Phase 2: Concurrent batch removes with "
-                  << FLAGS_num_threads << " threads";
-
-        BenchmarkStats stats;
-        stats.InitThreads(FLAGS_num_threads,
-                          FLAGS_num_keys / FLAGS_num_threads);
-        stats.StartTimer();
-
-        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        auto threads = LaunchRemoveWorkers(
-            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
-            /*use_batch*/ true,
-            [](size_t idx) { return MakeKey(idx); });
-
-        done_latch.wait();
-        stats.StopTimer();
-
-        for (auto& th : threads) {
-            th.join();
-        }
-
-        stats.Finalize();
-        stats.Print("BATCH REMOVE BENCHMARK");
+        stats.Print(use_batch ? "SEGMENT BATCH REMOVE BENCHMARK"
+                              : "SEGMENT REMOVE BENCHMARK");
 
         return 0;
     }
@@ -1416,9 +1391,9 @@ class StressBenchmark {
         } else if (FLAGS_scenario == "list_segments") {
             return RunListSegments();
         } else if (FLAGS_scenario == "remove") {
-            return RunRemove();
+            return RunSegmentRemove(false);
         } else if (FLAGS_scenario == "batch_remove") {
-            return RunBatchRemove();
+            return RunSegmentRemove(true);
         } else if (FLAGS_scenario == "remote_memory" ||
                    FLAGS_scenario == "remote_disk") {
             if (FLAGS_role == "writer") {
