@@ -621,6 +621,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         MutexLocker locker(&offloading_mutex_);
         auto heartbeat_result = client_->OffloadObjectHeartbeat(
             enable_offloading_, offloading_objects);
+        LOG(INFO) << "GC_E2E_DEBUG: Heartbeat enable_offloading="
+                  << enable_offloading_
+                  << " result_ok=" << heartbeat_result.has_value()
+                  << " tasks=" << offloading_objects.size();
+        if (!heartbeat_result) {
+            LOG(ERROR) << "GC_E2E_DEBUG: Heartbeat error="
+                       << heartbeat_result.error();
+        }
         if (!heartbeat_result) {
             ErrorCode err = heartbeat_result.error();
             if (err == ErrorCode::SEGMENT_NOT_FOUND) {
