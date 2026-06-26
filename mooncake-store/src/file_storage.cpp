@@ -383,8 +383,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys);
         if (!allocate_res) {
-            LOG(ERROR) << "GC_E2E_DEBUG: AllocateOffloadingBuckets failed: "
-                       << allocate_res.error();
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
             return allocate_res;
@@ -397,9 +395,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         buckets_keys.emplace_back(std::move(keys));
     }
-    LOG(INFO) << "GC_E2E_DEBUG: buckets_keys.size=" << buckets_keys.size()
-              << " storage_object_sizes=" << storage_object_sizes.size();
-
     auto complete_handler =
         [this, &task_by_storage_key](
             const std::vector<std::string>& keys,
@@ -428,7 +423,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     };
 
     for (const auto& keys : buckets_keys) {
-        LOG(INFO) << "GC_E2E_DEBUG: processing bucket_keys.size=" << keys.size();
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
@@ -450,16 +444,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
                                                         user_batch_object);
             if (!query_result) {
-                LOG(ERROR) << "GC_E2E_DEBUG: BatchQuerySlices failed: "
-                           << query_result.error()
-                           << " user_keys=" << user_keys.size();
                 LOG(ERROR) << "BatchQuerySlices failed with error: "
                            << query_result.error();
                 continue;
             }
-            LOG(INFO) << "GC_E2E_DEBUG: BatchQuerySlices OK user_keys="
-                      << user_keys.size()
-                      << " got=" << user_batch_object.size();
             for (size_t i = 0; i < storage_keys.size(); ++i) {
                 auto it = user_batch_object.find(user_keys[i]);
                 if (it != user_batch_object.end()) {
@@ -469,9 +457,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
         if (batch_object.empty()) {
-            LOG(ERROR) << "GC_E2E_DEBUG: batch_object empty after "
-                       << "BatchQuerySlices, skipping BatchOffload. "
-                       << "keys=" << keys.size();
             continue;
         }
 
@@ -635,14 +620,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         MutexLocker locker(&offloading_mutex_);
         auto heartbeat_result = client_->OffloadObjectHeartbeat(
             enable_offloading_, offloading_objects);
-        LOG(INFO) << "GC_E2E_DEBUG: Heartbeat enable_offloading="
-                  << enable_offloading_
-                  << " result_ok=" << heartbeat_result.has_value()
-                  << " tasks=" << offloading_objects.size();
-        if (!heartbeat_result) {
-            LOG(ERROR) << "GC_E2E_DEBUG: Heartbeat error="
-                       << heartbeat_result.error();
-        }
         if (!heartbeat_result) {
             ErrorCode err = heartbeat_result.error();
             if (err == ErrorCode::SEGMENT_NOT_FOUND) {

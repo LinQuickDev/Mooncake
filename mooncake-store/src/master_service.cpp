@@ -1731,17 +1731,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                         object_id.user_key,
                         OffloadingTask{replica.id(),
                                        std::chrono::system_clock::now()});
-                    MC_LOG(INFO) << "GC_E2E_DEBUG: PushOffloadingQueue OK for key="
-                                 << object_id.user_key;
-                } else {
-                    MC_LOG(ERROR) << "GC_E2E_DEBUG: PushOffloadingQueue FAILED for key="
-                                  << object_id.user_key << " error=" << result.error();
                 }
             });
-    } else {
-        MC_LOG(INFO) << "GC_E2E_DEBUG: offload skipped enable_offload_="
-                     << enable_offload_ << " offload_on_evict_="
-                     << offload_on_evict_;
     }
 
     // If the object is completed, remove it from the processing set.

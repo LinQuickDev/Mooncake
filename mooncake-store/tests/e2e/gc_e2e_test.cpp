@@ -59,6 +59,22 @@ static int CountFilesWithSuffix(const fs::path& dir,
     return count;
 }
 
+// List all .bucket file names (without directory) in dir.
+static std::vector<std::string> ListBucketFiles(const fs::path& dir) {
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator(dir, ec)) {
+        if (entry.is_regular_file()) {
+            auto name = entry.path().filename().string();
+            if (name.size() >= 6 &&
+                name.compare(name.size() - 6, 6, ".bucket") == 0) {
+                names.push_back(name);
+            }
+        }
+    }
+    return names;
+}
+
 // Read a key via RealClient::get_buffer into a std::string. Returns
 // std::nullopt on failure.
 static std::optional<std::string> ReadKey(
@@ -98,13 +114,14 @@ class GCE2ETest : public ::testing::Test {
         setenv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS", "200", 1);
         saved_gc_ratio_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
         setenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO", "0.1", 1);
-        // Set bucket_keys_limit=1 so a single offloaded key fills a bucket
-        // immediately. Without this, keys accumulate in the ungrouped pool
-        // (default limit 500) and no .bucket file is written until 500 keys
-        // are offloaded.
+        // Set bucket_keys_limit=2 so 2 keys group into one bucket. This is
+        // essential for testing copy-on-write compaction: removing 1 of 2
+        // keys forces GC to rewrite the surviving key to a new bucket and
+        // delete the old one. With limit=1 each key gets its own bucket and
+        // compaction only deletes empty buckets (no rewrite path tested).
         saved_bucket_keys_limit_ =
             GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
-        setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1", 1);
+        setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "2", 1);
     }
 
     void TearDown() override {
@@ -187,13 +204,10 @@ class GCE2ETest : public ::testing::Test {
     bool PutAndWaitOffloaded(const std::string& key,
                              const std::string& value,
                              const fs::path& ssd_dir) {
-        LOG(INFO) << "PutAndWaitOffloaded: key=" << key
-                  << " watching dir=" << ssd_dir;
         std::span<const char> span(value.data(), value.size());
         ReplicateConfig config;
         config.replica_num = 1;
         if (real_client_->put(key, span, config) != 0) {
-            LOG(ERROR) << "PutAndWaitOffloaded: put failed for key=" << key;
             return false;
         }
         // Wait for offload: a .bucket file must appear in ssd_dir, AND the
@@ -205,26 +219,57 @@ class GCE2ETest : public ::testing::Test {
                 auto got = ReadKey(real_client_, key);
                 if (got.has_value() && got.value() == value) return true;
             }
-            if (i % 50 == 0) {  // log every 5s
-                LOG(INFO) << "PutAndWaitOffloaded: key=" << key
-                          << " elapsed=" << (i * 100) << "ms"
-                          << " buckets=" << buckets;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Put multiple keys, then wait until ALL are offloaded (a .bucket file
+    // appears and each key is readable). Keys put before the next heartbeat
+    // are grouped into the same bucket (up to bucket_keys_limit).
+    bool PutBatchAndWaitOffloaded(
+        const std::vector<std::pair<std::string, std::string>>& kvs,
+        const fs::path& ssd_dir) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        for (const auto& [key, value] : kvs) {
+            std::span<const char> span(value.data(), value.size());
+            if (real_client_->put(key, span, config) != 0) return false;
+        }
+        // Wait for offload of all keys.
+        for (int i = 0; i < 400; ++i) {  // up to 40s
+            int buckets = CountFilesWithSuffix(ssd_dir, ".bucket");
+            if (buckets > 0) {
+                bool all_ok = true;
+                for (const auto& [key, value] : kvs) {
+                    auto got = ReadKey(real_client_, key);
+                    if (!got.has_value() || got.value() != value) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if (all_ok) return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        // Final diagnostic: list all files in the dir tree.
-        LOG(ERROR) << "PutAndWaitOffloaded: TIMEOUT for key=" << key
-                   << ". Files in " << ssd_dir << ":";
-        std::error_code ec;
-        for (auto& e : fs::recursive_directory_iterator(ssd_dir, ec)) {
-            LOG(ERROR) << "  " << e.path().string();
+        return false;
+    }
+
+    // Wait for GC compaction: detect by old bucket file(s) disappearing and
+    // new one(s) appearing. Returns the set of bucket file names before and
+    // after for caller verification. Polls up to 30s.
+    bool WaitForCompaction(const fs::path& ssd_dir,
+                           const std::vector<std::string>& buckets_before,
+                           std::vector<std::string>& buckets_after) {
+        for (int i = 0; i < 150; ++i) {  // up to 30s
+            buckets_after = ListBucketFiles(ssd_dir);
+            // Compaction: at least one old bucket file gone, or set changed.
+            if (buckets_after != buckets_before) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        // Also check tmp_dir_ root (master may write elsewhere).
-        LOG(ERROR) << "Files in " << tmp_dir_ << ":";
-        for (auto& e : fs::recursive_directory_iterator(tmp_dir_, ec)) {
-            if (e.is_regular_file())
-                LOG(ERROR) << "  " << e.path().string();
-        }
+        buckets_after = ListBucketFiles(ssd_dir);
         return false;
     }
 
@@ -241,9 +286,13 @@ class GCE2ETest : public ::testing::Test {
 // -------------------------------------------------------------------
 // Test 1: RemoveReclaimsSSDSpace
 //
-// Put 2 keys, remove 1, wait for GC. The removed key's tombstone should
-// trigger compaction; the surviving key must remain readable with
-// correct data throughout.
+// Put 2 keys into the same bucket (bucket_keys_limit=2), remove 1. GC
+// compaction must rewrite the surviving key to a new bucket and delete
+// the old bucket file. Validates:
+//   - Old .bucket file is deleted (space reclaimed)
+//   - New .bucket file appears (survivor rewritten)
+//   - Surviving key readable with correct data throughout
+//   - Removed key stays gone
 // -------------------------------------------------------------------
 TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     ASSERT_TRUE(StartMasterWithOffload());
@@ -255,23 +304,24 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     const std::string v2(4 * kMB, 'B');
 
     fs::path ssd_dir = tmp_dir_ / "ssd_offload";
-    ASSERT_TRUE(PutAndWaitOffloaded(k1, v1, ssd_dir))
-        << "k1 offload timed out";
-    ASSERT_TRUE(PutAndWaitOffloaded(k2, v2, ssd_dir))
-        << "k2 offload timed out";
+    // Put both keys before the next heartbeat so they land in one bucket.
+    ASSERT_TRUE(PutBatchAndWaitOffloaded({{k1, v1}, {k2, v2}}, ssd_dir))
+        << "offload timed out";
 
-    int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
+    auto buckets_before = ListBucketFiles(ssd_dir);
+    ASSERT_EQ(buckets_before.size(), 1u)
+        << "Expected 1 bucket with 2 keys, got " << buckets_before.size();
 
-    // Remove k1. This marks a tombstone; GC should compact the bucket.
-    // force=true bypasses the object lease (PutEnd sets a lease that would
-    // otherwise reject Remove with OBJECT_HAS_LEASE = -706).
+    // Remove k1. This marks a tombstone; GC should compact the bucket
+    // (rewrite k2 to a new bucket, delete old bucket file).
     ASSERT_EQ(real_client_->remove(k1, /*force=*/true), 0);
 
-    // Wait for GC to run (interval=200ms, ratio=0.1). Poll for the
-    // surviving key to remain readable AND bucket file reclamation.
-    bool reclaimed = false;
-    for (int i = 0; i < 100; ++i) {
-        // k2 must stay readable throughout.
+    // Wait for compaction: bucket file set must change (old deleted, new
+    // written). Also verify data integrity throughout.
+    std::vector<std::string> buckets_after;
+    bool compacted = false;
+    for (int i = 0; i < 150; ++i) {
+        // k2 must stay readable with correct data throughout GC.
         auto got2 = ReadKey(real_client_, k2);
         ASSERT_TRUE(got2.has_value())
             << "Surviving key k2 became unreadable during GC";
@@ -282,31 +332,37 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
         ASSERT_FALSE(got1.has_value())
             << "Removed key k1 became readable again";
 
-        // Check if a compaction produced a new bucket file (old one deleted).
-        int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
-        if (buckets_now > 0 && buckets_now != buckets_before) {
-            reclaimed = true;
+        buckets_after = ListBucketFiles(ssd_dir);
+        if (buckets_after != buckets_before) {
+            // Verify the OLD bucket file is actually deleted (not just a
+            // new one added).
+            for (const auto& old_name : buckets_before) {
+                EXPECT_FALSE(fs::exists(ssd_dir / old_name))
+                    << "Old bucket file " << old_name
+                    << " should be deleted after compaction";
+            }
+            compacted = true;
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // k2 final integrity check.
+    // Final checks.
     auto got = ReadKey(real_client_, k2);
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got.value(), v2) << "Surviving key data corrupted after GC";
 
-    LOG(INFO) << "GC reclamation "
-              << (reclaimed ? "detected" : "not detected (timeout)")
-              << "; buckets_before=" << buckets_before;
+    EXPECT_TRUE(compacted) << "GC compaction not detected within 30s";
+    EXPECT_FALSE(buckets_after.empty())
+        << "New bucket file should exist after compaction";
 }
 
 // -------------------------------------------------------------------
 // Test 2: RemoveMiddleKeyPreservesSurvivors
 //
-// Put 3 keys, remove the middle one, wait for GC. Both survivors must
-// read back correctly; removed key must stay gone. This exercises the
-// copy-on-write live-key preservation under real offload grouping.
+// Put 2 keys into the same bucket, remove 1, wait for GC. The surviving
+// key must be rewritten with correct data (copy-on-write preservation).
+// This is the core "don't lose un-removed keys" invariant.
 // -------------------------------------------------------------------
 TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     ASSERT_TRUE(StartMasterWithOffload());
@@ -314,30 +370,27 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
 
     const std::string k1 = "gc_mid_k1";
     const std::string k2 = "gc_mid_k2";
-    const std::string k3 = "gc_mid_k3";
     const std::string v1(4 * kMB, 'X');
     const std::string v2(4 * kMB, 'Y');
-    const std::string v3(4 * kMB, 'Z');
 
     fs::path ssd_dir = tmp_dir_ / "ssd_offload";
-    ASSERT_TRUE(PutAndWaitOffloaded(k1, v1, ssd_dir));
-    ASSERT_TRUE(PutAndWaitOffloaded(k2, v2, ssd_dir));
-    ASSERT_TRUE(PutAndWaitOffloaded(k3, v3, ssd_dir));
+    ASSERT_TRUE(PutBatchAndWaitOffloaded({{k1, v1}, {k2, v2}}, ssd_dir))
+        << "offload timed out";
 
-    // Remove the middle key (force=true to bypass lease).
+    auto buckets_before = ListBucketFiles(ssd_dir);
+    ASSERT_EQ(buckets_before.size(), 1u);
+
+    // Remove k2 (force=true to bypass lease).
     ASSERT_EQ(real_client_->remove(k2, /*force=*/true), 0);
 
-    // Wait for GC to compact, then verify survivors. Poll for bucket file
-    // count change AND data integrity.
-    int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
+    // Wait for compaction, verifying survivor k1 integrity throughout.
+    std::vector<std::string> buckets_after;
     bool compacted = false;
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 150; ++i) {
         auto got1 = ReadKey(real_client_, k1);
-        auto got3 = ReadKey(real_client_, k3);
-        if (got1.has_value() && got1.value() == v1 &&
-            got3.has_value() && got3.value() == v3) {
-            int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
-            if (buckets_now != buckets_before) {
+        if (got1.has_value() && got1.value() == v1) {
+            buckets_after = ListBucketFiles(ssd_dir);
+            if (buckets_after != buckets_before) {
                 compacted = true;
                 break;
             }
@@ -345,21 +398,17 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // k1 and k3 must survive with correct data.
+    // k1 must survive with correct data.
     auto got1 = ReadKey(real_client_, k1);
     ASSERT_TRUE(got1.has_value());
-    EXPECT_EQ(got1.value(), v1) << "k1 data corrupted after GC";
-    auto got3 = ReadKey(real_client_, k3);
-    ASSERT_TRUE(got3.has_value());
-    EXPECT_EQ(got3.value(), v3) << "k3 data corrupted after GC";
+    EXPECT_EQ(got1.value(), v1) << "k1 data corrupted after GC compaction";
 
     // k2 must remain gone.
     auto got2 = ReadKey(real_client_, k2);
     EXPECT_FALSE(got2.has_value())
         << "Removed key k2 should not be readable";
 
-    LOG(INFO) << "Test2 compaction "
-              << (compacted ? "detected" : "not detected (timeout)");
+    EXPECT_TRUE(compacted) << "GC compaction not detected within 30s";
 }
 
 // -------------------------------------------------------------------
@@ -373,24 +422,48 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
     ASSERT_TRUE(StartRealClient());
 
     const std::string k1 = "gc_batch_k1";
+    const std::string k2 = "gc_batch_k2";
     const std::string v1(4 * kMB, 'Q');
+    const std::string v2(4 * kMB, 'R');
+
     fs::path ssd_dir = tmp_dir_ / "ssd_offload";
-    ASSERT_TRUE(PutAndWaitOffloaded(k1, v1, ssd_dir));
+    ASSERT_TRUE(PutBatchAndWaitOffloaded({{k1, v1}, {k2, v2}}, ssd_dir))
+        << "offload timed out";
+
+    auto buckets_before = ListBucketFiles(ssd_dir);
 
     // Batch remove: k1 exists, k_absent does not. force=true bypasses lease.
     std::vector<std::string> keys{k1, "gc_batch_absent"};
     auto results = real_client_->batchRemove(keys, /*force=*/true);
     ASSERT_EQ(results.size(), 2u);
-    // k1 should succeed (0); absent key may succeed or fail depending on
-    // master semantics, but k1 must be gone either way.
 
     // Wait for GC.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::vector<std::string> buckets_after;
+    bool compacted = false;
+    for (int i = 0; i < 150; ++i) {
+        // k2 (not removed) must stay readable.
+        auto got2 = ReadKey(real_client_, k2);
+        if (got2.has_value() && got2.value() == v2) {
+            buckets_after = ListBucketFiles(ssd_dir);
+            if (buckets_after != buckets_before) {
+                compacted = true;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 
     // k1 must be gone.
     auto got1 = ReadKey(real_client_, k1);
     EXPECT_FALSE(got1.has_value())
         << "Batch-removed key k1 should not be readable";
+
+    // k2 must survive.
+    auto got2 = ReadKey(real_client_, k2);
+    ASSERT_TRUE(got2.has_value());
+    EXPECT_EQ(got2.value(), v2) << "k2 data corrupted after GC";
+
+    EXPECT_TRUE(compacted) << "GC compaction not detected within 30s";
 }
 
 }  // namespace testing
