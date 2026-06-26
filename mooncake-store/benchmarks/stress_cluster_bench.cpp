@@ -1589,7 +1589,7 @@ class StressBenchmark {
                 std::string key = key_func(key_idx);
 
                 auto t0 = Clock::now();
-                int ret = client_->remove(key);
+                int ret = client_->remove(key, /*force=*/true);
                 auto t1 = Clock::now();
 
                 int64_t lat_ns = ElapsedNanos(t0, t1);
@@ -1621,7 +1621,7 @@ class StressBenchmark {
                 }
 
                 auto t0 = Clock::now();
-                auto results = client_->batchRemove(key_list);
+                auto results = client_->batchRemove(key_list, /*force=*/true);
                 auto t1 = Clock::now();
 
                 int64_t lat_ns = ElapsedNanos(t0, t1);
