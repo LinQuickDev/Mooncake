@@ -2075,8 +2075,12 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     }
     // Mark SSD tombstone for explicit-delete GC (bucket backend only;
     // other backends no-op). Does not change Remove semantics.
+    // object_bucket_map_ is keyed by tenant-scoped storage key, so we must
+    // convert the user key to the storage key format.
     if (file_storage_) {
-        file_storage_->MarkRemoved(key);
+        auto storage_key =
+            MakeTenantScopedStorageKey(client_->tenant_id(), key);
+        file_storage_->MarkRemoved(storage_key);
     }
     return {};
 }
@@ -2119,11 +2123,15 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
     }
     auto results = client_->BatchRemove(keys, force);
     // Mark SSD tombstone only for successfully removed keys.
+    // object_bucket_map_ is keyed by tenant-scoped storage key, so we must
+    // convert user keys to storage key format.
     if (file_storage_) {
+        const auto& tenant = client_->tenant_id();
         std::vector<std::string> removed;
         for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
             if (results[i].has_value()) {
-                removed.push_back(keys[i]);
+                removed.push_back(
+                    MakeTenantScopedStorageKey(tenant, keys[i]));
             }
         }
         if (!removed.empty()) {
