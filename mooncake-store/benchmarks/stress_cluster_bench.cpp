@@ -189,7 +189,7 @@ DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
 
 DEFINE_string(scenario, "local_memory",
               "Benchmark scenario: local_memory, remote_memory, local_disk, "
-              "remote_disk, segment_write, segment_read");
+              "remote_disk, segment_write, segment_read, remove, batch_remove");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
@@ -1236,6 +1236,138 @@ class StressBenchmark {
         return 0;
     }
 
+    int RunRemove() {
+        LOG(INFO) << "=== REMOVE BENCHMARK ===";
+        LOG(INFO) << "Scenario: " << FLAGS_scenario;
+        LOG(INFO) << "Removing " << FLAGS_num_keys << " keys with "
+                  << FLAGS_num_threads << " threads, batch_size="
+                  << FLAGS_batch_size;
+
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
+        if (buf_ret != 0) return buf_ret;
+
+        mooncake::ReplicateConfig config;
+        config.replica_num = FLAGS_replica_num;
+        config.with_hard_pin = FLAGS_hard_pin;
+
+        LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
+                  << " keys before removal...";
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            std::string key = MakeKey(i);
+            FillBuffer(i);
+            int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
+            if (ret != 0) {
+                LOG(ERROR) << "put_from failed for key=" << key;
+                return ret;
+            }
+            if ((i + 1) % 50 == 0) {
+                LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
+            }
+        }
+        LOG(INFO) << "Prefill phase complete";
+
+        int warmup_ret = DoWarmup();
+        if (warmup_ret != 0) {
+            LOG(WARNING) << "Warmup had errors, continuing anyway";
+        }
+
+        LOG(INFO) << "Phase 2: Concurrent removes with " << FLAGS_num_threads
+                  << " threads";
+
+        BenchmarkStats stats;
+        stats.InitThreads(FLAGS_num_threads,
+                          FLAGS_num_keys / FLAGS_num_threads);
+        stats.StartTimer();
+
+        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        auto threads = LaunchRemoveWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
+            /*use_batch*/ false,
+            [](size_t idx) { return MakeKey(idx); });
+
+        done_latch.wait();
+        stats.StopTimer();
+
+        for (auto& th : threads) {
+            th.join();
+        }
+
+        stats.Finalize();
+        stats.Print("REMOVE BENCHMARK");
+
+        return 0;
+    }
+
+    int RunBatchRemove() {
+        LOG(INFO) << "=== BATCH REMOVE BENCHMARK ===";
+        LOG(INFO) << "Scenario: " << FLAGS_scenario;
+        LOG(INFO) << "Removing " << FLAGS_num_keys << " keys with "
+                  << FLAGS_num_threads << " threads, batch_size="
+                  << FLAGS_batch_size;
+
+        if (FLAGS_batch_size <= 1) {
+            LOG(WARNING) << "batch_remove scenario requires batch_size > 1; "
+                         << "falling back to single-key removes would defeat "
+                         << "the purpose. Using batch_size=32.";
+        }
+
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
+        if (buf_ret != 0) return buf_ret;
+
+        mooncake::ReplicateConfig config;
+        config.replica_num = FLAGS_replica_num;
+        config.with_hard_pin = FLAGS_hard_pin;
+
+        LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
+                  << " keys before removal...";
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            std::string key = MakeKey(i);
+            FillBuffer(i);
+            int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
+            if (ret != 0) {
+                LOG(ERROR) << "put_from failed for key=" << key;
+                return ret;
+            }
+            if ((i + 1) % 50 == 0) {
+                LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
+            }
+        }
+        LOG(INFO) << "Prefill phase complete";
+
+        int warmup_ret = DoWarmup();
+        if (warmup_ret != 0) {
+            LOG(WARNING) << "Warmup had errors, continuing anyway";
+        }
+
+        LOG(INFO) << "Phase 2: Concurrent batch removes with "
+                  << FLAGS_num_threads << " threads";
+
+        BenchmarkStats stats;
+        stats.InitThreads(FLAGS_num_threads,
+                          FLAGS_num_keys / FLAGS_num_threads);
+        stats.StartTimer();
+
+        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        auto threads = LaunchRemoveWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
+            /*use_batch*/ true,
+            [](size_t idx) { return MakeKey(idx); });
+
+        done_latch.wait();
+        stats.StopTimer();
+
+        for (auto& th : threads) {
+            th.join();
+        }
+
+        stats.Finalize();
+        stats.Print("BATCH REMOVE BENCHMARK");
+
+        return 0;
+    }
+
     int RunListSegments() {
         LOG(INFO) << "Discovering segments from master at "
                   << FLAGS_master_server << ":" << FLAGS_master_admin_port;
@@ -1283,6 +1415,10 @@ class StressBenchmark {
             return RunSegmentRead();
         } else if (FLAGS_scenario == "list_segments") {
             return RunListSegments();
+        } else if (FLAGS_scenario == "remove") {
+            return RunRemove();
+        } else if (FLAGS_scenario == "batch_remove") {
+            return RunBatchRemove();
         } else if (FLAGS_scenario == "remote_memory" ||
                    FLAGS_scenario == "remote_disk") {
             if (FLAGS_role == "writer") {
@@ -1451,6 +1587,108 @@ class StressBenchmark {
             threads.emplace_back([&, t, my_keys, key_offset]() {
                 BatchReadWorker(t, my_keys, key_offset, stats, start_latch,
                                 done_latch, key_func);
+            });
+        }
+        return threads;
+    }
+
+    void RemoveWorker(size_t tid, size_t my_keys, size_t key_offset,
+                      BenchmarkStats& stats, std::latch& start_latch,
+                      std::latch& done_latch, bool use_batch,
+                      const std::function<std::string(size_t)>& key_func) {
+        bindToSocket(tid % NR_SOCKETS);
+
+        ThreadResult& result = stats.GetThreadResult(tid);
+        result.latencies_ns.reserve(my_keys);
+
+        start_latch.arrive_and_wait();
+
+        size_t keys = 0;
+        size_t queries = 0;
+        size_t failed = 0;
+        size_t bytes = 0;
+
+        if (!use_batch) {
+            for (size_t i = 0; i < my_keys; ++i) {
+                size_t key_idx = key_offset + i;
+                std::string key = key_func(key_idx);
+
+                auto t0 = Clock::now();
+                int ret = client_->remove(key);
+                auto t1 = Clock::now();
+
+                int64_t lat_ns = ElapsedNanos(t0, t1);
+                result.latencies_ns.push_back(lat_ns);
+
+                if (ret != 0) {
+                    ++failed;
+                    LOG_EVERY_N(ERROR, 100)
+                        << "remove failed key=" << key << " ret=" << ret;
+                } else {
+                    // Account removed payload as transferred bytes so throughput
+                    // stats stay comparable with the read benchmark.
+                    bytes += FLAGS_value_size;
+                }
+                ++keys;
+                ++queries;
+            }
+        } else {
+            size_t per_key_buf = FLAGS_value_size;
+            size_t i = 0;
+            while (i < my_keys) {
+                std::vector<std::string> key_list;
+                size_t batch_end = std::min(i + FLAGS_batch_size, my_keys);
+                key_list.reserve(batch_end - i);
+
+                for (size_t j = i; j < batch_end; ++j) {
+                    size_t key_idx = key_offset + j;
+                    key_list.push_back(key_func(key_idx));
+                }
+
+                auto t0 = Clock::now();
+                auto results = client_->batchRemove(key_list);
+                auto t1 = Clock::now();
+
+                int64_t lat_ns = ElapsedNanos(t0, t1);
+                result.latencies_ns.push_back(lat_ns);
+
+                for (size_t k = 0; k < results.size(); ++k) {
+                    if (results[k] != 0) {
+                        ++failed;
+                    } else {
+                        bytes += per_key_buf;
+                    }
+                    ++keys;
+                }
+                ++queries;
+
+                i = batch_end;
+            }
+        }
+
+        result.total_bytes = bytes;
+        result.total_keys = keys;
+        result.total_queries = queries;
+        result.failed_ops = failed;
+
+        done_latch.arrive_and_wait();
+    }
+
+    std::vector<std::thread> LaunchRemoveWorkers(
+        size_t num_threads, size_t total_keys, BenchmarkStats& stats,
+        std::latch& start_latch, std::latch& done_latch, bool use_batch,
+        const std::function<std::string(size_t)>& key_func) {
+        std::vector<std::thread> threads;
+        size_t keys_per_thread = total_keys / num_threads;
+        size_t remainder = total_keys % num_threads;
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
+            size_t key_offset = t * keys_per_thread + std::min(t, remainder);
+
+            threads.emplace_back([&, t, my_keys, key_offset, use_batch]() {
+                RemoveWorker(t, my_keys, key_offset, stats, start_latch,
+                             done_latch, use_batch, key_func);
             });
         }
         return threads;
