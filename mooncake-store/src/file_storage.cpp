@@ -445,10 +445,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
                                                         user_batch_object);
             if (!query_result) {
+                LOG(ERROR) << "GC_E2E_DEBUG: BatchQuerySlices failed: "
+                           << query_result.error()
+                           << " user_keys=" << user_keys.size();
                 LOG(ERROR) << "BatchQuerySlices failed with error: "
                            << query_result.error();
                 continue;
             }
+            LOG(INFO) << "GC_E2E_DEBUG: BatchQuerySlices OK user_keys="
+                      << user_keys.size()
+                      << " got=" << user_batch_object.size();
             for (size_t i = 0; i < storage_keys.size(); ++i) {
                 auto it = user_batch_object.find(user_keys[i]);
                 if (it != user_batch_object.end()) {
@@ -458,6 +464,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
         if (batch_object.empty()) {
+            LOG(ERROR) << "GC_E2E_DEBUG: batch_object empty after "
+                       << "BatchQuerySlices, skipping BatchOffload. "
+                       << "keys=" << keys.size();
             continue;
         }
 
