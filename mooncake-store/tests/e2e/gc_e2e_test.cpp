@@ -236,10 +236,12 @@ class GCE2ETest : public ::testing::Test {
             std::span<const char> span(value.data(), value.size());
             if (real_client_->put(key, span, config) != 0) return false;
         }
-        // Wait for offload of all keys.
+        // Wait for offload of all keys: a .bucket file MUST appear (offload
+        // completed) AND each key must be readable via get_buffer.
+        // Heartbeat interval is 10s; with bucket_keys_limit=2, 2 keys fill
+        // a bucket on the first heartbeat after put. Wait up to 40s.
         for (int i = 0; i < 400; ++i) {  // up to 40s
-            int buckets = CountFilesWithSuffix(ssd_dir, ".bucket");
-            if (buckets > 0) {
+            if (CountFilesWithSuffix(ssd_dir, ".bucket") > 0) {
                 bool all_ok = true;
                 for (const auto& [key, value] : kvs) {
                     auto got = ReadKey(real_client_, key);
