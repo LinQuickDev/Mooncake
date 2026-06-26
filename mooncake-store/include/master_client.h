@@ -380,6 +380,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
     GetNoFSegmentsByName(const std::string& segment_name);
 
+    [[nodiscard]] tl::expected<std::vector<UrmaWarmupTarget>, ErrorCode>
+    GetUrmaWarmupTargets();
+
     /**
      * @brief Gets the cluster ID for the current client to use as subdirectory
      * name

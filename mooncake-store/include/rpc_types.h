@@ -83,6 +83,14 @@ struct NoFSegmentOwnerInfo {
 };
 YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 
+struct UrmaWarmupTarget {
+    std::string segment_name;
+    uintptr_t base_address{0};
+    uint64_t size_bytes{0};
+    std::string te_endpoint;
+};
+YLT_REFL(UrmaWarmupTarget, segment_name, base_address, size_bytes, te_endpoint);
+
 /**
  * @brief Response structure for CopyStart operation
  */

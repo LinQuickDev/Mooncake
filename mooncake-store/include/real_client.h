@@ -96,6 +96,8 @@ class RealClient : public PyClient {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
+    int warmupUrmaTransfers();
+
     uint64_t alloc_from_mem_pool(size_t size) { return 0; };
 
     int put(const std::string &key, std::span<const char> value,

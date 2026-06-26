@@ -322,6 +322,11 @@ class MooncakeStorePyWrapper {
         return store_->health_check();
     }
 
+    int warmup_urma_transfers() {
+        if (!real_client_) return to_py_ret(ErrorCode::INVALID_PARAMS);
+        return real_client_->warmupUrmaTransfers();
+    }
+
     py::dict mount_segment(const std::string &path, size_t size, size_t offset,
                            const std::string &protocol,
                            const std::string &location) {
@@ -2229,6 +2234,10 @@ PYBIND11_MODULE(store, m) {
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")
+        .def("warmup_urma_transfers",
+             &MooncakeStorePyWrapper::warmup_urma_transfers,
+             "Warm up URMA transfer connections by reading one byte from each "
+             "mounted UB segment. No-op for non-UB clients.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

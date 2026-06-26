@@ -1119,6 +1119,17 @@ int RealClient::initAll(const std::string &protocol_,
         initAll_internal(protocol_, device_name, mount_segment_size));
 }
 
+int RealClient::warmupUrmaTransfers() {
+    if (!client_) {
+        return toInt(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    auto result = client_->WarmupUrmaTransfers();
+    if (!result) {
+        return toInt(result.error());
+    }
+    return 0;
+}
+
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
