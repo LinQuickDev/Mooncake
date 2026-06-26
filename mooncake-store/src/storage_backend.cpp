@@ -2461,13 +2461,8 @@ void BucketStorageBackend::MarkRemoved(const std::string& key) {
     SharedMutexLocker lock(&mutex_);
     auto it = object_bucket_map_.find(key);
     if (it == object_bucket_map_.end()) {
-        LOG(WARNING) << "[GC] MarkRemoved key not found in object_bucket_map_"
-                     << " key_size=" << key.size()
-                     << " map_size=" << object_bucket_map_.size();
         return;  // not in local storage or already removed — idempotent
     }
-    LOG(INFO) << "[GC] MarkRemoved key found, bucket_id=" << it->second.bucket_id
-              << " key_size=" << key.size();
     int64_t bucket_id = it->second.bucket_id;
     int64_t freed = it->second.data_size + it->second.key_size;
     object_bucket_map_.erase(it);
@@ -2531,7 +2526,10 @@ BucketStorageBackend::SelectGCCandidate() {
 }
 
 bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
-    return CompactBuckets({bucket_id});
+    // Single-bucket compaction: force write even if live keys don't fill
+    // a full bucket (pass space_pressure=true to bypass the "defer if not
+    // full" check in CompactBuckets).
+    return CompactBuckets({bucket_id}, true);
 }
 
 bool BucketStorageBackend::CompactBuckets(

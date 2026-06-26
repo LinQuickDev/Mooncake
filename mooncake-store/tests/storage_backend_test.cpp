@@ -2837,10 +2837,12 @@ TEST_F(StorageBackendTest, BucketStorageBackend_CrossBucketMergeCompaction) {
     std::string v1(1024, 'a'), v2(1024, 'b');
     std::string v3(1024, 'c'), v4(1024, 'd');
 
-    ASSERT_TRUE(offload_batch({{k1, v1}, {k2, v2}}).has_value());
-    int64_t bucket_a = offload_batch({{k1, v1}, {k2, v2}}).value();
-    ASSERT_TRUE(offload_batch({{k3, v3}, {k4, v4}}).has_value());
-    int64_t bucket_b = offload_batch({{k3, v3}, {k4, v4}}).value();
+    auto offload_a = offload_batch({{k1, v1}, {k2, v2}});
+    ASSERT_TRUE(offload_a.has_value());
+    int64_t bucket_a = offload_a.value();
+    auto offload_b = offload_batch({{k3, v3}, {k4, v4}});
+    ASSERT_TRUE(offload_b.has_value());
+    int64_t bucket_b = offload_b.value();
 
     // Remove k2 from bucket A and k4 from bucket B (tombstones).
     storage_backend.MarkRemoved(k2);
