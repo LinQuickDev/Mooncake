@@ -132,15 +132,13 @@ class GCE2ETest : public ::testing::Test {
     }
 
     bool StartMasterWithOffload() {
-        // Do NOT set root_fs_dir: if master returns a non-empty fsdir, the
-        // client sets up its own file-per-key StorageBackend and writes DISK
-        // replicas there (master-side disk caching), which preempts the
-        // client-side FileStorage/BucketStorageBackend offload path — master
-        // sees a DISK replica already exists and never pushes an offload task.
-        // With enable_offload=true but no root_fs_dir, master pushes offload
-        // tasks that the client's FileStorage drains via heartbeat.
+        // Match production config: enable_offload=true, no root_fs_dir
+        // (master doesn't do disk caching; offload tasks are pushed to the
+        // client's FileStorage via heartbeat). Set a long lease TTL so
+        // objects aren't evicted before offload completes.
         auto config = InProcMasterConfigBuilder()
                           .set_enable_offload(true)
+                          .set_default_kv_lease_ttl(300000)
                           .build();
         return master_.Start(config);
     }
@@ -152,6 +150,13 @@ class GCE2ETest : public ::testing::Test {
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
         std::string ssd_path = tmp_dir_.string() + "/ssd_offload";
         fs::create_directories(ssd_path);
+        // Set MOONCAKE_OFFLOAD_FILE_STORAGE_PATH env var (same as production)
+        // so FileStorageConfig::FromEnvironment picks it up. This matches the
+        // production deployment pattern where the env var is set before
+        // launching the client.
+        setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ssd_path.c_str(), 1);
+        setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+               "bucket_storage_backend", 1);
         // enable_ssd_offload=true creates FileStorage + BucketStorageBackend.
         int ret = real_client_->setup_real(
             "localhost:17890", "P2PHANDSHAKE",
