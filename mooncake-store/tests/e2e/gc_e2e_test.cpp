@@ -329,10 +329,14 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     // Wait for all offload tasks to settle into object_bucket_map_.
     WaitForAllOffloadsSettled();
 
+    // Snapshot bucket file names before remove.
+    auto bucket_files_before = ListBucketFiles(ssd_dir);
+
     // Remove k1. GC should compact (delete k1's empty bucket file).
     ASSERT_EQ(real_client_->remove(k1, /*force=*/true), 0);
 
-    // Wait for GC: bucket file count should decrease (k1's bucket deleted).
+    // Wait for GC: bucket file set should change (old file deleted, and/or
+    // new file written if compaction rewrote surviving keys).
     bool reclaimed = false;
     for (int i = 0; i < 150; ++i) {  // up to 30s
         // k2 must stay readable with correct data throughout GC.
@@ -346,10 +350,19 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
         ASSERT_FALSE(got1.has_value())
             << "Removed key k1 became readable again";
 
-        int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
-        if (buckets_now < buckets_before) {
-            reclaimed = true;
-            break;
+        // Compaction changes the bucket file set (old deleted, new written).
+        auto bucket_files_now = ListBucketFiles(ssd_dir);
+        if (bucket_files_now != bucket_files_before) {
+            // Verify at least one old file is gone.
+            for (const auto& old_name : bucket_files_before) {
+                if (std::find(bucket_files_now.begin(),
+                              bucket_files_now.end(),
+                              old_name) == bucket_files_now.end()) {
+                    reclaimed = true;
+                    break;
+                }
+            }
+            if (reclaimed) break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -390,18 +403,28 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     // Wait for all offload tasks to settle into object_bucket_map_.
     WaitForAllOffloadsSettled();
 
+    // Snapshot bucket file names before remove.
+    auto bucket_files_before = ListBucketFiles(ssd_dir);
+
     // Remove k2 (force=true to bypass lease).
     ASSERT_EQ(real_client_->remove(k2, /*force=*/true), 0);
 
-    // Wait for GC: bucket count should decrease.
+    // Wait for GC: bucket file set should change.
     bool compacted = false;
     for (int i = 0; i < 150; ++i) {
         auto got1 = ReadKey(real_client_, k1);
         if (got1.has_value() && got1.value() == v1) {
-            int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
-            if (buckets_now < buckets_before) {
-                compacted = true;
-                break;
+            auto bucket_files_now = ListBucketFiles(ssd_dir);
+            if (bucket_files_now != bucket_files_before) {
+                for (const auto& old_name : bucket_files_before) {
+                    if (std::find(bucket_files_now.begin(),
+                                  bucket_files_now.end(),
+                                  old_name) == bucket_files_now.end()) {
+                        compacted = true;
+                        break;
+                    }
+                }
+                if (compacted) break;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -447,20 +470,30 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
     // Wait for all offload tasks to settle into object_bucket_map_.
     WaitForAllOffloadsSettled();
 
+    // Snapshot bucket file names before remove.
+    auto bucket_files_before = ListBucketFiles(ssd_dir);
+
     // Batch remove: k1 exists, k_absent does not. force=true bypasses lease.
     std::vector<std::string> keys{k1, "gc_batch_absent"};
     auto results = real_client_->batchRemove(keys, /*force=*/true);
     ASSERT_EQ(results.size(), 2u);
 
-    // Wait for GC: bucket count should decrease.
+    // Wait for GC: bucket file set should change.
     bool compacted = false;
     for (int i = 0; i < 150; ++i) {
         auto got2 = ReadKey(real_client_, k2);
         if (got2.has_value() && got2.value() == v2) {
-            int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
-            if (buckets_now < buckets_before) {
-                compacted = true;
-                break;
+            auto bucket_files_now = ListBucketFiles(ssd_dir);
+            if (bucket_files_now != bucket_files_before) {
+                for (const auto& old_name : bucket_files_before) {
+                    if (std::find(bucket_files_now.begin(),
+                                  bucket_files_now.end(),
+                                  old_name) == bucket_files_now.end()) {
+                        compacted = true;
+                        break;
+                    }
+                }
+                if (compacted) break;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
