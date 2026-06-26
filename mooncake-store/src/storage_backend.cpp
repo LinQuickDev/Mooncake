@@ -2578,28 +2578,52 @@ bool BucketStorageBackend::CompactBuckets(
         }
     };
 
-    // If no live keys at all, delete all old buckets entirely.
-    if (live_keys_info.empty()) {
+    // Identify buckets with zero live keys — delete them immediately
+    // without waiting for merge. Buckets with live keys participate in
+    // the merge.
+    std::set<int64_t> buckets_with_live;
+    for (const auto& info : live_keys_info) {
+        buckets_with_live.insert(info.old_bucket_id);
+    }
+
+    std::vector<int64_t> empty_buckets;
+    for (auto& [bid, pr] : old_buckets) {
+        if (buckets_with_live.find(bid) == buckets_with_live.end()) {
+            empty_buckets.push_back(bid);
+        }
+    }
+
+    if (!empty_buckets.empty()) {
         std::vector<std::shared_ptr<BucketMetadata>> to_drain;
         {
             SharedMutexLocker lock(&mutex_);
-            for (auto& [bid, pr] : old_buckets) {
+            for (int64_t bid : empty_buckets) {
                 auto it = buckets_.find(bid);
                 if (it != buckets_.end()) {
                     total_size_ -=
                         it->second->data_size + it->second->meta_size;
                     buckets_.erase(it);
-                    lru_index_.erase({pr.second, bid});
-                    to_drain.push_back(pr.first);
+                    int64_t ts = old_buckets[bid].second;
+                    lru_index_.erase({ts, bid});
+                    to_drain.push_back(old_buckets[bid].first);
                 }
             }
         }
         for (auto& bucket : to_drain) {
             WaitForInflightReads(bucket);
         }
-        for (auto& [bid, pr] : old_buckets) {
+        for (int64_t bid : empty_buckets) {
             DeleteBucketFiles(bid);
         }
+        // Remove deleted buckets from old_buckets so they don't interfere
+        // with the merge logic below.
+        for (int64_t bid : empty_buckets) {
+            old_buckets.erase(bid);
+        }
+    }
+
+    // If no live keys remain (all buckets were empty), we're done.
+    if (live_keys_info.empty()) {
         return true;
     }
 
