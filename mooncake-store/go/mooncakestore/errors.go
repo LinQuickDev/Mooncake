@@ -21,6 +21,7 @@ var (
 	ErrSetupFailed     = errors.New("mooncakestore: setup failed")
 	ErrInitAllFailed   = errors.New("mooncakestore: init_all failed")
 	ErrHealthCheck     = errors.New("mooncakestore: health check failed")
+	ErrWarmupUrma      = errors.New("mooncakestore: URMA warmup failed")
 	ErrPut             = errors.New("mooncakestore: put failed")
 	ErrGet             = errors.New("mooncakestore: get failed")
 	ErrRemove          = errors.New("mooncakestore: remove failed")

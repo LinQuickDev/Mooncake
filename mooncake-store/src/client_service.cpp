@@ -3203,6 +3203,85 @@ tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
     return {};
 }
 
+tl::expected<size_t, ErrorCode> Client::WarmupUrmaTransfers() {
+    if (protocol_ != "ub") {
+        MC_VLOG(1) << "Skip URMA warmup for protocol=" << protocol_;
+        return 0;
+    }
+    if (!transfer_engine_ || !transfer_submitter_) {
+        MC_LOG(ERROR) << "URMA warmup failed: transfer engine is not ready";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto warmup_targets = master_client_.GetUrmaWarmupTargets();
+    if (!warmup_targets) {
+        MC_LOG(ERROR) << "URMA warmup failed: unable to get segment list, "
+                      << "error=" << warmup_targets.error();
+        return tl::make_unexpected(warmup_targets.error());
+    }
+
+    alignas(64) char warmup_byte = 0;
+    int rc = transfer_engine_->registerLocalMemory(
+        &warmup_byte, sizeof(warmup_byte), "cpu:0",
+        /*remote_accessible=*/false, /*update_metadata=*/false);
+    if (rc != 0) {
+        MC_LOG(ERROR) << "URMA warmup failed: register local byte failed, rc="
+                      << rc;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    struct UnregisterGuard {
+        TransferEngine* engine;
+        void* addr;
+        ~UnregisterGuard() {
+            if (engine && addr) {
+                engine->unregisterLocalMemory(addr,
+                                              /*update_metadata=*/false);
+            }
+        }
+    } unregister_guard{transfer_engine_.get(), &warmup_byte};
+
+    size_t warmed_count = 0;
+    for (const auto& target : *warmup_targets) {
+        const std::string endpoint =
+            target.te_endpoint.empty() ? target.segment_name
+                                       : target.te_endpoint;
+        if (endpoint.empty()) {
+            MC_VLOG(1) << "Skip URMA warmup for segment with empty endpoint";
+            continue;
+        }
+
+        AllocatedBuffer::Descriptor buffer_desc;
+        buffer_desc.size_ = target.size_bytes;
+        buffer_desc.buffer_address_ = target.base_address;
+        buffer_desc.protocol_ = "ub";
+        buffer_desc.transport_endpoint_ = endpoint;
+
+        MemoryDescriptor memory_desc;
+        memory_desc.buffer_descriptor = std::move(buffer_desc);
+
+        Replica::Descriptor replica_desc;
+        replica_desc.id = 0;
+        replica_desc.status = ReplicaStatus::COMPLETE;
+        replica_desc.descriptor_variant = std::move(memory_desc);
+
+        std::vector<Slice> slices = {{&warmup_byte, sizeof(warmup_byte)}};
+        ErrorCode err =
+            TransferReadRange(replica_desc, slices, /*src_offset=*/0);
+        if (err != ErrorCode::OK) {
+            MC_LOG(ERROR) << "URMA warmup failed for segment="
+                          << target.segment_name << ", endpoint=" << endpoint
+                          << ", error=" << err;
+            return tl::make_unexpected(err);
+        }
+        ++warmed_count;
+    }
+
+    MC_LOG(INFO) << "URMA warmup complete, warmed_segments=" << warmed_count
+                 << ", total_targets=" << warmup_targets->size();
+    return warmed_count;
+}
+
 tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,

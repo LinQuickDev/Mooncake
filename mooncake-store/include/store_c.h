@@ -62,6 +62,8 @@ int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
 
 int mooncake_store_health_check(mooncake_store_t store);
 
+int mooncake_store_warmup_urma_transfers(mooncake_store_t store);
+
 // ---------------------------------------------------------------------------
 // Put operations
 // ---------------------------------------------------------------------------

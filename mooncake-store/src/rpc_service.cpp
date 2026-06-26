@@ -1756,6 +1756,47 @@ WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
         [] {}, [] {});
 }
 
+tl::expected<std::vector<UrmaWarmupTarget>, ErrorCode>
+WrappedMasterService::GetUrmaWarmupTargets(const UUID& client_id) {
+    return execute_rpc(
+        "GetUrmaWarmupTargets",
+        [&]() -> tl::expected<std::vector<UrmaWarmupTarget>, ErrorCode> {
+            auto details = master_service_.GetSegmentsDetail();
+            if (!details) {
+                return tl::make_unexpected(details.error());
+            }
+
+            std::vector<UrmaWarmupTarget> result;
+            result.reserve(details->size());
+            for (const auto& detail : *details) {
+                if (detail.protocol != "ub") {
+                    continue;
+                }
+                if (detail.size_bytes == 0 || detail.base_address == 0) {
+                    continue;
+                }
+                if (detail.status != SegmentStatus::OK &&
+                    detail.status != SegmentStatus::DRAINING &&
+                    detail.status != SegmentStatus::GRACEFULLY_UNMOUNTING) {
+                    continue;
+                }
+
+                UrmaWarmupTarget item;
+                item.segment_name = detail.segment_name;
+                item.base_address = detail.base_address;
+                item.size_bytes = detail.size_bytes;
+                item.te_endpoint = detail.te_endpoint;
+                result.emplace_back(std::move(item));
+            }
+            return result;
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", get URMA warmup targets");
+        },
+        [] {}, [] {});
+}
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
@@ -2213,6 +2254,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetUrmaWarmupTargets>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);

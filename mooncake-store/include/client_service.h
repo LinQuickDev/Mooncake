@@ -429,6 +429,13 @@ class Client {
         int64_t ssd_total_capacity_bytes);
 
     /**
+     * @brief Warm up URMA transfer connections by reading one byte from each
+     * mounted UB segment. No-op for non-UB clients.
+     * @return Number of segments successfully warmed.
+     */
+    tl::expected<size_t, ErrorCode> WarmupUrmaTransfers();
+
+    /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for this
      * client. Mirror of OffloadObjectHeartbeat. Returns tenant-scoped tasks the
      * caller (FileStorage) must read from local SSD and stage as MEMORY

@@ -183,6 +183,9 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
+    tl::expected<std::vector<UrmaWarmupTarget>, ErrorCode> GetUrmaWarmupTargets(
+        const UUID& client_id);
+
     tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
     GetSegmentsDetailForAdmin();
 

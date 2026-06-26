@@ -189,6 +189,11 @@ struct RpcNameTraits<&WrappedMasterService::GetNoFSegmentsByName> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetUrmaWarmupTargets> {
+    static constexpr const char* value = "GetUrmaWarmupTargets";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Ping> {
     static constexpr const char* value = "Ping";
 };
@@ -882,6 +887,17 @@ MasterClient::GetNoFSegmentsByName(const std::string& segment_name) {
 
     auto result = invoke_rpc<&WrappedMasterService::GetNoFSegmentsByName,
                              std::vector<NoFSegmentOwnerInfo>>(segment_name);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<UrmaWarmupTarget>, ErrorCode>
+MasterClient::GetUrmaWarmupTargets() {
+    ScopedVLogTimer timer(1, "MasterClient::GetUrmaWarmupTargets");
+    timer.LogRequest("client_id=", client_id_);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetUrmaWarmupTargets,
+                             std::vector<UrmaWarmupTarget>>(client_id_);
     timer.LogResponseExpected(result);
     return result;
 }

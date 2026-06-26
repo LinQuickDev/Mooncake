@@ -111,6 +111,19 @@ func (s *Store) HealthCheck() error {
 	return nil
 }
 
+// WarmupUrmaTransfers pre-connects URMA transfer paths by reading one byte
+// from each mounted UB segment. It is a no-op for non-UB clients.
+func (s *Store) WarmupUrmaTransfers() error {
+	if s.handle == nil {
+		return ErrStoreNil
+	}
+	ret := C.mooncake_store_warmup_urma_transfers(s.handle)
+	if ret != 0 {
+		return ErrWarmupUrma
+	}
+	return nil
+}
+
 // Close tears down the store client and frees resources.
 func (s *Store) Close() {
 	if s.handle != nil {
