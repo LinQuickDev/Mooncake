@@ -2458,7 +2458,13 @@ void BucketStorageBackend::MarkRemoved(const std::string& key) {
     SharedMutexLocker lock(&mutex_);
     auto it = object_bucket_map_.find(key);
     if (it == object_bucket_map_.end()) {
-        LOG(INFO) << "GC_E2E_DEBUG: MarkRemoved key not found: " << key;
+        LOG(INFO) << "GC_E2E_DEBUG: MarkRemoved key not found: " << key
+                  << " (size=" << key.size() << ")"
+                  << " map_size=" << object_bucket_map_.size();
+        for (const auto& [k, v] : object_bucket_map_) {
+            LOG(INFO) << "GC_E2E_DEBUG:   map_key size=" << k.size()
+                      << " bucket_id=" << v.bucket_id;
+        }
         return;  // not in local storage or already removed — idempotent
     }
     int64_t bucket_id = it->second.bucket_id;
