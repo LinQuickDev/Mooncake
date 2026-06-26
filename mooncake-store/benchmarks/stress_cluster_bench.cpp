@@ -1250,21 +1250,21 @@ class StressBenchmark {
         config.replica_num = FLAGS_replica_num;
         config.with_hard_pin = FLAGS_hard_pin;
 
-        LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
-                  << " keys before removal...";
-        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
-            std::string key = MakeKey(i);
-            FillBuffer(i);
-            int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
-            if (ret != 0) {
-                LOG(ERROR) << "put_from failed for key=" << key;
-                return ret;
-            }
-            if ((i + 1) % 50 == 0) {
-                LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
-            }
-        }
-        LOG(INFO) << "Prefill phase complete";
+        // LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
+        //           << " keys before removal...";
+        // for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+        //     std::string key = MakeKey(i);
+        //     FillBuffer(i);
+        //     int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
+        //     if (ret != 0) {
+        //         LOG(ERROR) << "put_from failed for key=" << key;
+        //         return ret;
+        //     }
+        //     if ((i + 1) % 50 == 0) {
+        //         LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
+        //     }
+        // }
+        // LOG(INFO) << "Prefill phase complete";
 
         int warmup_ret = DoWarmup();
         if (warmup_ret != 0) {
@@ -1319,21 +1319,21 @@ class StressBenchmark {
         config.replica_num = FLAGS_replica_num;
         config.with_hard_pin = FLAGS_hard_pin;
 
-        LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
-                  << " keys before removal...";
-        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
-            std::string key = MakeKey(i);
-            FillBuffer(i);
-            int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
-            if (ret != 0) {
-                LOG(ERROR) << "put_from failed for key=" << key;
-                return ret;
-            }
-            if ((i + 1) % 50 == 0) {
-                LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
-            }
-        }
-        LOG(INFO) << "Prefill phase complete";
+        // LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
+        //           << " keys before removal...";
+        // for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+        //     std::string key = MakeKey(i);
+        //     FillBuffer(i);
+        //     int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
+        //     if (ret != 0) {
+        //         LOG(ERROR) << "put_from failed for key=" << key;
+        //         return ret;
+        //     }
+        //     if ((i + 1) % 50 == 0) {
+        //         LOG(INFO) << "  Prefilled " << (i + 1) << "/" << FLAGS_num_keys;
+        //     }
+        // }
+        // LOG(INFO) << "Prefill phase complete";
 
         int warmup_ret = DoWarmup();
         if (warmup_ret != 0) {
