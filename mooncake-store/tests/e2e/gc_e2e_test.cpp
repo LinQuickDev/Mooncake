@@ -223,6 +223,16 @@ class GCE2ETest : public ::testing::Test {
         return false;
     }
 
+    // After all keys are put and individually confirmed offloaded, wait an
+    // extra heartbeat cycle to ensure ALL keys have been drained from the
+    // offloading queue into object_bucket_map_. Without this, a key put
+    // after the first heartbeat may not yet be in object_bucket_map_ when
+    // MarkRemoved is called, making the tombstone a no-op.
+    void WaitForAllOffloadsSettled() {
+        // Two heartbeat intervals (10s each) to be safe.
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+    }
+
     // Put multiple keys, then wait until ALL are offloaded (a .bucket file
     // appears and each key is readable). Keys put before the next heartbeat
     // are grouped into the same bucket (up to bucket_keys_limit).
@@ -311,6 +321,9 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
     ASSERT_GT(buckets_before, 0) << "No bucket files after offload";
 
+    // Wait for all offload tasks to settle into object_bucket_map_.
+    WaitForAllOffloadsSettled();
+
     // Remove k1. GC should compact (delete k1's empty bucket file).
     ASSERT_EQ(real_client_->remove(k1, /*force=*/true), 0);
 
@@ -369,6 +382,9 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
     ASSERT_GT(buckets_before, 0);
 
+    // Wait for all offload tasks to settle into object_bucket_map_.
+    WaitForAllOffloadsSettled();
+
     // Remove k2 (force=true to bypass lease).
     ASSERT_EQ(real_client_->remove(k2, /*force=*/true), 0);
 
@@ -422,6 +438,9 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
 
     int buckets_before = CountFilesWithSuffix(ssd_dir, ".bucket");
     ASSERT_GT(buckets_before, 0);
+
+    // Wait for all offload tasks to settle into object_bucket_map_.
+    WaitForAllOffloadsSettled();
 
     // Batch remove: k1 exists, k_absent does not. force=true bypasses lease.
     std::vector<std::string> keys{k1, "gc_batch_absent"};
