@@ -329,8 +329,10 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
     // Wait for all offload tasks to settle into object_bucket_map_.
     WaitForAllOffloadsSettled();
 
-    // Snapshot bucket file names before remove.
+    // Snapshot bucket file names AFTER settle (all buckets written) and
+    // BEFORE remove. This is the baseline for detecting GC compaction.
     auto bucket_files_before = ListBucketFiles(ssd_dir);
+    int buckets_after_settle = CountFilesWithSuffix(ssd_dir, ".bucket");
 
     // Remove k1. GC should compact (delete k1's empty bucket file).
     ASSERT_EQ(real_client_->remove(k1, /*force=*/true), 0);
@@ -350,20 +352,21 @@ TEST_F(GCE2ETest, RemoveReclaimsSSDSpace) {
         ASSERT_FALSE(got1.has_value())
             << "Removed key k1 became readable again";
 
-        // Compaction changes the bucket file set (old deleted, new written).
+        // Detect: any file in before-set gone, OR count decreased.
         auto bucket_files_now = ListBucketFiles(ssd_dir);
-        if (bucket_files_now != bucket_files_before) {
-            // Verify at least one old file is gone.
-            for (const auto& old_name : bucket_files_before) {
-                if (std::find(bucket_files_now.begin(),
-                              bucket_files_now.end(),
-                              old_name) == bucket_files_now.end()) {
-                    reclaimed = true;
-                    break;
-                }
+        for (const auto& old_name : bucket_files_before) {
+            if (std::find(bucket_files_now.begin(),
+                          bucket_files_now.end(),
+                          old_name) == bucket_files_now.end()) {
+                reclaimed = true;
+                break;
             }
-            if (reclaimed) break;
         }
+        int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
+        if (!reclaimed && buckets_now < buckets_after_settle) {
+            reclaimed = true;
+        }
+        if (reclaimed) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
@@ -403,8 +406,11 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
     // Wait for all offload tasks to settle into object_bucket_map_.
     WaitForAllOffloadsSettled();
 
-    // Snapshot bucket file names before remove.
+    // Snapshot bucket file names AFTER settle (all buckets written) and
+    // BEFORE remove. This is the baseline for detecting GC compaction.
     auto bucket_files_before = ListBucketFiles(ssd_dir);
+    // Re-count after settle — more buckets may have appeared.
+    int buckets_after_settle = CountFilesWithSuffix(ssd_dir, ".bucket");
 
     // Remove k2 (force=true to bypass lease).
     ASSERT_EQ(real_client_->remove(k2, /*force=*/true), 0);
@@ -415,17 +421,20 @@ TEST_F(GCE2ETest, RemoveMiddleKeyPreservesSurvivors) {
         auto got1 = ReadKey(real_client_, k1);
         if (got1.has_value() && got1.value() == v1) {
             auto bucket_files_now = ListBucketFiles(ssd_dir);
-            if (bucket_files_now != bucket_files_before) {
-                for (const auto& old_name : bucket_files_before) {
-                    if (std::find(bucket_files_now.begin(),
-                                  bucket_files_now.end(),
-                                  old_name) == bucket_files_now.end()) {
-                        compacted = true;
-                        break;
-                    }
+            // Detect: any file in before-set gone, OR count decreased.
+            for (const auto& old_name : bucket_files_before) {
+                if (std::find(bucket_files_now.begin(),
+                              bucket_files_now.end(),
+                              old_name) == bucket_files_now.end()) {
+                    compacted = true;
+                    break;
                 }
-                if (compacted) break;
             }
+            int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
+            if (!compacted && buckets_now < buckets_after_settle) {
+                compacted = true;
+            }
+            if (compacted) break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -470,8 +479,10 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
     // Wait for all offload tasks to settle into object_bucket_map_.
     WaitForAllOffloadsSettled();
 
-    // Snapshot bucket file names before remove.
+    // Snapshot bucket file names AFTER settle (all buckets written) and
+    // BEFORE remove.
     auto bucket_files_before = ListBucketFiles(ssd_dir);
+    int buckets_after_settle = CountFilesWithSuffix(ssd_dir, ".bucket");
 
     // Batch remove: k1 exists, k_absent does not. force=true bypasses lease.
     std::vector<std::string> keys{k1, "gc_batch_absent"};
@@ -484,17 +495,19 @@ TEST_F(GCE2ETest, BatchRemoveMixedExistingAndAbsent) {
         auto got2 = ReadKey(real_client_, k2);
         if (got2.has_value() && got2.value() == v2) {
             auto bucket_files_now = ListBucketFiles(ssd_dir);
-            if (bucket_files_now != bucket_files_before) {
-                for (const auto& old_name : bucket_files_before) {
-                    if (std::find(bucket_files_now.begin(),
-                                  bucket_files_now.end(),
-                                  old_name) == bucket_files_now.end()) {
-                        compacted = true;
-                        break;
-                    }
+            for (const auto& old_name : bucket_files_before) {
+                if (std::find(bucket_files_now.begin(),
+                              bucket_files_now.end(),
+                              old_name) == bucket_files_now.end()) {
+                    compacted = true;
+                    break;
                 }
-                if (compacted) break;
             }
+            int buckets_now = CountFilesWithSuffix(ssd_dir, ".bucket");
+            if (!compacted && buckets_now < buckets_after_settle) {
+                compacted = true;
+            }
+            if (compacted) break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }

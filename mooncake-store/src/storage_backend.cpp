@@ -2503,11 +2503,6 @@ BucketStorageBackend::SelectGCCandidate() {
         const auto& bucket = it->second;
         int64_t deleted =
             bucket->deleted_bytes_.load(std::memory_order_relaxed);
-        LOG(WARNING) << "[GC] SelectGCCandidate scan bucket=" << it->first
-                     << " deleted=" << deleted
-                     << " data_size=" << bucket->data_size
-                     << " compacting=" << bucket->compacting_.load(
-                            std::memory_order_relaxed);
         if (deleted <= 0) continue;
         if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
 
@@ -2786,11 +2781,6 @@ void BucketStorageBackend::GCThreadFunc() {
                         ? static_cast<double>(deleted) /
                               static_cast<double>(data_size)
                         : 0.0;
-                LOG(WARNING) << "[GC] candidate bucket=" << candidate->first
-                             << " deleted=" << deleted
-                             << " data_size=" << data_size
-                             << " ratio=" << ratio
-                             << " space_pressure=" << space_pressure;
                 if (!space_pressure &&
                     ratio < bucket_backend_config_.gc_deleted_ratio) {
                     break;  // no candidate meets ratio threshold
