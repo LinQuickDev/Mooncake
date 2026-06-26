@@ -2458,9 +2458,12 @@ void BucketStorageBackend::MarkRemoved(const std::string& key) {
     SharedMutexLocker lock(&mutex_);
     auto it = object_bucket_map_.find(key);
     if (it == object_bucket_map_.end()) {
+        LOG(INFO) << "GC_E2E_DEBUG: MarkRemoved key not found: " << key;
         return;  // not in local storage or already removed — idempotent
     }
     int64_t bucket_id = it->second.bucket_id;
+    LOG(INFO) << "GC_E2E_DEBUG: MarkRemoved key=" << key
+              << " bucket_id=" << bucket_id;
     int64_t freed = it->second.data_size + it->second.key_size;
     object_bucket_map_.erase(it);
 
@@ -2523,6 +2526,7 @@ BucketStorageBackend::SelectGCCandidate() {
 }
 
 bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
+    LOG(INFO) << "GC_E2E_DEBUG: CompactBucket called bucket_id=" << bucket_id;
     // Step 1: lock-snapshot live keys
     std::shared_ptr<BucketMetadata> old_bucket;
     std::vector<std::string> live_keys;
@@ -2770,7 +2774,10 @@ void BucketStorageBackend::GCThreadFunc() {
             {
                 SharedMutexLocker lock(&mutex_);
                 auto candidate = SelectGCCandidate();
-                if (candidate == buckets_.end()) break;
+                if (candidate == buckets_.end()) {
+                    LOG(INFO) << "GC_E2E_DEBUG: SelectGCCandidate no candidate";
+                    break;
+                }
                 // Check deleted ratio threshold (unless space pressure
                 // forces compaction of any tombstone bucket).
                 int64_t deleted = candidate->second->deleted_bytes_.load(
@@ -2781,6 +2788,12 @@ void BucketStorageBackend::GCThreadFunc() {
                         ? static_cast<double>(deleted) /
                               static_cast<double>(data_size)
                         : 0.0;
+                LOG(INFO) << "GC_E2E_DEBUG: candidate bucket="
+                          << candidate->first << " deleted=" << deleted
+                          << " data_size=" << data_size
+                          << " ratio=" << ratio << " threshold="
+                          << bucket_backend_config_.gc_deleted_ratio
+                          << " space_pressure=" << space_pressure;
                 if (!space_pressure &&
                     ratio < bucket_backend_config_.gc_deleted_ratio) {
                     break;  // no candidate meets ratio threshold
