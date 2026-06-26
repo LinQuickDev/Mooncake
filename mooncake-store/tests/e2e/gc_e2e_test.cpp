@@ -132,9 +132,15 @@ class GCE2ETest : public ::testing::Test {
     }
 
     bool StartMasterWithOffload() {
+        // Do NOT set root_fs_dir: if master returns a non-empty fsdir, the
+        // client sets up its own file-per-key StorageBackend and writes DISK
+        // replicas there (master-side disk caching), which preempts the
+        // client-side FileStorage/BucketStorageBackend offload path — master
+        // sees a DISK replica already exists and never pushes an offload task.
+        // With enable_offload=true but no root_fs_dir, master pushes offload
+        // tasks that the client's FileStorage drains via heartbeat.
         auto config = InProcMasterConfigBuilder()
                           .set_enable_offload(true)
-                          .set_root_fs_dir(tmp_dir_.string())
                           .build();
         return master_.Start(config);
     }
