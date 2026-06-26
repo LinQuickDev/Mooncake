@@ -98,6 +98,13 @@ class GCE2ETest : public ::testing::Test {
         setenv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS", "200", 1);
         saved_gc_ratio_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
         setenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO", "0.1", 1);
+        // Set bucket_keys_limit=1 so a single offloaded key fills a bucket
+        // immediately. Without this, keys accumulate in the ungrouped pool
+        // (default limit 500) and no .bucket file is written until 500 keys
+        // are offloaded.
+        saved_bucket_keys_limit_ =
+            GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1", 1);
     }
 
     void TearDown() override {
@@ -110,6 +117,8 @@ class GCE2ETest : public ::testing::Test {
         RestoreEnv("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", saved_disable_);
         RestoreEnv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS", saved_gc_interval_);
         RestoreEnv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO", saved_gc_ratio_);
+        RestoreEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT",
+                   saved_bucket_keys_limit_);
 
         std::error_code ec;
         fs::remove_all(tmp_dir_, ec);
@@ -226,6 +235,7 @@ class GCE2ETest : public ::testing::Test {
     std::optional<std::string> saved_disable_;
     std::optional<std::string> saved_gc_interval_;
     std::optional<std::string> saved_gc_ratio_;
+    std::optional<std::string> saved_bucket_keys_limit_;
 };
 
 // -------------------------------------------------------------------
