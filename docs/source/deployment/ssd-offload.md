@@ -176,7 +176,8 @@ GC tuning (optional):
 | `MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS` | `1000` | GC scan interval |
 | `MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO` | `0.25` | Compact bucket when deleted bytes / data size >= this |
 | `MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO` | `0.90` | Force compaction of any tombstone bucket when total size / max >= this |
-| `MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND` | `1` | Max buckets compacted per GC round |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND` | `1` | Max old buckets collected per GC round for cross-bucket merge |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_MERGE_ENABLE` | `true` | Enable cross-bucket merge: collect live keys from multiple tombstone buckets into one new bucket. When false, each bucket is compacted independently |
 
 **Important:** Only keys removed via `Remove`/`BatchRemove` are reclaimed.
 `RemoveByRegex`/`RemoveAll` do not trigger this GC. When no tombstone space

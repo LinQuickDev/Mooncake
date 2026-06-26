@@ -222,8 +222,12 @@ struct BucketBackendConfig {
     double gc_deleted_ratio = 0.25;
     // Trigger GC when total_size / max_total_size >= this ratio.
     double gc_high_watermark_ratio = 0.90;
-    // Max buckets compacted per GC round.
+    // Max old buckets collected per GC round for cross-bucket merge.
     int64_t gc_max_buckets_per_round = 1;
+    // Enable cross-bucket merge compaction (collect live keys from multiple
+    // tombstone buckets into one new bucket). When false, each bucket is
+    // compacted independently (no merge).
+    bool gc_merge_enable = true;
 
     bool Validate() const;
 
@@ -888,6 +892,17 @@ class BucketStorageBackend : public StorageBackendInterface {
     // (will retry next round). Public to allow explicit compaction and
     // testing (analogous to DeleteBucket).
     bool CompactBucket(int64_t bucket_id);
+
+    // Compact multiple buckets into one new bucket (cross-bucket merge).
+    // Collects live keys from all given old buckets, groups them by
+    // bucket_keys_limit/bucket_size_limit, and writes ONE new bucket per
+    // round (the first group that fills up). If the first group doesn't
+    // fill a full bucket and there's no space pressure, the merge is
+    // deferred to the next round. Old buckets whose live keys are all
+    // migrated are deleted.
+    // Returns true on success (or deferred), false on transient failure.
+    bool CompactBuckets(const std::vector<int64_t>& bucket_ids,
+                        bool space_pressure = false);
 
    private:
     // --- Background GC ---
