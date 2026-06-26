@@ -109,11 +109,13 @@ class GCE2ETest : public ::testing::Test {
         setenv("MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY", "lru", 1);
         saved_disable_ = GetEnvOpt("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION");
         setenv("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", "true", 1);
-        // Tighten GC so compaction runs quickly in tests.
+        // Tighten GC so compaction runs after remove. Set interval long
+        // enough that GC doesn't fire during offload settlement (which
+        // could compact a bucket before remove creates a tombstone).
         saved_gc_interval_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS");
-        setenv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS", "200", 1);
+        setenv("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS", "15000", 1);
         saved_gc_ratio_ = GetEnvOpt("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
-        setenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO", "0.1", 1);
+        setenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO", "0.01", 1);
         // Set bucket_keys_limit=1 so each offloaded key fills a bucket
         // immediately. This ensures .bucket files are written on the first
         // heartbeat after put. With limit=2, keys may sit in the ungrouped
@@ -229,8 +231,11 @@ class GCE2ETest : public ::testing::Test {
     // after the first heartbeat may not yet be in object_bucket_map_ when
     // MarkRemoved is called, making the tombstone a no-op.
     void WaitForAllOffloadsSettled() {
-        // Two heartbeat intervals (10s each) to be safe.
-        std::this_thread::sleep_for(std::chrono::seconds(20));
+        // Wait less than gc_interval_ms (15s) so GC doesn't fire during
+        // settlement. Two heartbeat cycles (10s each) would be ideal, but
+        // 12s is enough for the 2nd heartbeat to drain remaining tasks
+        // while staying under the GC interval.
+        std::this_thread::sleep_for(std::chrono::seconds(12));
     }
 
     // Put multiple keys, then wait until ALL are offloaded (a .bucket file
