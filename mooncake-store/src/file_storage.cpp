@@ -383,6 +383,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys);
         if (!allocate_res) {
+            LOG(ERROR) << "GC_E2E_DEBUG: AllocateOffloadingBuckets failed: "
+                       << allocate_res.error();
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
             return allocate_res;
@@ -395,6 +397,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         buckets_keys.emplace_back(std::move(keys));
     }
+    LOG(INFO) << "GC_E2E_DEBUG: buckets_keys.size=" << buckets_keys.size()
+              << " storage_object_sizes=" << storage_object_sizes.size();
 
     auto complete_handler =
         [this, &task_by_storage_key](
@@ -424,6 +428,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     };
 
     for (const auto& keys : buckets_keys) {
+        LOG(INFO) << "GC_E2E_DEBUG: processing bucket_keys.size=" << keys.size();
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
