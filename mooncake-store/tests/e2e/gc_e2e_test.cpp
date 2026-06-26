@@ -167,19 +167,43 @@ class GCE2ETest : public ::testing::Test {
     bool PutAndWaitOffloaded(const std::string& key,
                              const std::string& value,
                              const fs::path& ssd_dir) {
+        LOG(INFO) << "PutAndWaitOffloaded: key=" << key
+                  << " watching dir=" << ssd_dir;
         std::span<const char> span(value.data(), value.size());
         ReplicateConfig config;
         config.replica_num = 1;
-        if (real_client_->put(key, span, config) != 0) return false;
+        if (real_client_->put(key, span, config) != 0) {
+            LOG(ERROR) << "PutAndWaitOffloaded: put failed for key=" << key;
+            return false;
+        }
         // Wait for offload: a .bucket file must appear in ssd_dir, AND the
         // key must be readable via get_buffer (confirms data integrity).
-        for (int i = 0; i < 150; ++i) {  // up to 15s
+        // Heartbeat interval is 10s, so wait up to 40s.
+        for (int i = 0; i < 400; ++i) {  // up to 40s
             int buckets = CountFilesWithSuffix(ssd_dir, ".bucket");
             if (buckets > 0) {
                 auto got = ReadKey(real_client_, key);
                 if (got.has_value() && got.value() == value) return true;
             }
+            if (i % 50 == 0) {  // log every 5s
+                LOG(INFO) << "PutAndWaitOffloaded: key=" << key
+                          << " elapsed=" << (i * 100) << "ms"
+                          << " buckets=" << buckets;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        // Final diagnostic: list all files in the dir tree.
+        LOG(ERROR) << "PutAndWaitOffloaded: TIMEOUT for key=" << key
+                   << ". Files in " << ssd_dir << ":";
+        std::error_code ec;
+        for (auto& e : fs::recursive_directory_iterator(ssd_dir, ec)) {
+            LOG(ERROR) << "  " << e.path().string();
+        }
+        // Also check tmp_dir_ root (master may write elsewhere).
+        LOG(ERROR) << "Files in " << tmp_dir_ << ":";
+        for (auto& e : fs::recursive_directory_iterator(tmp_dir_, ec)) {
+            if (e.is_regular_file())
+                LOG(ERROR) << "  " << e.path().string();
         }
         return false;
     }
