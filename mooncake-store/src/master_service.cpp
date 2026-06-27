@@ -3074,10 +3074,43 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Remove object metadata
             ErasePromotionTaskIfPresent(tenant_state, key);
+
+            // Collect LOCAL_DISK replica holders before erasing, so we
+            // can notify them to reclaim SSD space via RemoveObjectHeartbeat.
+            std::vector<UUID> batch_local_disk_holders;
+            metadata.VisitReplicas(
+                [](const Replica& replica) {
+                    return replica.is_local_disk_replica();
+                },
+                [&batch_local_disk_holders](Replica& replica) {
+                    auto cid = replica.get_local_disk_client_id();
+                    if (cid.has_value()) {
+                        batch_local_disk_holders.push_back(cid.value());
+                    }
+                });
+
             EraseMetadata(tenant_state, it, normalized_tenant);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
+
+            // Push removed key to each LOCAL_DISK holder's removed_keys queue.
+            if (!batch_local_disk_holders.empty()) {
+                ScopedLocalDiskSegmentAccess local_disk_segment_access =
+                    segment_manager_.getLocalDiskSegmentAccess();
+                auto& client_local_disk_segment =
+                    local_disk_segment_access.getClientLocalDiskSegment();
+                for (const auto& holder_id : batch_local_disk_holders) {
+                    auto seg_it = client_local_disk_segment.find(holder_id);
+                    if (seg_it != client_local_disk_segment.end()) {
+                        MutexLocker locker(
+                            &seg_it->second->offloading_mutex_);
+                        seg_it->second->removed_keys.push_back(
+                            RemoveTaskItem{normalized_tenant, key});
+                    }
+                }
+            }
+
             results[original_idx] = {};  // Success
         }
     }
