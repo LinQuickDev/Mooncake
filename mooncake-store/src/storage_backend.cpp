@@ -2664,6 +2664,14 @@ bool BucketStorageBackend::CompactBuckets(
         (group_size >= bucket_backend_config_.bucket_size_limit);
     if (!group_full && !space_pressure) {
         // Not enough live keys to fill a bucket; defer to next round.
+        LOG(INFO) << "[GC] CompactBuckets deferred: group_count="
+                  << group_count
+                  << " group_size=" << group_size
+                  << " bucket_keys_limit="
+                  << bucket_backend_config_.bucket_keys_limit
+                  << " bucket_size_limit="
+                  << bucket_backend_config_.bucket_size_limit
+                  << " total_live_keys=" << live_keys_info.size();
         reset_compacting();
         return true;
     }
