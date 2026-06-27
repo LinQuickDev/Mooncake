@@ -2914,7 +2914,7 @@ tl::expected<void, ErrorCode> Client::warmup(
                          << segment_name << "'";
             return false;
         }
-        auto target_meta_data = transfer_engine_->getMetadata(target_id);
+        auto target_meta_data = transfer_engine_->getMetadata();
         auto target_segment = target_meta_data->getSegmentDescByID(target_id);
         Transport::TransferRequest request;
         request.opcode = op;
