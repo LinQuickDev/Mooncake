@@ -2080,7 +2080,14 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (file_storage_) {
         auto storage_key =
             MakeTenantScopedStorageKey(client_->tenant_id(), key);
+        LOG(INFO) << "[GC_DEBUG] remove_internal key=" << key
+                  << " storage_key_size=" << storage_key.size()
+                  << " tenant=" << client_->tenant_id()
+                  << " calling MarkRemoved";
         file_storage_->MarkRemoved(storage_key);
+    } else {
+        LOG(WARNING) << "[GC_DEBUG] remove_internal key=" << key
+                     << " file_storage_ is null, skipping MarkRemoved";
     }
     return {};
 }

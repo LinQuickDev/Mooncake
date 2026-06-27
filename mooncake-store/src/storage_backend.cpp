@@ -2461,9 +2461,14 @@ void BucketStorageBackend::MarkRemoved(const std::string& key) {
     SharedMutexLocker lock(&mutex_);
     auto it = object_bucket_map_.find(key);
     if (it == object_bucket_map_.end()) {
+        LOG(WARNING) << "[GC_DEBUG] MarkRemoved key not found"
+                     << " key_size=" << key.size()
+                     << " map_size=" << object_bucket_map_.size();
         return;  // not in local storage or already removed — idempotent
     }
     int64_t bucket_id = it->second.bucket_id;
+    LOG(INFO) << "[GC_DEBUG] MarkRemoved key found bucket_id=" << bucket_id
+              << " key_size=" << key.size();
     int64_t freed = it->second.data_size + it->second.key_size;
     object_bucket_map_.erase(it);
 
@@ -2898,6 +2903,8 @@ void BucketStorageBackend::GCThreadFunc() {
         if (!gc_running_.load(std::memory_order_acquire)) break;
 
         if (!bucket_backend_config_.gc_enable) continue;
+
+        LOG(INFO) << "[GC_DEBUG] GC round starting, checking candidates";
 
         // Check space pressure under shared lock (total_size_ is
         // GUARDED_BY(mutex_)).
