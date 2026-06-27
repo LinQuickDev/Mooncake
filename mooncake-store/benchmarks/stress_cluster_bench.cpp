@@ -709,6 +709,21 @@ class StressBenchmark {
         return "seg_" + sanitized + "_key_" + std::to_string(idx);
     }
 
+    // Key generator for remove/batch_remove scenarios. Uses a distinct
+    // "rmv_" prefix so remove keys never collide with segment_write keys
+    // ("seg_"). This allows remove and write benchmarks to run independently
+    // without cross-contamination.
+    static std::string MakeRemoveKey(const std::string& segment, size_t idx) {
+        static const char* kSpecialChars = ".:-/\\[]{}()@#$%^&*+=|<>,;!?`'\"~";
+        std::string sanitized = segment;
+        for (char& c : sanitized) {
+            if (std::strchr(kSpecialChars, c) != nullptr || std::isspace(c)) {
+                c = '_';
+            }
+        }
+        return "rmv_" + sanitized + "_key_" + std::to_string(idx);
+    }
+
     int RunSegmentWrite() {
         auto segments = DiscoverSegmentsIfNeeded(
             "--segments not specified, auto-discovering");
@@ -1284,7 +1299,7 @@ class StressBenchmark {
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             for (size_t s = 0; s < remove_segments.size(); ++s) {
                 const auto& segment = remove_segments[s];
-                std::string key = MakeSegmentKey(segment, i);
+                std::string key = MakeRemoveKey(segment, i);
                 FillBuffer(i);
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
@@ -1307,7 +1322,7 @@ class StressBenchmark {
         std::vector<std::string> all_keys;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             for (size_t s = 0; s < remove_segments.size(); ++s) {
-                all_keys.push_back(MakeSegmentKey(remove_segments[s], i));
+                all_keys.push_back(MakeRemoveKey(remove_segments[s], i));
             }
         }
         LOG(INFO) << "Total keys to remove: " << all_keys.size();
