@@ -613,6 +613,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 0: Drain removed keys from master ===
+    // TEMPORARILY DISABLED: RemoveObjectHeartbeat causes segfault.
+    // TODO: re-enable after fixing the crash.
+#if 0
     {
         if (!client_) {
             LOG(ERROR) << "[GC_E2E] Heartbeat: client_ is null";
@@ -638,6 +641,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
             }
         }
     }
+#endif
 
     std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
