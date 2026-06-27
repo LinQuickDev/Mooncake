@@ -2867,6 +2867,116 @@ std::vector<int> Client::GetNicNumaNodes() const {
     return {nodes.begin(), nodes.end()};
 }
 
+tl::expected<void, ErrorCode> Client::warmup(
+    const std::shared_ptr<ClientBufferAllocator>& allocator) {
+    if (!transfer_engine_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!allocator) {
+        LOG(WARNING) << "warmup: no buffer allocator provided, skipping";
+        return {};
+    }
+
+    // Allocate a buffer from the client's buffer allocator.  The allocator's
+    // underlying memory is already registered with the transfer engine during
+    // setup_internal, so it can be used directly as the source (WRITE) and
+    // destination (READ) for warmup transfers.  BufferHandle is RAII: it
+    // deallocates the buffer back to the allocator on destruction, so no
+    // explicit register/unregister is needed here.
+    constexpr size_t kWarmupBufSize = 4096;
+    auto buf_handle = allocator->allocate(kWarmupBufSize);
+    if (!buf_handle) {
+        LOG(WARNING) << "warmup: failed to allocate warmup buffer";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::memset(buf_handle->ptr(), 0, buf_handle->size());
+
+    // Fetch all segment names registered with the master.
+    auto segments_result = master_client_.GetAllSegments();
+    if (!segments_result) {
+        LOG(WARNING) << "warmup: GetAllSegments failed: "
+                     << toString(segments_result.error());
+        return tl::unexpected(segments_result.error());
+    }
+
+    const auto& segments = segments_result.value();
+    LOG(INFO) << "warmup: pre-establishing connections to "
+              << segments.size() << " segment(s) for protocol '"
+              << protocol_ << "'";
+
+    // Helper lambda: submit a single transfer request and poll to completion.
+    auto submit_and_wait = [&](Transport::TransferRequest::OpCode op,
+                              SegmentID target_id,
+                              const std::string& segment_name) -> bool {
+        auto batch_id = transfer_engine_->allocateBatchID(1);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(WARNING) << "warmup: allocateBatchID failed for '"
+                         << segment_name << "'";
+            return false;
+        }
+
+        Transport::TransferRequest request;
+        request.opcode = op;
+        request.source = buf_handle->ptr();  // registered buffer carries r/w data
+        request.target_id = target_id;
+        request.target_offset = 0;
+        request.length = kWarmupBufSize;
+
+        auto status = transfer_engine_->submitTransfer(batch_id, {request});
+        if (!status.ok()) {
+            LOG(WARNING) << "warmup: submitTransfer("
+                         << (op == Transport::TransferRequest::WRITE ? "W" : "R")
+                         << ") failed for '" << segment_name
+                         << "': " << status.message();
+            transfer_engine_->freeBatchID(batch_id);
+            return false;
+        }
+
+        // Poll for completion — the connection handshake occurs here.
+        Transport::TransferStatus ts;
+        for (int poll = 0; poll < 1000; ++poll) {
+            auto s = transfer_engine_->getTransferStatus(batch_id, 0, ts);
+            if (!s.ok()) break;
+            if (ts.s == Transport::COMPLETED ||
+                ts.s == Transport::FAILED ||
+                ts.s == Transport::INVALID)
+                break;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        transfer_engine_->freeBatchID(batch_id);
+        return ts.s == Transport::COMPLETED;
+    };
+
+    size_t success_count = 0;
+    for (const auto& segment_name : segments) {
+        // Open the segment to resolve its SegmentID (caches the descriptor).
+        auto target_id = transfer_engine_->openSegment(segment_name);
+        if (target_id == (SegmentHandle)-1) {
+            LOG(WARNING) << "warmup: cannot open segment '"
+                         << segment_name << "'";
+            continue;
+        }
+        // Skip the local segment — no point self-connecting, and a WRITE
+        // would corrupt our own buffer.
+        if (target_id == LOCAL_SEGMENT_ID) {
+            continue;
+        }
+
+        // Issue a 1-byte WRITE then a 1-byte READ using the registered
+        // buffer to exercise both directions of the connection.
+        bool ok = submit_and_wait(Transport::TransferRequest::WRITE,
+                                  target_id, segment_name);
+        ok = submit_and_wait(Transport::TransferRequest::READ,
+                             target_id, segment_name) && ok;
+        if (ok) ++success_count;
+    }
+
+    LOG(INFO) << "warmup: completed, " << success_count << "/"
+              << segments.size() << " segments processed";
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {

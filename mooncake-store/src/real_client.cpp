@@ -967,6 +967,45 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    // Optionally warmup transport connections to all segments
+    // currently registered with the master.  This is especially valuable
+    // for high-concurrency small-file workloads where on-demand RDMA QP
+    // handshakes can storm the listener and surface as TRANSFER_FAIL.
+    // Controlled by MC_STORE_WARMUP (default: disabled to
+    // preserve existing behaviour). Set to 1/true/yes to enable.
+    if (client_) {
+        const char* env = std::getenv("MC_STORE_WARMUP");
+        bool enable_warmup = false;
+        if (env) {
+            std::string val = env;
+            std::transform(val.begin(), val.end(), val.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            enable_warmup =
+                (val == "1" || val == "true" || val == "yes" || val == "on");
+        }
+        if (enable_warmup) {
+            // warmup issues RDMA transfers using a buffer from
+            // client_buffer_allocator_, which must be registered with the
+            // transfer engine.  For cxl protocol or zero-sized buffers the
+            // allocator base is not registered, so skip warmup in that case.
+            if (!local_buffer_region_.has_value() ||
+                local_buffer_region_->size == 0) {
+                LOG(WARNING) << "Warmup enabled but local buffer is not "
+                             << "registered (protocol=" << this->protocol
+                             << "), skipping warmup";
+            } else {
+                LOG(INFO) << "Warming up connections to all registered segments";
+                auto warmup_result = client_->warmup(client_buffer_allocator_);
+                if (!warmup_result) {
+                    LOG(WARNING)
+                        << "Warmup failed: "
+                        << toString(warmup_result.error())
+                        << ", continuing setup (will connect on demand)";
+                }
+            }
+        }
+    }
+
     return {};
 }
 

@@ -2212,6 +2212,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
         &wrapped_master_service);
     server.register_handler<
+        &mooncake::WrappedMasterService::GetAllSegmentsForAdmin>(
+        &wrapped_master_service);
+    server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
