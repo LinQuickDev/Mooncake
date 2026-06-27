@@ -613,26 +613,29 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 0: Drain removed keys from master ===
-    // Master pushes {tenant_id, key} pairs to this client's removed_keys
-    // queue when a Remove/BatchRemove deletes a key that had a LOCAL_DISK
-    // replica here. We mark each as a tombstone so GC can reclaim SSD space.
     {
-        auto remove_result =
-            client_->RemoveObjectHeartbeat(client_->getClientId());
-        if (remove_result) {
-            if (!remove_result.value().empty()) {
-                LOG(INFO) << "[GC_E2E] RemoveObjectHeartbeat got "
-                          << remove_result.value().size()
-                          << " removed key(s)";
-            }
-            for (const auto& item : remove_result.value()) {
-                auto storage_key =
-                    MakeTenantScopedStorageKey(item.tenant_id, item.key);
-                storage_backend_->MarkRemoved(storage_key);
-            }
+        if (!client_) {
+            LOG(ERROR) << "[GC_E2E] Heartbeat: client_ is null";
         } else {
-            LOG(WARNING) << "[GC_E2E] RemoveObjectHeartbeat error: "
-                         << remove_result.error();
+            auto client_id = client_->getClientId();
+            LOG(INFO) << "[GC_E2E] Calling RemoveObjectHeartbeat";
+            auto remove_result =
+                client_->RemoveObjectHeartbeat(client_id);
+            if (remove_result) {
+                if (!remove_result.value().empty()) {
+                    LOG(INFO) << "[GC_E2E] RemoveObjectHeartbeat got "
+                              << remove_result.value().size()
+                              << " removed key(s)";
+                }
+                for (const auto& item : remove_result.value()) {
+                    auto storage_key =
+                        MakeTenantScopedStorageKey(item.tenant_id, item.key);
+                    storage_backend_->MarkRemoved(storage_key);
+                }
+            } else {
+                LOG(WARNING) << "[GC_E2E] RemoveObjectHeartbeat error: "
+                             << remove_result.error();
+            }
         }
     }
 
