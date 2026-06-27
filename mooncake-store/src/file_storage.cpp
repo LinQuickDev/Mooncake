@@ -634,6 +634,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
             LOG(WARNING) << "[GC_E2E] RemoveObjectHeartbeat error: "
                          << remove_result.error();
         }
+    }
 
     std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
