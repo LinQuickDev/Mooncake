@@ -2914,12 +2914,13 @@ tl::expected<void, ErrorCode> Client::warmup(
                          << segment_name << "'";
             return false;
         }
-
+        auto target_meta_data = transfer_engine_->getMetadata(target_id);
+        auto target_segment = target_meta_data->getSegmentDescByID(target_id);
         Transport::TransferRequest request;
         request.opcode = op;
         request.source = buf_handle->ptr();  // registered buffer carries r/w data
         request.target_id = target_id;
-        request.target_offset = 0;
+        request.target_offset = target_segment->buffers[0].addr;
         request.length = kWarmupBufSize;
 
         auto status = transfer_engine_->submitTransfer(batch_id, {request});
