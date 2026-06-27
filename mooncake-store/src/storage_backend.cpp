@@ -2630,22 +2630,59 @@ bool BucketStorageBackend::CompactBuckets(
         return true;
     }
 
-    // Step 2: read live key data from each old bucket (lock-free IO).
-    // Group reads by old bucket to open each file once.
-    std::unordered_map<std::string, std::string> live_data_buffers;
-    std::unordered_map<std::string, std::vector<Slice>> live_batch;
+    // Step 2: group live keys by bucket_keys_limit / bucket_size_limit
+    // using metadata only (no file IO). Only the FIRST group that fills up
+    // will be written as a new bucket; remaining keys are deferred to the
+    // next round.
+    struct GroupedKey {
+        std::string key;
+        int64_t old_bucket_id;
+        BucketObjectMetadata meta;
+        int64_t total_size;  // key_size + data_size
+    };
+    std::vector<GroupedKey> first_group_keys;
+    int64_t group_count = 0;
+    int64_t group_size = 0;
 
-    for (auto& [bid, pr] : old_buckets) {
-        auto& old_bucket = pr.first;
-        std::vector<std::pair<std::string, BucketObjectMetadata>> keys_to_read;
-        for (auto& info : live_keys_info) {
-            if (info.old_bucket_id == bid) {
-                keys_to_read.push_back({info.key, info.meta});
-            }
+    for (const auto& info : live_keys_info) {
+        int64_t key_total =
+            info.meta.key_size + info.meta.data_size;
+        if (group_count >= bucket_backend_config_.bucket_keys_limit ||
+            (group_count > 0 && group_size + key_total >
+                                    bucket_backend_config_.bucket_size_limit)) {
+            break;  // first group is full
         }
-        if (keys_to_read.empty()) continue;
+        first_group_keys.push_back(
+            {info.key, info.old_bucket_id, info.meta, key_total});
+        group_size += key_total;
+        ++group_count;
+    }
 
-        // Scope the BucketReadGuard to this bucket's reads.
+    // Check if first group is full enough to write.
+    bool group_full =
+        (group_count >= bucket_backend_config_.bucket_keys_limit) ||
+        (group_size >= bucket_backend_config_.bucket_size_limit);
+    if (!group_full && !space_pressure) {
+        // Not enough live keys to fill a bucket; defer to next round.
+        reset_compacting();
+        return true;
+    }
+
+    // Step 3: read ONLY the first group's live key data from old buckets
+    // (lock-free IO). Open each old bucket file once, read only the keys
+    // that are in the first group.
+    std::unordered_map<std::string, std::string> live_data_buffers;
+    std::unordered_map<std::string, std::vector<Slice>> first_group;
+
+    // Group first_group_keys by old_bucket_id to open each file once.
+    std::unordered_map<int64_t,
+                       std::vector<const GroupedKey*>> keys_by_bucket;
+    for (const auto& gk : first_group_keys) {
+        keys_by_bucket[gk.old_bucket_id].push_back(&gk);
+    }
+
+    for (auto& [bid, keys_ptr] : keys_by_bucket) {
+        auto& old_bucket = old_buckets[bid].first;
         bool read_ok = true;
         {
             BucketReadGuard guard(old_bucket);
@@ -2659,29 +2696,30 @@ bool BucketStorageBackend::CompactBuckets(
                     read_ok = false;
                 } else {
                     auto& file = file_result.value();
-                    for (auto& [key, meta] : keys_to_read) {
+                    for (const auto* gk : keys_ptr) {
                         std::string data;
-                        data.resize(meta.data_size);
-                        int64_t actual_offset = meta.offset + meta.key_size;
+                        data.resize(gk->meta.data_size);
+                        int64_t actual_offset =
+                            gk->meta.offset + gk->meta.key_size;
                         iovec iov{data.data(),
-                                  static_cast<size_t>(meta.data_size)};
+                                  static_cast<size_t>(gk->meta.data_size)};
                         auto read_res =
                             file->vector_read(&iov, 1, actual_offset);
                         if (!read_res ||
                             read_res.value() !=
-                                static_cast<size_t>(meta.data_size)) {
+                                static_cast<size_t>(gk->meta.data_size)) {
                             LOG(ERROR)
                                 << "CompactBuckets: read failed for key: "
-                                << key << ", bucket_id=" << bid;
+                                << gk->key << ", bucket_id=" << bid;
                             read_ok = false;
                             break;
                         }
-                        live_data_buffers[key] = std::move(data);
-                        live_batch.emplace(
-                            key,
+                        live_data_buffers[gk->key] = std::move(data);
+                        first_group.emplace(
+                            gk->key,
                             std::vector<Slice>{Slice{
-                                live_data_buffers[key].data(),
-                                live_data_buffers[key].size()}});
+                                live_data_buffers[gk->key].data(),
+                                live_data_buffers[gk->key].size()}});
                     }
                 }
             }
@@ -2691,38 +2729,6 @@ bool BucketStorageBackend::CompactBuckets(
             reset_compacting();
             return false;
         }
-    }
-
-    // Step 3: group live keys by bucket_keys_limit / bucket_size_limit.
-    // Only write the FIRST group (one new bucket per round).
-    std::unordered_map<std::string, std::vector<Slice>> first_group;
-    int64_t group_count = 0;
-    int64_t group_size = 0;
-    bool first_group_full = false;
-
-    for (auto& [key, slices] : live_batch) {
-        int64_t key_total = static_cast<int64_t>(key.size());
-        for (auto& s : slices) key_total += s.size;
-
-        if (group_count >= bucket_backend_config_.bucket_keys_limit ||
-            (group_count > 0 && group_size + key_total >
-                                    bucket_backend_config_.bucket_size_limit)) {
-            // Current group is full — this is the first group.
-            first_group_full = true;
-            break;
-        }
-        first_group[key] = slices;
-        group_size += key_total;
-        ++group_count;
-    }
-
-    // Check if first group is full enough to write.
-    bool group_full = (group_count >= bucket_backend_config_.bucket_keys_limit) ||
-                      (group_size >= bucket_backend_config_.bucket_size_limit);
-    if (!group_full && !space_pressure) {
-        // Not enough live keys to fill a bucket; defer to next round.
-        reset_compacting();
-        return true;
     }
 
     // Step 4: write the first group as a new bucket.
