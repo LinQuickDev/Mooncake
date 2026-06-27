@@ -2251,9 +2251,10 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
         &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::RemoveObjectHeartbeat>(
-        &wrapped_master_service);
+    // TEMPORARILY DISABLED: RemoveObjectHeartbeat registration causes segfault.
+    // server.register_handler<
+    //     &mooncake::WrappedMasterService::RemoveObjectHeartbeat>(
+    //     &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
             &wrapped_master_service);
