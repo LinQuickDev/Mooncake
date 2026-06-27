@@ -2073,22 +2073,10 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
-    // Mark SSD tombstone for explicit-delete GC (bucket backend only;
-    // other backends no-op). Does not change Remove semantics.
-    // object_bucket_map_ is keyed by tenant-scoped storage key, so we must
-    // convert the user key to the storage key format.
-    if (file_storage_) {
-        auto storage_key =
-            MakeTenantScopedStorageKey(client_->tenant_id(), key);
-        LOG(INFO) << "[GC_DEBUG] remove_internal key=" << key
-                  << " storage_key_size=" << storage_key.size()
-                  << " tenant=" << client_->tenant_id()
-                  << " calling MarkRemoved";
-        file_storage_->MarkRemoved(storage_key);
-    } else {
-        LOG(WARNING) << "[GC_DEBUG] remove_internal key=" << key
-                     << " file_storage_ is null, skipping MarkRemoved";
-    }
+    // SSD tombstone marking is handled by the storage node (mooncake_client)
+    // via RemoveHeartbeat RPC — master pushes removed keys to the LOCAL_DISK
+    // replica holder, which calls MarkRemoved. We do NOT call MarkRemoved
+    // here because this client may not be the SSD storage node.
     return {};
 }
 
@@ -2129,22 +2117,8 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     auto results = client_->BatchRemove(keys, force);
-    // Mark SSD tombstone only for successfully removed keys.
-    // object_bucket_map_ is keyed by tenant-scoped storage key, so we must
-    // convert user keys to storage key format.
-    if (file_storage_) {
-        const auto& tenant = client_->tenant_id();
-        std::vector<std::string> removed;
-        for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
-            if (results[i].has_value()) {
-                removed.push_back(
-                    MakeTenantScopedStorageKey(tenant, keys[i]));
-            }
-        }
-        if (!removed.empty()) {
-            file_storage_->BatchMarkRemoved(removed);
-        }
-    }
+    // SSD tombstone marking is handled by the storage node via
+    // RemoveHeartbeat RPC. See remove_internal for details.
     return results;
 }
 

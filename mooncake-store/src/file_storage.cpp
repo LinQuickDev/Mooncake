@@ -612,6 +612,27 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         });
     }
 
+    // === STEP 0: Drain removed keys from master ===
+    // Master pushes {tenant_id, key} pairs to this client's removed_keys
+    // queue when a Remove/BatchRemove deletes a key that had a LOCAL_DISK
+    // replica here. We mark each as a tombstone so GC can reclaim SSD space.
+    {
+        auto remove_result = client_->RemoveHeartbeat(client_->getClientId());
+        if (remove_result) {
+            for (const auto& [tenant_id, key] : remove_result.value()) {
+                auto storage_key =
+                    MakeTenantScopedStorageKey(tenant_id, key);
+                storage_backend_->MarkRemoved(storage_key);
+            }
+            if (!remove_result.value().empty()) {
+                VLOG(1) << "RemoveHeartbeat drained "
+                        << remove_result.value().size()
+                        << " removed key(s) from master";
+            }
+        }
+        // Errors are non-fatal: removed keys will be retried next heartbeat.
+    }
+
     std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
 

@@ -95,6 +95,13 @@ struct LocalDiskSegment {
     // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
         offloading_mutex_) promotion_objects;
+    // Keys removed via Remove/BatchRemove that had LOCAL_DISK replicas on
+    // this client. Populated by master's Remove when the key has a
+    // LOCAL_DISK replica. Drained by RemoveHeartbeat RPC. Same locking as
+    // offloading_objects (offloading_mutex_).
+    // Each entry: {tenant_id, user_key}.
+    std::vector<std::pair<std::string, std::string>> GUARDED_BY(
+        offloading_mutex_) removed_keys;
     explicit LocalDiskSegment(bool enable_offloading)
         : enable_offloading(enable_offloading) {}
 

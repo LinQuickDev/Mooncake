@@ -2786,7 +2786,38 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
 
     auto& tenant_state = accessor.GetTenantState();
     ErasePromotionTaskIfPresent(tenant_state, key);
+
+    // Before erasing metadata, collect LOCAL_DISK replica holders so we
+    // can notify them to reclaim SSD space via RemoveHeartbeat.
+    std::vector<UUID> local_disk_holders;
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_local_disk_replica();
+        },
+        [&local_disk_holders](Replica& replica) {
+            auto client_id = replica.get_local_disk_client_id();
+            if (client_id.has_value()) {
+                local_disk_holders.push_back(client_id.value());
+            }
+        });
+
     accessor.Erase();
+
+    // Push removed key to each LOCAL_DISK holder's removed_keys queue.
+    if (!local_disk_holders.empty()) {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        for (const auto& holder_id : local_disk_holders) {
+            auto it = client_local_disk_segment.find(holder_id);
+            if (it != client_local_disk_segment.end()) {
+                MutexLocker locker(&it->second->offloading_mutex_);
+                it->second->removed_keys.emplace_back(tenant_id, key);
+            }
+        }
+    }
+
     return {};
 }
 
@@ -3218,6 +3249,26 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         }
     }
     return {};
+}
+
+auto MasterService::RemoveHeartbeat(const UUID& client_id)
+    -> tl::expected<std::vector<std::pair<std::string, std::string>>,
+                    ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    std::vector<std::pair<std::string, std::string>> result;
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        result = std::move(local_disk_segment_it->second->removed_keys);
+    }
+    return result;
 }
 
 auto MasterService::ReportSsdCapacity(const UUID& client_id,

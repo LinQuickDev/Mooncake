@@ -443,6 +443,16 @@ class MasterClient {
     PromotionObjectHeartbeat(const UUID& client_id);
 
     /**
+     * @brief Drain the removed_keys queue from master. Returns {tenant_id,
+     * key} pairs that were removed via Remove/BatchRemove and had LOCAL_DISK
+     * replicas on this client. The caller should MarkRemoved each key to
+     * trigger SSD tombstone + GC compaction.
+     */
+    [[nodiscard]] tl::expected<
+        std::vector<std::pair<std::string, std::string>>, ErrorCode>
+    RemoveHeartbeat(const UUID& client_id);
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * promotion. Returns the new replica's descriptor that the caller writes
      * via Transfer Engine.

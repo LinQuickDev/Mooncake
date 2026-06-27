@@ -603,6 +603,18 @@ class MasterService {
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
 
     /**
+     * @brief Drain the removed_keys queue for a client.
+     *
+     * Returns the list of {tenant_id, key} pairs that were removed via
+     * Remove/BatchRemove and had LOCAL_DISK replicas on this client. The
+     * client should call MarkRemoved on each key to trigger SSD tombstone
+     * marking + GC compaction.
+     */
+    auto RemoveHeartbeat(const UUID& client_id)
+        -> tl::expected<std::vector<std::pair<std::string, std::string>>,
+                        ErrorCode>;
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
      * DRAM via the existing AllocationStrategy, optionally biased toward the
      * caller's local memory segment via preferred_segments. The new replica is
