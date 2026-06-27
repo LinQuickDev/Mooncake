@@ -2074,7 +2074,7 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
         return tl::unexpected(remove_result.error());
     }
     // SSD tombstone marking is handled by the storage node (mooncake_client)
-    // via RemoveHeartbeat RPC — master pushes removed keys to the LOCAL_DISK
+    // via RemoveObjectHeartbeat RPC — master pushes removed keys to the LOCAL_DISK
     // replica holder, which calls MarkRemoved. We do NOT call MarkRemoved
     // here because this client may not be the SSD storage node.
     return {};
@@ -2118,7 +2118,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
     }
     auto results = client_->BatchRemove(keys, force);
     // SSD tombstone marking is handled by the storage node via
-    // RemoveHeartbeat RPC. See remove_internal for details.
+    // RemoveObjectHeartbeat RPC. See remove_internal for details.
     return results;
 }
 

@@ -195,8 +195,8 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
-    tl::expected<std::vector<std::pair<std::string, std::string>>, ErrorCode>
-    RemoveHeartbeat(const UUID& client_id);
+    tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeat(const UUID& client_id);
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);

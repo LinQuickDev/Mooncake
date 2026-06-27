@@ -2788,7 +2788,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     ErasePromotionTaskIfPresent(tenant_state, key);
 
     // Before erasing metadata, collect LOCAL_DISK replica holders so we
-    // can notify them to reclaim SSD space via RemoveHeartbeat.
+    // can notify them to reclaim SSD space via RemoveObjectHeartbeat.
     std::vector<UUID> local_disk_holders;
     metadata.VisitReplicas(
         [](const Replica& replica) {
@@ -2813,7 +2813,8 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
             auto it = client_local_disk_segment.find(holder_id);
             if (it != client_local_disk_segment.end()) {
                 MutexLocker locker(&it->second->offloading_mutex_);
-                it->second->removed_keys.emplace_back(tenant_id, key);
+                it->second->removed_keys.push_back(
+                    RemoveTaskItem{tenant_id, key});
             }
         }
     }
@@ -3251,9 +3252,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return {};
 }
 
-auto MasterService::RemoveHeartbeat(const UUID& client_id)
-    -> tl::expected<std::vector<std::pair<std::string, std::string>>,
-                    ErrorCode> {
+auto MasterService::RemoveObjectHeartbeat(const UUID& client_id)
+    -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();
@@ -3263,7 +3263,7 @@ auto MasterService::RemoveHeartbeat(const UUID& client_id)
     if (local_disk_segment_it == client_local_disk_segment.end()) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    std::vector<std::pair<std::string, std::string>> result;
+    std::vector<RemoveTaskItem> result;
     {
         MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
         result = std::move(local_disk_segment_it->second->removed_keys);

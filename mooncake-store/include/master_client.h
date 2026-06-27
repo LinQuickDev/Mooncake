@@ -448,9 +448,8 @@ class MasterClient {
      * replicas on this client. The caller should MarkRemoved each key to
      * trigger SSD tombstone + GC compaction.
      */
-    [[nodiscard]] tl::expected<
-        std::vector<std::pair<std::string, std::string>>, ErrorCode>
-    RemoveHeartbeat(const UUID& client_id);
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeat(const UUID& client_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

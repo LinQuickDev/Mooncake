@@ -610,9 +610,8 @@ class MasterService {
      * client should call MarkRemoved on each key to trigger SSD tombstone
      * marking + GC compaction.
      */
-    auto RemoveHeartbeat(const UUID& client_id)
-        -> tl::expected<std::vector<std::pair<std::string, std::string>>,
-                        ErrorCode>;
+    auto RemoveObjectHeartbeat(const UUID& client_id)
+        -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode>;
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
