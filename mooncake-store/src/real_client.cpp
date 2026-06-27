@@ -1760,15 +1760,15 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     auto log_put = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
-        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_alloc - t0)
-                            .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_alloc)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto alloc_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_alloc - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         MC_LOG(INFO) << "put_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] alloc_us[" << alloc_us
                      << "] write_us[" << write_us << "] total_us[" << total_us
@@ -1910,18 +1910,18 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 
     if (breakdown_log) {
         auto now = std::chrono::steady_clock::now();
-        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t_prep - t0)
-                           .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_prep)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         const char *status = success_count == results.size() ? "ok"
-                             : success_count == 0             ? "err"
-                                                              : "partial";
+                             : success_count == 0            ? "err"
+                                                             : "partial";
         MC_LOG(INFO) << "batch_put_breakdown num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] prep_us[" << prep_us << "] write_us[" << write_us
@@ -2764,21 +2764,21 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto log_breakdown = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
-        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_query - t0)
-                            .count();
+        auto query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count();
         auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(
                              t_select - t_query)
                              .count();
         auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             t_alloc - t_select)
                             .count();
-        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           now - t_alloc)
-                           .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto read_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us[" << query_us
                      << "] select_us[" << select_us << "] alloc_us[" << alloc_us
@@ -3301,18 +3301,18 @@ RealClient::batch_get_buffer_internal(
         for (const auto &result : final_results) {
             if (result) success_count++;
         }
-        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_query - t0)
-                            .count();
+        auto query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count();
         auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            t_prep - t_query)
                            .count();
         auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            t_read - t_prep)
                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_read - t0)
-                            .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_read - t0)
+                .count();
         MC_LOG(INFO) << "batch_get_breakdown num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
@@ -3492,9 +3492,9 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         .query_result = std::move(query_value),
         .replica = std::move(replica),
         .total_size = total_size,
-        .query_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        t_query - t0)
-                        .count(),
+        .query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count(),
         .select_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          t_select - t_query)
                          .count(),
@@ -3646,8 +3646,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 objects.emplace(
                     key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
                                              src_offset + size}});
-                auto r = batch_get_into_offload_object_internal(endpoint,
-                                                                objects);
+                auto r =
+                    batch_get_into_offload_object_internal(endpoint, objects);
                 pt_ssd.End(r ? 0 : -1);
                 return r;
             },
@@ -3730,7 +3730,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
     const auto &metadata = metadata_result.value();
     auto read_start = breakdown_log ? std::chrono::steady_clock::now()
-                                     : std::chrono::steady_clock::time_point{};
+                                    : std::chrono::steady_clock::time_point{};
     auto read_result =
         execute_ranged_read(key, buffer, dst_offset, src_offset, size, metadata,
                             size_is_buffer_capacity);
@@ -3758,14 +3758,15 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            read_end - read_start)
                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            read_end - t0)
-                            .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(read_end - t0)
+                .count();
         MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us["
-                     << metadata.query_us << "] select_us[" << metadata.select_us
-                     << "] read_us[" << read_us << "] total_us[" << total_us
-                     << "] type[" << metadata.replica_type << "] mode[" << mode
+                     << metadata.query_us << "] select_us["
+                     << metadata.select_us << "] read_us[" << read_us
+                     << "] total_us[" << total_us << "] type["
+                     << metadata.replica_type << "] mode[" << mode
                      << "] status[" << status << "]";
     }
 
@@ -4148,18 +4149,18 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         for (const auto &r : results) {
             if (r.has_value()) success_count++;
         }
-        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t_prep - t0)
-                           .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_prep)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         const char *status = success_count == results.size() ? "ok"
-                             : success_count == 0             ? "err"
-                                                              : "partial";
+                             : success_count == 0            ? "err"
+                                                             : "partial";
         MC_LOG(INFO) << "batch_put_into_breakdown num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] prep_us[" << prep_us << "] write_us[" << write_us
@@ -4216,15 +4217,15 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
     auto log_put = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
-        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t_prep - t0)
-                           .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_prep)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         MC_LOG(INFO) << "put_into_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] prep_us[" << prep_us
                      << "] write_us[" << write_us << "] total_us[" << total_us
@@ -5113,8 +5114,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     t_query - start_time)
                     .count();
             auto prep_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    t_prep - t_query)
+                std::chrono::duration_cast<std::chrono::microseconds>(t_prep -
+                                                                      t_query)
                     .count();
             auto total_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -5282,9 +5283,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     size_t offload_object_count = 0;
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        UbDiag::PerfPoint pt_ssd_read(
-            PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
-            UbDiag::PerfLevel::MODULE);
+        UbDiag::PerfPoint pt_ssd_read(PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
+                                      UbDiag::PerfLevel::MODULE);
         pt_ssd_read.Start();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
             offload_objects_it.first, offload_objects_it.second);
