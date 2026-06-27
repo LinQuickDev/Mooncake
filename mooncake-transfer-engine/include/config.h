@@ -52,6 +52,13 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Number of worker threads that concurrently handle inbound handshake
+    // requests on the listener. The legacy implementation processed requests
+    // strictly serially in a single thread, so under high concurrency (e.g.
+    // many small-file transfers firing simultaneous QP handshakes) the
+    // listener backlog was exhausted and clients hit the 60s read timeout,
+    // surfacing as TRANSFER_FAIL. Override via MC_HANDSHAKE_WORKER_THREADS.
+    int handshake_worker_threads = 16;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a
