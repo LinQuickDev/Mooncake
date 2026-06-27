@@ -1039,7 +1039,7 @@ MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
 tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
 MasterClient::RemoveObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveObjectHeartbeat");
-    timer.LogRequest("client_id=", client_id);
+    timer.LogRequest("client_id=", client_id.first, ":", client_id.second);
     return invoke_rpc<&WrappedMasterService::RemoveObjectHeartbeat,
                       std::vector<RemoveTaskItem>>(client_id);
 }
