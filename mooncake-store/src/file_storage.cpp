@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
+#include "mooncake_logging.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
