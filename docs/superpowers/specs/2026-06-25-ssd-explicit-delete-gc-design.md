@@ -175,16 +175,16 @@ sequenceDiagram
     participant GC
     participant Disk
 
-    Caller->>Master: Remove(key, force)
+    Caller->>Master: Remove key force
     Master->>Master: 收集 LOCAL_DISK 持有者
     Master->>Master: EraseMetadata
     Master->>Master: 推 removed_keys 到 SSD 队列
     Master-->>Caller: ok
 
     SSD->>Master: RemoveObjectHeartbeat
-    Master-->>SSD: [RemoveTaskItem{tenant, key}]
-    SSD->>SSD: MarkRemoved(storage_key)
-    Note over SSD: deleted_bytes_ 增加
+    Master-->>SSD: RemoveTaskItem tenant key
+    SSD->>SSD: MarkRemoved storage_key
+    Note over SSD: deleted_bytes 增加
 
     GC->>SSD: SelectGCCandidate
     GC->>SSD: CompactBuckets
@@ -202,16 +202,16 @@ sequenceDiagram
     participant SSD as BucketBackend
     participant Disk
 
-    Note over GC: 候选: bucket A [k1(live), k2(tomb)], bucket B [k3(live), k4(tomb)]
-    GC->>SSD: CompactBuckets([A, B])
-    SSD->>SSD: 标 A, B compacting_=true
-    SSD->>SSD: 收集 live: k1, k3
-    SSD->>SSD: 分组: [k1, k3] 填满 bucket_keys_limit=2
-    SSD->>Disk: 读 k1 from A, k3 from B
-    SSD->>Disk: 写新 bucket X = [k1, k3]
-    SSD->>SSD: 锁内: remap k1→X, k3→X; 删 A, B
-    SSD->>Disk: 等 inflight, 删 A.bucket, B.bucket
-    Note over SSD: 结果: bucket X=[k1,k3], A/B 已删
+    Note over GC: 候选 bucket A k1 live k2 tomb + bucket B k3 live k4 tomb
+    GC->>SSD: CompactBuckets A B
+    SSD->>SSD: 标 A B compacting true
+    SSD->>SSD: 收集 live k1 k3
+    SSD->>SSD: 分组 k1 k3 填满 keys_limit=2
+    SSD->>Disk: 读 k1 from A + k3 from B
+    SSD->>Disk: 写新 bucket X k1 k3
+    SSD->>SSD: 锁内 remap k1 X k3 X 删 A B
+    SSD->>Disk: 等 inflight 删 A bucket B bucket
+    Note over SSD: 结果 bucket X=k1 k3 A B 已删
 ```
 
 ## 10. Testing
