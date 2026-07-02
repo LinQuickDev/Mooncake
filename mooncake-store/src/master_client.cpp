@@ -184,6 +184,11 @@ struct RpcNameTraits<&WrappedMasterService::GetAllNoFSegments> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetAllSegmentsForAdmin> {
+    static constexpr const char* value = "GetAllSegmentsForAdmin";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetNoFSegmentsByName> {
     static constexpr const char* value = "GetNoFSegmentsByName";
 };
@@ -871,6 +876,17 @@ MasterClient::GetAllNoFSegments() {
 
     auto result = invoke_rpc<&WrappedMasterService::GetAllNoFSegments,
                              std::vector<NoFSegment>>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+MasterClient::GetAllSegments() {
+    ScopedVLogTimer timer(1, "MasterClient::GetAllSegments");
+    timer.LogRequest("Get all segments, client_id=", client_id_);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetAllSegmentsForAdmin,
+                             std::vector<std::string>>();
     timer.LogResponseExpected(result);
     return result;
 }

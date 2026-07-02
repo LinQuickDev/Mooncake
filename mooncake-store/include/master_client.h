@@ -372,6 +372,15 @@ class MasterClient {
     GetAllNoFSegments();
 
     /**
+     * @brief Fetch all registered segment names from master.
+     * Used for pre-establishing connections during client setup.
+     * @return Vector of segment names (format: {ip}:{port}) on success,
+     * ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments();
+
+    /**
      * @brief Gets all mounted NoF segments that match a segment name together
      * with their owner client ids.
      * @param segment_name Mounted NoF segment name

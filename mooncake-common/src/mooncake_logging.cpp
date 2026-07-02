@@ -41,7 +41,8 @@ uint64_t SteadyClockNs() {
 
 double ParseHiFreqLogSampleRate() {
     const char* value = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
-    if (value == nullptr || *value == '\0') return 1.0;  // default: full sampling
+    if (value == nullptr || *value == '\0')
+        return 1.0;  // default: full sampling
     errno = 0;
     char* end = nullptr;
     double rate = std::strtod(value, &end);
@@ -104,15 +105,15 @@ struct LogEntry {
 // Hot path (Enqueue): take the mutex, move the entry into a PRE-ALLOCATED ring
 // buffer, release.  No per-message heap allocation for queue nodes and no
 // blocking: when the ring is full the OLDEST entry is overwritten (overrun) and
-// a counter is bumped.  This bounds producer latency -- a hot business thread is
-// never stalled waiting on slow log IO -- at the cost of dropping the oldest
+// a counter is bumped.  This bounds producer latency -- a hot business thread
+// is never stalled waiting on slow log IO -- at the cost of dropping the oldest
 // pending lines under sustained overload.  The dropped count is reported
 // periodically as a WARNING so loss is never silent.
 //
-// Background: ParseWorkerCount() writer threads drain the ring via glog.  One of
-// them also performs the periodic FlushLogFiles (coordinated by an atomic so it
-// runs once per interval regardless of worker count) and the overrun report --
-// both off the hot path.
+// Background: ParseWorkerCount() writer threads drain the ring via glog.  One
+// of them also performs the periodic FlushLogFiles (coordinated by an atomic so
+// it runs once per interval regardless of worker count) and the overrun report
+// -- both off the hot path.
 class AsyncLogQueue {
    public:
     static AsyncLogQueue& Instance() {
@@ -178,8 +179,9 @@ class AsyncLogQueue {
         // covering BOTH the async MC_LOG output written below AND synchronous
         // LOG()/MC_LOG emitted on business threads (they share the same glog
         // file).  This keeps the tail of the log (e.g. get_into_breakdown /
-        // put_result) from being lost when the host process is torn down without
-        // running atexit/static destructors (Go's os.Exit, SIGKILL under k8s).
+        // put_result) from being lost when the host process is torn down
+        // without running atexit/static destructors (Go's os.Exit, SIGKILL
+        // under k8s).
         while (true) {
             LogEntry entry;
             bool have_entry = false;
@@ -219,7 +221,8 @@ class AsyncLogQueue {
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count();
         const int64_t interval_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(flush_interval_)
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                flush_interval_)
                 .count();
         int64_t last = last_flush_ns_.load(std::memory_order_relaxed);
         if (now_ns - last < interval_ns) return;
@@ -232,8 +235,8 @@ class AsyncLogQueue {
     }
 
     // Emit one synchronous WARNING if entries were overrun since the last
-    // report, so dropped logs are never silent.  The counter is read+reset under
-    // the queue mutex; the WriteSync itself does not touch the ring.
+    // report, so dropped logs are never silent.  The counter is read+reset
+    // under the queue mutex; the WriteSync itself does not touch the ring.
     void ReportOverruns() {
         uint64_t dropped = 0;
         {

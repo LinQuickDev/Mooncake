@@ -29,7 +29,7 @@ namespace mooncake {
 namespace {
 std::atomic<int> g_urma_runtime_init_depth{0};
 std::atomic<bool> g_urma_runtime_owned{false};
-}
+}  // namespace
 
 static urma_transport_mode_t parseTransMode(const std::string& mode) {
     if (mode == "RC") return URMA_TM_RC;
@@ -502,7 +502,7 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        if (port < 0 || port >= MAX_PORT_CNT){
+        if (port < 0 || port >= MAX_PORT_CNT) {
             for (int p = 0; p < MAX_PORT_CNT; p++) {
                 auto port_attr = dev_attr_.port_attr[p];
                 if (port_attr.state == URMA_PORT_ACTIVE ||
@@ -514,8 +514,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             if (dev_attr_.port_cnt != 0 &&
                 dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE &&
                 dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER) {
-                LOG(WARNING) << "Device " << device_name
-                            << " not found active port";
+                LOG(WARNING)
+                    << "Device " << device_name << " not found active port";
                 if (urma_delete_context(context)) {
                     PLOG(ERROR)
                         << "urma_delete_context(" << device_name << ") failed";
@@ -525,7 +525,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             }
         } else {
             LOG(WARNING) << "Device " << device_name
-                            << " manually specified port: " << static_cast<int>(port);
+                         << " manually specified port: "
+                         << static_cast<int>(port);
             port_ = static_cast<uint8_t>(port);
         }
 

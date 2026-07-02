@@ -261,6 +261,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* handshake_worker_threads =
+        std::getenv("MC_HANDSHAKE_WORKER_THREADS");
+    if (handshake_worker_threads) {
+        try {
+            int val = std::stoi(handshake_worker_threads);
+            if (val > 0) {
+                config.handshake_worker_threads = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_WORKER_THREADS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_WORKER_THREADS environment "
+                            "value: "
+                         << handshake_worker_threads << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_connect_timeout =
         std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
     if (handshake_connect_timeout) {
@@ -467,10 +485,9 @@ void loadGlobalConfig(GlobalConfig& config) {
                 config.urma_active_port = val;
                 LOG(INFO) << "MC_URMA_ACTIVE_PORT is " << val;
             } else {
-                LOG(WARNING)
-                    << "Ignore value from environment variable "
-                       "MC_URMA_ACTIVE_PORT, it should be >= 0; "
-                       "using auto-selection (scan active ports)";
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_URMA_ACTIVE_PORT, it should be >= 0; "
+                                "using auto-selection (scan active ports)";
             }
         } catch (const std::exception& e) {
             LOG(WARNING) << "Failed to parse MC_URMA_ACTIVE_PORT='"
@@ -562,6 +579,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    LOG(INFO) << "handshake_listen_backlog = "
+              << config.handshake_listen_backlog;
+    LOG(INFO) << "handshake_worker_threads = "
+              << config.handshake_worker_threads;
+    LOG(INFO) << "handshake_connect_timeout = "
+              << config.handshake_connect_timeout;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

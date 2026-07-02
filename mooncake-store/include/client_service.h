@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "client_buffer.hpp"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -570,6 +571,25 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    /**
+     * @brief Warmup transport-level connections to all segments
+     * currently registered with the master.
+     *
+     * Allocates a buffer via the given ClientBufferAllocator (whose base is
+     * already registered with the transfer engine) and issues a 1-byte WRITE
+     * then READ per segment to trigger eager connection setup (e.g. RDMA QP
+     * handshakes). This amortises the first-transfer handshake latency and
+     * mitigates TRANSFER_FAIL caused by handshake storms under
+     * high-concurrency small-file workloads.
+     *
+     * @param allocator Client buffer allocator used to allocate/release the
+     *                 warmup buffer; its memory is already registered with
+     *                 the transfer engine.
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> warmup(
+        const std::shared_ptr<ClientBufferAllocator>& allocator);
 
     /**
      * @brief Get the endpoint address for segment operations.

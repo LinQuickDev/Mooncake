@@ -235,8 +235,9 @@ inline double NanosToSec(int64_t ns) { return static_cast<double>(ns) / 1e9; }
 struct ThreadResult {
     std::vector<int64_t> latencies_ns;  // per-query latency
     size_t total_bytes = 0;
-    size_t total_keys = 0;     // number of keys processed
-    size_t total_queries = 0;  // number of API calls (get_into / batch_get_into)
+    size_t total_keys = 0;  // number of keys processed
+    size_t total_queries =
+        0;  // number of API calls (get_into / batch_get_into)
     size_t failed_ops = 0;
 };
 
@@ -289,10 +290,11 @@ class BenchmarkStats {
 
     double MeanLatencyUs() const {
         if (merged_latencies_ns_.empty()) return 0.0;
-        double sum = static_cast<double>(std::accumulate(
-            merged_latencies_ns_.begin(), merged_latencies_ns_.end(),
-            int64_t(0)));
-        return NanosToUs(sum / static_cast<double>(merged_latencies_ns_.size()));
+        double sum = static_cast<double>(
+            std::accumulate(merged_latencies_ns_.begin(),
+                            merged_latencies_ns_.end(), int64_t(0)));
+        return NanosToUs(sum /
+                         static_cast<double>(merged_latencies_ns_.size()));
     }
 
     double ThroughputMBps() const {
@@ -1135,14 +1137,15 @@ class StressBenchmark {
                           << " (failed=" << interval_failed << ")"
                           << "  lat[us]: avg="
                           << NanosToUs(interval_stats.avg_latency_ns)
-                          << ", P50=" << NanosToUs(interval_stats.p50_latency_ns)
-                          << ", P90=" << NanosToUs(interval_stats.p90_latency_ns)
+                          << ", P50="
+                          << NanosToUs(interval_stats.p50_latency_ns)
+                          << ", P90="
+                          << NanosToUs(interval_stats.p90_latency_ns)
                           << ", P99="
                           << NanosToUs(interval_stats.p99_latency_ns)
                           << "  total: " << cur_queries << " queries, "
-                          << cur_keys << " keys, "
-                          << total_throughput_mbps << " MB/s, "
-                          << total_keys_per_sec << " keys/s, "
+                          << cur_keys << " keys, " << total_throughput_mbps
+                          << " MB/s, " << total_keys_per_sec << " keys/s, "
                           << total_queries_per_sec << " qps"
                           << " (failed=" << cur_failed << ")\n";
 
