@@ -3334,6 +3334,26 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::BatchPushOffloadObject(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    auto future = transfer_submitter_->submit_batch_push_offload_object(
+        requester_te_addr, keys, src_pointers, dst_slices);
+    if (!future) {
+        MC_LOG(ERROR) << "Failed to submit push transfer operation";
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        MC_LOG(ERROR) << "Push transfer failed, error code is " << result;
+        return tl::make_unexpected(result);
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas) {

@@ -108,6 +108,16 @@ PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC,            "real_client.cpp::batch_get_into_of
 PERF_KEY_DEF(GET_SSD_TRANSFER_DATA,          "real_client.cpp::batch_get_into_offload_object_internal",  "TransferData")
 PERF_KEY_DEF(GET_SSD_RELEASE_BUFFER,         "real_client.cpp::batch_get_into_offload_object_internal",  "ReleaseBuffer")
 
+// === Owner-side offload sub-steps (pull & push) ===
+PERF_KEY_DEF(GET_SSD_OWNER_READ,             "file_storage.cpp::BatchGet",                               "OwnerSsdRead")
+PERF_KEY_DEF(GET_SSD_OWNER_ALLOC,            "file_storage.cpp::BatchGet",                               "OwnerAllocBuffer")
+PERF_KEY_DEF(GET_SSD_OWNER_LOAD,             "file_storage.cpp::BatchGet",                               "OwnerDiskLoad")
+PERF_KEY_DEF(GET_SSD_OWNER_LOAD_PLAN,        "storage_backend.cpp::BatchLoad",                           "OwnerLoadPlan")
+PERF_KEY_DEF(GET_SSD_OWNER_LOAD_URING,       "storage_backend.cpp::BatchLoad",                           "OwnerLoadUring")
+PERF_KEY_DEF(GET_SSD_OWNER_LOAD_POSIX,       "storage_backend.cpp::BatchLoad",                           "OwnerLoadPosix")
+PERF_KEY_DEF(GET_SSD_OWNER_PUSH_WRITE,       "real_client.cpp::batch_get_offload_object_push",           "OwnerPushWrite")
+PERF_KEY_DEF(GET_SSD_OWNER_RELEASE,          "file_storage.cpp::ReleaseBuffer",                          "OwnerReleaseBuffer")
+
 // === UB / URMA endpoint first connection path ===
 PERF_KEY_DEF(UB_HANDSHAKE_ENCODE,            "transfer_metadata.cpp::TransferHandshakeUtil::encode",     "Encode")
 PERF_KEY_DEF(UB_HANDSHAKE_DECODE,            "transfer_metadata.cpp::TransferHandshakeUtil::decode",     "Decode")

@@ -23,6 +23,11 @@
 #include <ylt/util/tl/expected.hpp>
 #include "storage/distributed/distributed_storage_backend.h"
 
+// ubdiag perf points for the offload owner-side disk load breakdown.
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+
 namespace mooncake {
 
 bool FilePerKeyConfig::Validate() const {
@@ -1393,6 +1398,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<int64_t, std::vector<ReadPlan>> bucket_read_plans;
     std::vector<BucketReadGuard> bucket_guards;  // RAII guards for all buckets
 
+    // Phase 1: build read plan under lock (OwnerLoadPlan). Pure in-memory
+    // metadata lookups; the error early-returns let the dtor Abandon the
+    // unfinished sample.
+    UbDiag::PerfPoint pt_plan(PerfKey::GET_SSD_OWNER_LOAD_PLAN,
+                              UbDiag::PerfLevel::MODULE);
+    pt_plan.Start();
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
         for (const auto& [key, dest_slice] : batch_object) {
@@ -1443,6 +1454,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                          metadata.key_size, metadata.data_size, dest_slice});
         }
     }
+    pt_plan.End(0);
     // Lock released here - bucket files protected by BucketReadGuards
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
@@ -1488,8 +1500,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Zero-copy path: read directly into the slice buffer.
                 // dest_slice.ptr is 4096-aligned and oversized (from
                 // AllocateBatch) to accommodate the full aligned read range.
+                UbDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
+                                           UbDiag::PerfLevel::MODULE);
+                pt_uring.Start();
                 read_res = uring_file->read_aligned(
                     plan.dest_slice.ptr, aligned_size, aligned_offset);
+                pt_uring.End(read_res ? 0 : -1);
 
                 if (read_res) {
                     // Adjust ptr to point to actual data start (no memcpy)
@@ -1501,9 +1517,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             } else
 #endif
             {
-                // Fallback to vector_read for non-UringFile
+                // Fallback to vector_read for non-UringFile (preadv).
                 iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                UbDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
+                                           UbDiag::PerfLevel::MODULE);
+                pt_posix.Start();
                 read_res = file->vector_read(&iov, 1, actual_offset);
+                pt_posix.End(read_res ? 0 : -1);
             }
 
             if (!read_res) {
