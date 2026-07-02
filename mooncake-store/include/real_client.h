@@ -533,6 +533,9 @@ class RealClient : public PyClient {
         int64_t query_us;
         int64_t select_us;
         std::string replica_type;
+        size_t replica_count{0};
+        std::string local_endpoint{"-"};
+        std::string remote_endpoint{"-"};
     };
 
     tl::expected<RangedReadMetadata, ErrorCode>
@@ -680,7 +683,8 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             uint64_t trace_id = 0);
 
     /**
      * @brief Push-mode offload handler, run on the data owner. Reads the

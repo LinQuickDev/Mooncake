@@ -16,10 +16,13 @@ void ApplyMooncakeLogEnableToGlog();
 
 // High-frequency log sampling.  Parses MC_HIFREQ_LOG_SAMPLE_RATE once (default
 // 0.1, clamped to [0,1]) and caches it process-wide.  ShouldSampleHiFreqLog()
-// rolls a thread-local RNG: each call returns true with probability == rate.
-// Used to gate per-request high-frequency logs (e.g. real_client breakdown).
+// without an id rolls a thread-local RNG. The trace-id overload hashes the id
+// so all layers handling the same request make the same sampling decision.
 double HiFreqLogSampleRate();
 bool ShouldSampleHiFreqLog();
+// Deterministic variant used to correlate high-frequency logs across
+// processes and worker threads. A zero trace id falls back to random sampling.
+bool ShouldSampleHiFreqLog(uint64_t trace_id);
 
 class ScopedTraceId {
    public:

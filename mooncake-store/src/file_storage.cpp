@@ -1,6 +1,7 @@
 #include "file_storage.h"
 
 #include <memory>
+#include <numeric>
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
@@ -331,6 +332,41 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const uint64_t total_bytes =
+        std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+    uint64_t alloc_us = 0;
+    StorageReadStats read_stats;
+    auto log_breakdown = [&](const char* fallback_status,
+                             ErrorCode fallback_error) {
+        if (!breakdown_log) return;
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start_time)
+                .count();
+        const char* status =
+            read_stats.status == "ok" ? fallback_status
+                                      : read_stats.status.c_str();
+        const ErrorCode error =
+            read_stats.error_code == ErrorCode::OK ? fallback_error
+                                                   : read_stats.error_code;
+        MC_LOG(INFO) << "storage_read_breakdown num_keys=" << keys.size()
+                     << " total_bytes=" << total_bytes
+                     << " alloc_us=" << alloc_us
+                     << " plan_us=" << read_stats.plan_us
+                     << " file_open_us=" << read_stats.file_open_us
+                     << " disk_read_us=" << read_stats.disk_read_us
+                     << " total_us=" << total_us
+                     << " slowest_key=" << read_stats.slowest_key
+                     << " slowest_disk_read_us="
+                     << read_stats.slowest_disk_read_us
+                     << " io_mode=" << read_stats.io_mode
+                     << " status=" << status
+                     << " error_key=" << read_stats.error_key
+                     << " error_code=" << static_cast<int>(error);
+    };
     // Owner-side SSD read total (OwnerSsdRead); broken down into buffer
     // allocation (OwnerAllocBuffer) and disk load (OwnerDiskLoad). End() is on
     // the success path only — the error early-returns let the dtor Abandon the
@@ -341,20 +377,27 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     UbDiag::PerfPoint pt_alloc(PerfKey::GET_SSD_OWNER_ALLOC,
                                UbDiag::PerfLevel::MODULE);
     pt_alloc.Start();
+    const auto alloc_start = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
+    alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - alloc_start)
+                   .count();
     pt_alloc.End(allocate_res ? 0 : -1);
     if (!allocate_res) {
         LOG(ERROR) << "Failed to allocate batch objects";
+        log_breakdown("alloc_fail", allocate_res.error());
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = allocate_res.value();
     UbDiag::PerfPoint pt_load(PerfKey::GET_SSD_OWNER_LOAD,
                               UbDiag::PerfLevel::MODULE);
     pt_load.Start();
+    ScopedStorageReadStats stats_scope(breakdown_log ? &read_stats : nullptr);
     auto result = BatchLoad(allocated_batch->slices);
     pt_load.End(result ? 0 : -1);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
+        log_breakdown("read_fail", result.error());
         return tl::make_unexpected(result.error());
     }
 
@@ -381,6 +424,7 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
+    log_breakdown("ok", ErrorCode::OK);
     pt_read.End(0);
     return batch_result;
 }

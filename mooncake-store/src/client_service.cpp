@@ -1380,6 +1380,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
+    const bool batch_item_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     if (!transfer_submitter_) {
         MC_LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1535,6 +1537,36 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 }
             }
         }
+        if (batch_item_log) {
+            std::string selected_type = "disk";
+            std::string remote_endpoint = "-";
+            if (stored_replica.is_memory_replica()) {
+                selected_type = "memory";
+                remote_endpoint =
+                    stored_replica.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
+            } else if (stored_replica.is_nof_replica()) {
+                selected_type = "nof";
+                remote_endpoint =
+                    stored_replica.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
+            }
+            const auto slices_it = slices.find(key);
+            const size_t bytes =
+                slices_it == slices.end()
+                    ? 0
+                    : CalculateSliceSize(slices_it->second);
+            MC_LOG(INFO)
+                << "batch_transfer_item op=batch_get key=" << key
+                << " batch_index=" << index
+                << " selected_type=" << selected_type
+                << " strategy=" << future.strategy()
+                << " local_endpoint=" << GetSegmentEndpoint()
+                << " remote_endpoint=" << remote_endpoint
+                << " bytes=" << bytes << " status="
+                << (result == ErrorCode::OK ? "ok" : "transfer_fail")
+                << " error_code=" << static_cast<int>(result);
+        }
     }
 
     // As lease expired is a rare case, we check all the results with the same
@@ -1679,6 +1711,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             pt_tw.End(transfer_err == ErrorCode::OK ? 0 : -1);
             if (transfer_err != ErrorCode::OK) {
+                MC_LOG(ERROR) << "transfer_write_failed key=" << key
+                              << " error_code="
+                              << static_cast<int>(transfer_err);
                 // Revoke put operation
                 UbDiag::PerfPoint pt_revoke(PerfKey::PUT_SINGLE_PUT_REVOKE,
                                             UbDiag::PerfLevel::MODULE);
@@ -1787,6 +1822,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (replica.is_memory_replica()) {
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
+                MC_LOG(ERROR) << "transfer_write_failed key=" << key
+                              << " error_code="
+                              << static_cast<int>(transfer_err);
                 auto revoke_result =
                     master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
                 if (!revoke_result) {
@@ -2108,6 +2146,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+    const bool batch_item_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     if (!transfer_submitter_) {
         MC_LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
@@ -2181,7 +2221,33 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                         replica, op.slices, TransferRequest::WRITE);
                 }
                 pt_submit.End(submit_result ? 0 : -1);
+                if (batch_item_log) {
+                    const auto& handle =
+                        replica.is_memory_replica()
+                            ? replica.get_memory_descriptor().buffer_descriptor
+                            : replica.get_nof_descriptor().buffer_descriptor;
+                    MC_LOG(INFO)
+                        << "batch_transfer_item op=batch_put key=" << op.key
+                        << " selected_type="
+                        << (replica.is_memory_replica() ? "memory" : "nof")
+                        << " strategy="
+                        << (submit_result ? submit_result->strategy()
+                                          : TransferStrategy::EMPTY)
+                        << " local_endpoint=" << GetSegmentEndpoint()
+                        << " remote_endpoint=" << handle.transport_endpoint_
+                        << " bytes=" << CalculateSliceSize(op.slices)
+                        << " status="
+                        << (submit_result ? "submitted" : "submit_fail")
+                        << " error_code="
+                        << static_cast<int>(
+                               submit_result ? ErrorCode::OK
+                                             : ErrorCode::TRANSFER_FAIL);
+                }
                 if (!submit_result) {
+                    MC_LOG(ERROR)
+                        << "transfer_failed op=batch_put key=" << op.key
+                        << " direction=write stage=submit error_code="
+                        << static_cast<int>(ErrorCode::TRANSFER_FAIL);
                     std::string failure_context =
                         "Failed to submit transfer for replica " +
                         std::to_string(replica_idx);
@@ -2212,6 +2278,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             auto& pending_transfer = op.pending_transfers[i];
             ErrorCode transfer_result = pending_transfer.future.get();
             if (transfer_result != ErrorCode::OK) {
+                MC_LOG(ERROR)
+                    << "transfer_failed op=batch_put key=" << op.key
+                    << " direction=write stage=wait error_code="
+                    << static_cast<int>(transfer_result);
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
                 std::string error_context =
@@ -3322,13 +3392,26 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit transfer operation";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_get_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=read remote_endpoint=" << transfer_engine_addr
+                << " stage=submit error_code="
+                << static_cast<int>(ErrorCode::TRANSFER_FAIL);
+        }
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
     auto result = future->get();
     if (result != ErrorCode::OK) {
-        MC_LOG(ERROR) << "Transfer failed, error code is " << result;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_get_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=read remote_endpoint=" << transfer_engine_addr
+                << " stage=wait error_code=" << static_cast<int>(result);
+        }
         return tl::make_unexpected(result);
     }
     return {};
@@ -3342,13 +3425,26 @@ tl::expected<void, ErrorCode> Client::BatchPushOffloadObject(
     auto future = transfer_submitter_->submit_batch_push_offload_object(
         requester_te_addr, keys, src_pointers, dst_slices);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit push transfer operation";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_push_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=write remote_endpoint=" << requester_te_addr
+                << " stage=submit error_code="
+                << static_cast<int>(ErrorCode::TRANSFER_FAIL);
+        }
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
     auto result = future->get();
     if (result != ErrorCode::OK) {
-        MC_LOG(ERROR) << "Push transfer failed, error code is " << result;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_push_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=write remote_endpoint=" << requester_te_addr
+                << " stage=wait error_code=" << static_cast<int>(result);
+        }
         return tl::make_unexpected(result);
     }
     return {};
@@ -3733,6 +3829,24 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code) {
     bool is_write = (op_code == TransferRequest::WRITE);
+    std::string remote_endpoint = "-";
+    if (replica_descriptor.is_memory_replica()) {
+        remote_endpoint =
+            replica_descriptor.get_memory_descriptor()
+                .buffer_descriptor.transport_endpoint_;
+    } else if (replica_descriptor.is_nof_replica()) {
+        remote_endpoint =
+            replica_descriptor.get_nof_descriptor()
+                .buffer_descriptor.transport_endpoint_;
+    } else if (replica_descriptor.is_local_disk_replica()) {
+        remote_endpoint =
+            replica_descriptor.get_local_disk_descriptor().transport_endpoint;
+    }
+    const bool diag_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    const auto submit_start =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
     UbDiag::PerfPoint pt_full(is_write ? PerfKey::PUT_SINGLE_TRANSFER_FULL
                                        : PerfKey::GET_SINGLE_TRANSFER_FULL,
                               UbDiag::PerfLevel::MODULE);
@@ -3762,10 +3876,30 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
     pt_submit.End(future ? 0 : -1);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit transfer operation";
+        if (diag_log) {
+            const auto submit_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - submit_start)
+                    .count();
+            MC_LOG(INFO) << "transfer_diag op="
+                         << (is_write ? "put" : "get")
+                         << " direction=" << (is_write ? "write" : "read")
+                         << " strategy=unknown request_count=" << slices.size()
+                         << " total_bytes=" << CalculateSliceSize(slices)
+                         << " submit_us=" << submit_us
+                         << (is_write ? " local_endpoint=" : "")
+                         << (is_write ? GetSegmentEndpoint() : "")
+                         << (is_write ? " remote_endpoint=" : "")
+                         << (is_write ? remote_endpoint : "")
+                         << " wait_us=0 status=submit_fail error_code="
+                         << static_cast<int>(ErrorCode::TRANSFER_FAIL);
+        }
         pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
+    const auto submit_end =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
 
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
 
@@ -3774,8 +3908,34 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                               UbDiag::PerfLevel::DEBUG);
     pt_wait.Start();
     auto result = future->get();
+    const auto wait_end =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
     pt_wait.End(result == ErrorCode::OK ? 0 : -1);
     pt_full.End(result == ErrorCode::OK ? 0 : -1);
+    if (diag_log) {
+        const auto submit_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                submit_end - submit_start)
+                .count();
+        const auto wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(wait_end -
+                                                                  submit_end)
+                .count();
+        MC_LOG(INFO) << "transfer_diag op=" << (is_write ? "put" : "get")
+                     << " direction=" << (is_write ? "write" : "read")
+                     << " strategy=" << future->strategy()
+                     << " request_count=" << slices.size()
+                     << " total_bytes=" << CalculateSliceSize(slices)
+                     << (is_write ? " local_endpoint=" : "")
+                     << (is_write ? GetSegmentEndpoint() : "")
+                     << (is_write ? " remote_endpoint=" : "")
+                     << (is_write ? remote_endpoint : "")
+                     << " submit_us=" << submit_us << " wait_us=" << wait_us
+                     << " status="
+                     << (result == ErrorCode::OK ? "ok" : "transfer_fail")
+                     << " error_code=" << static_cast<int>(result);
+    }
     return result;
 }
 
@@ -3787,16 +3947,42 @@ ErrorCode Client::TransferReadInternal(
         return ErrorCode::INVALID_PARAMS;
     }
 
+    const bool diag_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    const auto submit_start =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
                                                        slices, src_offset);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit range read operation";
         return ErrorCode::TRANSFER_FAIL;
     }
+    const auto submit_end =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
 
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
-
-    return future->get();
+    const auto result = future->get();
+    if (diag_log) {
+        const auto wait_end = std::chrono::steady_clock::now();
+        MC_LOG(INFO)
+            << "transfer_diag op=get_into_range"
+            << " direction=read strategy=" << future->strategy()
+            << " request_count=" << slices.size()
+            << " total_bytes=" << CalculateSliceSize(slices)
+            << " submit_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   submit_end - submit_start)
+                   .count()
+            << " wait_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(wait_end -
+                                                                     submit_end)
+                   .count()
+            << " status="
+            << (result == ErrorCode::OK ? "ok" : "transfer_fail")
+            << " error_code=" << static_cast<int>(result);
+    }
+    return result;
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,

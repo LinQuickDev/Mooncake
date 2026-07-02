@@ -323,6 +323,22 @@ bool ShouldSampleHiFreqLog() {
     return dist(rng) < rate;
 }
 
+bool ShouldSampleHiFreqLog(uint64_t trace_id) {
+    if (trace_id == 0) return ShouldSampleHiFreqLog();
+    const double rate = HiFreqLogSampleRate();
+    if (rate >= 1.0) return true;
+    if (rate <= 0.0) return false;
+
+    // SplitMix64 finalizer: stable, cheap, and sufficiently uniform for
+    // deterministic sampling. Use the top 53 bits to match double precision.
+    uint64_t value = trace_id + 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    value ^= value >> 31;
+    constexpr double kScale = 1.0 / static_cast<double>(1ULL << 53);
+    return static_cast<double>(value >> 11) * kScale < rate;
+}
+
 bool ShouldLog(google::LogSeverity severity) {
     // MC_LOG_ENABLE was removed: MC_LOG now behaves like plain glog LOG and is
     // gated only by glog's own severity threshold (still async + trace_id).
