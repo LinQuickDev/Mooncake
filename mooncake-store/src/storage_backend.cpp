@@ -1507,59 +1507,83 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
+        // Batch path: when the file is a UringFile, collect all keys in this
+        // bucket into a single batch_read() call. This submits up to 32 SQEs
+        // before waiting, raising NVMe queue depth from 1 (per-key
+        // read_aligned) to up to 32, which dramatically improves throughput
+        // on multi-key buckets.
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            std::vector<UringFile::ReadDesc> descs;
+            descs.reserve(read_plans.size());
+            // Track per-key alignment metadata for ptr adjustment after read.
+            struct AlignedReadInfo {
+                std::string key;
+                int64_t offset_in_buffer;
+            };
+            std::vector<AlignedReadInfo> read_infos;
+            read_infos.reserve(read_plans.size());
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end =
-                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t data_end = actual_offset +
+                                   static_cast<int64_t>(plan.dest_slice.size);
                 int64_t aligned_end = static_cast<int64_t>(align_up(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
                     static_cast<size_t>(aligned_end - aligned_offset);
                 int64_t offset_in_buffer = actual_offset - aligned_offset;
 
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
+                descs.push_back(
+                    {plan.dest_slice.ptr, aligned_size,
+                     static_cast<off_t>(aligned_offset)});
+                read_infos.push_back({plan.key, offset_in_buffer});
+            }
 
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
-                }
-            } else
+            // Submit all reads in this bucket at once (batched internally in
+            // chunks of QUEUE_DEPTH=32). Returns total bytes read.
+            auto batch_result =
+                uring_file->batch_read(descs.data(),
+                                       static_cast<int>(descs.size()));
+            if (!batch_result) {
+                LOG(ERROR) << "batch_read failed for bucket_id="
+                           << bucket_id << ", error: " << batch_result.error();
+                return tl::make_unexpected(batch_result.error());
+            }
+
+            // Adjust each key's dest ptr to the actual data start (zero-copy:
+            // data was read directly into the slice buffer, possibly with a
+            // small offset due to O_DIRECT alignment).
+            for (const auto& info : read_infos) {
+                batch_object.at(info.key).ptr =
+                    static_cast<char*>(batch_object.at(info.key).ptr) +
+                    info.offset_in_buffer;
+            }
+        } else
 #endif
-            {
-                // Fallback to vector_read for non-UringFile
+        {
+            // Fallback to per-key vector_read for non-UringFile (PosixFile).
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
-            }
+                auto read_res = file->vector_read(&iov, 1, actual_offset);
 
-            if (!read_res) {
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
-            }
+                if (!read_res) {
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
 
-            if (read_res.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
-                           << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                if (read_res.value() != plan.dest_slice.size) {
+                    LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                               << ", expected: " << plan.dest_slice.size
+                               << ", got: " << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
             }
         }
     }
