@@ -2725,7 +2725,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
                                  : std::chrono::system_clock::time_point{};
-    auto t_query = t0, t_select = t0, t_alloc = t0;
+    auto t_query = t0, t_local_endpoints = t0, t_select = t0, t_alloc = t0;
     std::string replica_type;
     std::string remote_endpoint = "-";
 
@@ -2761,6 +2761,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                                 UbDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
+    if (breakdown_log) {
+        t_local_endpoints = std::chrono::steady_clock::now();
+    }
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (breakdown_log) t_select = std::chrono::steady_clock::now();
     pt_select.End(best_replica ? 0 : -1);
@@ -2817,6 +2820,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(
                              t_select - t_query)
                              .count();
+        auto local_endpoints_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_local_endpoints - t_query)
+                .count();
+        auto select_replica_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_select - t_local_endpoints)
+                .count();
         auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             t_alloc - t_select)
                             .count();
@@ -2828,7 +2839,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                 .count();
         MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us[" << query_us
-                     << "] select_us[" << select_us << "] alloc_us[" << alloc_us
+                     << "] select_us[" << select_us
+                     << "] local_endpoints_us[" << local_endpoints_us
+                     << "] select_replica_us[" << select_replica_us
+                     << "] alloc_us[" << alloc_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
                      << "] type[" << replica_type << "] replica_count["
                      << replica_list.size() << "] selected_type["
@@ -3513,6 +3527,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
                                 UbDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
+    auto t_local_endpoints = std::chrono::steady_clock::now();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     auto t_select = std::chrono::steady_clock::now();
     pt_select.End(best_replica ? 0 : -1);
@@ -3553,6 +3568,14 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         .select_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          t_select - t_query)
                          .count(),
+        .local_endpoints_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_local_endpoints - t_query)
+                .count(),
+        .select_replica_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_select - t_local_endpoints)
+                .count(),
         .replica_type = std::move(replica_type),
         .replica_count = replica_count,
         .local_endpoint = client_->GetSegmentEndpoint(),
@@ -3780,7 +3803,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
                     .count();
             MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                          << FormatWallClock(t0_wall)
-                         << "] query_us[0] select_us[0] read_us[0] total_us["
+                         << "] query_us[0] select_us[0] local_endpoints_us[0]"
+                            " select_replica_us[0] read_us[0] total_us["
                          << total_us << "] type[unknown] mode[unknown] status["
                          << toString(metadata_result.error()) << "]";
         }
@@ -3823,7 +3847,9 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us["
                      << metadata.query_us << "] select_us["
-                     << metadata.select_us << "] read_us[" << read_us
+                     << metadata.select_us << "] local_endpoints_us["
+                     << metadata.local_endpoints_us << "] select_replica_us["
+                     << metadata.select_replica_us << "] read_us[" << read_us
                      << "] total_us[" << total_us << "] type["
                      << metadata.replica_type << "] mode[" << mode
                      << "] replica_count[" << metadata.replica_count

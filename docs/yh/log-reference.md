@@ -693,6 +693,10 @@ retain random local sampling.
 - `transfer_diag.submit_us`: validation, segment lookup, request construction,
   and submission until a future is returned.
 - `transfer_diag.wait_us`: time blocked in `future.get()`.
+- `local_endpoints_us`: time spent locking and copying the locally mounted
+  Transfer Engine endpoint set.
+- `select_replica_us`: time spent scanning the returned replicas and choosing
+  the preferred complete replica.
 - Transfer-layer records intentionally do not carry object keys; correlate
   them with Store records through the existing trace id.
 - `storage_read_breakdown.alloc_us`: owner ClientBuffer batch allocation.

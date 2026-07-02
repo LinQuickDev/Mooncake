@@ -532,6 +532,8 @@ class RealClient : public PyClient {
         uint64_t total_size;
         int64_t query_us;
         int64_t select_us;
+        int64_t local_endpoints_us;
+        int64_t select_replica_us;
         std::string replica_type;
         size_t replica_count{0};
         std::string local_endpoint{"-"};
