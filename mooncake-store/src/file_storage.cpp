@@ -1084,19 +1084,31 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
                                  UbDiag::PerfLevel::MODULE);
     pt_release.Start();
+    const auto start = std::chrono::steady_clock::now();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     MutexLocker locker(&client_buffer_mutex_);
     auto it = client_buffer_allocated_batches_.find(batch_id);
-    if (it != client_buffer_allocated_batches_.end()) {
+    const bool found = it != client_buffer_allocated_batches_.end();
+    if (found) {
         VLOG(1) << "Releasing buffer for batch_id: " << batch_id
                 << " (transfer completed)";
         client_buffer_allocated_batches_.erase(it);
-        pt_release.End(0);
-        return true;
+    } else {
+        VLOG(1) << "batch_id " << batch_id
+                << " not found (may have been GC'd already)";
     }
-    VLOG(1) << "batch_id " << batch_id
-            << " not found (may have been GC'd already)";
-    pt_release.End(-1);
-    return false;
+    const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+    if (breakdown_log) {
+        MC_LOG(INFO) << "storage_release_breakdown batch_id=" << batch_id
+                     << " total_us=" << total_us
+                     << " found=" << (found ? 1 : 0)
+                     << " status=" << (found ? "ok" : "not_found");
+    }
+    pt_release.End(found ? 0 : -1);
+    return found;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {

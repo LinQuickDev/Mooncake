@@ -57,6 +57,26 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+struct OffloadReadTiming {
+    uint64_t offload_rpc_us{0};
+    uint64_t transfer_data_us{0};
+    uint64_t release_buffer_us{0};
+};
+
+thread_local OffloadReadTiming *current_offload_read_timing = nullptr;
+
+class ScopedOffloadReadTiming {
+   public:
+    explicit ScopedOffloadReadTiming(OffloadReadTiming *timing)
+        : previous_(current_offload_read_timing) {
+        current_offload_read_timing = timing;
+    }
+    ~ScopedOffloadReadTiming() { current_offload_read_timing = previous_; }
+
+   private:
+    OffloadReadTiming *previous_;
+};
+
 // Format a wall-clock time_point as "YYYY-MM-DD HH:MM:SS.ffffff" for the
 // request-start (t0) field in the *_breakdown logs.  Only called at log
 // emission time (guarded by breakdown_log); the cheap system_clock::now() that
@@ -3804,7 +3824,9 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
             MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                          << FormatWallClock(t0_wall)
                          << "] query_us[0] select_us[0] local_endpoints_us[0]"
-                            " select_replica_us[0] read_us[0] total_us["
+                            " select_replica_us[0] read_us[0]"
+                            " offload_rpc_us[0] transfer_data_us[0]"
+                            " release_buffer_us[0] read_overhead_us[0] total_us["
                          << total_us << "] type[unknown] mode[unknown] status["
                          << toString(metadata_result.error()) << "]";
         }
@@ -3812,6 +3834,9 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     }
 
     const auto &metadata = metadata_result.value();
+    OffloadReadTiming offload_timing;
+    ScopedOffloadReadTiming offload_timing_scope(
+        breakdown_log ? &offload_timing : nullptr);
     auto read_start = breakdown_log ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
     auto read_result =
@@ -3844,12 +3869,25 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         auto total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(read_end - t0)
                 .count();
+        const uint64_t known_read_us =
+            offload_timing.offload_rpc_us + offload_timing.transfer_data_us +
+            offload_timing.release_buffer_us;
+        const uint64_t read_overhead_us =
+            read_us > static_cast<int64_t>(known_read_us)
+                ? static_cast<uint64_t>(read_us) - known_read_us
+                : 0;
         MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us["
                      << metadata.query_us << "] select_us["
                      << metadata.select_us << "] local_endpoints_us["
                      << metadata.local_endpoints_us << "] select_replica_us["
                      << metadata.select_replica_us << "] read_us[" << read_us
+                     << "] offload_rpc_us[" << offload_timing.offload_rpc_us
+                     << "] transfer_data_us["
+                     << offload_timing.transfer_data_us
+                     << "] release_buffer_us["
+                     << offload_timing.release_buffer_us
+                     << "] read_overhead_us[" << read_overhead_us
                      << "] total_us[" << total_us << "] type["
                      << metadata.replica_type << "] mode[" << mode
                      << "] replica_count[" << metadata.replica_count
@@ -6301,14 +6339,29 @@ async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes,
                                      uint64_t trace_id) {
+    const auto handler_start = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
     struct CallState {
+        CallState()
+            : pt_queue(PerfKey::GET_SSD_OWNER_RPC_QUEUE,
+                       UbDiag::PerfLevel::DEBUG),
+              pt_batch_get(PerfKey::GET_SSD_OWNER_RPC_BATCH_GET,
+                           UbDiag::PerfLevel::MODULE),
+              pt_resume(PerfKey::GET_SSD_OWNER_RPC_RESUME,
+                        UbDiag::PerfLevel::DEBUG) {}
         std::vector<std::string> keys;
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
         uint64_t trace_id;
+        std::chrono::steady_clock::time_point worker_start;
+        std::chrono::steady_clock::time_point worker_end;
+        UbDiag::PerfPoint pt_queue;
+        UbDiag::PerfPoint pt_batch_get;
+        UbDiag::PerfPoint pt_resume;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
@@ -6316,27 +6369,96 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->file_storage = file_storage_;
     state->trace_id = trace_id;
     auto *s = state.get();
+    s->pt_queue.Start();
     auto try_result = co_await coro_io::post(
         [s]() {
+            s->worker_start = std::chrono::steady_clock::now();
+            s->pt_queue.End(0);
             mooncake::logging::ScopedTraceId trace(s->trace_id);
-            return s->file_storage->BatchGet(s->keys, s->sizes);
+            s->pt_batch_get.Start();
+            auto result = s->file_storage->BatchGet(s->keys, s->sizes);
+            s->pt_batch_get.End(result ? 0 : -1);
+            s->worker_end = std::chrono::steady_clock::now();
+            s->pt_resume.Start();
+            return result;
         });
+    const auto resumed = std::chrono::steady_clock::now();
+    s->pt_resume.End(0);
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
                    << result.error();
+        if (breakdown_log) {
+            mooncake::logging::ScopedTraceId trace(trace_id);
+            MC_LOG(INFO)
+                << "offload_rpc_server_breakdown mode=pull"
+                << " num_keys=" << keys.size()
+                << " queue_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       s->worker_start - handler_start)
+                       .count()
+                << " batch_get_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       s->worker_end - s->worker_start)
+                       .count()
+                << " resume_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - s->worker_end)
+                       .count()
+                << " response_us=0 total_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - handler_start)
+                       .count()
+                << " status=read_fail error_code="
+                << static_cast<int>(result.error());
+        }
         co_return tl::make_unexpected(result.error());
     }
-    co_return BatchGetOffloadObjectResponse(
+    const auto response_start = std::chrono::steady_clock::now();
+    BatchGetOffloadObjectResponse response(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
+    const auto response_end = std::chrono::steady_clock::now();
+    const auto queue_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              s->worker_start - handler_start)
+                              .count();
+    const auto batch_get_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(s->worker_end -
+                                                              s->worker_start)
+            .count();
+    const auto resume_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(resumed -
+                                                              s->worker_end)
+            .count();
+    const auto response_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(response_end -
+                                                              response_start)
+            .count();
+    const auto total_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(response_end -
+                                                              handler_start)
+            .count();
+    if (breakdown_log) {
+        mooncake::logging::ScopedTraceId trace(trace_id);
+        MC_LOG(INFO) << "offload_rpc_server_breakdown mode=pull"
+                     << " num_keys=" << keys.size()
+                     << " queue_us=" << queue_us
+                     << " batch_get_us=" << batch_get_us
+                     << " resume_us=" << resume_us
+                     << " response_us=" << response_us
+                     << " total_us=" << total_us << " status=ok";
+    }
+    co_return response;
 }
 
 async_simple::coro::Lazy<
     tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
 RealClient::batch_get_offload_object_push(
     const BatchGetOffloadObjectPushRequest &req) {
+    const auto handler_start = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(req.trace_id);
     if (!file_storage_) {
         LOG(ERROR)
             << "batch_get_offload_object_push called but file_storage_ is null";
@@ -6354,10 +6476,25 @@ RealClient::batch_get_offload_object_push(
     // heap-owned state pattern as batch_get_offload_object: the lambda captures
     // only a raw pointer.
     struct CallState {
+        CallState()
+            : pt_queue(PerfKey::GET_SSD_OWNER_RPC_QUEUE,
+                       UbDiag::PerfLevel::DEBUG),
+              pt_batch_get(PerfKey::GET_SSD_OWNER_RPC_BATCH_GET,
+                           UbDiag::PerfLevel::MODULE),
+              pt_resume(PerfKey::GET_SSD_OWNER_RPC_RESUME,
+                        UbDiag::PerfLevel::DEBUG) {}
         BatchGetOffloadObjectPushRequest req;
         std::shared_ptr<FileStorage> file_storage;
         Client *client;
         uint64_t trace_id;
+        std::chrono::steady_clock::time_point worker_start;
+        std::chrono::steady_clock::time_point worker_end;
+        uint64_t batch_get_us{0};
+        uint64_t transfer_us{0};
+        uint64_t release_us{0};
+        UbDiag::PerfPoint pt_queue;
+        UbDiag::PerfPoint pt_batch_get;
+        UbDiag::PerfPoint pt_resume;
     };
     auto state = std::make_unique<CallState>();
     state->req = req;
@@ -6365,15 +6502,27 @@ RealClient::batch_get_offload_object_push(
     state->client = client_.get();
     state->trace_id = req.trace_id;
     auto *s = state.get();
+    s->pt_queue.Start();
     auto try_result =
         co_await coro_io::post([s]() -> tl::expected<void, ErrorCode> {
+            s->worker_start = std::chrono::steady_clock::now();
+            s->pt_queue.End(0);
             mooncake::logging::ScopedTraceId trace(s->trace_id);
             // Stage the on-disk blobs into the local ClientBuffer
             // (FileStorage::BatchGet carries the OwnerSsdRead breakdown).
+            const auto batch_get_start = std::chrono::steady_clock::now();
+            s->pt_batch_get.Start();
             auto result = s->file_storage->BatchGet(s->req.keys, s->req.sizes);
+            s->pt_batch_get.End(result ? 0 : -1);
+            s->batch_get_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - batch_get_start)
+                    .count();
             if (!result) {
                 LOG(ERROR) << "Push offload BatchGet failed, err_code = "
                            << result.error();
+                s->worker_end = std::chrono::steady_clock::now();
+                s->pt_resume.Start();
                 return tl::make_unexpected(result.error());
             }
             const uint64_t batch_id = result.value().batch_id;
@@ -6381,32 +6530,99 @@ RealClient::batch_get_offload_object_push(
             UbDiag::PerfPoint pt_write(PerfKey::GET_SSD_OWNER_PUSH_WRITE,
                                        UbDiag::PerfLevel::MODULE);
             pt_write.Start();
+            const auto transfer_start = std::chrono::steady_clock::now();
             auto write_result = s->client->BatchPushOffloadObject(
                 s->req.requester_te_addr, s->req.keys, result.value().pointers,
                 s->req.dst_slices);
+            s->transfer_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - transfer_start)
+                    .count();
             pt_write.End(write_result ? 0 : -1);
             // The WRITE has completed (BatchPushOffloadObject blocks on the
             // transfer future), so the ClientBuffer can be reclaimed
             // immediately instead of waiting for the GC lease
             // (FileStorage::ReleaseBuffer carries OwnerReleaseBuffer).
+            const auto release_start = std::chrono::steady_clock::now();
             s->file_storage->ReleaseBuffer(batch_id);
+            s->release_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - release_start)
+                    .count();
+            s->worker_end = std::chrono::steady_clock::now();
+            s->pt_resume.Start();
             return write_result;
         });
+    const auto resumed = std::chrono::steady_clock::now();
+    s->pt_resume.End(0);
     auto pushed = try_result.value();
     if (!pushed) {
         LOG(ERROR) << "Push offload transfer failed, err_code = "
                    << pushed.error();
+        if (breakdown_log) {
+            mooncake::logging::ScopedTraceId trace(req.trace_id);
+            MC_LOG(INFO)
+                << "offload_rpc_server_breakdown mode=push"
+                << " num_keys=" << req.keys.size()
+                << " queue_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       s->worker_start - handler_start)
+                       .count()
+                << " batch_get_us=" << s->batch_get_us
+                << " transfer_data_us=" << s->transfer_us
+                << " release_buffer_us=" << s->release_us
+                << " resume_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - s->worker_end)
+                       .count()
+                << " response_us=0 total_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - handler_start)
+                       .count()
+                << " status=failed error_code="
+                << static_cast<int>(pushed.error());
+        }
         co_return tl::make_unexpected(pushed.error());
     }
-    co_return BatchGetOffloadObjectPushResponse(ErrorCode::OK);
+    const auto response_start = std::chrono::steady_clock::now();
+    BatchGetOffloadObjectPushResponse response(ErrorCode::OK);
+    const auto response_end = std::chrono::steady_clock::now();
+    if (breakdown_log) {
+        mooncake::logging::ScopedTraceId trace(req.trace_id);
+        MC_LOG(INFO)
+            << "offload_rpc_server_breakdown mode=push"
+            << " num_keys=" << req.keys.size()
+            << " queue_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   s->worker_start - handler_start)
+                   .count()
+            << " batch_get_us=" << s->batch_get_us
+            << " transfer_data_us=" << s->transfer_us
+            << " release_buffer_us=" << s->release_us
+            << " resume_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   resumed - s->worker_end)
+                   .count()
+            << " response_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   response_end - response_start)
+                   .count()
+            << " total_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   response_end - handler_start)
+                   .count()
+            << " status=ok";
+    }
+    co_return response;
 }
 
-bool RealClient::release_offload_buffer(uint64_t batch_id) {
+bool RealClient::release_offload_buffer(uint64_t batch_id, uint64_t trace_id) {
     if (!file_storage_) {
         LOG(WARNING)
             << "release_offload_buffer called but file_storage_ is null";
         return false;
     }
+    mooncake::logging::ScopedTraceId trace(trace_id);
     // Owner-side buffer release triggered by the requester's RPC (pull path).
     // FileStorage::ReleaseBuffer carries the OwnerReleaseBuffer perf point.
     return file_storage_->ReleaseBuffer(batch_id);
@@ -6459,8 +6675,17 @@ RealClient::batch_get_into_offload_object_internal(
         UbDiag::PerfPoint pt_push(PerfKey::GET_SSD_OFFLOAD_RPC,
                                   UbDiag::PerfLevel::MODULE);
         pt_push.Start();
+        const auto rpc_start = std::chrono::steady_clock::now();
+        ClientRequester::RpcTiming rpc_timing;
         auto pushResp = client_requester_->batch_get_offload_object_push(
-            target_rpc_service_addr, push_req);
+            target_rpc_service_addr, push_req, &rpc_timing);
+        const auto rpc_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - rpc_start)
+                .count();
+        if (current_offload_read_timing) {
+            current_offload_read_timing->offload_rpc_us = rpc_us;
+        }
         pt_push.End(pushResp ? 0 : -1);
         if (!pushResp) {
             LOG(ERROR) << "Push offload failed with error: "
@@ -6488,8 +6713,16 @@ RealClient::batch_get_into_offload_object_internal(
     UbDiag::PerfPoint pt_rpc(PerfKey::GET_SSD_OFFLOAD_RPC,
                              UbDiag::PerfLevel::MODULE);
     pt_rpc.Start();
+    const auto rpc_start = std::chrono::steady_clock::now();
+    ClientRequester::RpcTiming rpc_timing;
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, storage_keys, sizes);
+        target_rpc_service_addr, storage_keys, sizes, &rpc_timing);
+    const auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - rpc_start)
+                            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->offload_rpc_us = rpc_us;
+    }
     pt_rpc.End(batchGetResp ? 0 : -1);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
@@ -6504,9 +6737,17 @@ RealClient::batch_get_into_offload_object_internal(
     UbDiag::PerfPoint pt_transfer(PerfKey::GET_SSD_TRANSFER_DATA,
                                   UbDiag::PerfLevel::MODULE);
     pt_transfer.Start();
+    const auto transfer_start = std::chrono::steady_clock::now();
     auto result =
         client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
                                        batchGetResp->pointers, objects);
+    const auto transfer_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - transfer_start)
+            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->transfer_data_us = transfer_us;
+    }
     pt_transfer.End(result ? 0 : -1);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = static_cast<uint64_t>(
@@ -6520,13 +6761,23 @@ RealClient::batch_get_into_offload_object_internal(
               << ", batch_id: " << batchGetResp->batch_id
               << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
 
-    // Release buffer immediately after transfer completion (fire-and-forget)
-    // This allows early buffer reclamation instead of waiting for GC lease
+    // Release the owner buffer immediately after transfer completion. This RPC
+    // is synchronous; measuring it separately exposes owner lock/reclaim stalls.
     UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_RELEASE_BUFFER,
                                  UbDiag::PerfLevel::MODULE);
     pt_release.Start();
+    const auto release_start = std::chrono::steady_clock::now();
+    ClientRequester::RpcTiming release_timing;
     client_requester_->release_offload_buffer(target_rpc_service_addr,
-                                              batchGetResp->batch_id);
+                                              batchGetResp->batch_id,
+                                              &release_timing);
+    const auto release_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - release_start)
+            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->release_buffer_us = release_us;
+    }
     pt_release.End(0);
 
     if (!result) {
@@ -6567,11 +6818,24 @@ ClientRequester::ClientRequester() {
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 ClientRequester::batch_get_offload_object(const std::string &client_addr,
                                           const std::vector<std::string> &keys,
-                                          const std::vector<int64_t> &sizes) {
+                                          const std::vector<int64_t> &sizes,
+                                          RpcTiming *timing) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result =
         invoke_rpc<&RealClient::batch_get_offload_object,
                    BatchGetOffloadObjectResponse>(
-            client_addr, keys, sizes, mooncake::logging::CurrentTraceId());
+            client_addr, timing, keys, sizes, trace_id);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=pull"
+                     << " endpoint=" << client_addr
+                     << " num_keys=" << keys.size()
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " request_submit_us=" << timing->request_submit_us
+                     << " response_wait_us=" << timing->response_wait_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
@@ -6583,10 +6847,22 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
 tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
 ClientRequester::batch_get_offload_object_push(
     const std::string &client_addr,
-    const BatchGetOffloadObjectPushRequest &req) {
+    const BatchGetOffloadObjectPushRequest &req, RpcTiming *timing) {
     auto result = invoke_rpc<&RealClient::batch_get_offload_object_push,
-                             BatchGetOffloadObjectPushResponse>(client_addr,
-                                                                req);
+                             BatchGetOffloadObjectPushResponse>(
+        client_addr, timing, req);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(req.trace_id)) {
+        mooncake::logging::ScopedTraceId trace(req.trace_id);
+        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=push"
+                     << " endpoint=" << client_addr
+                     << " num_keys=" << req.keys.size()
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " request_submit_us=" << timing->request_submit_us
+                     << " response_wait_us=" << timing->response_wait_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object_push, client_addr = "
@@ -6596,10 +6872,22 @@ ClientRequester::batch_get_offload_object_push(
 }
 
 void ClientRequester::release_offload_buffer(const std::string &client_addr,
-                                             uint64_t batch_id) {
-    // Fire-and-forget: attempt to release buffer, log errors but don't block
+                                             uint64_t batch_id,
+                                             RpcTiming *timing) {
+    // Synchronous RPC. Failure is non-fatal because GC eventually reclaims it.
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
-        client_addr, batch_id);
+        client_addr, timing, batch_id, trace_id);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "offload_release_client_breakdown endpoint="
+                     << client_addr << " batch_id=" << batch_id
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " request_submit_us=" << timing->request_submit_us
+                     << " response_wait_us=" << timing->response_wait_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         // This is expected in some cases (e.g., network issues, buffer already
         // GC'd) Log at INFO level since GC will eventually clean up anyway
@@ -6614,26 +6902,74 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
-    const std::string &client_addr, Args &&...args) {
+    const std::string &client_addr, RpcTiming *timing, Args &&...args) {
+    const auto total_start = std::chrono::steady_clock::now();
+    UbDiag::PerfPoint pt_pool(PerfKey::GET_SSD_OFFLOAD_RPC_POOL,
+                              UbDiag::PerfLevel::DEBUG);
+    pt_pool.Start();
     auto client_pool = client_pools_->at(client_addr);
-    return async_simple::coro::syncAwait(
+    pt_pool.End(0);
+    if (timing) {
+        timing->pool_lookup_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+    }
+    auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            const auto submit_start = std::chrono::steady_clock::now();
+            UbDiag::PerfPoint pt_submit(PerfKey::GET_SSD_OFFLOAD_RPC_SUBMIT,
+                                        UbDiag::PerfLevel::DEBUG);
+            pt_submit.Start();
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client &client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            pt_submit.End(ret.has_value() ? 0 : -1);
+            if (timing) {
+                timing->request_submit_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - submit_start)
+                        .count();
+            }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
+            const auto wait_start = std::chrono::steady_clock::now();
+            UbDiag::PerfPoint pt_wait(PerfKey::GET_SSD_OFFLOAD_RPC_WAIT,
+                                      UbDiag::PerfLevel::MODULE);
+            pt_wait.Start();
             auto result = co_await std::move(ret.value());
+            pt_wait.End(result ? 0 : -1);
+            if (timing) {
+                timing->response_wait_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - wait_start)
+                        .count();
+            }
             if (!result) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
-            co_return result->result();
+            const auto parse_start = std::chrono::steady_clock::now();
+            auto response = result->result();
+            if (timing) {
+                timing->result_parse_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - parse_start)
+                        .count();
+            }
+            co_return response;
         }());
+    if (timing) {
+        timing->total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+    }
+    return rpc_result;
 }
 }  // namespace mooncake
