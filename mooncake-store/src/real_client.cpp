@@ -6839,8 +6839,8 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
                      << " endpoint=" << client_addr
                      << " num_keys=" << keys.size()
                      << " pool_lookup_us=" << timing->pool_lookup_us
-                     << " request_submit_us=" << timing->request_submit_us
-                     << " response_wait_us=" << timing->response_wait_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
                      << " result_parse_us=" << timing->result_parse_us
                      << " total_us=" << timing->total_us
                      << " status=" << (result ? "ok" : "rpc_fail");
@@ -6866,8 +6866,8 @@ ClientRequester::batch_get_offload_object_push(
                      << " endpoint=" << client_addr
                      << " num_keys=" << req.keys.size()
                      << " pool_lookup_us=" << timing->pool_lookup_us
-                     << " request_submit_us=" << timing->request_submit_us
-                     << " response_wait_us=" << timing->response_wait_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
                      << " result_parse_us=" << timing->result_parse_us
                      << " total_us=" << timing->total_us
                      << " status=" << (result ? "ok" : "rpc_fail");
@@ -6891,8 +6891,8 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
         MC_LOG(INFO) << "offload_release_client_breakdown endpoint="
                      << client_addr << " batch_id=" << batch_id
                      << " pool_lookup_us=" << timing->pool_lookup_us
-                     << " request_submit_us=" << timing->request_submit_us
-                     << " response_wait_us=" << timing->response_wait_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
                      << " result_parse_us=" << timing->result_parse_us
                      << " total_us=" << timing->total_us
                      << " status=" << (result ? "ok" : "rpc_fail");
@@ -6912,8 +6912,6 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     const std::string &client_addr, RpcTiming *timing, Args &&...args) {
-    using RpcServiceReturn =
-        decltype(coro_rpc::get_return_type<ServiceMethod>());
     const auto total_start = std::chrono::steady_clock::now();
     UbDiag::PerfPoint pt_pool(PerfKey::GET_SSD_OFFLOAD_RPC_POOL,
                               UbDiag::PerfLevel::DEBUG);
@@ -6928,70 +6926,40 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     }
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            const auto submit_start = std::chrono::steady_clock::now();
-            auto pt_submit = std::make_shared<UbDiag::PerfPoint>(
-                PerfKey::GET_SSD_OFFLOAD_RPC_SUBMIT, UbDiag::PerfLevel::DEBUG);
-            auto submit_ended = std::make_shared<std::atomic<bool>>(false);
-            pt_submit->Start();
+            const auto rpc_call_start = std::chrono::steady_clock::now();
+            UbDiag::PerfPoint pt_rpc_call(
+                PerfKey::GET_SSD_OFFLOAD_RPC_CALL, UbDiag::PerfLevel::DEBUG);
+            pt_rpc_call.Start();
             auto ret = co_await client_pool->send_request(
-                [&, pt_submit,
-                 submit_ended](coro_io::client_reuse_hint,
-                               coro_rpc::coro_rpc_client &client)
-                    -> async_simple::coro::Lazy<async_simple::coro::Lazy<
-                        coro_rpc::async_rpc_result<RpcServiceReturn>>> {
-                    // coro_rpc::send_request returns two nested Lazy objects:
-                    // the outer one completes after connection acquisition and
-                    // request submission; the inner one waits for the reply.
-                    auto response_lazy =
-                        co_await client.send_request<ServiceMethod>(
-                            std::forward<Args>(args)...);
-                    if (timing) {
-                        timing->request_submit_us =
-                            std::chrono::duration_cast<
-                                std::chrono::microseconds>(
-                                std::chrono::steady_clock::now() - submit_start)
-                                .count();
-                    }
-                    pt_submit->End(0);
-                    submit_ended->store(true, std::memory_order_release);
-                    co_return
-                        [response_lazy = std::move(response_lazy),
-                         timing]() mutable
-                        -> async_simple::coro::Lazy<
-                            coro_rpc::async_rpc_result<RpcServiceReturn>> {
-                        const auto wait_start =
-                            std::chrono::steady_clock::now();
-                        UbDiag::PerfPoint pt_wait(
-                            PerfKey::GET_SSD_OFFLOAD_RPC_WAIT,
-                            UbDiag::PerfLevel::MODULE);
-                        pt_wait.Start();
-                        auto response = co_await std::move(response_lazy);
-                        pt_wait.End(response ? 0 : -1);
-                        if (timing) {
-                            timing->response_wait_us =
-                                std::chrono::duration_cast<
-                                    std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() -
-                                    wait_start)
-                                    .count();
-                        }
-                        co_return std::move(response);
-                    }();
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client &client) {
+                    return client.send_request<ServiceMethod>(
+                        std::forward<Args>(args)...);
                 });
-            if (!submit_ended->load(std::memory_order_acquire)) {
-                pt_submit->End(-1);
-                if (timing) {
-                    timing->request_submit_us =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - submit_start)
-                            .count();
-                }
+            pt_rpc_call.End(ret.has_value() ? 0 : -1);
+            if (timing) {
+                timing->rpc_call_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - rpc_call_start)
+                        .count();
             }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
+            const auto result_get_start = std::chrono::steady_clock::now();
+            UbDiag::PerfPoint pt_result_get(
+                PerfKey::GET_SSD_OFFLOAD_RPC_RESULT_GET,
+                UbDiag::PerfLevel::MODULE);
+            pt_result_get.Start();
             auto result = co_await std::move(ret.value());
+            pt_result_get.End(result ? 0 : -1);
+            if (timing) {
+                timing->result_get_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_get_start)
+                        .count();
+            }
             if (!result) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);

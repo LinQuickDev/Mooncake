@@ -142,8 +142,8 @@ class ClientRequester {
    public:
     struct RpcTiming {
         uint64_t pool_lookup_us{0};
-        uint64_t request_submit_us{0};
-        uint64_t response_wait_us{0};
+        uint64_t rpc_call_us{0};
+        uint64_t result_get_us{0};
         uint64_t result_parse_us{0};
         uint64_t total_us{0};
     };

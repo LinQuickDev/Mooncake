@@ -106,8 +106,8 @@ PERF_KEY_DEF(PUT_BATCH_COLLECT_RESULTS,      "client_service.cpp::BatchPut",    
 // === batch_get_into_offload_object_internal 子步骤 (SSD read) ===
 PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC,            "real_client.cpp::batch_get_into_offload_object_internal",  "OffloadRpc")
 PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_POOL,       "real_client.cpp::ClientRequester::invoke_rpc",             "RpcPoolLookup")
-PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_SUBMIT,     "real_client.cpp::ClientRequester::invoke_rpc",             "RpcSubmit")
-PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_WAIT,       "real_client.cpp::ClientRequester::invoke_rpc",             "RpcResponseWait")
+PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_CALL,       "real_client.cpp::ClientRequester::invoke_rpc",             "RpcCall")
+PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_RESULT_GET, "real_client.cpp::ClientRequester::invoke_rpc",             "RpcResultGet")
 PERF_KEY_DEF(GET_SSD_TRANSFER_DATA,          "real_client.cpp::batch_get_into_offload_object_internal",  "TransferData")
 PERF_KEY_DEF(GET_SSD_RELEASE_BUFFER,         "real_client.cpp::batch_get_into_offload_object_internal",  "ReleaseBuffer")
 
