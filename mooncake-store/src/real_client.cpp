@@ -6634,6 +6634,8 @@ RealClient::batch_get_into_offload_object_internal(
     std::unordered_map<std::string, std::vector<Slice>> &objects) {
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
@@ -6698,15 +6700,16 @@ RealClient::batch_get_into_offload_object_internal(
             return tl::make_unexpected(pushResp->error_code);
         }
         auto end_time = std::chrono::steady_clock::now();
-        auto elapsed_time = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(end_time -
                                                                   start_time)
-                .count());
-        LOG(INFO) << "Time taken for batch_get_into_offload_object_internal "
-                     "(push): "
-                  << elapsed_time << "ms, with target_rpc_service_addr: "
-                  << target_rpc_service_addr
-                  << ", key size: " << objects.size();
+                .count();
+        if (breakdown_log) {
+            MC_LOG(INFO) << "offload_read_breakdown mode=push"
+                         << " endpoint=" << target_rpc_service_addr
+                         << " num_keys=" << objects.size()
+                         << " total_us=" << total_us << " status=ok";
+        }
         return {};
     }
 
@@ -6754,12 +6757,18 @@ RealClient::batch_get_into_offload_object_internal(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
                                                               start_time)
             .count());
-    LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
-              << elapsed_time
-              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
-              << ", key size: " << objects.size()
-              << ", batch_id: " << batchGetResp->batch_id
-              << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+    if (breakdown_log) {
+        MC_LOG(INFO) << "offload_read_breakdown mode=pull"
+                     << " endpoint=" << target_rpc_service_addr
+                     << " num_keys=" << objects.size()
+                     << " batch_id=" << batchGetResp->batch_id
+                     << " gc_ttl_ms=" << batchGetResp->gc_ttl_ms
+                     << " pre_release_total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - start_time)
+                            .count()
+                     << " status=" << (result ? "ok" : "transfer_fail");
+    }
 
     // Release the owner buffer immediately after transfer completion. This RPC
     // is synchronous; measuring it separately exposes owner lock/reclaim stalls.
@@ -6903,6 +6912,8 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     const std::string &client_addr, RpcTiming *timing, Args &&...args) {
+    using RpcServiceReturn =
+        decltype(coro_rpc::get_return_type<ServiceMethod>());
     const auto total_start = std::chrono::steady_clock::now();
     UbDiag::PerfPoint pt_pool(PerfKey::GET_SSD_OFFLOAD_RPC_POOL,
                               UbDiag::PerfLevel::DEBUG);
@@ -6918,51 +6929,82 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             const auto submit_start = std::chrono::steady_clock::now();
-            UbDiag::PerfPoint pt_submit(PerfKey::GET_SSD_OFFLOAD_RPC_SUBMIT,
-                                        UbDiag::PerfLevel::DEBUG);
-            pt_submit.Start();
+            auto pt_submit = std::make_shared<UbDiag::PerfPoint>(
+                PerfKey::GET_SSD_OFFLOAD_RPC_SUBMIT, UbDiag::PerfLevel::DEBUG);
+            auto submit_ended = std::make_shared<std::atomic<bool>>(false);
+            pt_submit->Start();
             auto ret = co_await client_pool->send_request(
-                [&](coro_io::client_reuse_hint,
-                    coro_rpc::coro_rpc_client &client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                [&, pt_submit,
+                 submit_ended](coro_io::client_reuse_hint,
+                               coro_rpc::coro_rpc_client &client)
+                    -> async_simple::coro::Lazy<async_simple::coro::Lazy<
+                        coro_rpc::async_rpc_result<RpcServiceReturn>>> {
+                    // coro_rpc::send_request returns two nested Lazy objects:
+                    // the outer one completes after connection acquisition and
+                    // request submission; the inner one waits for the reply.
+                    auto response_lazy =
+                        co_await client.send_request<ServiceMethod>(
+                            std::forward<Args>(args)...);
+                    if (timing) {
+                        timing->request_submit_us =
+                            std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - submit_start)
+                                .count();
+                    }
+                    pt_submit->End(0);
+                    submit_ended->store(true, std::memory_order_release);
+                    co_return
+                        [response_lazy = std::move(response_lazy),
+                         timing]() mutable
+                        -> async_simple::coro::Lazy<
+                            coro_rpc::async_rpc_result<RpcServiceReturn>> {
+                        const auto wait_start =
+                            std::chrono::steady_clock::now();
+                        UbDiag::PerfPoint pt_wait(
+                            PerfKey::GET_SSD_OFFLOAD_RPC_WAIT,
+                            UbDiag::PerfLevel::MODULE);
+                        pt_wait.Start();
+                        auto response = co_await std::move(response_lazy);
+                        pt_wait.End(response ? 0 : -1);
+                        if (timing) {
+                            timing->response_wait_us =
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    wait_start)
+                                    .count();
+                        }
+                        co_return std::move(response);
+                    }();
                 });
-            pt_submit.End(ret.has_value() ? 0 : -1);
-            if (timing) {
-                timing->request_submit_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - submit_start)
-                        .count();
+            if (!submit_ended->load(std::memory_order_acquire)) {
+                pt_submit->End(-1);
+                if (timing) {
+                    timing->request_submit_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - submit_start)
+                            .count();
+                }
             }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
-            const auto wait_start = std::chrono::steady_clock::now();
-            UbDiag::PerfPoint pt_wait(PerfKey::GET_SSD_OFFLOAD_RPC_WAIT,
-                                      UbDiag::PerfLevel::MODULE);
-            pt_wait.Start();
             auto result = co_await std::move(ret.value());
-            pt_wait.End(result ? 0 : -1);
-            if (timing) {
-                timing->response_wait_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - wait_start)
-                        .count();
-            }
             if (!result) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             const auto parse_start = std::chrono::steady_clock::now();
-            auto response = result->result();
+            auto response = std::move(result->result());
             if (timing) {
                 timing->result_parse_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - parse_start)
                         .count();
             }
-            co_return response;
+            co_return std::move(response);
         }());
     if (timing) {
         timing->total_us =
