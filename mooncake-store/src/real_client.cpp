@@ -944,7 +944,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
         offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+            std::make_unique<coro_rpc::coro_rpc_server>(8, 0, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
