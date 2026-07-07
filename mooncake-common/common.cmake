@@ -89,7 +89,6 @@ option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
 
 if (USE_UB)
-  add_compile_definitions(USE_UB)
   message(STATUS "ub transport is enabled")
   include(${CMAKE_CURRENT_LIST_DIR}/FindUrma.cmake)
 endif()

@@ -250,8 +250,8 @@ target_link_libraries(
          ${EXTRA_LIBS} ${SPDK_STATIC_LIBS} asio_shared mooncake_common
   PRIVATE transfer_engine)
 
-# UbDiag instrumentation
-find_package(UbDiag REQUIRED)
+# UbDiag instrumentation (resolved by FindUbDiag.cmake: submodule > system > mock)
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
 target_link_libraries(mooncake_store PRIVATE UbDiag::ubdiag_lib)
 target_include_directories(mooncake_store PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
