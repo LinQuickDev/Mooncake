@@ -332,16 +332,13 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
-                [trace_id](coro_io::client_reuse_hint,
+                [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    coro_rpc::request_config_t config{};
-                    config.trace_id = trace_id;
                     return client.send_request<ServiceMethod>(
-                        std::move(config), std::forward<Args>(args)...);
+                        std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
@@ -375,17 +372,14 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
             auto ret = co_await pool->send_request(
-                [trace_id](coro_io::client_reuse_hint,
+                [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    coro_rpc::request_config_t config{};
-                    config.trace_id = trace_id;
                     return client.send_request<ServiceMethod>(
-                        std::move(config), std::forward<Args>(args)...);
+                        std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
