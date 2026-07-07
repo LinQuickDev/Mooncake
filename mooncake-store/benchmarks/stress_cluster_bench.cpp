@@ -11,6 +11,7 @@
 #include <latch>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -218,6 +219,9 @@ DEFINE_uint64(duration, 0,
               "scenario (0 = read num_keys once)");
 DEFINE_uint64(statis_interval, 5,
               "Statistics print interval in seconds for segment_read scenario");
+DEFINE_uint64(shuffle_seed, 0,
+              "Seed for deterministic shuffle of segment_read keys "
+              "(0 = disabled)");
 
 using Clock = std::chrono::steady_clock;
 using Nanos = std::chrono::nanoseconds;
@@ -818,6 +822,12 @@ class StressBenchmark {
             for (size_t s = 0; s < read_segments.size(); ++s) {
                 all_keys.push_back(MakeSegmentKey(read_segments[s], i));
             }
+        }
+        if (FLAGS_shuffle_seed != 0) {
+            std::mt19937_64 rng(FLAGS_shuffle_seed);
+            std::shuffle(all_keys.begin(), all_keys.end(), rng);
+            LOG(INFO) << "Shuffled segment_read keys with seed="
+                      << FLAGS_shuffle_seed;
         }
         LOG(INFO) << "Total keys to read: " << all_keys.size();
 
