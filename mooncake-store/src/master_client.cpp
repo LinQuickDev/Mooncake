@@ -332,6 +332,9 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     }
 
     auto start_time = std::chrono::steady_clock::now();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    MC_LOG(INFO) << "MC_RPC_BEGIN trace_id=" << trace_id
+                 << " func=" << RpcNameTraits<ServiceMethod>::value;
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
@@ -357,6 +360,14 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                 metrics_->rpc_latency.observe(
                     {RpcNameTraits<ServiceMethod>::value}, latency.count());
             }
+            auto end_time = std::chrono::steady_clock::now();
+            auto latency_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    end_time - start_time)
+                    .count();
+            MC_LOG(INFO) << "MC_RPC_END trace_id=" << trace_id
+                         << " func=" << RpcNameTraits<ServiceMethod>::value
+                         << " latency=" << latency_us << "us";
             co_return result->result();
         }());
 }
@@ -372,6 +383,10 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     }
 
     auto start_time = std::chrono::steady_clock::now();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    MC_LOG(INFO) << "MC_RPC_BEGIN trace_id=" << trace_id
+                 << " func=" << RpcNameTraits<ServiceMethod>::value
+                 << " batch_size=" << input_size;
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
@@ -405,6 +420,14 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 metrics_->rpc_latency.observe(
                     {RpcNameTraits<ServiceMethod>::value}, latency.count());
             }
+            auto end_time = std::chrono::steady_clock::now();
+            auto latency_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    end_time - start_time)
+                    .count();
+            MC_LOG(INFO) << "MC_RPC_END trace_id=" << trace_id
+                         << " func=" << RpcNameTraits<ServiceMethod>::value
+                         << " latency=" << latency_us << "us";
             co_return result->result();
         }());
 }
