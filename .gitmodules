@@ -6,3 +6,7 @@
 	path = extern/yalantinglibs
 	url = https://github.com/alibaba/yalantinglibs.git
 	branch = v0.5.7
+[submodule "extern/ubdiag"]
+	path = extern/ubdiag
+	url = https://atomgit.com/liusiyu60/ubdiag
+	branch = fix/shm-probe-fastpath
