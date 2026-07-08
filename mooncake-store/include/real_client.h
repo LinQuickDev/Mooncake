@@ -506,7 +506,8 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        size_t offload_rpc_thread_num = 8);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);

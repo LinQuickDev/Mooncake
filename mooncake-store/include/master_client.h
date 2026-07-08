@@ -12,6 +12,7 @@
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
+#include "environ.h"
 #include "client_metric.h"
 #include "replica.h"
 #include "segment.h"
@@ -59,6 +60,8 @@ class MasterClient {
           metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
+        pool_conf.max_connection = Environ::Get().GetYltRpcPoolMaxConnection(
+            pool_conf.max_connection);
 
         // Disable alive_detect to prevent stale reconnection logs after HA
         // failover. Old client_pool objects remain in client_pools_ map and
@@ -442,6 +445,9 @@ class MasterClient {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetOffloadEndpoints();
+
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
      * client. Returns tenant-scoped tasks the caller should read from local
@@ -662,6 +668,8 @@ class MasterClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
+
+    void WarmupRpcPool();
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool

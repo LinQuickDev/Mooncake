@@ -5,9 +5,11 @@
 #include <csignal>
 #include <map>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "client_service.h"
@@ -185,6 +187,8 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id, RpcTiming *timing = nullptr);
 
+    void WarmupRpcPool(const std::string &client_addr);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -213,6 +217,8 @@ class ClientRequester {
     };
 
     mutable std::shared_mutex client_pool_mutex_;
+    mutable std::shared_mutex warmed_rpc_pool_mutex_;
+    std::unordered_set<std::string> warmed_rpc_pools_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
 
