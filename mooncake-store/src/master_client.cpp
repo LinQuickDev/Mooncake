@@ -5,6 +5,7 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include <csignal>
+#include <future>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -237,6 +238,11 @@ struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetOffloadEndpoints> {
+    static constexpr const char* value = "GetOffloadEndpoints";
 };
 
 template <>
@@ -480,6 +486,46 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 MasterClient::~MasterClient() = default;
 
+void MasterClient::WarmupRpcPool() {
+    auto pool = client_accessor_.GetClientPool();
+    if (!pool) {
+        return;
+    }
+    if (!Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        LOG(INFO) << "Master RPC pool warmup disabled by "
+                  << "MC_YLT_RPC_POOL_WARMUP";
+        return;
+    }
+    const size_t target_connections = Environ::Get().GetYltRpcPoolWarmupConnections(
+        pool->get_pool_config().max_connection);
+    if (target_connections == 0) {
+        LOG(INFO) << "Master RPC pool warmup disabled: target_connections=0";
+        return;
+    }
+
+    LOG(INFO) << "Warming up master RPC pool to " << target_connections
+              << " connection(s), max_connection="
+              << pool->get_pool_config().max_connection;
+    std::vector<std::future<bool>> futures;
+    futures.reserve(target_connections);
+    for (size_t i = 0; i < target_connections; ++i) {
+        futures.emplace_back(std::async(std::launch::async, [this]() {
+            auto result =
+                invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
+            return result.has_value();
+        }));
+    }
+
+    size_t ok_count = 0;
+    for (auto& future : futures) {
+        if (future.get()) {
+            ++ok_count;
+        }
+    }
+    LOG(INFO) << "Master RPC pool warmup completed: " << ok_count << "/"
+              << target_connections << " succeeded";
+}
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
@@ -510,6 +556,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
     }
+    WarmupRpcPool();
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
@@ -1104,6 +1151,17 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+MasterClient::GetOffloadEndpoints() {
+    ScopedVLogTimer timer(1, "MasterClient::GetOffloadEndpoints");
+    timer.LogRequest("action=get_offload_endpoints");
+
+    auto result = invoke_rpc<&WrappedMasterService::GetOffloadEndpoints,
+                             std::vector<std::string>>();
     timer.LogResponseExpected(result);
     return result;
 }

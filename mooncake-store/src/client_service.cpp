@@ -1072,6 +1072,11 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+Client::GetOffloadEndpoints() {
+    return master_client_.GetOffloadEndpoints();
+}
+
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
     std::chrono::steady_clock::time_point start_time =

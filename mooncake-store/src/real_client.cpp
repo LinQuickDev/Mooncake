@@ -18,9 +18,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <exception>
 #include <functional>
+#include <future>
 #include <limits>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 #include "mooncake_logging.h"
@@ -36,6 +39,7 @@
 #include "file_storage.h"
 #include "gpu_staging_utils.h"
 #include "default_config.h"
+#include "environ.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
@@ -681,7 +685,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path, const std::string &tenant_id) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    size_t offload_rpc_thread_num) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -943,14 +948,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
+        if (offload_rpc_thread_num == 0) {
+            LOG(WARNING) << "Invalid offload_rpc_thread_num=0, using 1";
+            offload_rpc_thread_num = 1;
+        }
         offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(8, 0, "0.0.0.0");
+            std::make_unique<coro_rpc::coro_rpc_server>(
+                offload_rpc_thread_num, 0, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object_push>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::service_ready_internal>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -960,7 +972,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
         offload_rpc_port_ = offload_rpc_server_->port();
-        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
+        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_
+                  << " with " << offload_rpc_thread_num << " thread(s)";
 
         // Build local_rpc_addr from hostname + auto-allocated port
         this->local_rpc_addr = buildHostNameWithPort(
@@ -982,6 +995,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        auto endpoints_result = client_->GetOffloadEndpoints();
+        if (!endpoints_result) {
+            LOG(WARNING) << "Failed to fetch offload RPC endpoints for pool "
+                         << "warmup: "
+                         << toString(endpoints_result.error());
+        } else {
+            const auto& endpoints = endpoints_result.value();
+            LOG(INFO) << "Warming up offload RPC pools for "
+                      << endpoints.size() << " endpoint(s) during client "
+                      << "initialization";
+            for (const auto& endpoint : endpoints) {
+                client_requester_->WarmupRpcPool(endpoint);
+            }
+        }
+    }
     if (FLAGS_enable_http_server) {
         if (start_http_server() != 0) {
             LOG(ERROR) << "Failed to start HTTP server on port "
@@ -996,15 +1025,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // Controlled by MC_STORE_WARMUP (default: disabled to
     // preserve existing behaviour). Set to 1/true/yes to enable.
     if (client_) {
-        const char* env = std::getenv("MC_STORE_WARMUP");
-        bool enable_warmup = false;
-        if (env) {
-            std::string val = env;
-            std::transform(val.begin(), val.end(), val.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
-            enable_warmup =
-                (val == "1" || val == "true" || val == "yes" || val == "on");
-        }
+        const bool enable_warmup = Environ::Get().GetStoreWarmupEnabled(false);
         if (enable_warmup) {
             // warmup issues RDMA transfers using a buffer from
             // client_buffer_allocator_, which must be registered with the
@@ -1043,7 +1064,7 @@ int RealClient::setup_real(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id));
+        tenant_id, Environ::Get().GetOffloadRpcThreadNum(8)));
 }
 
 namespace {
@@ -1145,6 +1166,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
+    auto offload_rpc_thread_num_opt =
+        get_config_size(config, "offload_rpc_thread_num",
+                        Environ::Get().GetOffloadRpcThreadNum(8));
+    if (!offload_rpc_thread_num_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    size_t offload_rpc_thread_num = offload_rpc_thread_num_opt.value();
 
     std::string enable_ssd_offload_str =
         get_config(config, "enable_ssd_offload", "false");
@@ -1157,7 +1185,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     return setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        offload_rpc_thread_num);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -6802,6 +6831,8 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+    pool_conf.max_connection =
+        Environ::Get().GetYltRpcPoolMaxConnection(pool_conf.max_connection);
     const char *value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
         pool_conf.client_config.socket_config =
@@ -6822,6 +6853,59 @@ ClientRequester::ClientRequester() {
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf);
+}
+
+void ClientRequester::WarmupRpcPool(const std::string &client_addr) {
+    if (!Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        return;
+    }
+
+    std::unique_lock lock(warmed_rpc_pool_mutex_);
+    const auto [_, inserted] = warmed_rpc_pools_.insert(client_addr);
+    if (!inserted) {
+        return;
+    }
+
+    auto client_pool = client_pools_->at(client_addr);
+    const size_t target_connections =
+        Environ::Get().GetYltRpcPoolWarmupConnections(
+            client_pool->get_pool_config().max_connection);
+    if (target_connections == 0) {
+        LOG(INFO) << "Offload RPC pool warmup disabled for " << client_addr
+                  << " by MC_YLT_RPC_POOL_WARMUP_CONNECTIONS=0";
+        return;
+    }
+
+    LOG(INFO) << "Warming up offload RPC pool for " << client_addr << " to "
+              << target_connections << " connection(s), max_connection="
+              << client_pool->get_pool_config().max_connection;
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(target_connections);
+    for (size_t i = 0; i < target_connections; ++i) {
+        futures.emplace_back(std::async(std::launch::async, [this, client_addr]() {
+            auto result =
+                invoke_rpc<&RealClient::service_ready_internal, void>(
+                    client_addr, nullptr);
+            return result.has_value();
+        }));
+    }
+
+    size_t ok_count = 0;
+    for (auto &future : futures) {
+        try {
+            if (future.get()) {
+                ++ok_count;
+            }
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Offload RPC pool warmup task failed for "
+                         << client_addr << ": " << e.what();
+        }
+    }
+
+    LOG(INFO) << "Offload RPC pool warmup completed for " << client_addr
+              << ": " << ok_count << "/" << target_connections
+              << " succeeded";
 }
 
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
@@ -6965,14 +7049,25 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             const auto parse_start = std::chrono::steady_clock::now();
-            auto response = std::move(result->result());
-            if (timing) {
-                timing->result_parse_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - parse_start)
-                        .count();
+            if constexpr (std::is_void_v<ReturnType>) {
+                result->result();
+                if (timing) {
+                    timing->result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - parse_start)
+                            .count();
+                }
+                co_return tl::expected<void, ErrorCode>{};
+            } else {
+                auto response = std::move(result->result());
+                if (timing) {
+                    timing->result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - parse_start)
+                            .count();
+                }
+                co_return std::move(response);
             }
-            co_return std::move(response);
         }());
     if (timing) {
         timing->total_us =
