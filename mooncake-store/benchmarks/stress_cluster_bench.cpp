@@ -200,6 +200,10 @@ DEFINE_uint64(num_threads, 1, "Number of concurrent reader threads");
 DEFINE_uint64(warmup_keys, 5, "Number of warmup keys (not counted in stats)");
 DEFINE_uint64(wait_seconds, 5,
               "Seconds to wait before reading (for remote scenarios)");
+DEFINE_uint64(client_init_wait_seconds, 0,
+              "Seconds to wait after RealClient setup succeeds and before "
+              "benchmark run starts. This can give asynchronous RPC/transfer "
+              "warmup and background initialization time to settle.");
 DEFINE_bool(verify, true, "Verify data integrity after read");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_bool(hard_pin, false,
@@ -1582,6 +1586,8 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Read seg nums:  " << FLAGS_read_segment_nums;
     LOG(INFO) << "  Duration:       " << FLAGS_duration << "s";
     LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
+    LOG(INFO) << "  Client init wait: " << FLAGS_client_init_wait_seconds
+              << "s";
 
     size_t total_data = FLAGS_num_keys * FLAGS_value_size;
     if (total_data > FLAGS_global_segment_size * 9.5 / 10) {
@@ -1597,6 +1603,14 @@ int main(int argc, char* argv[]) {
     if (ret != 0) {
         LOG(ERROR) << "Benchmark setup failed";
         return ret;
+    }
+
+    if (FLAGS_client_init_wait_seconds > 0) {
+        LOG(INFO) << "Waiting " << FLAGS_client_init_wait_seconds
+                  << " seconds after client setup before benchmark run...";
+        std::this_thread::sleep_for(
+            std::chrono::seconds(FLAGS_client_init_wait_seconds));
+        LOG(INFO) << "Client init wait complete";
     }
 
     ret = bench.Run();
