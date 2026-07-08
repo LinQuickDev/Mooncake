@@ -179,7 +179,7 @@ inline void init_ylt_log_level() {
         }
 
         easylog::init_log(severity, "logs/rpc.log", true, false,
-                          100 * 1024 * 1024, 3, false);
+                          1000 * 1024 * 1024, 3, false);
     });
 }
 
