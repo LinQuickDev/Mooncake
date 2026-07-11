@@ -48,6 +48,15 @@ uint32_t Environ::GetYltRpcPoolMaxConnection(uint32_t default_value) const {
     return static_cast<uint32_t>(value);
 }
 
+size_t Environ::GetYltRpcPoolIdleTimeoutMs(size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_IDLE_TIMEOUT_MS", default_value);
+}
+
+size_t Environ::GetYltRpcPoolShortIdleTimeoutMs(
+    size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_SHORT_IDLE_TIMEOUT_MS", default_value);
+}
+
 bool Environ::GetYltRpcPoolWarmupEnabled(bool default_value) const {
     return GetBool("MC_YLT_RPC_POOL_WARMUP", default_value);
 }

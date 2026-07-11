@@ -62,6 +62,12 @@ class MasterClient {
             pool_conf{};
         pool_conf.max_connection = Environ::Get().GetYltRpcPoolMaxConnection(
             pool_conf.max_connection);
+        pool_conf.idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+                pool_conf.idle_timeout.count()));
+        pool_conf.short_connect_idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+                pool_conf.short_connect_idle_timeout.count()));
 
         // Disable alive_detect to prevent stale reconnection logs after HA
         // failover. Old client_pool objects remain in client_pools_ map and

@@ -53,6 +53,8 @@ class Environ {
     int GetEfaCqThreads() const { return efa_cq_threads_; }
     size_t GetOffloadRpcThreadNum(size_t default_value = 8) const;
     uint32_t GetYltRpcPoolMaxConnection(uint32_t default_value = 100) const;
+    size_t GetYltRpcPoolIdleTimeoutMs(size_t default_value) const;
+    size_t GetYltRpcPoolShortIdleTimeoutMs(size_t default_value) const;
     bool GetYltRpcPoolWarmupEnabled(bool default_value = true) const;
     size_t GetYltRpcPoolWarmupConnections(size_t default_value) const;
     bool GetStoreWarmupEnabled(bool default_value = false) const;
