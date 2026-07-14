@@ -5,10 +5,10 @@
 #include <string>
 #include <vector>
 
-#include "embtable/emb_table/emb_table_bucket.h"
-#include "embtable/emb_table/emb_table_meta.h"
-#include "embtable/share_map_store/share_map_store.h"
-#include "embtable/types.h"
+#include "emb_table/emb_table_bucket.h"
+#include "emb_table/emb_table_meta.h"
+#include "share_map_store/share_map_store.h"
+#include "emb_types.h"
 #include "real_client.h"
 
 namespace embtable {

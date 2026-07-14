@@ -1,4 +1,4 @@
-#include "embtable/share_object/share_map.h"
+#include "share_object/share_map.h"
 
 #include <glog/logging.h>
 #include <unordered_map>

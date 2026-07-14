@@ -1,4 +1,4 @@
-#include "embtable/share_map_store/share_map_store.h"
+#include "share_map_store/share_map_store.h"
 
 #include <glog/logging.h>
 

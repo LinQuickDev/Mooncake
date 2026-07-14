@@ -7,8 +7,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "embtable/share_object/share_map.h"
-#include "embtable/types.h"
+#include "share_object/share_map.h"
+#include "emb_types.h"
 #include "real_client.h"
 
 namespace embtable {

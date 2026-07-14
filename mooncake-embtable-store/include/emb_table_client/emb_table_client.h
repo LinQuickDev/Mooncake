@@ -5,9 +5,9 @@
 #include <string>
 #include <vector>
 
-#include "embtable/emb_table/emb_table.h"
-#include "embtable/share_map_store/share_map_store.h"
-#include "embtable/types.h"
+#include "emb_table/emb_table.h"
+#include "share_map_store/share_map_store.h"
+#include "emb_types.h"
 #include "real_client.h"
 
 namespace embtable {

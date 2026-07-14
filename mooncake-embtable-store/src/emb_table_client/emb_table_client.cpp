@@ -1,4 +1,4 @@
-#include "embtable/emb_table_client/emb_table_client.h"
+#include "emb_table_client/emb_table_client.h"
 
 #include <glog/logging.h>
 

@@ -6,10 +6,10 @@
 #include <string>
 #include <vector>
 
-#include "embtable/share_object/index_object.h"
-#include "embtable/share_object/share_map_meta.h"
-#include "embtable/share_object/vector_object.h"
-#include "embtable/types.h"
+#include "share_object/index_object.h"
+#include "share_object/share_map_meta.h"
+#include "share_object/vector_object.h"
+#include "emb_types.h"
 #include "real_client.h"
 
 namespace embtable {

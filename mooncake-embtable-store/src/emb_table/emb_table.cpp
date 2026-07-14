@@ -1,4 +1,4 @@
-#include "embtable/emb_table/emb_table.h"
+#include "emb_table/emb_table.h"
 
 #include <glog/logging.h>
 #include <xxhash.h>

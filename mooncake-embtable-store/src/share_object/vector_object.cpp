@@ -1,4 +1,4 @@
-#include "embtable/share_object/vector_object.h"
+#include "share_object/vector_object.h"
 
 #include <glog/logging.h>
 

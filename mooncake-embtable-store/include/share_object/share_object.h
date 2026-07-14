@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "embtable/types.h"
+#include "emb_types.h"
 #include "real_client.h"
 
 namespace embtable {

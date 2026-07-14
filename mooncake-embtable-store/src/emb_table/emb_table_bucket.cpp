@@ -1,4 +1,4 @@
-#include "embtable/emb_table/emb_table_bucket.h"
+#include "emb_table/emb_table_bucket.h"
 
 #include <glog/logging.h>
 

@@ -1,4 +1,4 @@
-#include "embtable/share_object/share_map_meta.h"
+#include "share_object/share_map_meta.h"
 
 #include <glog/logging.h>
 #include "ylt/struct_json/json_reader.h"

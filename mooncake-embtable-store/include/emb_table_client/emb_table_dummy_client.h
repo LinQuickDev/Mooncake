@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "embtable/emb_table_client/emb_table_client.h"
-#include "embtable/types.h"
+#include "emb_table_client/emb_table_client.h"
+#include "emb_types.h"
 
 namespace embtable {
 

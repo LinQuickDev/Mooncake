@@ -8,6 +8,8 @@ project(mooncake_embtable_store VERSION 0.1.0 LANGUAGES CXX)
 
 # ---- Third-party: boomphf (BBHash) for perfect hashing (design doc 8.3) ----
 include(FetchContent)
+# Disconnect from network after initial fetch so builds work offline.
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     boomphf
     GIT_REPOSITORY https://github.com/rizkg/BBHash.git

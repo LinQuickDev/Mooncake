@@ -1,4 +1,4 @@
-#include "embtable/emb_table/emb_table_meta.h"
+#include "emb_table/emb_table_meta.h"
 
 #include <glog/logging.h>
 #include "ylt/struct_json/json_reader.h"

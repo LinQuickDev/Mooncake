@@ -4,7 +4,7 @@
 #include <cstring>
 #include <string_view>
 
-#include "embtable/types.h"
+#include "emb_types.h"
 
 namespace embtable {
 

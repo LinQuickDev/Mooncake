@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "embtable/share_object/share_object.h"
-#include "embtable/types.h"
+#include "share_object/share_object.h"
+#include "emb_types.h"
 #include "real_client.h"
 
 namespace embtable {

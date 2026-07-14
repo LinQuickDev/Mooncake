@@ -1,4 +1,4 @@
-#include "embtable/share_object/index_object.h"
+#include "share_object/index_object.h"
 
 #include <climits>
 #include <glog/logging.h>
