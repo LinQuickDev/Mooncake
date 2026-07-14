@@ -126,7 +126,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/extern/ubdiag/CMakeLists.txt")
       $<INSTALL_INTERFACE:include>)
 
     foreach(_MOONCAKE_UBDIAG_LIB_TARGET
-            ubdiag_manager_lib ubdiag_runtime_lib ubdiag_bpf_loader)
+            ubdiag_logger ubdiag_manager_lib ubdiag_runtime_lib ubdiag_bpf_loader)
       if(TARGET ${_MOONCAKE_UBDIAG_LIB_TARGET})
         target_include_directories(${_MOONCAKE_UBDIAG_LIB_TARGET} PUBLIC
           $<BUILD_INTERFACE:${_MOONCAKE_UBDIAG_SOURCE_DIR}/include>
