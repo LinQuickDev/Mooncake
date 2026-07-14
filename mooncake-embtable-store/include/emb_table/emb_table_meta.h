@@ -33,8 +33,13 @@ struct BucketInfo {
     uint64_t capacity = 0;
     uint64_t currentSize = 0;
     std::string tableKey;
+    // RPC endpoint ("host:port") of the ShareMapStore service that owns this
+    // bucket. Set when the bucket is created; other nodes use it to locate
+    // the remote ShareMapStore service for RPC calls.
+    std::string rpcEndpoint;
 };
-YLT_REFL(BucketInfo, bucketKey, valueSize, capacity, currentSize, tableKey);
+YLT_REFL(BucketInfo, bucketKey, valueSize, capacity, currentSize, tableKey,
+         rpcEndpoint);
 
 struct ReplicaInfo {
     std::string nodeId;
@@ -58,6 +63,13 @@ class EmbTableMeta {
 
     // Update an existing TableMetaInfo (e.g. after adding buckets).
     Status UpdateTableMeta(const TableMetaInfo& meta);
+
+    // Store BucketInfo in Mooncake Store under bucketKey + "_bucketmeta".
+    // Other nodes query this to find the rpcEndpoint of the owning node.
+    Status CreateBucketMeta(const BucketInfo& info);
+
+    // Query BucketInfo from Mooncake Store.
+    Status QueryBucketMeta(const std::string& bucketKey, BucketInfo& info);
 
     const TableMetaInfo& GetLocalMeta() const { return metaInfo_; }
 

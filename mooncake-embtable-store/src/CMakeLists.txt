@@ -37,9 +37,13 @@ target_link_libraries(embtable_share_object PUBLIC mooncake_store glog::glog)
 # ---- ShareMapStore layer (depends on ShareObject) ----
 add_library(embtable_share_map_store OBJECT
     share_map_store/share_map_store.cpp
+    share_map_store/share_map_store_rpc_service.cpp
+    share_map_store/share_map_store_client.cpp
 )
 target_include_directories(embtable_share_map_store PUBLIC
     ${EMBTABLE_INCLUDE_DIR}
+    ${MOONCAKE_STORE_INCLUDE_DIRS}
+    ${MOONCAKE_TE_INCLUDE_DIR}
 )
 target_link_libraries(embtable_share_map_store PUBLIC embtable_share_object)
 
@@ -51,6 +55,8 @@ add_library(embtable_emb_table OBJECT
 )
 target_include_directories(embtable_emb_table PUBLIC
     ${EMBTABLE_INCLUDE_DIR}
+    ${MOONCAKE_STORE_INCLUDE_DIRS}
+    ${MOONCAKE_TE_INCLUDE_DIR}
 )
 target_link_libraries(embtable_emb_table PUBLIC embtable_share_map_store)
 
@@ -61,6 +67,8 @@ add_library(embtable_emb_table_client OBJECT
 )
 target_include_directories(embtable_emb_table_client PUBLIC
     ${EMBTABLE_INCLUDE_DIR}
+    ${MOONCAKE_STORE_INCLUDE_DIRS}
+    ${MOONCAKE_TE_INCLUDE_DIR}
 )
 target_link_libraries(embtable_emb_table_client PUBLIC
     embtable_emb_table embtable_share_map_store)

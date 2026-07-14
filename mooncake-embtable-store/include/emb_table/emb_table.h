@@ -8,20 +8,35 @@
 #include "emb_table/emb_table_bucket.h"
 #include "emb_table/emb_table_meta.h"
 #include "share_map_store/share_map_store.h"
+#include "share_map_store/share_map_store_client.h"
 #include "emb_types.h"
 #include "real_client.h"
+#include "client_buffer.hpp"
 
 namespace embtable {
 
 // EmbTable is the logical embedding table (design doc 4.1). It shards data
 // across numBuckets_ buckets by hashing the key, and delegates each bucket's
 // storage to ShareMapStore.
+//
+// Find routing (design doc 4.3):
+//   1. Hash each key to determine its target bucket.
+//   2. Group (bucket, key) pairs by the owning node (resolved via bucket
+//      meta / Mooncake Client Query).
+//   3. For local buckets, call ShareMapStore::QueryData directly.
+//   4. For remote buckets, call ShareMapStoreClient::QueryData via RPC; the
+//      remote service packs results into a temp Mooncake Store object, which
+//      the client reads via TE read (get_buffer) — i.e. TE write on the
+//      server side delivers the buffer to the client's EmbTable Find buffer.
+//   5. Merge results back into the caller's output vector (same key order).
 class EmbTable {
    public:
     EmbTable(const std::string& tableName, uint32_t numBuckets,
              uint64_t valueSize,
              std::shared_ptr<ShareMapStore> shareMapStore,
-             std::shared_ptr<mooncake::RealClient> realClient);
+             std::shared_ptr<mooncake::RealClient> realClient,
+             std::shared_ptr<ShareMapStoreClient> shareMapStoreClient = nullptr,
+             const std::string& localHostname = "");
 
     // Initialize EmbTableMeta (create or query) and pre-create buckets.
     Status Init(bool createNew);
@@ -33,6 +48,13 @@ class EmbTable {
 
     // Batch find across all buckets. Values are returned in the same order
     // as keys; missing keys yield empty StringViews.
+    // bufferHandles (optional) keeps backing memory for remote results alive.
+    Status Find(const std::vector<uint64_t>& keys,
+                std::vector<StringView>& buffers,
+                std::vector<std::shared_ptr<mooncake::BufferHandle>>&
+                    bufferHandles);
+
+    // Convenience overload (discards bufferHandles after call).
     Status Find(const std::vector<uint64_t>& keys,
                 std::vector<StringView>& buffers);
 
@@ -61,6 +83,8 @@ class EmbTable {
     uint64_t valueSize_;
     std::shared_ptr<ShareMapStore> shareMapStore_;
     std::shared_ptr<mooncake::RealClient> realClient_;
+    std::shared_ptr<ShareMapStoreClient> shareMapStoreClient_;
+    std::string localHostname_;
     std::shared_ptr<EmbTableMeta> meta_;
     std::vector<std::shared_ptr<Bucket>> buckets_;
 };

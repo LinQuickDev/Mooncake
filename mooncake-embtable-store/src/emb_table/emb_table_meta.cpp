@@ -12,6 +12,10 @@ constexpr size_t kMetaObjectSize = 1ull * 1024 * 1024;  // 1 MiB
 std::string metaKey(const std::string& tableKey) {
     return tableKey + "_tablemeta";
 }
+
+std::string bucketMetaKey(const std::string& bucketKey) {
+    return bucketKey + "_bucketmeta";
+}
 }  // namespace
 
 EmbTableMeta::EmbTableMeta(std::shared_ptr<mooncake::RealClient> realClient)
@@ -65,6 +69,37 @@ Status EmbTableMeta::UpdateTableMeta(const TableMetaInfo& meta) {
                              "put_from (update) failed for table meta: " + meta.tableKey);
     }
     metaInfo_ = meta;
+    return Status::OK();
+}
+
+Status EmbTableMeta::CreateBucketMeta(const BucketInfo& info) {
+    if (info.bucketKey.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "empty bucketKey");
+    }
+    std::string json;
+    struct_json::to_json(info, json);
+    int ret = realClient_->put_from(bucketMetaKey(info.bucketKey), json.data(),
+                                    json.size());
+    if (ret != 0) {
+        return Status::Error(ErrorCode::kIOError,
+                             "put_from failed for bucket meta: " + info.bucketKey);
+    }
+    return Status::OK();
+}
+
+Status EmbTableMeta::QueryBucketMeta(const std::string& bucketKey,
+                                     BucketInfo& info) {
+    if (bucketKey.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "empty bucketKey");
+    }
+    std::string buf(kMetaObjectSize, '\0');
+    int ret =
+        realClient_->get_into(bucketMetaKey(bucketKey), buf.data(), buf.size());
+    if (ret != 0) {
+        return Status::Error(ErrorCode::kNotFound,
+                             "bucket meta not found: " + bucketKey);
+    }
+    struct_json::from_json(info, buf);
     return Status::OK();
 }
 

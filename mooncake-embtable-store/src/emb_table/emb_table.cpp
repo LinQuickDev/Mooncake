@@ -3,6 +3,8 @@
 #include <glog/logging.h>
 #include <xxhash.h>
 
+#include <algorithm>
+#include <fstream>
 #include <unordered_map>
 
 namespace embtable {
@@ -10,12 +12,16 @@ namespace embtable {
 EmbTable::EmbTable(const std::string& tableName, uint32_t numBuckets,
                    uint64_t valueSize,
                    std::shared_ptr<ShareMapStore> shareMapStore,
-                   std::shared_ptr<mooncake::RealClient> realClient)
+                   std::shared_ptr<mooncake::RealClient> realClient,
+                   std::shared_ptr<ShareMapStoreClient> shareMapStoreClient,
+                   const std::string& localHostname)
     : tableName_(tableName),
       numBuckets_(numBuckets > 0 ? numBuckets : 1),
       valueSize_(valueSize),
       shareMapStore_(std::move(shareMapStore)),
       realClient_(std::move(realClient)),
+      shareMapStoreClient_(std::move(shareMapStoreClient)),
+      localHostname_(localHostname),
       meta_(std::make_shared<EmbTableMeta>(realClient_)) {
     buckets_.reserve(numBuckets_);
 }
@@ -45,6 +51,9 @@ Status EmbTable::Init(bool createNew) {
     if (!s.IsOk()) return s;
 
     // Pre-create bucket objects (local handles; ShareMap created lazily).
+    // For newly created tables, register bucket meta in Mooncake Store so
+    // other nodes can locate the owning node via IsBucketLocal (design doc
+    // 4.3 — bucket meta replica carries the owner's transport endpoint).
     for (uint32_t i = 0; i < numBuckets_; ++i) {
         BucketInfo bi;
         bi.tableKey = info.tableKey;
@@ -52,8 +61,17 @@ Status EmbTable::Init(bool createNew) {
         bi.valueSize = valueSize_;
         bi.capacity = info.bucketCapacity;
         bi.currentSize = 0;
-        buckets_.push_back(std::make_shared<Bucket>(bi, shareMapStore_,
-                                                     realClient_));
+        // rpcEndpoint intentionally left empty; resolved lazily by Bucket.
+        buckets_.push_back(std::make_shared<Bucket>(
+            bi, shareMapStore_, realClient_, shareMapStoreClient_,
+            localHostname_));
+        if (createNew) {
+            auto bs = meta_->CreateBucketMeta(bi);
+            if (!bs.IsOk()) {
+                LOG(WARNING) << "CreateBucketMeta failed for " << bi.bucketKey
+                             << ": " << bs.msg();
+            }
+        }
     }
     return Status::OK();
 }
@@ -64,7 +82,7 @@ Status EmbTable::Insert(const std::vector<uint64_t>& keys,
         return Status::Error(ErrorCode::kInvalidArgument,
                              "keys/values size mismatch");
     }
-    // Group by bucket index for batched flush.
+    // Group by bucket index for batched inserts.
     std::unordered_map<uint32_t,
                        std::pair<std::vector<uint64_t>, std::vector<StringView>>>
         grouped;
@@ -74,40 +92,177 @@ Status EmbTable::Insert(const std::vector<uint64_t>& keys,
         entry.first.push_back(keys[i]);
         entry.second.push_back(values[i]);
     }
+    // Insert into each touched bucket's local buffer; flush only the buckets
+    // whose buffer reached the capacity threshold (design doc 4.1.4).
     for (auto& [bidx, kv] : grouped) {
-        auto s = buckets_[bidx]->Insert(kv.first, kv.second);
+        bool wouldFlush = false;
+        auto s = buckets_[bidx]->Insert(kv.first, kv.second, wouldFlush);
         if (!s.IsOk()) return s;
-    }
-    // Flush each touched bucket.
-    for (auto& [bidx, kv] : grouped) {
-        auto s = buckets_[bidx]->Flush();
-        if (!s.IsOk()) return s;
+        if (wouldFlush) {
+            s = buckets_[bidx]->Flush();
+            if (!s.IsOk()) return s;
+        }
     }
     return Status::OK();
 }
 
 Status EmbTable::Find(const std::vector<uint64_t>& keys,
-                      std::vector<StringView>& buffers) {
+                      std::vector<StringView>& buffers,
+                      std::vector<std::shared_ptr<mooncake::BufferHandle>>&
+                          bufferHandles) {
     buffers.clear();
     buffers.resize(keys.size());
-    // Group by bucket for batched queries.
+    bufferHandles.clear();
+    if (keys.empty()) return Status::OK();
+
+    // Step 1: Group keys by target bucket index.
     std::unordered_map<uint32_t, std::vector<size_t>> indexGroups;
     for (size_t i = 0; i < keys.size(); ++i) {
         uint32_t bidx = RouteToBucket(keys[i]);
         indexGroups[bidx].push_back(i);
     }
+
+    // Step 2: For each bucket, resolve locality (local vs. remote node).
+    // Group remote buckets by rpcEndpoint so we can batch RPC calls to the
+    // same remote node (design doc 4.3 — aggregate by compute node).
+    //
+    // Structure: rpcEndpoint -> list of (bucketIdx, indices, bucketKeys)
+    struct RemoteBucketTask {
+        uint32_t bucketIdx;
+        std::vector<size_t> indices;
+        std::vector<uint64_t> keys;
+    };
+    std::unordered_map<std::string, std::vector<RemoteBucketTask>>
+        remoteGroups;
+    // Local tasks: bucketIdx -> (indices, keys)
+    std::vector<std::pair<uint32_t, std::vector<size_t>>> localTasks;
+    std::unordered_map<uint32_t, std::vector<uint64_t>> localKeys;
+
     for (auto& [bidx, indices] : indexGroups) {
-        std::vector<uint64_t> bucketKeys;
-        bucketKeys.reserve(indices.size());
-        for (auto idx : indices) bucketKeys.push_back(keys[idx]);
-        std::vector<StringView> bucketVals;
-        auto s = buckets_[bidx]->Find(bucketKeys, bucketVals);
-        if (!s.IsOk()) return s;
-        for (size_t j = 0; j < indices.size(); ++j) {
-            buffers[indices[j]] = bucketVals[j];
+        // Force locality resolution on the bucket.
+        auto& bucket = buckets_[bidx];
+        auto s = bucket->Flush();  // ensure pending data is flushed first
+        if (!s.IsOk()) {
+            LOG(WARNING) << "Flush before Find failed for bucket "
+                         << bucket->BucketKey() << ": " << s.msg();
+        }
+
+        // Determine locality by checking bucket meta via ShareMapStoreClient.
+        // Bucket::resolveLocality is called inside Bucket::Find, but we need
+        // to know locality here to group remote buckets. We replicate the
+        // check by calling IsBucketLocal if a ShareMapStoreClient exists.
+        bool isLocal = true;
+        std::string endpoint;
+        if (shareMapStoreClient_) {
+            std::string ownerHost;
+            isLocal = shareMapStoreClient_->IsBucketLocal(bucket->BucketKey(),
+                                                          ownerHost);
+            if (!isLocal && !ownerHost.empty()) {
+                endpoint = ownerHost + ":50055";
+            }
+        }
+
+        std::vector<uint64_t> bkeys;
+        bkeys.reserve(indices.size());
+        for (auto idx : indices) bkeys.push_back(keys[idx]);
+
+        if (isLocal || endpoint.empty()) {
+            localTasks.emplace_back(bidx, indices);
+            localKeys[bidx] = std::move(bkeys);
+        } else {
+            remoteGroups[endpoint].push_back(
+                RemoteBucketTask{bidx, indices, std::move(bkeys)});
         }
     }
+
+    // Step 3: Execute local queries (direct ShareMapStore::QueryData).
+    for (auto& [bidx, indices] : localTasks) {
+        std::vector<StringView> bucketVals;
+        std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
+        auto s = buckets_[bidx]->Find(localKeys[bidx], bucketVals, tmpHandles);
+        if (!s.IsOk()) {
+            LOG(WARNING) << "Local Find failed for bucket "
+                         << buckets_[bidx]->BucketKey() << ": " << s.msg();
+            continue;
+        }
+        for (size_t j = 0; j < indices.size() && j < bucketVals.size(); ++j) {
+            buffers[indices[j]] = bucketVals[j];
+        }
+        // Keep handles alive (though local queries usually don't need them).
+        bufferHandles.insert(bufferHandles.end(),
+                             std::make_move_iterator(tmpHandles.begin()),
+                             std::make_move_iterator(tmpHandles.end()));
+    }
+
+    // Step 4: Execute remote queries grouped by endpoint (node aggregation).
+    // For each remote node, batch-query all buckets on that node in one RPC
+    // call (ShareMapStoreClient::BatchQueryData). The remote service packs
+    // results into temp Mooncake Store objects (TE write), and we read them
+    // back via get_buffer (TE read) — the data lands in our Find buffer.
+    for (auto& [endpoint, tasks] : remoteGroups) {
+        if (!shareMapStoreClient_) continue;
+
+        if (tasks.size() == 1) {
+            // Single bucket on this node — use simple QueryData.
+            auto& task = tasks[0];
+            std::vector<StringView> bucketVals;
+            std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
+            auto s = shareMapStoreClient_->QueryData(
+                endpoint, buckets_[task.bucketIdx]->BucketKey(), valueSize_,
+                task.keys, bucketVals, tmpHandles);
+            if (!s.IsOk()) {
+                LOG(WARNING) << "Remote QueryData failed for endpoint "
+                             << endpoint << ": " << s.msg();
+                continue;
+            }
+            for (size_t j = 0; j < task.indices.size() && j < bucketVals.size();
+                 ++j) {
+                buffers[task.indices[j]] = bucketVals[j];
+            }
+            bufferHandles.insert(bufferHandles.end(),
+                                 std::make_move_iterator(tmpHandles.begin()),
+                                 std::make_move_iterator(tmpHandles.end()));
+        } else {
+            // Multiple buckets on the same node — batch query.
+            std::vector<std::string> bucketKeys;
+            std::vector<std::vector<uint64_t>> keysPerBucket;
+            for (auto& task : tasks) {
+                bucketKeys.push_back(buckets_[task.bucketIdx]->BucketKey());
+                keysPerBucket.push_back(task.keys);
+            }
+            std::vector<std::vector<StringView>> buffersPerBucket;
+            std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
+            auto s = shareMapStoreClient_->BatchQueryData(
+                endpoint, bucketKeys, valueSize_, keysPerBucket,
+                buffersPerBucket, tmpHandles);
+            if (!s.IsOk()) {
+                LOG(WARNING) << "Remote BatchQueryData failed for endpoint "
+                             << endpoint << ": " << s.msg();
+                continue;
+            }
+            for (size_t t = 0; t < tasks.size() && t < buffersPerBucket.size();
+                 ++t) {
+                auto& task = tasks[t];
+                auto& bucketVals = buffersPerBucket[t];
+                for (size_t j = 0; j < task.indices.size() &&
+                                    j < bucketVals.size();
+                     ++j) {
+                    buffers[task.indices[j]] = bucketVals[j];
+                }
+            }
+            bufferHandles.insert(bufferHandles.end(),
+                                 std::make_move_iterator(tmpHandles.begin()),
+                                 std::make_move_iterator(tmpHandles.end()));
+        }
+    }
+
     return Status::OK();
+}
+
+Status EmbTable::Find(const std::vector<uint64_t>& keys,
+                      std::vector<StringView>& buffers) {
+    std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
+    return Find(keys, buffers, handles);
 }
 
 Status EmbTable::BuildIndex() {
@@ -121,8 +276,80 @@ Status EmbTable::BuildIndex() {
 Status EmbTable::Load(const std::vector<std::string>& keyFiles,
                       const std::vector<std::string>& valueFiles,
                       const std::string& format) {
-    return Status::Error(ErrorCode::kNotSupported,
-                         "EmbTable::Load not implemented yet");
+    if (keyFiles.size() != valueFiles.size()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "keyFiles/valueFiles size mismatch");
+    }
+    if (format != "binary" && format != "text") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unsupported format: " + format +
+                                 " (only 'binary' or 'text')");
+    }
+
+    const uint64_t valueSize = valueSize_;
+    const size_t batchSize = 1024;  // keys per Insert batch
+
+    for (size_t fi = 0; fi < keyFiles.size(); ++fi) {
+        // Read key file: binary file of uint64_t keys.
+        std::ifstream kf(keyFiles[fi], std::ios::binary);
+        if (!kf.is_open()) {
+            return Status::Error(ErrorCode::kIOError,
+                                 "cannot open key file: " + keyFiles[fi]);
+        }
+        std::vector<uint64_t> keys;
+        kf.seekg(0, std::ios::end);
+        auto sz = kf.tellg();
+        kf.seekg(0, std::ios::beg);
+        if (sz % sizeof(uint64_t) != 0) {
+            return Status::Error(
+                ErrorCode::kInvalidArgument,
+                "key file size not multiple of sizeof(uint64_t): " +
+                    keyFiles[fi]);
+        }
+        keys.resize(sz / sizeof(uint64_t));
+        kf.read(reinterpret_cast<char*>(keys.data()), sz);
+        kf.close();
+
+        // Read value file: binary file of valueSize-byte values.
+        std::ifstream vf(valueFiles[fi], std::ios::binary);
+        if (!vf.is_open()) {
+            return Status::Error(ErrorCode::kIOError,
+                                 "cannot open value file: " + valueFiles[fi]);
+        }
+        vf.seekg(0, std::ios::end);
+        auto vsz = vf.tellg();
+        vf.seekg(0, std::ios::beg);
+        if (vsz != static_cast<std::streamoff>(keys.size() * valueSize)) {
+            return Status::Error(
+                ErrorCode::kInvalidArgument,
+                "value file size mismatch with key count: " + valueFiles[fi]);
+        }
+        std::string valuesData(vsz, '\0');
+        vf.read(&valuesData[0], vsz);
+        vf.close();
+
+        // Insert in batches.
+        for (size_t start = 0; start < keys.size(); start += batchSize) {
+            size_t end = std::min(start + batchSize, keys.size());
+            std::vector<uint64_t> batchKeys(keys.begin() + start,
+                                            keys.begin() + end);
+            std::vector<StringView> batchVals;
+            batchVals.reserve(end - start);
+            for (size_t i = 0; i < batchKeys.size(); ++i) {
+                const char* p = valuesData.data() + (start + i) * valueSize;
+                batchVals.emplace_back(p, valueSize);
+            }
+            auto s = Insert(batchKeys, batchVals);
+            if (!s.IsOk()) return s;
+        }
+    }
+
+    // Flush all buckets after loading is complete.
+    for (auto& bucket : buckets_) {
+        auto s = bucket->Flush();
+        if (!s.IsOk()) return s;
+    }
+    return Status::OK();
 }
 
 Status EmbTable::Delete(const std::vector<uint64_t>& keys) {

@@ -71,6 +71,39 @@ class ShareMapStore {
     // Access an existing ShareMap (nullptr if absent).
     std::shared_ptr<ShareMap> GetShareMap(const std::string& bucketKey);
 
+    // Query data and write the packed result buffer to a temporary Mooncake
+    // Store object. Used by the RPC service so remote callers can fetch the
+    // packed buffer via TE read (get_buffer). The result buffer layout is:
+    //   for each key: [1-byte found flag][valueSize bytes data]
+    // resultObjectSize is set to keys.size() * (1 + valueSize).
+    Status QueryDataToStore(const std::string& bucketKey,
+                            const std::vector<uint64_t>& keys,
+                            uint64_t valueSize,
+                            std::string& resultObjectKey,
+                            uint64_t& resultObjectSize,
+                            std::vector<int8_t>& foundFlags);
+
+    // Batch query: query multiple buckets on this node, pack all results
+    // into ONE aggregated buffer, and write it to a single temporary Mooncake
+    // Store object (one TE write). Layout:
+    //   [bucketCount(8B)]
+    //   for each bucket: [bucketKeyLen(4B)][bucketKey][keyCount(8B)]
+    //                    for each key: [1B found flag][valueSize bytes data]
+    // Each entry in resultObjectKeys/foundFlagsPerBucket is also filled so
+    // the client knows how to parse the per-bucket segments.
+    Status BatchQueryDataToStore(
+        const std::vector<std::string>& bucketKeys,
+        const std::vector<std::vector<uint64_t>>& keysPerBucket,
+        uint64_t valueSize,
+        std::vector<std::string>& resultObjectKeys,
+        std::vector<uint64_t>& resultObjectSizes,
+        std::vector<std::vector<int8_t>>& foundFlagsPerBucket);
+
+    // Expose the underlying Mooncake client (used by RPC service and Bucket).
+    std::shared_ptr<mooncake::RealClient> GetClient() const {
+        return realClient_;
+    }
+
     const DeploymentConfig& Config() const { return config_; }
     bool IsInitialized() const { return initialized_; }
 
