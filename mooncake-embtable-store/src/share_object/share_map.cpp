@@ -1,6 +1,11 @@
 #include "share_object/share_map.h"
 
 #include <glog/logging.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <thread>
 #include <unordered_map>
 
 namespace embtable {
@@ -92,22 +97,58 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
         return linearLookup(keys, buffers);
     }
     buffers.clear();
-    buffers.reserve(keys.size());
-    for (auto k : keys) {
+    buffers.resize(keys.size());
+
+    // PHF lookup with key verification (design doc 4.3 — guard against PHF
+    // false positives). For each key:
+    //   1. PHF -> vecIndex
+    //   2. Read key at vecIndex from keyVec and memcmp against query key
+    //   3. Only if matched, read value at vecIndex from valueVec
+    static constexpr size_t kParallelThreshold = 128;
+    static constexpr size_t kParallelism = 4;
+
+    auto lookupOne = [&](size_t i) {
         uint64_t idx = 0;
-        auto s = indexObj_->Lookup(k, idx);
+        auto s = indexObj_->Lookup(keys[i], idx);
         if (!s.IsOk()) {
-            buffers.emplace_back();
-            continue;
+            return;  // buffers[i] already default-constructed (empty)
+        }
+        // Verify the key at idx matches (PHF false-positive guard).
+        StringView storedKey;
+        s = keyVec_->Get(idx, storedKey);
+        if (!s.IsOk() || storedKey.size() != sizeof(uint64_t) ||
+            std::memcmp(storedKey.data(), &keys[i], sizeof(uint64_t)) != 0) {
+            // PHF returned a wrong slot — treat as not found.
+            return;
         }
         StringView v;
         s = valueVec_->Get(idx, v);
-        if (!s.IsOk()) {
-            buffers.emplace_back();
-        } else {
-            buffers.push_back(v);
+        if (s.IsOk()) {
+            buffers[i] = v;
         }
+    };
+
+    if (keys.size() <= kParallelThreshold) {
+        for (size_t i = 0; i < keys.size(); ++i) lookupOne(i);
+        return Status::OK();
     }
+
+    // Parallel lookup for large batches: partition keys into contiguous
+    // chunks so each worker writes to a disjoint range of `buffers` (no
+    // concurrent writes to the same slot).
+    size_t total = keys.size();
+    size_t chunk = (total + kParallelism - 1) / kParallelism;
+    std::vector<std::thread> workers;
+    workers.reserve(kParallelism);
+    for (size_t w = 0; w < kParallelism; ++w) {
+        size_t start = w * chunk;
+        size_t end = std::min(start + chunk, total);
+        if (start >= end) break;
+        workers.emplace_back([&, start, end]() {
+            for (size_t i = start; i < end; ++i) lookupOne(i);
+        });
+    }
+    for (auto& t : workers) t.join();
     return Status::OK();
 }
 
@@ -154,17 +195,29 @@ Status ShareMap::Import() {
     auto s = meta_->Deserialize();
     if (!s.IsOk()) return s;
     valueSize_ = meta_->GetValueSize();
-    // Reconstruct key/value/index from Mooncake Store.
-    // Note: VectorObject currently does not expose Import; for cross-node
-    // reads the PHF index and value-vector are the primary path. We import
-    // the index here so Lookup works; key/vector Import is a future
-    // enhancement tracked separately.
+    uint64_t total = meta_->GetTotalSize();
+
+    // Reconstruct key/value/index from Mooncake Store. Each VectorObject
+    // imports all its backing segments so that Get() works locally after
+    // this returns (design doc 4.3 — cross-node local Lookup).
+    s = keyVec_->ImportAll(total);
+    if (!s.IsOk()) {
+        LOG(ERROR) << "Import keyVec failed for " << bucketKey_ << ": "
+                   << s.msg();
+        return s;
+    }
+    s = valueVec_->ImportAll(total);
+    if (!s.IsOk()) {
+        LOG(ERROR) << "Import valueVec failed for " << bucketKey_ << ": "
+                   << s.msg();
+        return s;
+    }
     s = indexObj_->Import();
     if (!s.IsOk()) {
         LOG(WARNING) << "IndexObject Import failed: " << s.msg()
-                     << " (linear scan fallback will be unavailable)";
+                     << " (PHF lookup unavailable, will use linear scan)";
     }
-    size_.store(meta_->GetTotalSize(), std::memory_order_release);
+    size_.store(total, std::memory_order_release);
     published_.store(true, std::memory_order_release);
     return Status::OK();
 }

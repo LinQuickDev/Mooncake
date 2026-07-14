@@ -47,6 +47,12 @@ class VectorObject {
     // Publish all backing ShareObjects to Mooncake Store.
     Status PublishAll();
 
+    // Import all backing ShareObjects from Mooncake Store into local buffers.
+    // Used by cross-node reconstruction: allocates `dataNum` elements worth of
+    // ShareObjects (matching the publisher's layout) and pulls each segment
+    // via ShareObject::Import(). After this returns, Get() works locally.
+    Status ImportAll(uint64_t dataNum);
+
    private:
     size_t CalculateShareObjectNum(uint64_t capacity) const;
     std::string GetShareObjectName(size_t idx) const;

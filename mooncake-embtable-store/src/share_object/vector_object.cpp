@@ -137,4 +137,40 @@ Status VectorObject::PublishAll() {
     return Status::OK();
 }
 
+Status VectorObject::ImportAll(uint64_t dataNum) {
+    std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (dataNum == 0) {
+        shareObjects_.clear();
+        capacity_ = 0;
+        size_.store(0, std::memory_order_release);
+        return Status::OK();
+    }
+    size_t neededObjs = CalculateShareObjectNum(dataNum);
+    // Allocate exactly the same number of ShareObjects as the publisher did,
+    // each with the same fixed size, then Import each segment.
+    shareObjects_.clear();
+    shareObjects_.reserve(neededObjs);
+    for (size_t i = 0; i < neededObjs; ++i) {
+        auto obj = std::make_unique<ShareObject>(GetShareObjectName(i),
+                                                 shareObjectSize_, realClient_);
+        auto s = obj->Create();  // allocate local buffer
+        if (!s.IsOk()) {
+            return Status::Error(ErrorCode::kInternal,
+                                 "Create ShareObject failed: " + s.msg());
+        }
+        s = obj->Import();  // pull from Mooncake Store
+        if (!s.IsOk()) {
+            LOG(ERROR) << "ImportAll failed for " << obj->Key() << ": "
+                       << s.msg();
+            return s;
+        }
+        shareObjects_.push_back(std::move(obj));
+    }
+    uint64_t elemsPerObj = shareObjectSize_ / elemSize_;
+    if (elemsPerObj == 0) elemsPerObj = 1;
+    capacity_ = shareObjects_.size() * elemsPerObj;
+    size_.store(dataNum, std::memory_order_release);
+    return Status::OK();
+}
+
 }  // namespace embtable
