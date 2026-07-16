@@ -23,6 +23,9 @@ struct DeploymentConfig {
     // RPC service port for EmbTableClient to reach this ShareMapStore.
     // 0 disables the RPC server (local-only mode).
     uint16_t rpcPort = 0;
+    // Registered staging buffer used by the ShareMapStore RPC service for
+    // direct Transfer Engine writes to remote EmbTable clients.
+    uint64_t transferBufferSize = 64ull * 1024 * 1024;
     // Default per-bucket ShareObject size (design doc 8.2).
     uint64_t shareObjectSize = 64ull * 1024 * 1024;
 };
@@ -71,32 +74,33 @@ class ShareMapStore {
     // Access an existing ShareMap (nullptr if absent).
     std::shared_ptr<ShareMap> GetShareMap(const std::string& bucketKey);
 
-    // Query data and write the packed result buffer to a temporary Mooncake
-    // Store object. Used by the RPC service so remote callers can fetch the
-    // packed buffer via TE read (get_buffer). The result buffer layout is:
+    // Query data, pack it in the service's registered transfer buffer, and
+    // write it directly to a registered remote client buffer through TE.
+    // The result buffer layout is:
     //   for each key: [1-byte found flag][valueSize bytes data]
-    // resultObjectSize is set to keys.size() * (1 + valueSize).
-    Status QueryDataToStore(const std::string& bucketKey,
-                            const std::vector<uint64_t>& keys,
-                            uint64_t valueSize,
-                            std::string& resultObjectKey,
-                            uint64_t& resultObjectSize,
-                            std::vector<int8_t>& foundFlags);
+    Status QueryDataToBuffer(const std::string& bucketKey,
+                             const std::vector<uint64_t>& keys,
+                             uint64_t valueSize,
+                             const std::string& targetEndpoint,
+                             uint64_t targetAddress,
+                             uint64_t targetCapacity,
+                             uint64_t& transferredSize,
+                             std::vector<int8_t>& foundFlags);
 
     // Batch query: query multiple buckets on this node, pack all results
-    // into ONE aggregated buffer, and write it to a single temporary Mooncake
-    // Store object (one TE write). Layout:
+    // into ONE aggregated buffer, and write it directly to the client's
+    // registered buffer with one TE transfer. Layout:
     //   [bucketCount(8B)]
     //   for each bucket: [bucketKeyLen(4B)][bucketKey][keyCount(8B)]
     //                    for each key: [1B found flag][valueSize bytes data]
-    // Each entry in resultObjectKeys/foundFlagsPerBucket is also filled so
-    // the client knows how to parse the per-bucket segments.
-    Status BatchQueryDataToStore(
+    Status BatchQueryDataToBuffer(
         const std::vector<std::string>& bucketKeys,
         const std::vector<std::vector<uint64_t>>& keysPerBucket,
         uint64_t valueSize,
-        std::vector<std::string>& resultObjectKeys,
-        std::vector<uint64_t>& resultObjectSizes,
+        const std::string& targetEndpoint,
+        uint64_t targetAddress,
+        uint64_t targetCapacity,
+        uint64_t& transferredSize,
         std::vector<std::vector<int8_t>>& foundFlagsPerBucket);
 
     // Expose the underlying Mooncake client (used by RPC service and Bucket).
@@ -119,6 +123,10 @@ class ShareMapStore {
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::unordered_map<std::string, std::shared_ptr<ShareMap>> shareMaps_;
     mutable std::mutex mutex_;
+    std::unique_ptr<char[]> transferBuffer_;
+    uint64_t transferBufferSize_ = 0;
+    std::mutex transferMutex_;
+    bool transferBufferRegistered_ = false;
     bool initialized_ = false;
 };
 

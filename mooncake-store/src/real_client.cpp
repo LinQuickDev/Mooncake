@@ -2573,6 +2573,23 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    // A local memory replica already contains an address valid in this
+    // process. Return a non-owning view instead of allocating a second buffer
+    // and copying the object through the Transfer Engine.
+    if (replica.is_memory_replica() &&
+        client_->IsReplicaOnLocalMemory(replica)) {
+        const auto &descriptor =
+            replica.get_memory_descriptor().buffer_descriptor;
+        if (descriptor.buffer_address_ == 0 ||
+            descriptor.size_ < total_length) {
+            LOG(ERROR) << "Invalid local memory descriptor for key: " << key;
+            return nullptr;
+        }
+        return std::make_shared<BufferHandle>(
+            reinterpret_cast<void *>(descriptor.buffer_address_),
+            total_length, []() {});
+    }
+
     // Allocate buffer
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
@@ -3047,6 +3064,38 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
 
 int RealClient::register_buffer(void *buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
+}
+
+int RealClient::register_transfer_buffer(void *buffer, size_t size) {
+    if (!client_ || buffer == nullptr || size == 0) {
+        return to_py_ret(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INVALID_PARAMS)));
+    }
+    auto result =
+        client_->RegisterLocalMemory(buffer, size, kWildcardLocation, true, true);
+    if (!result) {
+        return to_py_ret(result);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        registered_buffer_sizes_[buffer] = size;
+    }
+    return 0;
+}
+
+std::string RealClient::get_transfer_endpoint() const {
+    return client_ ? client_->GetTransportEndpoint() : std::string();
+}
+
+int RealClient::subTransferTask(void *source, size_t size,
+                                const std::string &target_endpoint,
+                                uint64_t target_address) {
+    if (!client_) {
+        return to_py_ret(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INVALID_PARAMS)));
+    }
+    return to_py_ret(client_->SubmitTransferTask(
+        source, size, target_endpoint, target_address));
 }
 
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(

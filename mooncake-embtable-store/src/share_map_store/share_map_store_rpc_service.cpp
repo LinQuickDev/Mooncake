@@ -8,9 +8,10 @@ namespace embtable {
 QueryDataResponse ShareMapStoreRpcService::HandleQueryData(
     const QueryDataRequest& req) {
     QueryDataResponse resp;
-    Status s = store_.QueryDataToStore(req.bucketKey, req.keys, req.valueSize,
-                                       resp.resultObjectKey,
-                                       resp.resultObjectSize, resp.foundFlags);
+    Status s = store_.QueryDataToBuffer(
+        req.bucketKey, req.keys, req.valueSize, req.targetEndpoint,
+        req.targetAddress, req.targetCapacity, resp.transferredSize,
+        resp.foundFlags);
     if (!s.IsOk()) {
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
@@ -23,7 +24,7 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
     BatchQueryDataResponse resp;
     if (req.entries.empty()) return resp;
 
-    // Aggregate all bucket queries into ONE buffer + ONE TE write.
+    // Aggregate all bucket queries into ONE buffer + ONE direct TE write.
     std::vector<std::string> bucketKeys;
     std::vector<std::vector<uint64_t>> keysPerBucket;
     bucketKeys.reserve(req.entries.size());
@@ -33,27 +34,25 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
         keysPerBucket.push_back(entry.keys);
     }
 
-    std::vector<std::string> resultObjectKeys;
-    std::vector<uint64_t> resultObjectSizes;
+    uint64_t transferredSize = 0;
     std::vector<std::vector<int8_t>> foundFlagsPerBucket;
-    Status s = store_.BatchQueryDataToStore(
-        bucketKeys, keysPerBucket, req.valueSize, resultObjectKeys,
-        resultObjectSizes, foundFlagsPerBucket);
+    Status s = store_.BatchQueryDataToBuffer(
+        bucketKeys, keysPerBucket, req.valueSize, req.targetEndpoint,
+        req.targetAddress, req.targetCapacity, transferredSize,
+        foundFlagsPerBucket);
     if (!s.IsOk()) {
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
         return resp;
     }
 
-    // All buckets share a single aggregated object key; the client parses
-    // segments from the buffer. We return one response per bucket so the
-    // client can map results back, but resultObjectKey is the same.
+    // Return one control response per bucket; all data already resides in the
+    // single registered client buffer.
     resp.responses.reserve(req.entries.size());
     for (size_t i = 0; i < req.entries.size(); ++i) {
         QueryDataResponse single;
-        if (i < resultObjectKeys.size()) {
-            single.resultObjectKey = resultObjectKeys[i];
-            single.resultObjectSize = resultObjectSizes[i];
+        single.transferredSize = transferredSize;
+        if (i < foundFlagsPerBucket.size()) {
             single.foundFlags = std::move(foundFlagsPerBucket[i]);
         }
         resp.responses.push_back(std::move(single));

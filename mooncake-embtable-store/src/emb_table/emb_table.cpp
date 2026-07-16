@@ -14,7 +14,8 @@ EmbTable::EmbTable(const std::string& tableName, uint32_t numBuckets,
                    std::shared_ptr<ShareMapStore> shareMapStore,
                    std::shared_ptr<mooncake::RealClient> realClient,
                    std::shared_ptr<ShareMapStoreClient> shareMapStoreClient,
-                   const std::string& localHostname)
+                   const std::string& localHostname,
+                   uint16_t shareMapStoreRpcPort)
     : tableName_(tableName),
       numBuckets_(numBuckets > 0 ? numBuckets : 1),
       valueSize_(valueSize),
@@ -22,6 +23,7 @@ EmbTable::EmbTable(const std::string& tableName, uint32_t numBuckets,
       realClient_(std::move(realClient)),
       shareMapStoreClient_(std::move(shareMapStoreClient)),
       localHostname_(localHostname),
+      shareMapStoreRpcPort_(shareMapStoreRpcPort),
       meta_(std::make_shared<EmbTableMeta>(realClient_)) {
     buckets_.reserve(numBuckets_);
 }
@@ -52,8 +54,8 @@ Status EmbTable::Init(bool createNew) {
 
     // Pre-create bucket objects (local handles; ShareMap created lazily).
     // For newly created tables, register bucket meta in Mooncake Store so
-    // other nodes can locate the owning node via IsBucketLocal (design doc
-    // 4.3 — bucket meta replica carries the owner's transport endpoint).
+    // other nodes can locate the owning node from bucket-meta replica
+    // placement (design doc 4.3).
     for (uint32_t i = 0; i < numBuckets_; ++i) {
         BucketInfo bi;
         bi.tableKey = info.tableKey;
@@ -61,10 +63,19 @@ Status EmbTable::Init(bool createNew) {
         bi.valueSize = valueSize_;
         bi.capacity = info.bucketCapacity;
         bi.currentSize = 0;
-        // rpcEndpoint intentionally left empty; resolved lazily by Bucket.
+        if (createNew && shareMapStoreRpcPort_ != 0) {
+            bi.rpcEndpoint =
+                localHostname_ + ":" + std::to_string(shareMapStoreRpcPort_);
+        } else if (!createNew) {
+            BucketInfo storedInfo;
+            auto queryStatus = meta_->QueryBucketMeta(bi.bucketKey, storedInfo);
+            if (queryStatus.IsOk()) {
+                bi = std::move(storedInfo);
+            }
+        }
         buckets_.push_back(std::make_shared<Bucket>(
             bi, shareMapStore_, realClient_, shareMapStoreClient_,
-            localHostname_));
+            localHostname_, shareMapStoreRpcPort_));
         if (createNew) {
             auto bs = meta_->CreateBucketMeta(bi);
             if (!bs.IsOk()) {
@@ -147,29 +158,28 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
                          << bucket->BucketKey() << ": " << s.msg();
         }
 
-        // Determine locality by checking bucket meta via ShareMapStoreClient.
-        // Bucket::resolveLocality is called inside Bucket::Find, but we need
-        // to know locality here to group remote buckets. We replicate the
-        // check by calling IsBucketLocal if a ShareMapStoreClient exists.
-        bool isLocal = true;
-        std::string endpoint;
-        if (shareMapStoreClient_) {
-            std::string ownerHost;
-            isLocal = shareMapStoreClient_->IsBucketLocal(bucket->BucketKey(),
-                                                          ownerHost);
-            if (!isLocal && !ownerHost.empty()) {
-                endpoint = ownerHost + ":50055";
-            }
+        // Bucket owns locality resolution so routing and endpoint construction
+        // are consistent across Find, Flush, and BuildIndex.
+        auto localityStatus = bucket->ResolveLocality();
+        if (!localityStatus.IsOk()) {
+            return localityStatus;
         }
+        bool isLocal = bucket->IsLocal();
+        std::string endpoint = bucket->RpcEndpoint();
 
         std::vector<uint64_t> bkeys;
         bkeys.reserve(indices.size());
         for (auto idx : indices) bkeys.push_back(keys[idx]);
 
-        if (isLocal || endpoint.empty()) {
+        if (isLocal) {
             localTasks.emplace_back(bidx, indices);
             localKeys[bidx] = std::move(bkeys);
         } else {
+            if (endpoint.empty()) {
+                return Status::Error(
+                    ErrorCode::kNotFound,
+                    "remote bucket endpoint is empty: " + bucket->BucketKey());
+            }
             remoteGroups[endpoint].push_back(
                 RemoteBucketTask{bidx, indices, std::move(bkeys)});
         }
@@ -261,8 +271,8 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
 
 Status EmbTable::Find(const std::vector<uint64_t>& keys,
                       std::vector<StringView>& buffers) {
-    std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
-    return Find(keys, buffers, handles);
+    lastFindBufferHandles_.clear();
+    return Find(keys, buffers, lastFindBufferHandles_);
 }
 
 Status EmbTable::BuildIndex() {

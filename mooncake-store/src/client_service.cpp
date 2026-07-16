@@ -849,6 +849,33 @@ void Client::InitTransferSubmitter() {
 #endif
 }
 
+tl::expected<void, ErrorCode> Client::SubmitTransferTask(
+    void* source, size_t size, const std::string& target_endpoint,
+    uint64_t target_address) {
+    if (!transfer_submitter_ || source == nullptr || size == 0 ||
+        target_endpoint.empty() || target_address == 0) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    AllocatedBuffer::Descriptor buffer_descriptor{
+        static_cast<uint64_t>(size), static_cast<uintptr_t>(target_address),
+        protocol_, target_endpoint};
+    Replica::Descriptor replica{
+        0, MemoryDescriptor{std::move(buffer_descriptor)},
+        ReplicaStatus::COMPLETE};
+    std::vector<Slice> slices{{source, size}};
+    auto future =
+        transfer_submitter_->submit(replica, slices, TransferRequest::WRITE);
+    if (!future.has_value()) {
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        return tl::unexpected(result);
+    }
+    return {};
+}
+
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,

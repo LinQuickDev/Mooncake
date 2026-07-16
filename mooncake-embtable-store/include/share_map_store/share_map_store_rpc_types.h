@@ -8,31 +8,31 @@
 
 namespace embtable {
 
-// Query data for a single bucket. The server queries the ShareMap, packs
-// results into a buffer, writes it to a temporary Mooncake Store object
-// (via put -> TE write), and returns the object key. The client reads it
-// via get_buffer (TE read).
+// Query data for a single bucket. The RPC carries control metadata only.
+// The service packs results in its registered transfer buffer and uses the
+// Transfer Engine to write directly into the registered client buffer.
 struct QueryDataRequest {
     std::string bucketKey;
     std::vector<uint64_t> keys;
     uint64_t valueSize = 0;
+    std::string targetEndpoint;
+    uint64_t targetAddress = 0;
+    uint64_t targetCapacity = 0;
 };
-YLT_REFL(QueryDataRequest, bucketKey, keys, valueSize);
+YLT_REFL(QueryDataRequest, bucketKey, keys, valueSize, targetEndpoint,
+         targetAddress, targetCapacity);
 
 struct QueryDataResponse {
     int32_t statusCode = 0;
     std::string errorMsg;
-    // Temporary Mooncake Store object key holding the packed result buffer.
-    std::string resultObjectKey;
-    uint64_t resultObjectSize = 0;
+    uint64_t transferredSize = 0;
     // Per-key found flags (1 = found, 0 = not found).
     std::vector<int8_t> foundFlags;
 };
-YLT_REFL(QueryDataResponse, statusCode, errorMsg, resultObjectKey,
-         resultObjectSize, foundFlags);
+YLT_REFL(QueryDataResponse, statusCode, errorMsg, transferredSize, foundFlags);
 
-// Batch query: multiple buckets on the same remote node in one RPC call.
-// Each bucket gets its own temp result object.
+// Batch query: multiple buckets on the same remote node in one control RPC
+// and one aggregated TE data transfer.
 struct BatchQueryEntry {
     std::string bucketKey;
     std::vector<uint64_t> keys;
@@ -42,8 +42,12 @@ YLT_REFL(BatchQueryEntry, bucketKey, keys);
 struct BatchQueryDataRequest {
     std::vector<BatchQueryEntry> entries;
     uint64_t valueSize = 0;
+    std::string targetEndpoint;
+    uint64_t targetAddress = 0;
+    uint64_t targetCapacity = 0;
 };
-YLT_REFL(BatchQueryDataRequest, entries, valueSize);
+YLT_REFL(BatchQueryDataRequest, entries, valueSize, targetEndpoint,
+         targetAddress, targetCapacity);
 
 struct BatchQueryDataResponse {
     int32_t statusCode = 0;

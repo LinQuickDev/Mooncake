@@ -25,9 +25,8 @@ namespace embtable {
 //      meta / Mooncake Client Query).
 //   3. For local buckets, call ShareMapStore::QueryData directly.
 //   4. For remote buckets, call ShareMapStoreClient::QueryData via RPC; the
-//      remote service packs results into a temp Mooncake Store object, which
-//      the client reads via TE read (get_buffer) — i.e. TE write on the
-//      server side delivers the buffer to the client's EmbTable Find buffer.
+//      RPC carries control metadata and the remote service uses TE to write
+//      packed results directly into the client's registered Find buffer.
 //   5. Merge results back into the caller's output vector (same key order).
 class EmbTable {
    public:
@@ -36,7 +35,8 @@ class EmbTable {
              std::shared_ptr<ShareMapStore> shareMapStore,
              std::shared_ptr<mooncake::RealClient> realClient,
              std::shared_ptr<ShareMapStoreClient> shareMapStoreClient = nullptr,
-             const std::string& localHostname = "");
+             const std::string& localHostname = "",
+             uint16_t shareMapStoreRpcPort = 0);
 
     // Initialize EmbTableMeta (create or query) and pre-create buckets.
     Status Init(bool createNew);
@@ -54,7 +54,8 @@ class EmbTable {
                 std::vector<std::shared_ptr<mooncake::BufferHandle>>&
                     bufferHandles);
 
-    // Convenience overload (discards bufferHandles after call).
+    // Convenience overload. Keeps remote transfer-buffer handles alive until
+    // the next Find call so returned StringViews remain valid.
     Status Find(const std::vector<uint64_t>& keys,
                 std::vector<StringView>& buffers);
 
@@ -85,8 +86,11 @@ class EmbTable {
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::shared_ptr<ShareMapStoreClient> shareMapStoreClient_;
     std::string localHostname_;
+    uint16_t shareMapStoreRpcPort_ = 0;
     std::shared_ptr<EmbTableMeta> meta_;
     std::vector<std::shared_ptr<Bucket>> buckets_;
+    std::vector<std::shared_ptr<mooncake::BufferHandle>>
+        lastFindBufferHandles_;
 };
 
 }  // namespace embtable

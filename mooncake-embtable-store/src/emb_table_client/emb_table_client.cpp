@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <thread>
 #include <unistd.h>
 
 #include "ylt/coro_rpc/impl/coro_rpc_server.hpp"
@@ -27,8 +28,9 @@ EmbTableClient::~EmbTableClient() {
     // Stop the RPC server before destroying the service.
     if (rpcServer_) {
         rpcServer_->stop();
-        rpcServer_.reset();
     }
+    if (rpcThread_.joinable()) rpcThread_.join();
+    rpcServer_.reset();
     rpcService_.reset();
 }
 
@@ -67,8 +69,9 @@ Status EmbTableClient::Init() {
     }
 
     // Create the ShareMapStoreClient for remote RPC calls.
-    shareMapStoreClient_ =
-        std::make_shared<ShareMapStoreClient>(realClient_, localHostname_);
+    shareMapStoreClient_ = std::make_shared<ShareMapStoreClient>(realClient_);
+    s = shareMapStoreClient_->Init(options_.deployment.transferBufferSize);
+    if (!s.IsOk()) return s;
 
     // Start the ShareMapStore RPC service (if a port is configured).
     if (options_.deployment.rpcPort != 0) {
@@ -78,16 +81,21 @@ Status EmbTableClient::Init() {
         rpcService_->RegisterHandlers(*rpcServer_);
         // Start the server in a background thread.
         // coro_rpc_server::start() blocks; we run it asynchronously.
-        std::thread([this]() {
+        rpcThread_ = std::thread([this]() {
             LOG(INFO) << "ShareMapStore RPC service listening on port "
                       << options_.deployment.rpcPort;
-            rpcServer_->start();
-        }).detach();
+            auto ec = rpcServer_->start();
+            if (ec) {
+                LOG(ERROR) << "ShareMapStore RPC service stopped with error: "
+                           << ec.message();
+            }
+        });
     }
 
     embTable_ = std::make_shared<EmbTable>(
         options_.tableName, options_.numBuckets, options_.valueSize,
-        shareMapStore_, realClient_, shareMapStoreClient_, localHostname_);
+        shareMapStore_, realClient_, shareMapStoreClient_, localHostname_,
+        options_.deployment.rpcPort);
     return embTable_->Init(options_.createNew);
 }
 

@@ -6,60 +6,48 @@
 
 #include <async_simple/coro/SyncAwait.h>
 #include <glog/logging.h>
-#include "replica.h"
-#include "client_service.h"
 
 namespace embtable {
 
-std::string ShareMapStoreClient::ExtractHostname(
-    const std::string& endpoint) {
-    // transport_endpoint_ looks like "hostname:port" or "ip:port".
-    auto pos = endpoint.rfind(':');
-    if (pos == std::string::npos) return endpoint;
-    return endpoint.substr(0, pos);
+ShareMapStoreClient::~ShareMapStoreClient() {
+    transferAllocator_.reset();
+    if (transferBufferRegistered_ && transferBuffer_ && client_) {
+        client_->unregister_buffer(transferBuffer_.get());
+    }
 }
 
-bool ShareMapStoreClient::IsBucketLocal(const std::string& bucketKey,
-                                        std::string& ownerHostname) {
-    ownerHostname.clear();
-    if (!client_) return false;
-
-    // Query the bucket meta object's replica info via Mooncake Client
-    // (design doc 4.3 — Query bucket meta replica to localize the owning
-    // node). The bucket meta object key is bucketKey + "_bucketmeta".
-    std::string bucketMetaKey = bucketKey + "_bucketmeta";
-    auto queryResult = client_->batch_query({bucketMetaKey});
-    if (queryResult.empty()) return false;
-
-    auto& first = queryResult[0];
-    if (!first.has_value()) return false;
-    const auto& replicas = first.value().replicas;
-    if (replicas.empty()) return false;
-
-    // Check if any replica is on local memory using the Client helper.
-    // PyClient holds a shared_ptr<mooncake::Client> client_ member.
-    if (!client_->client_) return false;
-    for (const auto& replica : replicas) {
-        if (client_->client_->IsReplicaOnLocalMemory(replica)) {
-            ownerHostname = localHostname_;
-            return true;
-        }
+Status ShareMapStoreClient::Init(uint64_t transferBufferSize) {
+    if (!client_ || transferBufferSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid ShareMapStoreClient transfer buffer");
     }
-
-    // Not local: extract the owning host from the first memory replica's
-    // transport_endpoint_ ("host:port").
-    for (const auto& replica : replicas) {
-        if (replica.is_memory_replica()) {
-            const auto& mem_desc =
-                std::get<mooncake::MemoryDescriptor>(replica.descriptor_variant);
-            const auto& endpoint = mem_desc.buffer_descriptor.transport_endpoint_;
-            if (!endpoint.empty()) {
-                ownerHostname = ExtractHostname(endpoint);
-                return false;
-            }
-        }
+    transferBuffer_ = std::unique_ptr<char[]>(new char[transferBufferSize]);
+    transferBufferSize_ = transferBufferSize;
+    if (client_->register_transfer_buffer(transferBuffer_.get(),
+                                          transferBufferSize_) != 0) {
+        transferBuffer_.reset();
+        transferBufferSize_ = 0;
+        return Status::Error(
+            ErrorCode::kIOError,
+            "failed to register ShareMapStoreClient transfer buffer");
     }
-    return false;
+    transferBufferRegistered_ = true;
+    transferAllocator_ = mooncake::ClientBufferAllocator::create(
+        transferBuffer_.get(), transferBufferSize_);
+    return Status::OK();
+}
+
+std::shared_ptr<mooncake::BufferHandle>
+ShareMapStoreClient::AllocateTransferBuffer(uint64_t size) {
+    if (!transferAllocator_ || size == 0 || size > transferBufferSize_) {
+        return nullptr;
+    }
+    auto allocation = transferAllocator_->allocate(size);
+    if (!allocation.has_value()) {
+        return nullptr;
+    }
+    return std::make_shared<mooncake::BufferHandle>(
+        std::move(allocation.value()));
 }
 
 coro_rpc::coro_rpc_client* ShareMapStoreClient::GetClient(
@@ -92,6 +80,10 @@ void ShareMapStoreClient::ParseResultBuffer(
     const char* ptr = static_cast<const char*>(data);
     uint64_t entrySize = 1 + valueSize;
     for (size_t i = 0; i < numKeys; ++i) {
+        if ((i + 1) * entrySize > dataSize) {
+            buffers[i] = StringView();
+            continue;
+        }
         if (i < foundFlags.size() && foundFlags[i]) {
             const char* entry = ptr + i * entrySize;
             buffers[i] = StringView(entry + 1, valueSize);
@@ -181,6 +173,15 @@ Status ShareMapStoreClient::QueryData(
     req.bucketKey = bucketKey;
     req.keys = keys;
     req.valueSize = valueSize;
+    const uint64_t expectedSize = keys.size() * (1 + valueSize);
+    auto handle = AllocateTransferBuffer(expectedSize);
+    if (!handle) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "client transfer buffer exhausted");
+    }
+    req.targetEndpoint = client_->get_transfer_endpoint();
+    req.targetAddress = reinterpret_cast<uint64_t>(handle->ptr());
+    req.targetCapacity = handle->size();
 
     auto result = async_simple::coro::syncAwait(
         rpcClient->call<&ShareMapStoreRpcService::HandleQueryData>(req));
@@ -194,22 +195,17 @@ Status ShareMapStoreClient::QueryData(
                              "Remote query failed: " + resp.errorMsg);
     }
 
-    // Read temp object via TE read (get_buffer).
-    if (resp.resultObjectKey.empty()) {
+    if (resp.transferredSize == 0) {
         return Status::OK();
     }
-    auto handle = client_->get_buffer(resp.resultObjectKey);
-    if (!handle) {
-        return Status::Error(ErrorCode::kIOError,
-                             "get_buffer failed: " + resp.resultObjectKey);
+    if (resp.transferredSize > handle->size()) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "remote query exceeded target buffer");
     }
 
-    ParseResultBuffer(handle->ptr(), handle->size(), valueSize,
+    ParseResultBuffer(handle->ptr(), resp.transferredSize, valueSize,
                       keys.size(), resp.foundFlags, buffers, handle);
     bufferHandles.push_back(handle);
-
-    // Clean up temp object.
-    client_->remove(resp.resultObjectKey);
     return Status::OK();
 }
 
@@ -237,6 +233,20 @@ Status ShareMapStoreClient::BatchQueryData(
         entry.keys = keysPerBucket[i];
         req.entries.push_back(std::move(entry));
     }
+    uint64_t expectedSize = sizeof(uint64_t);
+    for (size_t i = 0; i < bucketKeys.size(); ++i) {
+        expectedSize += sizeof(uint32_t) + bucketKeys[i].size() +
+                        sizeof(uint64_t) +
+                        keysPerBucket[i].size() * (1 + valueSize);
+    }
+    auto handle = AllocateTransferBuffer(expectedSize);
+    if (!handle) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "client transfer buffer exhausted");
+    }
+    req.targetEndpoint = client_->get_transfer_endpoint();
+    req.targetAddress = reinterpret_cast<uint64_t>(handle->ptr());
+    req.targetCapacity = handle->size();
 
     auto result = async_simple::coro::syncAwait(
         rpcClient->call<&ShareMapStoreRpcService::HandleBatchQueryData>(req));
@@ -253,60 +263,19 @@ Status ShareMapStoreClient::BatchQueryData(
     buffersPerBucket.assign(bucketKeys.size(), {});
     if (resp.responses.empty()) return Status::OK();
 
-    // Detect aggregated mode: all responses share the same resultObjectKey.
-    // In that case we do a single get_buffer (TE read) and parse segments.
-    const auto& firstKey = resp.responses[0].resultObjectKey;
-    bool aggregated = !firstKey.empty();
+    uint64_t transferredSize = resp.responses[0].transferredSize;
+    if (transferredSize > handle->size()) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "remote batch query exceeded target buffer");
+    }
+    std::vector<std::vector<int8_t>> flagsPerBucket;
+    flagsPerBucket.reserve(resp.responses.size());
     for (const auto& r : resp.responses) {
-        if (r.resultObjectKey != firstKey) {
-            aggregated = false;
-            break;
-        }
+        flagsPerBucket.push_back(r.foundFlags);
     }
-
-    if (aggregated) {
-        // Single get_buffer for the whole aggregated buffer.
-        auto handle = client_->get_buffer(firstKey);
-        if (!handle) {
-            for (size_t i = 0; i < bucketKeys.size(); ++i) {
-                buffersPerBucket[i].resize(keysPerBucket[i].size());
-            }
-            return Status::Error(
-                ErrorCode::kIOError,
-                "get_buffer failed for aggregated result: " + firstKey);
-        }
-        std::vector<std::vector<int8_t>> flagsPerBucket;
-        flagsPerBucket.reserve(resp.responses.size());
-        for (const auto& r : resp.responses) {
-            flagsPerBucket.push_back(r.foundFlags);
-        }
-        ParseAggregatedBuffer(handle->ptr(), handle->size(), valueSize,
-                              bucketKeys, flagsPerBucket, buffersPerBucket,
-                              handle);
-        bufferHandles.push_back(handle);
-        client_->remove(firstKey);
-        return Status::OK();
-    }
-
-    // Fallback: per-bucket get_buffer (non-aggregated legacy path).
-    for (size_t i = 0; i < resp.responses.size() && i < bucketKeys.size(); ++i) {
-        const auto& single = resp.responses[i];
-        auto& buffers = buffersPerBucket[i];
-        if (single.statusCode != 0 || single.resultObjectKey.empty()) {
-            buffers.resize(keysPerBucket[i].size());
-            continue;
-        }
-        auto handle = client_->get_buffer(single.resultObjectKey);
-        if (!handle) {
-            buffers.resize(keysPerBucket[i].size());
-            continue;
-        }
-        ParseResultBuffer(handle->ptr(), handle->size(), valueSize,
-                          keysPerBucket[i].size(), single.foundFlags, buffers,
-                          handle);
-        bufferHandles.push_back(handle);
-        client_->remove(single.resultObjectKey);
-    }
+    ParseAggregatedBuffer(handle->ptr(), transferredSize, valueSize,
+                          bucketKeys, flagsPerBucket, buffersPerBucket, handle);
+    bufferHandles.push_back(handle);
     return Status::OK();
 }
 

@@ -1,8 +1,6 @@
 #include "share_map_store/share_map_store.h"
 
-#include <atomic>
 #include <cstring>
-#include <span>
 #include <string>
 
 #include <glog/logging.h>
@@ -12,7 +10,11 @@ namespace embtable {
 ShareMapStore::ShareMapStore(DeploymentConfig config)
     : config_(std::move(config)) {}
 
-ShareMapStore::~ShareMapStore() = default;
+ShareMapStore::~ShareMapStore() {
+    if (transferBufferRegistered_ && transferBuffer_ && realClient_) {
+        realClient_->unregister_buffer(transferBuffer_.get());
+    }
+}
 
 Status ShareMapStore::Init() {
     if (initialized_) return Status::OK();
@@ -27,6 +29,21 @@ Status ShareMapStore::Init() {
         return Status::Error(ErrorCode::kInternal,
                              "RealClient setup_real failed: " + config_.masterAddress);
     }
+    if (config_.transferBufferSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "transferBufferSize must be > 0");
+    }
+    transferBuffer_ =
+        std::unique_ptr<char[]>(new char[config_.transferBufferSize]);
+    transferBufferSize_ = config_.transferBufferSize;
+    if (realClient_->register_transfer_buffer(transferBuffer_.get(),
+                                              transferBufferSize_) != 0) {
+        transferBuffer_.reset();
+        transferBufferSize_ = 0;
+        return Status::Error(ErrorCode::kIOError,
+                             "failed to register ShareMapStore transfer buffer");
+    }
+    transferBufferRegistered_ = true;
     initialized_ = true;
     return Status::OK();
 }
@@ -103,19 +120,22 @@ std::shared_ptr<ShareMap> ShareMapStore::GetShareMap(
     return it->second;
 }
 
-Status ShareMapStore::QueryDataToStore(const std::string& bucketKey,
-                                       const std::vector<uint64_t>& keys,
-                                       uint64_t valueSize,
-                                       std::string& resultObjectKey,
-                                       uint64_t& resultObjectSize,
-                                       std::vector<int8_t>& foundFlags) {
+Status ShareMapStore::QueryDataToBuffer(
+    const std::string& bucketKey, const std::vector<uint64_t>& keys,
+    uint64_t valueSize, const std::string& targetEndpoint,
+    uint64_t targetAddress, uint64_t targetCapacity,
+    uint64_t& transferredSize, std::vector<int8_t>& foundFlags) {
     if (!initialized_) {
         return Status::Error(ErrorCode::kInternal,
                              "ShareMapStore not initialized");
     }
+    transferredSize = 0;
     if (keys.empty()) {
-        resultObjectSize = 0;
         return Status::OK();
+    }
+    if (targetEndpoint.empty() || targetAddress == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid target transfer buffer");
     }
     // 1. Local query
     std::vector<StringView> buffers;
@@ -131,13 +151,19 @@ Status ShareMapStore::QueryDataToStore(const std::string& bucketKey,
 
     // 2. Pack results: [1-byte found flag][valueSize bytes data]
     uint64_t entrySize = 1 + valueSize;
-    resultObjectSize = keys.size() * entrySize;
-    std::string packed;
-    packed.resize(resultObjectSize);
+    transferredSize = keys.size() * entrySize;
+    if (transferredSize > targetCapacity ||
+        transferredSize > transferBufferSize_) {
+        return Status::Error(
+            ErrorCode::kOutOfRange,
+            "query result exceeds registered transfer buffer capacity");
+    }
+
+    std::lock_guard<std::mutex> lock(transferMutex_);
     foundFlags.resize(keys.size(), 0);
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        char* dest = &packed[i * entrySize];
+        char* dest = transferBuffer_.get() + i * entrySize;
         if (i < buffers.size() && buffers[i].data() != nullptr &&
             buffers[i].size() >= valueSize) {
             foundFlags[i] = 1;
@@ -149,36 +175,38 @@ Status ShareMapStore::QueryDataToStore(const std::string& bucketKey,
         }
     }
 
-    // 3. Write packed buffer to a temporary Mooncake Store object (TE write).
-    static std::atomic<uint64_t> counter{0};
-    resultObjectKey = "embtable_qresult_" + bucketKey + "_" +
-                      std::to_string(counter.fetch_add(1));
-    mooncake::ReplicateConfig config;
-    int ret = realClient_->put(
-        resultObjectKey,
-        std::span<const char>(packed.data(), packed.size()), config);
+    // 3. Data plane: write directly into the caller's registered buffer.
+    int ret = realClient_->subTransferTask(
+        transferBuffer_.get(), transferredSize, targetEndpoint, targetAddress);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
-                             "put temp result object failed: " + resultObjectKey);
+                             "Transfer Engine query result write failed");
     }
     return Status::OK();
 }
 
-Status ShareMapStore::BatchQueryDataToStore(
+Status ShareMapStore::BatchQueryDataToBuffer(
     const std::vector<std::string>& bucketKeys,
     const std::vector<std::vector<uint64_t>>& keysPerBucket,
-    uint64_t valueSize,
-    std::vector<std::string>& resultObjectKeys,
-    std::vector<uint64_t>& resultObjectSizes,
+    uint64_t valueSize, const std::string& targetEndpoint,
+    uint64_t targetAddress, uint64_t targetCapacity,
+    uint64_t& transferredSize,
     std::vector<std::vector<int8_t>>& foundFlagsPerBucket) {
     if (!initialized_) {
         return Status::Error(ErrorCode::kInternal,
                              "ShareMapStore not initialized");
     }
-    resultObjectKeys.clear();
-    resultObjectSizes.clear();
+    transferredSize = 0;
     foundFlagsPerBucket.clear();
     if (bucketKeys.empty()) return Status::OK();
+    if (bucketKeys.size() != keysPerBucket.size()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "bucketKeys/keysPerBucket size mismatch");
+    }
+    if (targetEndpoint.empty() || targetAddress == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid target transfer buffer");
+    }
 
     const size_t bucketCount = bucketKeys.size();
     const uint64_t entrySize = 1 + valueSize;
@@ -200,7 +228,7 @@ Status ShareMapStore::BatchQueryDataToStore(
                 if (s.IsOk()) s = QueryData(bucketKey, keys, buffers);
             }
             if (!s.IsOk()) {
-                LOG(WARNING) << "BatchQueryDataToStore: query failed for "
+                LOG(WARNING) << "BatchQueryDataToBuffer: query failed for "
                              << bucketKey << ": " << s.msg();
             }
         }
@@ -213,11 +241,23 @@ Status ShareMapStore::BatchQueryDataToStore(
     //   for each bucket:
     //     [bucketKeyLen(4B)][bucketKey bytes][keyCount(8B)]
     //     for each key: [1B found flag][valueSize bytes data]
-    std::string packed;
-    // Reserve header.
-    packed.resize(sizeof(uint64_t));  // bucketCount placeholder
-    auto* header = reinterpret_cast<uint64_t*>(&packed[0]);
-    *header = bucketCount;
+    uint64_t requiredSize = sizeof(uint64_t);
+    for (size_t i = 0; i < bucketCount; ++i) {
+        requiredSize += sizeof(uint32_t) + bucketKeys[i].size() +
+                        sizeof(uint64_t) +
+                        keysPerBucket[i].size() * entrySize;
+    }
+    if (requiredSize > targetCapacity || requiredSize > transferBufferSize_) {
+        return Status::Error(
+            ErrorCode::kOutOfRange,
+            "batch query result exceeds registered transfer buffer capacity");
+    }
+
+    std::lock_guard<std::mutex> lock(transferMutex_);
+    char* writePtr = transferBuffer_.get();
+    uint64_t bucketCountValue = bucketCount;
+    std::memcpy(writePtr, &bucketCountValue, sizeof(uint64_t));
+    writePtr += sizeof(uint64_t);
 
     foundFlagsPerBucket.resize(bucketCount);
     for (size_t i = 0; i < bucketCount; ++i) {
@@ -228,21 +268,18 @@ Status ShareMapStore::BatchQueryDataToStore(
 
         // bucketKeyLen (4B) + bucketKey bytes + keyCount (8B)
         uint32_t keyLen = static_cast<uint32_t>(bucketKey.size());
-        size_t curSize = packed.size();
-        packed.resize(curSize + sizeof(uint32_t) + keyLen + sizeof(uint64_t));
-        std::memcpy(&packed[curSize], &keyLen, sizeof(uint32_t));
-        curSize += sizeof(uint32_t);
-        std::memcpy(&packed[curSize], bucketKey.data(), keyLen);
-        curSize += keyLen;
-        std::memcpy(&packed[curSize], &keyCount, sizeof(uint64_t));
+        std::memcpy(writePtr, &keyLen, sizeof(uint32_t));
+        writePtr += sizeof(uint32_t);
+        std::memcpy(writePtr, bucketKey.data(), keyLen);
+        writePtr += keyLen;
+        std::memcpy(writePtr, &keyCount, sizeof(uint64_t));
+        writePtr += sizeof(uint64_t);
 
         // per-key entries
         foundFlagsPerBucket[i].assign(keyCount, 0);
         if (keyCount == 0) continue;
-        size_t entriesStart = packed.size();
-        packed.resize(entriesStart + keyCount * entrySize);
         for (uint64_t k = 0; k < keyCount; ++k) {
-            char* dest = &packed[entriesStart + k * entrySize];
+            char* dest = writePtr;
             if (k < buffers.size() && buffers[k].data() != nullptr &&
                 buffers[k].size() >= valueSize) {
                 foundFlagsPerBucket[i][k] = 1;
@@ -252,29 +289,17 @@ Status ShareMapStore::BatchQueryDataToStore(
                 dest[0] = static_cast<char>(0);
                 std::memset(dest + 1, 0, valueSize);
             }
+            writePtr += entrySize;
         }
     }
 
-    // Phase 3: Single TE write for the entire aggregated buffer.
-    static std::atomic<uint64_t> batchCounter{0};
-    std::string aggregatedKey = "embtable_batch_qresult_" +
-                                std::to_string(batchCounter.fetch_add(1));
-    mooncake::ReplicateConfig config;
-    int ret = realClient_->put(
-        aggregatedKey,
-        std::span<const char>(packed.data(), packed.size()), config);
+    // Phase 3: Single direct TE write for the entire aggregated buffer.
+    transferredSize = requiredSize;
+    int ret = realClient_->subTransferTask(
+        transferBuffer_.get(), transferredSize, targetEndpoint, targetAddress);
     if (ret != 0) {
-        return Status::Error(
-            ErrorCode::kIOError,
-            "put aggregated batch result object failed: " + aggregatedKey);
-    }
-    // All buckets share the same aggregated object key; the client parses
-    // segments from the single buffer. We still record per-bucket sizes
-    // (computed from keyCount) so callers can validate.
-    resultObjectKeys.assign(bucketCount, aggregatedKey);
-    resultObjectSizes.resize(bucketCount);
-    for (size_t i = 0; i < bucketCount; ++i) {
-        resultObjectSizes[i] = keysPerBucket[i].size() * entrySize;
+        return Status::Error(ErrorCode::kIOError,
+                             "Transfer Engine batch query write failed");
     }
     return Status::OK();
 }

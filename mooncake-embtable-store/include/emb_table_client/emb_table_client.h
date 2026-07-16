@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "emb_table/emb_table.h"
@@ -87,6 +88,7 @@ class EmbTableClient {
     // RPC service (kept alive for the lifetime of the client).
     std::unique_ptr<ShareMapStoreRpcService> rpcService_;
     std::unique_ptr<coro_rpc::coro_rpc_server> rpcServer_;
+    std::thread rpcThread_;
     std::string localHostname_;
 };
 

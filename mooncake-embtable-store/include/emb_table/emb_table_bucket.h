@@ -30,7 +30,8 @@ class Bucket {
            std::shared_ptr<ShareMapStore> shareMapStore,
            std::shared_ptr<mooncake::RealClient> realClient,
            std::shared_ptr<ShareMapStoreClient> shareMapStoreClient = nullptr,
-           const std::string& localHostname = "");
+           const std::string& localHostname = "",
+           uint16_t shareMapStoreRpcPort = 0);
 
     // Append key/value pairs to the local buffer. All values must be
     // info_.valueSize bytes. Sets wouldFlush=true when the local buffer
@@ -65,20 +66,22 @@ class Bucket {
     uint64_t FlushThreshold() const { return flushThreshold_; }
     void SetFlushThreshold(uint64_t threshold) { flushThreshold_ = threshold; }
 
+    // Resolve the current owner from bucket-meta replica placement. This is
+    // intentionally re-evaluated so bucket relocation is observed.
+    Status ResolveLocality();
+
     // Whether this bucket's data is stored locally on this node.
     bool IsLocal() const { return isLocal_; }
     const std::string& RpcEndpoint() const { return info_.rpcEndpoint; }
 
    private:
-    // Resolve whether the bucket is local or remote. Idempotent.
-    Status resolveLocality();
-
     BucketInfo info_;
     std::string bucketKey_;
     std::shared_ptr<ShareMapStore> shareMapStore_;
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::shared_ptr<ShareMapStoreClient> shareMapStoreClient_;
     std::string localHostname_;
+    uint16_t shareMapStoreRpcPort_ = 0;
 
     // Local write buffer for batched inserts (design doc 4.1.4 Insert flow).
     std::vector<uint64_t> localKeys_;
@@ -87,8 +90,6 @@ class Bucket {
     // bucket should be flushed. Default 4096 (design doc 4.1.4).
     uint64_t flushThreshold_ = 4096;
 
-    // Locality state (resolved lazily on first use).
-    bool localityResolved_ = false;
     bool isLocal_ = true;
 };
 

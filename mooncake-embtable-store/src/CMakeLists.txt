@@ -89,6 +89,23 @@ target_include_directories(mooncake_embtable_store PUBLIC
 target_link_libraries(mooncake_embtable_store PUBLIC
     mooncake_store glog::glog)
 
+add_executable(embtable_client
+    emb_table_client/embtable_client_main.cpp
+)
+target_include_directories(embtable_client PRIVATE
+    ${EMBTABLE_INCLUDE_DIR}
+    ${MOONCAKE_STORE_INCLUDE_DIRS}
+    ${MOONCAKE_TE_INCLUDE_DIR}
+)
+target_link_libraries(embtable_client PRIVATE
+    mooncake_embtable_store
+    transfer_engine
+    gflags::gflags
+    glog::glog
+    pthread
+)
+
 if(BUILD_SHARED_LIBS)
     install(TARGETS mooncake_embtable_store DESTINATION lib)
+    install(TARGETS embtable_client DESTINATION bin)
 endif()

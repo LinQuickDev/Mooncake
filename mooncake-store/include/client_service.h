@@ -569,6 +569,10 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    tl::expected<void, ErrorCode> SubmitTransferTask(
+        void* source, size_t size, const std::string& target_endpoint,
+        uint64_t target_address);
+
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     /**

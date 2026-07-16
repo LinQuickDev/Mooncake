@@ -9,8 +9,9 @@ ShareObject::ShareObject(const std::string& key, size_t size,
     : key_(key), size_(size), realClient_(std::move(realClient)) {}
 
 ShareObject::~ShareObject() {
-    // Local buffer is freed automatically via unique_ptr. We do not
-    // automatically Del() the remote object; callers must do so explicitly.
+    if (registered_ && local_buffer_ && realClient_) {
+        realClient_->unregister_buffer(local_buffer_.get());
+    }
 }
 
 Status ShareObject::Create() {
@@ -24,7 +25,14 @@ Status ShareObject::Create() {
     // downstream consumers (e.g. value records up to 512B).
     local_buffer_ = std::unique_ptr<char[]>(new char[size_]);
     std::memset(local_buffer_.get(), 0, size_);
+    if (!realClient_ ||
+        realClient_->register_buffer(local_buffer_.get(), size_) != 0) {
+        local_buffer_.reset();
+        return Status::Error(ErrorCode::kIOError,
+                             "register_buffer failed for key: " + key_);
+    }
     owns_local_ = true;
+    registered_ = true;
     return Status::OK();
 }
 
@@ -86,8 +94,16 @@ Status ShareObject::Del() {
         // Treat remove failure as non-fatal (object may already be gone).
         LOG(WARNING) << "remove failed for key: " << key_ << " ret=" << ret;
     }
+    if (registered_ && local_buffer_) {
+        int unregisterRet = realClient_->unregister_buffer(local_buffer_.get());
+        if (unregisterRet != 0) {
+            LOG(WARNING) << "unregister_buffer failed for key: " << key_
+                         << " ret=" << unregisterRet;
+        }
+    }
     local_buffer_.reset();
     owns_local_ = false;
+    registered_ = false;
     return Status::OK();
 }
 

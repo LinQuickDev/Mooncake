@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,25 +17,25 @@
 namespace embtable {
 
 // ShareMapStoreClient is the RPC client used by Bucket/EmbTable to call a
-// remote ShareMapStore service. It manages coro_rpc_client connections and
-// reads temp result objects from Mooncake Store via TE read (get_buffer).
+// remote ShareMapStore service. It owns one registered transfer buffer and
+// sub-allocates non-overlapping result regions from it.
 //
 // Lifecycle of a remote query:
-//   1. Client sends QueryDataRequest via coro_rpc to the remote service.
-//   2. Remote service queries local ShareMap, packs results, writes to a
-//      temp Mooncake Store object (TE write), returns the object key.
-//   3. Client reads the temp object via get_buffer (TE read) → BufferHandle.
+//   1. Client allocates a slice from its registered transfer buffer.
+//   2. RPC sends that slice's endpoint/address/capacity as control metadata.
+//   3. Remote service writes the packed result directly into the slice by TE.
 //   4. Client parses the packed buffer into StringViews.
-//   5. Client removes the temp object.
-//   6. BufferHandle is kept alive (stored in outBuffers) so StringViews
+//   5. BufferHandle is kept alive (stored in outBuffers) so StringViews
 //      remain valid until the caller is done.
 class ShareMapStoreClient {
    public:
-    ShareMapStoreClient(std::shared_ptr<mooncake::RealClient> client,
-                        const std::string& localHostname)
-        : client_(std::move(client)), localHostname_(localHostname) {}
+    explicit ShareMapStoreClient(
+        std::shared_ptr<mooncake::RealClient> client)
+        : client_(std::move(client)) {}
 
-    ~ShareMapStoreClient() = default;
+    ~ShareMapStoreClient();
+
+    Status Init(uint64_t transferBufferSize);
 
     // Query a single bucket on the remote node. On success:
     //   - buffers[i] points to value data (or empty if not found)
@@ -67,16 +68,6 @@ class ShareMapStoreClient {
     Status BuildIndex(const std::string& rpcEndpoint,
                       const std::string& bucketKey);
 
-    // Check whether a bucket's data is stored locally (on this node) by
-    // querying the bucket's ShareMapMeta ShareObject key. Returns true if a
-    // replica is on local memory. Also returns the owning hostname (from
-    // transport_endpoint_) for remote buckets.
-    bool IsBucketLocal(const std::string& bucketKey,
-                       std::string& ownerHostname);
-
-    // Extract hostname from a transport_endpoint string like "host:port".
-    static std::string ExtractHostname(const std::string& endpoint);
-
    private:
     // Get or create a coro_rpc_client for the given endpoint.
     coro_rpc::coro_rpc_client* GetClient(const std::string& rpcEndpoint);
@@ -102,8 +93,14 @@ class ShareMapStoreClient {
         std::vector<std::vector<StringView>>& buffersPerBucket,
         std::shared_ptr<mooncake::BufferHandle> handle);
 
+    std::shared_ptr<mooncake::BufferHandle> AllocateTransferBuffer(
+        uint64_t size);
+
     std::shared_ptr<mooncake::RealClient> client_;
-    std::string localHostname_;
+    std::unique_ptr<char[]> transferBuffer_;
+    uint64_t transferBufferSize_ = 0;
+    bool transferBufferRegistered_ = false;
+    std::shared_ptr<mooncake::ClientBufferAllocator> transferAllocator_;
     // Cache of coro_rpc_client per endpoint.
     std::unordered_map<std::string, std::unique_ptr<coro_rpc::coro_rpc_client>>
         clientCache_;

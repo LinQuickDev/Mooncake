@@ -63,6 +63,7 @@ class ShareObject {
     // Local backing buffer. Allocated lazily by Create() or Write().
     std::unique_ptr<char[]> local_buffer_;
     bool owns_local_ = false;  // whether we allocated (and own) local_buffer_
+    bool registered_ = false;
 };
 
 }  // namespace embtable

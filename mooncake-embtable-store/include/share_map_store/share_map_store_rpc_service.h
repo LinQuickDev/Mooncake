@@ -9,8 +9,8 @@
 
 namespace embtable {
 
-// ShareMapStoreRpcService wraps a ShareMapStore with coro_rpc handlers so
-// that remote EmbTable nodes can query/publish/build-index over RPC.
+// ShareMapStoreRpcService wraps a ShareMapStore with coro_rpc handlers. RPC
+// carries control metadata; query payloads move through registered TE buffers.
 //
 // Usage:
 //   ShareMapStoreRpcService service(store);

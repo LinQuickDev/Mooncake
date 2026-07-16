@@ -1,14 +1,13 @@
 #include "emb_table/emb_table_meta.h"
 
 #include <glog/logging.h>
+#include <span>
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
 namespace embtable {
 
 namespace {
-constexpr size_t kMetaObjectSize = 1ull * 1024 * 1024;  // 1 MiB
-
 std::string metaKey(const std::string& tableKey) {
     return tableKey + "_tablemeta";
 }
@@ -29,12 +28,13 @@ Status EmbTableMeta::CreateTableMeta(const TableMetaInfo& params) {
     std::string json;
     struct_json::to_json(params, json);
 
-    // put_from into Mooncake Store.
-    int ret = realClient_->put_from(metaKey(params.tableKey), json.data(),
-                                    json.size());
+    mooncake::ReplicateConfig config;
+    int ret = realClient_->put(
+        metaKey(params.tableKey),
+        std::span<const char>(json.data(), json.size()), config);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
-                             "put_from failed for table meta: " + params.tableKey);
+                             "put failed for table meta: " + params.tableKey);
     }
     metaInfo_ = params;
     return Status::OK();
@@ -45,12 +45,12 @@ Status EmbTableMeta::QueryTableMeta(const std::string& tableKey,
     if (tableKey.empty()) {
         return Status::Error(ErrorCode::kInvalidArgument, "empty tableKey");
     }
-    std::string buf(kMetaObjectSize, '\0');
-    int ret = realClient_->get_into(metaKey(tableKey), buf.data(), buf.size());
-    if (ret != 0) {
+    auto handle = realClient_->get_buffer(metaKey(tableKey));
+    if (!handle) {
         return Status::Error(ErrorCode::kNotFound,
                              "table meta not found: " + tableKey);
     }
+    std::string buf(static_cast<const char*>(handle->ptr()), handle->size());
     struct_json::from_json(meta, buf);
     metaInfo_ = meta;
     return Status::OK();
@@ -62,11 +62,13 @@ Status EmbTableMeta::UpdateTableMeta(const TableMetaInfo& meta) {
     }
     std::string json;
     struct_json::to_json(meta, json);
-    int ret = realClient_->put_from(metaKey(meta.tableKey), json.data(),
-                                    json.size());
+    mooncake::ReplicateConfig config;
+    int ret = realClient_->put(
+        metaKey(meta.tableKey),
+        std::span<const char>(json.data(), json.size()), config);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
-                             "put_from (update) failed for table meta: " + meta.tableKey);
+                             "put (update) failed for table meta: " + meta.tableKey);
     }
     metaInfo_ = meta;
     return Status::OK();
@@ -78,11 +80,13 @@ Status EmbTableMeta::CreateBucketMeta(const BucketInfo& info) {
     }
     std::string json;
     struct_json::to_json(info, json);
-    int ret = realClient_->put_from(bucketMetaKey(info.bucketKey), json.data(),
-                                    json.size());
+    mooncake::ReplicateConfig config;
+    int ret = realClient_->put(
+        bucketMetaKey(info.bucketKey),
+        std::span<const char>(json.data(), json.size()), config);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
-                             "put_from failed for bucket meta: " + info.bucketKey);
+                             "put failed for bucket meta: " + info.bucketKey);
     }
     return Status::OK();
 }
@@ -92,13 +96,12 @@ Status EmbTableMeta::QueryBucketMeta(const std::string& bucketKey,
     if (bucketKey.empty()) {
         return Status::Error(ErrorCode::kInvalidArgument, "empty bucketKey");
     }
-    std::string buf(kMetaObjectSize, '\0');
-    int ret =
-        realClient_->get_into(bucketMetaKey(bucketKey), buf.data(), buf.size());
-    if (ret != 0) {
+    auto handle = realClient_->get_buffer(bucketMetaKey(bucketKey));
+    if (!handle) {
         return Status::Error(ErrorCode::kNotFound,
                              "bucket meta not found: " + bucketKey);
     }
+    std::string buf(static_cast<const char*>(handle->ptr()), handle->size());
     struct_json::from_json(info, buf);
     return Status::OK();
 }
