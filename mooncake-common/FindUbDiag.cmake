@@ -62,10 +62,48 @@ function(_mooncake_ubdiag_get_imported_location target out_var)
   set(${out_var} "" PARENT_SCOPE)
 endfunction()
 
+function(_mooncake_ubdiag_require_submodule_file source_dir relative_path)
+  set(_required_file "${source_dir}/${relative_path}")
+  if(EXISTS "${_required_file}")
+    return()
+  endif()
+
+  # A pull updates the parent gitlink but does not repair deleted files in an
+  # already checked-out submodule. Restore only the required tracked file and
+  # leave every other local UbDiag change untouched.
+  find_program(_MOONCAKE_UBDIAG_GIT_EXECUTABLE NAMES git)
+  if(_MOONCAKE_UBDIAG_GIT_EXECUTABLE AND EXISTS "${source_dir}/.git")
+    execute_process(
+      COMMAND "${_MOONCAKE_UBDIAG_GIT_EXECUTABLE}"
+              -C "${source_dir}" checkout -- "${relative_path}"
+      RESULT_VARIABLE _restore_result
+      OUTPUT_QUIET
+      ERROR_QUIET)
+    if(_restore_result EQUAL 0 AND EXISTS "${_required_file}")
+      message(STATUS "UbDiag: restored missing tracked file ${relative_path}")
+      return()
+    endif()
+  endif()
+
+  message(FATAL_ERROR
+    "UbDiag L1 submodule is incomplete: ${_required_file} is missing.\n"
+    "Restore the recorded submodule contents with:\n"
+    "  git submodule sync --recursive\n"
+    "  git submodule update --init --checkout extern/ubdiag")
+endfunction()
+
 # Layer 1: Submodule (same pattern as extern/pybind11). UbDiag's generic
 # BUILD_TESTS / BUILD_EXAMPLES default to ON and collide with Mooncake option
 # names, so temporarily narrow them only while adding the submodule.
 if(EXISTS "${CMAKE_SOURCE_DIR}/extern/ubdiag/CMakeLists.txt")
+  file(STRINGS "${CMAKE_SOURCE_DIR}/extern/ubdiag/CMakeLists.txt"
+       _MOONCAKE_UBDIAG_PACKAGE_CONFIG_REFS
+       REGEX "UbDiagConfig\\.cmake\\.in")
+  if(_MOONCAKE_UBDIAG_PACKAGE_CONFIG_REFS)
+    _mooncake_ubdiag_require_submodule_file(
+      "${CMAKE_SOURCE_DIR}/extern/ubdiag" "cmake/UbDiagConfig.cmake.in")
+  endif()
+
   set(_MOONCAKE_UBDIAG_SAVED_BUILD_EXAMPLES "${BUILD_EXAMPLES}")
   set(_MOONCAKE_UBDIAG_HAD_BUILD_EXAMPLES_CACHE FALSE)
   if(DEFINED CACHE{BUILD_EXAMPLES})
