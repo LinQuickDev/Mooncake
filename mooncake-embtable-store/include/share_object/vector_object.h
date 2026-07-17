@@ -24,8 +24,8 @@ class VectorObject {
                  std::shared_ptr<mooncake::RealClient> realClient,
                  uint64_t shareObjectSize = 64ull * 1024 * 1024);
 
-    // Pre-allocate capacity (number of elements) by creating enough
-    // ShareObjects up-front.
+    // Set the maximum number of elements. This does not allocate backing
+    // ShareObjects; capacity == 0 removes the limit.
     Status Reserve(uint64_t capacity);
 
     // Append `len` bytes of data (must equal elemSize_ for fixed-size records)
@@ -41,7 +41,9 @@ class VectorObject {
     Status ExportToVector(std::vector<uint64_t>& out) const;
 
     uint64_t Size() const { return size_.load(std::memory_order_acquire); }
-    uint64_t Capacity() const { return capacity_; }
+    uint64_t Capacity() const {
+        return capacity_.load(std::memory_order_acquire);
+    }
     uint64_t ElemSize() const { return elemSize_; }
 
     // Publish all backing ShareObjects to Mooncake Store.
@@ -56,12 +58,12 @@ class VectorObject {
    private:
     size_t CalculateShareObjectNum(uint64_t capacity) const;
     std::string GetShareObjectName(size_t idx) const;
-    Status ensureCapacity(uint64_t neededElements);
+    Status ensureShareObjects(uint64_t neededElements);
 
     std::string key_;
-    uint64_t elemSize_;          // bytes per element (8-512)
-    uint64_t shareObjectSize_;   // bytes per backing ShareObject
-    uint64_t capacity_ = 0;      // total element capacity
+    uint64_t elemSize_;                  // bytes per element (8-512)
+    uint64_t shareObjectSize_;           // bytes per backing ShareObject
+    std::atomic<uint64_t> capacity_{0};  // configured limit; 0 = unlimited
     std::atomic<uint64_t> size_{0};
     std::vector<std::unique_ptr<ShareObject>> shareObjects_;
     mutable std::shared_mutex rwMutex_;

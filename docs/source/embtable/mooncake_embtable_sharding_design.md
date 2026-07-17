@@ -1077,7 +1077,7 @@ sequenceDiagram
 | **本地 Buffer** | 批量缓冲写入（默认 4096 条），减少 ShareObject 创建次数 |
 | **节点缓存** | Bucket 首次 Flush 解析节点后缓存结果，避免重复 Query |
 | **本地优先** | 同节点数据直接调用实例方法，零 RPC 开销 |
-| **预分配容量** | `Reserve` 预分配 VectorObject，避免扩容 |
+| **按需扩容** | `Reserve` 仅设置容量上限，`Append` 跨段时才创建下一个 ShareObject |
 | **并行写入** | keys 和 values 并行追加 |
 | **异步 RPC** | 远程节点使用 coro_rpc 异步调用，不阻塞本地缓冲写入 |
 

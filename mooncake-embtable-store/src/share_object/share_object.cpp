@@ -1,5 +1,7 @@
 #include "share_object/share_object.h"
 
+#include <new>
+
 #include <glog/logging.h>
 
 namespace embtable {
@@ -10,7 +12,7 @@ ShareObject::ShareObject(const std::string& key, size_t size,
 
 ShareObject::~ShareObject() {
     if (registered_ && local_buffer_ && realClient_) {
-        realClient_->unregister_buffer(local_buffer_.get());
+        realClient_->unregister_buffer(local_buffer_->ptr());
     }
 }
 
@@ -21,17 +23,34 @@ Status ShareObject::Create() {
     if (size_ == 0) {
         return Status::Error(ErrorCode::kInvalidArgument, "size is 0");
     }
-    // Over-allocate to a multiple of 64 to keep alignment friendly for
-    // downstream consumers (e.g. value records up to 512B).
-    local_buffer_ = std::unique_ptr<char[]>(new char[size_]);
-    std::memset(local_buffer_.get(), 0, size_);
-    if (!realClient_ ||
-        realClient_->register_buffer(local_buffer_.get(), size_) != 0) {
+    if (!realClient_) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "RealClient is null for key: " + key_);
+    }
+    try {
+        local_allocator_ = mooncake::ClientBufferAllocator::create(
+            size_, realClient_->protocol);
+        auto allocation = local_allocator_->allocate(size_);
+        if (!allocation) {
+            local_allocator_.reset();
+            return Status::Error(ErrorCode::kBufferFull,
+                                 "buffer allocation failed for key: " + key_);
+        }
+        local_buffer_ = std::make_shared<mooncake::BufferHandle>(
+            std::move(allocation.value()));
+    } catch (const std::bad_alloc&) {
         local_buffer_.reset();
+        local_allocator_.reset();
+        return Status::Error(ErrorCode::kInternal,
+                             "buffer allocation failed for key: " + key_);
+    }
+    std::memset(local_buffer_->ptr(), 0, size_);
+    if (realClient_->register_buffer(local_buffer_->ptr(), size_) != 0) {
+        local_buffer_.reset();
+        local_allocator_.reset();
         return Status::Error(ErrorCode::kIOError,
                              "register_buffer failed for key: " + key_);
     }
-    owns_local_ = true;
     registered_ = true;
     return Status::OK();
 }
@@ -41,7 +60,7 @@ Status ShareObject::Import() {
         auto s = Create();
         if (!s.IsOk()) return s;
     }
-    int64_t ret = realClient_->get_into(key_, local_buffer_.get(), size_);
+    int64_t ret = realClient_->get_into(key_, local_buffer_->ptr(), size_);
     if (ret < 0) {
         return Status::Error(ErrorCode::kNotFound,
                              "get_into failed for key: " + key_);
@@ -54,11 +73,12 @@ Status ShareObject::Read(size_t offset, size_t len, void* data) const {
         return Status::Error(ErrorCode::kInternal,
                              "local buffer not initialized: " + key_);
     }
-    if (offset + len > size_) {
+    if (offset > size_ || len > size_ - offset) {
         return Status::Error(ErrorCode::kOutOfRange,
                              "read out of range for key: " + key_);
     }
-    std::memcpy(data, local_buffer_.get() + offset, len);
+    std::memcpy(data, static_cast<const char*>(local_buffer_->ptr()) + offset,
+                len);
     return Status::OK();
 }
 
@@ -67,11 +87,11 @@ Status ShareObject::Write(size_t offset, const void* data, size_t len) {
         auto s = Create();
         if (!s.IsOk()) return s;
     }
-    if (offset + len > size_) {
+    if (offset > size_ || len > size_ - offset) {
         return Status::Error(ErrorCode::kOutOfRange,
                              "write out of range for key: " + key_);
     }
-    std::memcpy(local_buffer_.get() + offset, data, len);
+    std::memcpy(static_cast<char*>(local_buffer_->ptr()) + offset, data, len);
     return Status::OK();
 }
 
@@ -80,7 +100,7 @@ Status ShareObject::Publish() {
         return Status::Error(ErrorCode::kInternal,
                              "cannot publish empty local buffer: " + key_);
     }
-    int ret = realClient_->put_from(key_, local_buffer_.get(), size_);
+    int ret = realClient_->put_from(key_, local_buffer_->ptr(), size_);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
                              "put_from failed for key: " + key_);
@@ -95,21 +115,26 @@ Status ShareObject::Del() {
         LOG(WARNING) << "remove failed for key: " << key_ << " ret=" << ret;
     }
     if (registered_ && local_buffer_) {
-        int unregisterRet = realClient_->unregister_buffer(local_buffer_.get());
+        int unregisterRet =
+            realClient_->unregister_buffer(local_buffer_->ptr());
         if (unregisterRet != 0) {
             LOG(WARNING) << "unregister_buffer failed for key: " << key_
                          << " ret=" << unregisterRet;
         }
     }
     local_buffer_.reset();
-    owns_local_ = false;
+    local_allocator_.reset();
     registered_ = false;
     return Status::OK();
 }
 
-void* ShareObject::Data() { return local_buffer_.get(); }
+void* ShareObject::Data() {
+    return local_buffer_ ? local_buffer_->ptr() : nullptr;
+}
 
-const void* ShareObject::Data() const { return local_buffer_.get(); }
+const void* ShareObject::Data() const {
+    return local_buffer_ ? local_buffer_->ptr() : nullptr;
+}
 
 size_t ShareObject::Size() const { return size_; }
 

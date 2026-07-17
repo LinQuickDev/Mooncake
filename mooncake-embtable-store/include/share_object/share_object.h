@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "client_buffer.hpp"
 #include "emb_types.h"
 #include "real_client.h"
 
@@ -60,9 +61,10 @@ class ShareObject {
     std::string key_;
     size_t size_;
     std::shared_ptr<mooncake::RealClient> realClient_;
-    // Local backing buffer. Allocated lazily by Create() or Write().
-    std::unique_ptr<char[]> local_buffer_;
-    bool owns_local_ = false;  // whether we allocated (and own) local_buffer_
+    // Allocator owns the aligned backing region; the handle owns the full
+    // allocation and keeps the allocator alive while the buffer is in use.
+    std::shared_ptr<mooncake::ClientBufferAllocator> local_allocator_;
+    std::shared_ptr<mooncake::BufferHandle> local_buffer_;
     bool registered_ = false;
 };
 

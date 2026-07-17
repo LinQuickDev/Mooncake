@@ -1,5 +1,7 @@
 #include "share_object/vector_object.h"
 
+#include <limits>
+
 #include <glog/logging.h>
 
 namespace embtable {
@@ -20,15 +22,19 @@ size_t VectorObject::CalculateShareObjectNum(uint64_t capacity) const {
     if (capacity == 0) return 0;
     uint64_t elemsPerObj = shareObjectSize_ / elemSize_;
     if (elemsPerObj == 0) elemsPerObj = 1;
-    return (capacity + elemsPerObj - 1) / elemsPerObj;
+    return 1 + (capacity - 1) / elemsPerObj;
 }
 
 std::string VectorObject::GetShareObjectName(size_t idx) const {
     return key_ + "_seg" + std::to_string(idx);
 }
 
-Status VectorObject::ensureCapacity(uint64_t neededElements) {
-    if (neededElements <= capacity_) return Status::OK();
+Status VectorObject::ensureShareObjects(uint64_t neededElements) {
+    const uint64_t capacity = capacity_.load(std::memory_order_relaxed);
+    if (capacity != 0 && neededElements > capacity) {
+        return Status::Error(ErrorCode::kBufferFull,
+                             "VectorObject capacity exceeded");
+    }
     size_t neededObjs = CalculateShareObjectNum(neededElements);
     while (shareObjects_.size() < neededObjs) {
         size_t idx = shareObjects_.size();
@@ -41,15 +47,17 @@ Status VectorObject::ensureCapacity(uint64_t neededElements) {
         }
         shareObjects_.push_back(std::move(obj));
     }
-    uint64_t elemsPerObj = shareObjectSize_ / elemSize_;
-    if (elemsPerObj == 0) elemsPerObj = 1;
-    capacity_ = shareObjects_.size() * elemsPerObj;
     return Status::OK();
 }
 
 Status VectorObject::Reserve(uint64_t capacity) {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
-    return ensureCapacity(capacity);
+    if (capacity != 0 && capacity < size_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "capacity is smaller than current size");
+    }
+    capacity_.store(capacity, std::memory_order_release);
+    return Status::OK();
 }
 
 Status VectorObject::Append(const void* data, size_t len, uint64_t& index) {
@@ -59,7 +67,11 @@ Status VectorObject::Append(const void* data, size_t len, uint64_t& index) {
     }
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
     uint64_t next = size_.load(std::memory_order_relaxed);
-    auto s = ensureCapacity(next + 1);
+    if (next == std::numeric_limits<uint64_t>::max()) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "VectorObject size overflow");
+    }
+    auto s = ensureShareObjects(next + 1);
     if (!s.IsOk()) return s;
     uint64_t elemsPerObj = shareObjectSize_ / elemSize_;
     if (elemsPerObj == 0) elemsPerObj = 1;
@@ -141,34 +153,31 @@ Status VectorObject::ImportAll(uint64_t dataNum) {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
     if (dataNum == 0) {
         shareObjects_.clear();
-        capacity_ = 0;
         size_.store(0, std::memory_order_release);
         return Status::OK();
     }
+    const uint64_t capacity = capacity_.load(std::memory_order_relaxed);
+    if (capacity != 0 && dataNum > capacity) {
+        return Status::Error(ErrorCode::kBufferFull,
+                             "import exceeds VectorObject capacity");
+    }
     size_t neededObjs = CalculateShareObjectNum(dataNum);
-    // Allocate exactly the same number of ShareObjects as the publisher did,
-    // each with the same fixed size, then Import each segment.
-    shareObjects_.clear();
-    shareObjects_.reserve(neededObjs);
+    // Import only the segments that contain published elements. Build the new
+    // vector off to the side so a failed import does not expose partial state.
+    std::vector<std::unique_ptr<ShareObject>> importedObjects;
+    importedObjects.reserve(neededObjs);
     for (size_t i = 0; i < neededObjs; ++i) {
         auto obj = std::make_unique<ShareObject>(GetShareObjectName(i),
                                                  shareObjectSize_, realClient_);
-        auto s = obj->Create();  // allocate local buffer
-        if (!s.IsOk()) {
-            return Status::Error(ErrorCode::kInternal,
-                                 "Create ShareObject failed: " + s.msg());
-        }
-        s = obj->Import();  // pull from Mooncake Store
+        auto s = obj->Import();
         if (!s.IsOk()) {
             LOG(ERROR) << "ImportAll failed for " << obj->Key() << ": "
                        << s.msg();
             return s;
         }
-        shareObjects_.push_back(std::move(obj));
+        importedObjects.push_back(std::move(obj));
     }
-    uint64_t elemsPerObj = shareObjectSize_ / elemSize_;
-    if (elemsPerObj == 0) elemsPerObj = 1;
-    capacity_ = shareObjects_.size() * elemsPerObj;
+    shareObjects_ = std::move(importedObjects);
     size_.store(dataNum, std::memory_order_release);
     return Status::OK();
 }
