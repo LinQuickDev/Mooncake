@@ -106,6 +106,8 @@ target_link_libraries(embtable_client PRIVATE
     pthread
 )
 
+add_subdirectory(../benchmarks benchmarks)
+
 if(BUILD_SHARED_LIBS)
     install(TARGETS mooncake_embtable_store DESTINATION lib)
     install(TARGETS embtable_client DESTINATION bin)

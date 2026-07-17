@@ -45,6 +45,8 @@ class EmbTableDummyClient {
 
     Status BuildIndex();
 
+    uint64_t ValueSize() const { return valueSize_; }
+
    private:
     std::shared_ptr<mooncake::BufferHandle> AllocateSharedBuffer(uint64_t size);
     void CleanupSharedMemory();
