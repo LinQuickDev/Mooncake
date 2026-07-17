@@ -87,11 +87,15 @@ Status IndexObject::Export() {
     std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
     asPhf(phf_.get())->save(ss);
     std::string data = ss.str();
-    if (data.size() > shareObject_.Size()) {
+    // Layout: [8-byte length][serialized PHF bytes]
+    uint64_t dataLen = data.size();
+    if (sizeof(uint64_t) + dataLen > shareObject_.Size()) {
         return Status::Error(ErrorCode::kBufferFull,
                              "serialized PHF exceeds ShareObject capacity");
     }
-    s = shareObject_.Write(0, data.data(), data.size());
+    s = shareObject_.Write(0, &dataLen, sizeof(uint64_t));
+    if (!s.IsOk()) return s;
+    s = shareObject_.Write(sizeof(uint64_t), data.data(), dataLen);
     if (!s.IsOk()) return s;
     return shareObject_.Publish();
 }
@@ -101,8 +105,19 @@ Status IndexObject::Import() {
     if (!s.IsOk()) return s;
     s = shareObject_.Import();
     if (!s.IsOk()) return s;
-    std::string raw(static_cast<const char*>(shareObject_.Data()),
-                    shareObject_.Size());
+    // Read the length prefix, then load exactly dataLen bytes (not the whole
+    // ShareObject, which is padded with zeros and corrupts BBHash load).
+    uint64_t dataLen = 0;
+    s = shareObject_.Read(0, sizeof(uint64_t), &dataLen);
+    if (!s.IsOk()) return s;
+    if (dataLen == 0 || dataLen > shareObject_.Size() - sizeof(uint64_t)) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid PHF payload length: " +
+                                 std::to_string(dataLen));
+    }
+    std::string raw(dataLen, '\0');
+    s = shareObject_.Read(sizeof(uint64_t), dataLen, raw.data());
+    if (!s.IsOk()) return s;
     std::stringstream ss(raw, std::ios::in | std::ios::out | std::ios::binary);
     phf_.reset();
     auto* loaded = new BoophfT();

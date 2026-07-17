@@ -194,8 +194,19 @@ Status ShareMap::Import() {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
     auto s = meta_->Deserialize();
     if (!s.IsOk()) return s;
-    valueSize_ = meta_->GetValueSize();
+    uint64_t realValueSize = meta_->GetValueSize();
     uint64_t total = meta_->GetTotalSize();
+
+    // ShareMapStore::Import creates this ShareMap with a placeholder
+    // valueSize=1 (it doesn't know the real size until meta is deserialized).
+    // If the placeholder differs from the real valueSize, rebuild valueVec_
+    // with the correct elemSize so ImportAll segments match the publisher's
+    // layout. keyVec_ always uses sizeof(uint64_t) so it is unaffected.
+    if (realValueSize != 0 && realValueSize != valueSize_) {
+        valueSize_ = realValueSize;
+        valueVec_ = std::make_unique<VectorObject>(
+            bucketKey_ + "_values", valueSize_, realClient_);
+    }
 
     // Reconstruct key/value/index from Mooncake Store. Each VectorObject
     // imports all its backing segments so that Get() works locally after
