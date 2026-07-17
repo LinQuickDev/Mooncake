@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "emb_table/emb_table.h"
+#include "emb_table_client/emb_table_rpc_service.h"
 #include "share_map_store/share_map_store.h"
 #include "share_map_store/share_map_store_client.h"
 #include "share_map_store/share_map_store_rpc_service.h"
@@ -22,8 +23,9 @@ namespace embtable {
 // remote EmbTableClient via SHM/RPC.
 //
 // This version supports both the local path and the RPC path:
-//   - On Init, it starts a ShareMapStore RPC service (if rpcPort > 0) so
-//     other nodes can query this node's buckets via coro_rpc.
+//   - On Init, it starts EmbTable and ShareMapStore RPC services (if
+//     rpcPort > 0). DummyClient uses EmbTable RPC + shared memory, while other
+//     nodes use ShareMapStore RPC + Transfer Engine.
 //   - It creates a ShareMapStoreClient used by EmbTable/Bucket to call
 //     remote ShareMapStore services when a bucket lives on another node.
 class EmbTableClient {
@@ -37,7 +39,7 @@ class EmbTableClient {
         // Local hostname (used for node-locality detection). If empty,
         // detected from the RealClient.
         std::string localHostname;
-        // RPC server thread count for ShareMapStore service.
+        // RPC server thread count for EmbTable and ShareMapStore services.
         size_t rpcThreads = 4;
     };
 
@@ -93,8 +95,9 @@ class EmbTableClient {
     std::shared_ptr<ShareMapStore> shareMapStore_;
     std::shared_ptr<ShareMapStoreClient> shareMapStoreClient_;
     std::shared_ptr<EmbTable> embTable_;
-    // RPC service (kept alive for the lifetime of the client).
-    std::unique_ptr<ShareMapStoreRpcService> rpcService_;
+    // RPC services (kept alive for the lifetime of the client).
+    std::unique_ptr<ShareMapStoreRpcService> shareMapRpcService_;
+    std::unique_ptr<EmbTableRpcService> embTableRpcService_;
     std::unique_ptr<coro_rpc::coro_rpc_server> rpcServer_;
     std::thread rpcThread_;
     std::string localHostname_;

@@ -23,8 +23,13 @@ DEFINE_string(embtable_master_address, "127.0.0.1:50051",
               "Mooncake Store master address");
 DEFINE_string(embtable_protocol, "tcp", "Transfer protocol");
 DEFINE_string(embtable_device_names, "", "Transfer device names");
-DEFINE_uint32(embtable_rpc_port, 50055, "ShareMapStore RPC service port");
-DEFINE_uint32(embtable_rpc_threads, 4, "ShareMapStore RPC worker threads");
+DEFINE_string(embtable_global_segment_size, "16 MB",
+              "Mooncake Store global segment size");
+DEFINE_string(embtable_local_buffer_size, "16 MB",
+              "Mooncake Store local buffer size");
+DEFINE_uint32(embtable_rpc_port, 50055,
+              "EmbTable and ShareMapStore RPC service port");
+DEFINE_uint32(embtable_rpc_threads, 4, "EmbTable RPC worker threads");
 DEFINE_string(embtable_transfer_buffer_size, "64 MB",
               "Registered RPC data-plane transfer buffer size");
 DEFINE_string(embtable_share_object_size, "64 MB",
@@ -59,6 +64,10 @@ int main(int argc, char* argv[]) {
     options.deployment.metadataServer = FLAGS_embtable_metadata_server;
     options.deployment.protocol = FLAGS_embtable_protocol;
     options.deployment.deviceNames = FLAGS_embtable_device_names;
+    options.deployment.globalSegmentSize =
+        mooncake::string_to_byte_size(FLAGS_embtable_global_segment_size);
+    options.deployment.localBufferSize =
+        mooncake::string_to_byte_size(FLAGS_embtable_local_buffer_size);
     options.deployment.rpcPort =
         static_cast<uint16_t>(FLAGS_embtable_rpc_port);
     options.deployment.transferBufferSize =

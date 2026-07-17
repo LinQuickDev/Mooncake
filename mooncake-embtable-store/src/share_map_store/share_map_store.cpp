@@ -26,8 +26,7 @@ Status ShareMapStore::Init() {
     realClient_ = std::make_shared<mooncake::RealClient>();
     int ret = realClient_->setup_real(
         /*local_hostname=*/"", config_.metadataServer,
-        /*global_segment_size=*/1024 * 1024 * 16,
-        /*local_buffer_size=*/1024 * 1024 * 16,
+        config_.globalSegmentSize, config_.localBufferSize,
         config_.protocol, config_.deviceNames,
         config_.masterAddress);
     if (ret != 0) {

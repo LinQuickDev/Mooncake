@@ -31,7 +31,8 @@ EmbTableClient::~EmbTableClient() {
     }
     if (rpcThread_.joinable()) rpcThread_.join();
     rpcServer_.reset();
-    rpcService_.reset();
+    embTableRpcService_.reset();
+    shareMapRpcService_.reset();
 }
 
 Status EmbTableClient::Init() {
@@ -58,7 +59,8 @@ Status EmbTableClient::Init() {
         realClient_ = std::make_shared<mooncake::RealClient>();
         int ret = realClient_->setup_real(
             localHostname_, options_.deployment.metadataServer,
-            1024 * 1024 * 16, 1024 * 1024 * 16,
+            options_.deployment.globalSegmentSize,
+            options_.deployment.localBufferSize,
             options_.deployment.protocol, options_.deployment.deviceNames,
             options_.deployment.masterAddress);
         if (ret != 0) {
@@ -73,30 +75,36 @@ Status EmbTableClient::Init() {
     s = shareMapStoreClient_->Init(options_.deployment.transferBufferSize);
     if (!s.IsOk()) return s;
 
-    // Start the ShareMapStore RPC service (if a port is configured).
+    embTable_ = std::make_shared<EmbTable>(
+        options_.tableName, options_.numBuckets, options_.valueSize,
+        shareMapStore_, realClient_, shareMapStoreClient_, localHostname_,
+        options_.deployment.rpcPort);
+    s = embTable_->Init(options_.createNew);
+    if (!s.IsOk()) return s;
+
+    // Start both RPC services only after EmbTable is fully initialized.
     if (options_.deployment.rpcPort != 0) {
-        rpcService_ = std::make_unique<ShareMapStoreRpcService>(*shareMapStore_);
+        shareMapRpcService_ =
+            std::make_unique<ShareMapStoreRpcService>(*shareMapStore_);
+        embTableRpcService_ = std::make_unique<EmbTableRpcService>(*this);
         rpcServer_ = std::make_unique<coro_rpc::coro_rpc_server>(
             options_.rpcThreads, options_.deployment.rpcPort);
-        rpcService_->RegisterHandlers(*rpcServer_);
+        shareMapRpcService_->RegisterHandlers(*rpcServer_);
+        embTableRpcService_->RegisterHandlers(*rpcServer_);
         // Start the server in a background thread.
         // coro_rpc_server::start() blocks; we run it asynchronously.
         rpcThread_ = std::thread([this]() {
-            LOG(INFO) << "ShareMapStore RPC service listening on port "
+            LOG(INFO) << "EmbTable RPC service listening on port "
                       << options_.deployment.rpcPort;
             auto ec = rpcServer_->start();
             if (ec) {
-                LOG(ERROR) << "ShareMapStore RPC service stopped with error: "
+                LOG(ERROR) << "EmbTable RPC service stopped with error: "
                            << ec.message();
             }
         });
     }
 
-    embTable_ = std::make_shared<EmbTable>(
-        options_.tableName, options_.numBuckets, options_.valueSize,
-        shareMapStore_, realClient_, shareMapStoreClient_, localHostname_,
-        options_.deployment.rpcPort);
-    return embTable_->Init(options_.createNew);
+    return Status::OK();
 }
 
 Status EmbTableClient::Insert(const std::vector<uint64_t>& keys,

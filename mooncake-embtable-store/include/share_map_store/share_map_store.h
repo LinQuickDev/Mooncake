@@ -22,6 +22,9 @@ struct DeploymentConfig {
     std::string protocol = "tcp";
     std::string deviceNames;
     std::string metadataServer = "http://127.0.0.1:8080/metadata";
+    // Mooncake Store segment and client-local allocator sizes.
+    uint64_t globalSegmentSize = 16ull * 1024 * 1024;
+    uint64_t localBufferSize = 16ull * 1024 * 1024;
     // RPC service port for EmbTableClient to reach this ShareMapStore.
     // 0 disables the RPC server (local-only mode).
     uint16_t rpcPort = 0;

@@ -1963,7 +1963,7 @@ mooncake-embtable-store/
 │   │   └── emb_table.h                     # EmbTable（xxHash 路由 + 全局调度聚合）
 │   └── emb_table_client/                   # EmbTableClient 层
 │       ├── emb_table_client.h              # 顶层 facade（Options + Init/Insert/Find/Load/BuildIndex）
-│       └── emb_table_dummy_client.h        # stub（转发到本地 EmbTableClient，SHM 通信待补）
+│       └── emb_table_dummy_client.h        # RPC 控制面 + POSIX SHM 数据面客户端
 ├── src/
 │   ├── CMakeLists.txt                      # 五个 OBJECT 库 + 聚合 mooncake_embtable_store
 │   ├── share_object/*.cpp
@@ -2028,7 +2028,7 @@ mooncake-embtable-store/
 - `PublishRequest/Response` / `FindRequest/Response` / `FindMultiBucketRequest/Response` / `BuildIndexRequest/Response` / `BuildIndexMultiBucketRequest/Response`：在 `share_map_store_rpc_service.h` 中定义（见 4.1.2）
 - `FileParser` / `CsvParser` / `ParquetParser` / `BinaryParser` / `TfrecordParser`：在 `emb_table_file_parser.h` 中定义（见 5.3.3）
 - `RpcServer`：直接使用 `ylt/coro_rpc::coro_rpc_server`，不额外封装（与 mooncake-store 风格一致）
-- `EmbTableDummyClient`：通过 Unix Domain Socket / SHM 将请求转发到同节点的 `EmbTableClient` 进程；当前实现为对本地 `EmbTableClient` 的直接转发 stub，SHM/coro_rpc 远程转发留作后续迭代
+- `EmbTableDummyClient`：通过 coro_rpc 将控制请求转发到同节点的 `EmbTableClient` 进程；Insert values 与 Find results 通过预注册 POSIX SHM 传输。
 
 ---
 
@@ -2075,7 +2075,7 @@ mooncake-embtable-store/
 - [ ] `FindMultiBucket` / `BuildIndexMultiBucket` RPC 接口实现
 - [ ] Mooncake Buffer 注册 + TE Write/Read 集成
 - [ ] `tests/` 单元测试用例
-- [ ] `EmbTableDummyClient` 的 SHM/coro_rpc 远程转发实现
+- [x] `EmbTableDummyClient` 的 SHM/coro_rpc 远程转发实现
 
 ---
 

@@ -63,6 +63,7 @@ target_link_libraries(embtable_emb_table PUBLIC embtable_share_map_store)
 # ---- EmbTableClient layer (depends on EmbTable + ShareMapStore) ----
 add_library(embtable_emb_table_client OBJECT
     emb_table_client/emb_table_client.cpp
+    emb_table_client/emb_table_rpc_service.cpp
     emb_table_client/emb_table_dummy_client.cpp
 )
 target_include_directories(embtable_emb_table_client PUBLIC
