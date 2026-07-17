@@ -1,6 +1,7 @@
 #include "share_map_store/share_map_store_client.h"
 
 #include <cstring>
+#include <new>
 #include <thread>
 #include <unordered_map>
 
@@ -10,10 +11,10 @@
 namespace embtable {
 
 ShareMapStoreClient::~ShareMapStoreClient() {
-    transferAllocator_.reset();
-    if (transferBufferRegistered_ && transferBuffer_ && client_) {
-        client_->unregister_buffer(transferBuffer_.get());
+    if (transferBufferRegistered_ && transferAllocator_ && client_) {
+        client_->unregister_buffer(transferAllocator_->getBase());
     }
+    transferAllocator_.reset();
 }
 
 Status ShareMapStoreClient::Init(uint64_t transferBufferSize) {
@@ -21,19 +22,29 @@ Status ShareMapStoreClient::Init(uint64_t transferBufferSize) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid ShareMapStoreClient transfer buffer");
     }
-    transferBuffer_ = std::unique_ptr<char[]>(new char[transferBufferSize]);
-    transferBufferSize_ = transferBufferSize;
-    if (client_->register_transfer_buffer(transferBuffer_.get(),
-                                          transferBufferSize_) != 0) {
-        transferBuffer_.reset();
-        transferBufferSize_ = 0;
+    try {
+        transferAllocator_ = mooncake::ClientBufferAllocator::create(
+            transferBufferSize, client_->protocol);
+    } catch (const std::bad_alloc&) {
+        return Status::Error(
+            ErrorCode::kInternal,
+            "failed to allocate ShareMapStoreClient transfer buffer");
+    }
+    if (!transferAllocator_ || !transferAllocator_->getBase()) {
+        transferAllocator_.reset();
+        return Status::Error(
+            ErrorCode::kInternal,
+            "failed to allocate ShareMapStoreClient transfer buffer");
+    }
+    if (client_->register_buffer(transferAllocator_->getBase(),
+                                 transferBufferSize) != 0) {
+        transferAllocator_.reset();
         return Status::Error(
             ErrorCode::kIOError,
             "failed to register ShareMapStoreClient transfer buffer");
     }
+    transferBufferSize_ = transferBufferSize;
     transferBufferRegistered_ = true;
-    transferAllocator_ = mooncake::ClientBufferAllocator::create(
-        transferBuffer_.get(), transferBufferSize_);
     return Status::OK();
 }
 

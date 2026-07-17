@@ -3066,23 +3066,6 @@ int RealClient::register_buffer(void *buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
 }
 
-int RealClient::register_transfer_buffer(void *buffer, size_t size) {
-    if (!client_ || buffer == nullptr || size == 0) {
-        return to_py_ret(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::INVALID_PARAMS)));
-    }
-    auto result =
-        client_->RegisterLocalMemory(buffer, size, kWildcardLocation, true, true);
-    if (!result) {
-        return to_py_ret(result);
-    }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
-    }
-    return 0;
-}
-
 std::string RealClient::get_transfer_endpoint() const {
     return client_ ? client_->GetTransportEndpoint() : std::string();
 }

@@ -105,10 +105,6 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
-    // Register a buffer that can be used as a remote Transfer Engine target.
-    // Unlike register_buffer(), this exposes the memory for peer DMA writes.
-    int register_transfer_buffer(void *buffer, size_t size);
-
     // Return the local Transfer Engine endpoint used in peer buffer
     // descriptors.
     std::string get_transfer_endpoint() const;

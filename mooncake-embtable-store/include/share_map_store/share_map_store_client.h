@@ -97,7 +97,6 @@ class ShareMapStoreClient {
         uint64_t size);
 
     std::shared_ptr<mooncake::RealClient> client_;
-    std::unique_ptr<char[]> transferBuffer_;
     uint64_t transferBufferSize_ = 0;
     bool transferBufferRegistered_ = false;
     std::shared_ptr<mooncake::ClientBufferAllocator> transferAllocator_;

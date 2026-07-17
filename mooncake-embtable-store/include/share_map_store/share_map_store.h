@@ -10,6 +10,7 @@
 
 #include "share_object/share_map.h"
 #include "emb_types.h"
+#include "client_buffer.hpp"
 #include "real_client.h"
 
 namespace embtable {
@@ -117,7 +118,7 @@ class ShareMapStore {
 
    private:
     struct TransferBufferSlot {
-        std::unique_ptr<char[]> buffer;
+        std::shared_ptr<mooncake::ClientBufferAllocator> allocator;
         bool registered = false;
         bool inUse = false;
     };

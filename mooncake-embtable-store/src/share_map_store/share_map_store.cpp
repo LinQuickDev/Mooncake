@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <string>
 
 #include <glog/logging.h>
@@ -14,8 +15,8 @@ ShareMapStore::ShareMapStore(DeploymentConfig config)
 
 ShareMapStore::~ShareMapStore() {
     for (auto& slot : transferBuffers_) {
-        if (slot.registered && slot.buffer && realClient_) {
-            realClient_->unregister_buffer(slot.buffer.get());
+        if (slot.registered && slot.allocator && realClient_) {
+            realClient_->unregister_buffer(slot.allocator->getBase());
         }
     }
 }
@@ -42,14 +43,28 @@ Status ShareMapStore::Init() {
     transferBuffers_.reserve(bufferCount);
     for (uint32_t i = 0; i < bufferCount; ++i) {
         TransferBufferSlot slot;
-        slot.buffer =
-            std::unique_ptr<char[]>(new char[config_.transferBufferSize]);
-        if (realClient_->register_transfer_buffer(slot.buffer.get(),
-                                                  config_.transferBufferSize) !=
-            0) {
+        try {
+            slot.allocator = mooncake::ClientBufferAllocator::create(
+                config_.transferBufferSize, config_.protocol);
+        } catch (const std::bad_alloc&) {
             for (auto& registeredSlot : transferBuffers_) {
-                if (registeredSlot.registered && registeredSlot.buffer) {
-                    realClient_->unregister_buffer(registeredSlot.buffer.get());
+                if (registeredSlot.registered && registeredSlot.allocator) {
+                    realClient_->unregister_buffer(
+                        registeredSlot.allocator->getBase());
+                }
+            }
+            transferBuffers_.clear();
+            return Status::Error(
+                ErrorCode::kInternal,
+                "failed to allocate ShareMapStore transfer buffer");
+        }
+        if (!slot.allocator || !slot.allocator->getBase() ||
+            realClient_->register_buffer(slot.allocator->getBase(),
+                                         config_.transferBufferSize) != 0) {
+            for (auto& registeredSlot : transferBuffers_) {
+                if (registeredSlot.registered && registeredSlot.allocator) {
+                    realClient_->unregister_buffer(
+                        registeredSlot.allocator->getBase());
                 }
             }
             transferBuffers_.clear();
@@ -181,11 +196,13 @@ Status ShareMapStore::QueryDataToBuffer(
         return Status::Error(ErrorCode::kInternal,
                              "no ShareMapStore transfer buffer available");
     }
-    auto& transferBuffer = transferBuffers_[bufferIndex].buffer;
+    auto& transferAllocator = transferBuffers_[bufferIndex].allocator;
+    auto* transferBuffer =
+        static_cast<char*>(transferAllocator->getBase());
     foundFlags.resize(keys.size(), 0);
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        char* dest = transferBuffer.get() + i * entrySize;
+        char* dest = transferBuffer + i * entrySize;
         if (i < buffers.size() && buffers[i].data() != nullptr &&
             buffers[i].size() >= valueSize) {
             foundFlags[i] = 1;
@@ -199,7 +216,7 @@ Status ShareMapStore::QueryDataToBuffer(
 
     // 3. Data plane: write directly into the caller's registered buffer.
     int ret = realClient_->subTransferTask(
-        transferBuffer.get(), transferredSize, targetEndpoint, targetAddress);
+        transferBuffer, transferredSize, targetEndpoint, targetAddress);
     ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
@@ -282,8 +299,10 @@ Status ShareMapStore::BatchQueryDataToBuffer(
         return Status::Error(ErrorCode::kInternal,
                              "no ShareMapStore transfer buffer available");
     }
-    auto& transferBuffer = transferBuffers_[bufferIndex].buffer;
-    char* writePtr = transferBuffer.get();
+    auto& transferAllocator = transferBuffers_[bufferIndex].allocator;
+    auto* transferBuffer =
+        static_cast<char*>(transferAllocator->getBase());
+    char* writePtr = transferBuffer;
     uint64_t bucketCountValue = bucketCount;
     std::memcpy(writePtr, &bucketCountValue, sizeof(uint64_t));
     writePtr += sizeof(uint64_t);
@@ -325,7 +344,7 @@ Status ShareMapStore::BatchQueryDataToBuffer(
     // Phase 3: Single direct TE write for the entire aggregated buffer.
     transferredSize = requiredSize;
     int ret = realClient_->subTransferTask(
-        transferBuffer.get(), transferredSize, targetEndpoint, targetAddress);
+        transferBuffer, transferredSize, targetEndpoint, targetAddress);
     ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
