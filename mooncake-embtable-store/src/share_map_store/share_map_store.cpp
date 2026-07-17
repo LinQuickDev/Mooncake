@@ -1,6 +1,8 @@
 #include "share_map_store/share_map_store.h"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include <glog/logging.h>
@@ -11,8 +13,10 @@ ShareMapStore::ShareMapStore(DeploymentConfig config)
     : config_(std::move(config)) {}
 
 ShareMapStore::~ShareMapStore() {
-    if (transferBufferRegistered_ && transferBuffer_ && realClient_) {
-        realClient_->unregister_buffer(transferBuffer_.get());
+    for (auto& slot : transferBuffers_) {
+        if (slot.registered && slot.buffer && realClient_) {
+            realClient_->unregister_buffer(slot.buffer.get());
+        }
     }
 }
 
@@ -33,17 +37,29 @@ Status ShareMapStore::Init() {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "transferBufferSize must be > 0");
     }
-    transferBuffer_ =
-        std::unique_ptr<char[]>(new char[config_.transferBufferSize]);
-    transferBufferSize_ = config_.transferBufferSize;
-    if (realClient_->register_transfer_buffer(transferBuffer_.get(),
-                                              transferBufferSize_) != 0) {
-        transferBuffer_.reset();
-        transferBufferSize_ = 0;
-        return Status::Error(ErrorCode::kIOError,
-                             "failed to register ShareMapStore transfer buffer");
+    const uint32_t bufferCount =
+        std::max<uint32_t>(1, config_.transferBufferCount);
+    transferBuffers_.reserve(bufferCount);
+    for (uint32_t i = 0; i < bufferCount; ++i) {
+        TransferBufferSlot slot;
+        slot.buffer =
+            std::unique_ptr<char[]>(new char[config_.transferBufferSize]);
+        if (realClient_->register_transfer_buffer(slot.buffer.get(),
+                                                  config_.transferBufferSize) !=
+            0) {
+            for (auto& registeredSlot : transferBuffers_) {
+                if (registeredSlot.registered && registeredSlot.buffer) {
+                    realClient_->unregister_buffer(registeredSlot.buffer.get());
+                }
+            }
+            transferBuffers_.clear();
+            return Status::Error(
+                ErrorCode::kIOError,
+                "failed to register ShareMapStore transfer buffer");
+        }
+        slot.registered = true;
+        transferBuffers_.push_back(std::move(slot));
     }
-    transferBufferRegistered_ = true;
     initialized_ = true;
     return Status::OK();
 }
@@ -153,17 +169,23 @@ Status ShareMapStore::QueryDataToBuffer(
     uint64_t entrySize = 1 + valueSize;
     transferredSize = keys.size() * entrySize;
     if (transferredSize > targetCapacity ||
-        transferredSize > transferBufferSize_) {
+        transferBuffers_.empty() ||
+        transferredSize > config_.transferBufferSize) {
         return Status::Error(
             ErrorCode::kOutOfRange,
             "query result exceeds registered transfer buffer capacity");
     }
 
-    std::lock_guard<std::mutex> lock(transferMutex_);
+    const size_t bufferIndex = AcquireTransferBuffer();
+    if (bufferIndex == std::numeric_limits<size_t>::max()) {
+        return Status::Error(ErrorCode::kInternal,
+                             "no ShareMapStore transfer buffer available");
+    }
+    auto& transferBuffer = transferBuffers_[bufferIndex].buffer;
     foundFlags.resize(keys.size(), 0);
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        char* dest = transferBuffer_.get() + i * entrySize;
+        char* dest = transferBuffer.get() + i * entrySize;
         if (i < buffers.size() && buffers[i].data() != nullptr &&
             buffers[i].size() >= valueSize) {
             foundFlags[i] = 1;
@@ -177,7 +199,8 @@ Status ShareMapStore::QueryDataToBuffer(
 
     // 3. Data plane: write directly into the caller's registered buffer.
     int ret = realClient_->subTransferTask(
-        transferBuffer_.get(), transferredSize, targetEndpoint, targetAddress);
+        transferBuffer.get(), transferredSize, targetEndpoint, targetAddress);
+    ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
                              "Transfer Engine query result write failed");
@@ -247,14 +270,20 @@ Status ShareMapStore::BatchQueryDataToBuffer(
                         sizeof(uint64_t) +
                         keysPerBucket[i].size() * entrySize;
     }
-    if (requiredSize > targetCapacity || requiredSize > transferBufferSize_) {
+    if (requiredSize > targetCapacity || transferBuffers_.empty() ||
+        requiredSize > config_.transferBufferSize) {
         return Status::Error(
             ErrorCode::kOutOfRange,
             "batch query result exceeds registered transfer buffer capacity");
     }
 
-    std::lock_guard<std::mutex> lock(transferMutex_);
-    char* writePtr = transferBuffer_.get();
+    const size_t bufferIndex = AcquireTransferBuffer();
+    if (bufferIndex == std::numeric_limits<size_t>::max()) {
+        return Status::Error(ErrorCode::kInternal,
+                             "no ShareMapStore transfer buffer available");
+    }
+    auto& transferBuffer = transferBuffers_[bufferIndex].buffer;
+    char* writePtr = transferBuffer.get();
     uint64_t bucketCountValue = bucketCount;
     std::memcpy(writePtr, &bucketCountValue, sizeof(uint64_t));
     writePtr += sizeof(uint64_t);
@@ -296,12 +325,43 @@ Status ShareMapStore::BatchQueryDataToBuffer(
     // Phase 3: Single direct TE write for the entire aggregated buffer.
     transferredSize = requiredSize;
     int ret = realClient_->subTransferTask(
-        transferBuffer_.get(), transferredSize, targetEndpoint, targetAddress);
+        transferBuffer.get(), transferredSize, targetEndpoint, targetAddress);
+    ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
                              "Transfer Engine batch query write failed");
     }
     return Status::OK();
+}
+
+size_t ShareMapStore::AcquireTransferBuffer() {
+    std::unique_lock<std::mutex> lock(transferBufferMutex_);
+    if (transferBuffers_.empty()) {
+        return std::numeric_limits<size_t>::max();
+    }
+    transferBufferCv_.wait(lock, [this]() {
+        for (const auto& slot : transferBuffers_) {
+            if (!slot.inUse) return true;
+        }
+        return false;
+    });
+    for (size_t i = 0; i < transferBuffers_.size(); ++i) {
+        if (!transferBuffers_[i].inUse) {
+            transferBuffers_[i].inUse = true;
+            return i;
+        }
+    }
+    return std::numeric_limits<size_t>::max();
+}
+
+void ShareMapStore::ReleaseTransferBuffer(size_t index) {
+    {
+        std::lock_guard<std::mutex> lock(transferBufferMutex_);
+        if (index < transferBuffers_.size()) {
+            transferBuffers_[index].inUse = false;
+        }
+    }
+    transferBufferCv_.notify_one();
 }
 
 }  // namespace embtable

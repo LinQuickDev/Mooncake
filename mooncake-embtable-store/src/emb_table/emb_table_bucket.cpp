@@ -37,6 +37,13 @@ Bucket::Bucket(BucketInfo info,
       shareMapStoreRpcPort_(shareMapStoreRpcPort) {}
 
 Status Bucket::ResolveLocality() {
+    std::lock_guard<std::mutex> localityLock(localityMutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (localityResolved_ &&
+        now - localityResolvedAt_ < std::chrono::seconds(1)) {
+        return Status::OK();
+    }
+
     std::string ownerHost;
     bool replicaResolved = false;
 
@@ -81,6 +88,8 @@ Status Bucket::ResolveLocality() {
         // Local-only deployments have no RPC routing requirement.
         if (!shareMapStoreClient_ || shareMapStoreRpcPort_ == 0) {
             isLocal_ = true;
+            localityResolved_ = true;
+            localityResolvedAt_ = now;
             return Status::OK();
         }
         return Status::Error(ErrorCode::kNotFound,
@@ -100,7 +109,14 @@ Status Bucket::ResolveLocality() {
         info_.rpcEndpoint =
             localHostname_ + ":" + std::to_string(shareMapStoreRpcPort_);
     }
+    localityResolved_ = true;
+    localityResolvedAt_ = now;
     return Status::OK();
+}
+
+void Bucket::InvalidateLocality() {
+    std::lock_guard<std::mutex> lock(localityMutex_);
+    localityResolved_ = false;
 }
 
 Status Bucket::Insert(const std::vector<uint64_t>& keys,
@@ -117,13 +133,16 @@ Status Bucket::Insert(const std::vector<uint64_t>& keys,
                                  "value size != bucket valueSize");
         }
     }
+    std::lock_guard<std::mutex> lock(bufferMutex_);
     // Inserts always go to the local write buffer; they are flushed later
     // when the buffer is full (design doc 4.1.4).
+    localKeys_.reserve(localKeys_.size() + keys.size());
+    localValues_.reserve(localValues_.size() + values.size());
     localKeys_.insert(localKeys_.end(), keys.begin(), keys.end());
     for (const auto& v : values) {
         localValues_.emplace_back(v.data(), v.size());
     }
-    wouldFlush = IsFull();
+    wouldFlush = localKeys_.size() >= flushThreshold_;
     return Status::OK();
 }
 
@@ -134,29 +153,54 @@ Status Bucket::Insert(const std::vector<uint64_t>& keys,
 }
 
 Status Bucket::Flush() {
-    if (localKeys_.empty()) return Status::OK();
+    // Serialize flushes for this bucket. A concurrent Find must not observe an
+    // empty pending buffer while another thread is still publishing the batch
+    // that it already removed from the buffer.
+    std::lock_guard<std::mutex> flushLock(flushMutex_);
+    std::vector<uint64_t> keys;
+    std::vector<std::string> values;
+    {
+        std::lock_guard<std::mutex> lock(bufferMutex_);
+        if (localKeys_.empty()) return Status::OK();
+        keys.swap(localKeys_);
+        values.swap(localValues_);
+    }
 
     // Resolve locality to decide whether to flush locally or remotely.
     auto s = ResolveLocality();
-    if (!s.IsOk()) return s;
+    if (!s.IsOk()) {
+        std::lock_guard<std::mutex> lock(bufferMutex_);
+        localKeys_.insert(localKeys_.begin(), keys.begin(), keys.end());
+        localValues_.insert(localValues_.begin(), values.begin(), values.end());
+        return s;
+    }
 
     std::vector<StringView> views;
-    views.reserve(localValues_.size());
-    for (const auto& v : localValues_) {
+    views.reserve(values.size());
+    for (const auto& v : values) {
         views.emplace_back(v);
     }
 
-    if (isLocal_ || !shareMapStoreClient_) {
-        s = shareMapStore_->Publish(bucketKey_, info_.valueSize, localKeys_,
-                                    views);
+    const bool local = IsLocal();
+    const auto endpoint = RpcEndpoint();
+    const auto valueSize = Info().valueSize;
+    if (local || !shareMapStoreClient_) {
+        s = shareMapStore_->Publish(bucketKey_, valueSize, keys, views);
     } else {
-        s = shareMapStoreClient_->Publish(info_.rpcEndpoint, bucketKey_,
-                                          info_.valueSize, localKeys_, views);
+        s = shareMapStoreClient_->Publish(endpoint, bucketKey_, valueSize, keys,
+                                          views);
     }
-    if (!s.IsOk()) return s;
-    info_.currentSize += localKeys_.size();
-    localKeys_.clear();
-    localValues_.clear();
+    if (!s.IsOk()) {
+        InvalidateLocality();
+        std::lock_guard<std::mutex> lock(bufferMutex_);
+        localKeys_.insert(localKeys_.begin(), keys.begin(), keys.end());
+        localValues_.insert(localValues_.begin(), values.begin(), values.end());
+        return s;
+    }
+    {
+        std::lock_guard<std::mutex> lock(localityMutex_);
+        info_.currentSize += keys.size();
+    }
     return Status::OK();
 }
 
@@ -167,15 +211,18 @@ Status Bucket::Find(const std::vector<uint64_t>& keys,
     auto s = ResolveLocality();
     if (!s.IsOk()) return s;
 
-    if (isLocal_ || !shareMapStoreClient_) {
+    const bool local = IsLocal();
+    const auto endpoint = RpcEndpoint();
+    if (local || !shareMapStoreClient_) {
         // Local query: ShareMap returns StringViews into ShareObject memory,
         // so no BufferHandle is needed (memory is managed by ShareMap).
         return shareMapStore_->QueryData(bucketKey_, keys, buffers);
     }
     // Remote query via RPC; the returned buffer is held by bufferHandles.
-    return shareMapStoreClient_->QueryData(info_.rpcEndpoint, bucketKey_,
-                                           info_.valueSize, keys, buffers,
-                                           bufferHandles);
+    s = shareMapStoreClient_->QueryData(endpoint, bucketKey_, Info().valueSize,
+                                        keys, buffers, bufferHandles);
+    if (!s.IsOk()) InvalidateLocality();
+    return s;
 }
 
 Status Bucket::BuildIndex() {
@@ -185,10 +232,49 @@ Status Bucket::BuildIndex() {
     s = ResolveLocality();
     if (!s.IsOk()) return s;
 
-    if (isLocal_ || !shareMapStoreClient_) {
+    const bool local = IsLocal();
+    const auto endpoint = RpcEndpoint();
+    if (local || !shareMapStoreClient_) {
         return shareMapStore_->BuildIndex(bucketKey_);
     }
-    return shareMapStoreClient_->BuildIndex(info_.rpcEndpoint, bucketKey_);
+    s = shareMapStoreClient_->BuildIndex(endpoint, bucketKey_);
+    if (!s.IsOk()) InvalidateLocality();
+    return s;
+}
+
+BucketInfo Bucket::Info() const {
+    std::lock_guard<std::mutex> lock(localityMutex_);
+    return info_;
+}
+
+uint64_t Bucket::PendingCount() const {
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    return localKeys_.size();
+}
+
+bool Bucket::IsFull() const {
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    return localKeys_.size() >= flushThreshold_;
+}
+
+uint64_t Bucket::FlushThreshold() const {
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    return flushThreshold_;
+}
+
+void Bucket::SetFlushThreshold(uint64_t threshold) {
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    flushThreshold_ = threshold;
+}
+
+bool Bucket::IsLocal() const {
+    std::lock_guard<std::mutex> lock(localityMutex_);
+    return isLocal_;
+}
+
+std::string Bucket::RpcEndpoint() const {
+    std::lock_guard<std::mutex> lock(localityMutex_);
+    return info_.rpcEndpoint;
 }
 
 }  // namespace embtable

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <future>
 #include <unordered_map>
 
 namespace embtable {
@@ -154,8 +155,7 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
         auto& bucket = buckets_[bidx];
         auto s = bucket->Flush();  // ensure pending data is flushed first
         if (!s.IsOk()) {
-            LOG(WARNING) << "Flush before Find failed for bucket "
-                         << bucket->BucketKey() << ": " << s.msg();
+            return s;
         }
 
         // Bucket owns locality resolution so routing and endpoint construction
@@ -204,65 +204,92 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
                              std::make_move_iterator(tmpHandles.end()));
     }
 
-    // Step 4: Execute remote queries grouped by endpoint (node aggregation).
-    // For each remote node, batch-query all buckets on that node in one RPC
-    // call (ShareMapStoreClient::BatchQueryData). The remote service packs
-    // results into temp Mooncake Store objects (TE write), and we read them
-    // back via get_buffer (TE read) — the data lands in our Find buffer.
-    for (auto& [endpoint, tasks] : remoteGroups) {
-        if (!shareMapStoreClient_) continue;
+    // Step 4: Execute remote queries grouped by endpoint. Each endpoint is
+    // queried independently so fan-out latency is bounded by the slowest
+    // remote node. A single endpoint stays inline to avoid creating a worker
+    // thread for the common one-node case.
+    struct RemoteQueryResult {
+        Status status;
+        std::string endpoint;
+        std::vector<RemoteBucketTask> tasks;
+        std::vector<std::vector<StringView>> buffersPerBucket;
+        std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
+    };
 
-        if (tasks.size() == 1) {
-            // Single bucket on this node — use simple QueryData.
-            auto& task = tasks[0];
+    auto queryRemote = [this](std::string endpoint,
+                              std::vector<RemoteBucketTask> tasks) {
+        RemoteQueryResult result;
+        result.status = Status::OK();
+        result.endpoint = endpoint;
+        result.tasks = std::move(tasks);
+        if (!shareMapStoreClient_) {
+            result.status = Status::Error(
+                ErrorCode::kInternal,
+                "remote bucket requires ShareMapStoreClient: " + endpoint);
+            return result;
+        }
+
+        if (result.tasks.size() == 1) {
+            auto& task = result.tasks[0];
             std::vector<StringView> bucketVals;
-            std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
-            auto s = shareMapStoreClient_->QueryData(
+            result.status = shareMapStoreClient_->QueryData(
                 endpoint, buckets_[task.bucketIdx]->BucketKey(), valueSize_,
-                task.keys, bucketVals, tmpHandles);
-            if (!s.IsOk()) {
-                LOG(WARNING) << "Remote QueryData failed for endpoint "
-                             << endpoint << ": " << s.msg();
-                continue;
+                task.keys, bucketVals, result.handles);
+            if (result.status.IsOk()) {
+                result.buffersPerBucket.push_back(std::move(bucketVals));
             }
-            for (size_t j = 0; j < task.indices.size() && j < bucketVals.size();
-                 ++j) {
+            return result;
+        }
+
+        std::vector<std::string> bucketKeys;
+        std::vector<std::vector<uint64_t>> keysPerBucket;
+        bucketKeys.reserve(result.tasks.size());
+        keysPerBucket.reserve(result.tasks.size());
+        for (const auto& task : result.tasks) {
+            bucketKeys.push_back(buckets_[task.bucketIdx]->BucketKey());
+            keysPerBucket.push_back(task.keys);
+        }
+        result.status = shareMapStoreClient_->BatchQueryData(
+            endpoint, bucketKeys, valueSize_, keysPerBucket,
+            result.buffersPerBucket, result.handles);
+        return result;
+    };
+
+    auto mergeRemote = [&](RemoteQueryResult result) -> Status {
+        if (!result.status.IsOk()) {
+            LOG(WARNING) << "Remote query failed for endpoint "
+                         << result.endpoint << ": " << result.status.msg();
+            return result.status;
+        }
+        for (size_t t = 0;
+             t < result.tasks.size() && t < result.buffersPerBucket.size(); ++t) {
+            const auto& task = result.tasks[t];
+            const auto& bucketVals = result.buffersPerBucket[t];
+            for (size_t j = 0;
+                 j < task.indices.size() && j < bucketVals.size(); ++j) {
                 buffers[task.indices[j]] = bucketVals[j];
             }
-            bufferHandles.insert(bufferHandles.end(),
-                                 std::make_move_iterator(tmpHandles.begin()),
-                                 std::make_move_iterator(tmpHandles.end()));
-        } else {
-            // Multiple buckets on the same node — batch query.
-            std::vector<std::string> bucketKeys;
-            std::vector<std::vector<uint64_t>> keysPerBucket;
-            for (auto& task : tasks) {
-                bucketKeys.push_back(buckets_[task.bucketIdx]->BucketKey());
-                keysPerBucket.push_back(task.keys);
-            }
-            std::vector<std::vector<StringView>> buffersPerBucket;
-            std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
-            auto s = shareMapStoreClient_->BatchQueryData(
-                endpoint, bucketKeys, valueSize_, keysPerBucket,
-                buffersPerBucket, tmpHandles);
-            if (!s.IsOk()) {
-                LOG(WARNING) << "Remote BatchQueryData failed for endpoint "
-                             << endpoint << ": " << s.msg();
-                continue;
-            }
-            for (size_t t = 0; t < tasks.size() && t < buffersPerBucket.size();
-                 ++t) {
-                auto& task = tasks[t];
-                auto& bucketVals = buffersPerBucket[t];
-                for (size_t j = 0; j < task.indices.size() &&
-                                    j < bucketVals.size();
-                     ++j) {
-                    buffers[task.indices[j]] = bucketVals[j];
-                }
-            }
-            bufferHandles.insert(bufferHandles.end(),
-                                 std::make_move_iterator(tmpHandles.begin()),
-                                 std::make_move_iterator(tmpHandles.end()));
+        }
+        bufferHandles.insert(bufferHandles.end(),
+                             std::make_move_iterator(result.handles.begin()),
+                             std::make_move_iterator(result.handles.end()));
+        return Status::OK();
+    };
+
+    if (remoteGroups.size() == 1) {
+        auto it = remoteGroups.begin();
+        auto s = mergeRemote(queryRemote(it->first, std::move(it->second)));
+        if (!s.IsOk()) return s;
+    } else if (!remoteGroups.empty()) {
+        std::vector<std::future<RemoteQueryResult>> futures;
+        futures.reserve(remoteGroups.size());
+        for (auto& [endpoint, tasks] : remoteGroups) {
+            futures.emplace_back(std::async(
+                std::launch::async, queryRemote, endpoint, std::move(tasks)));
+        }
+        for (auto& future : futures) {
+            auto s = mergeRemote(future.get());
+            if (!s.IsOk()) return s;
         }
     }
 
@@ -271,8 +298,17 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
 
 Status EmbTable::Find(const std::vector<uint64_t>& keys,
                       std::vector<StringView>& buffers) {
-    lastFindBufferHandles_.clear();
-    return Find(keys, buffers, lastFindBufferHandles_);
+    // StringView does not carry ownership. Keep the remote handles isolated
+    // per calling thread so concurrent callers do not invalidate one another's
+    // result storage. For independent lifetimes, use the explicit handles
+    // overload.
+    thread_local std::unordered_map<
+        const EmbTable*,
+        std::vector<std::shared_ptr<mooncake::BufferHandle>>>
+        threadFindHandles;
+    auto& handles = threadFindHandles[this];
+    handles.clear();
+    return Find(keys, buffers, handles);
 }
 
 Status EmbTable::BuildIndex() {

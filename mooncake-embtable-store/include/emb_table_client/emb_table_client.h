@@ -12,6 +12,7 @@
 #include "share_map_store/share_map_store_rpc_service.h"
 #include "emb_types.h"
 #include "real_client.h"
+#include "client_buffer.hpp"
 
 namespace embtable {
 
@@ -58,6 +59,13 @@ class EmbTableClient {
     // Batch find. buffers[i] is the value for keys[i] (empty if missing).
     Status Find(const std::vector<uint64_t>& keys,
                 std::vector<StringView>& buffers);
+
+    // Thread-safe result-lifetime variant. The caller owns bufferHandles and
+    // must keep it alive while consuming the returned StringViews.
+    Status Find(const std::vector<uint64_t>& keys,
+                std::vector<StringView>& buffers,
+                std::vector<std::shared_ptr<mooncake::BufferHandle>>&
+                    bufferHandles);
 
     // Build the perfect-hash index on all buckets (read-only afterwards).
     Status BuildIndex();

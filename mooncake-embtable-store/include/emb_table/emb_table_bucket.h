@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -48,7 +50,7 @@ class Bucket {
     Status Flush();
 
     // Whether the local buffer has reached the capacity threshold.
-    bool IsFull() const { return localKeys_.size() >= flushThreshold_; }
+    bool IsFull() const;
 
     // Query already-published data via ShareMapStore::QueryData.
     // Keeps bufferHandles alive so returned StringViews remain valid.
@@ -60,21 +62,23 @@ class Bucket {
     // Build the perfect-hash index for this bucket (flushes first).
     Status BuildIndex();
 
-    const BucketInfo& Info() const { return info_; }
+    BucketInfo Info() const;
     const std::string& BucketKey() const { return bucketKey_; }
-    uint64_t PendingCount() const { return localKeys_.size(); }
-    uint64_t FlushThreshold() const { return flushThreshold_; }
-    void SetFlushThreshold(uint64_t threshold) { flushThreshold_ = threshold; }
+    uint64_t PendingCount() const;
+    uint64_t FlushThreshold() const;
+    void SetFlushThreshold(uint64_t threshold);
 
     // Resolve the current owner from bucket-meta replica placement. This is
     // intentionally re-evaluated so bucket relocation is observed.
     Status ResolveLocality();
 
     // Whether this bucket's data is stored locally on this node.
-    bool IsLocal() const { return isLocal_; }
-    const std::string& RpcEndpoint() const { return info_.rpcEndpoint; }
+    bool IsLocal() const;
+    std::string RpcEndpoint() const;
 
    private:
+    void InvalidateLocality();
+
     BucketInfo info_;
     std::string bucketKey_;
     std::shared_ptr<ShareMapStore> shareMapStore_;
@@ -90,7 +94,12 @@ class Bucket {
     // bucket should be flushed. Default 4096 (design doc 4.1.4).
     uint64_t flushThreshold_ = 4096;
 
+    mutable std::mutex bufferMutex_;
+    mutable std::mutex flushMutex_;
+    mutable std::mutex localityMutex_;
     bool isLocal_ = true;
+    bool localityResolved_ = false;
+    std::chrono::steady_clock::time_point localityResolvedAt_{};
 };
 
 }  // namespace embtable

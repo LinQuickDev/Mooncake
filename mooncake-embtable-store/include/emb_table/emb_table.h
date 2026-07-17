@@ -55,7 +55,8 @@ class EmbTable {
                     bufferHandles);
 
     // Convenience overload. Keeps remote transfer-buffer handles alive until
-    // the next Find call so returned StringViews remain valid.
+    // the next Find call on the same calling thread. For independent result
+    // lifetimes, use the overload that accepts bufferHandles.
     Status Find(const std::vector<uint64_t>& keys,
                 std::vector<StringView>& buffers);
 
@@ -89,8 +90,6 @@ class EmbTable {
     uint16_t shareMapStoreRpcPort_ = 0;
     std::shared_ptr<EmbTableMeta> meta_;
     std::vector<std::shared_ptr<Bucket>> buckets_;
-    std::vector<std::shared_ptr<mooncake::BufferHandle>>
-        lastFindBufferHandles_;
 };
 
 }  // namespace embtable

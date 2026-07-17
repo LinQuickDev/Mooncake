@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,9 @@ struct DeploymentConfig {
     // Registered staging buffer used by the ShareMapStore RPC service for
     // direct Transfer Engine writes to remote EmbTable clients.
     uint64_t transferBufferSize = 64ull * 1024 * 1024;
+    // Number of independently registered staging buffers available to
+    // concurrent RPC handlers. A value of zero is treated as one.
+    uint32_t transferBufferCount = 4;
     // Default per-bucket ShareObject size (design doc 8.2).
     uint64_t shareObjectSize = 64ull * 1024 * 1024;
 };
@@ -112,6 +116,15 @@ class ShareMapStore {
     bool IsInitialized() const { return initialized_; }
 
    private:
+    struct TransferBufferSlot {
+        std::unique_ptr<char[]> buffer;
+        bool registered = false;
+        bool inUse = false;
+    };
+
+    size_t AcquireTransferBuffer();
+    void ReleaseTransferBuffer(size_t index);
+
     // Get-or-create a ShareMap for the given bucket. valueSize is required
     // when creating a new ShareMap; passing 0 keeps any existing ShareMap's
     // valueSize and returns an error if the bucket does not exist.
@@ -123,10 +136,9 @@ class ShareMapStore {
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::unordered_map<std::string, std::shared_ptr<ShareMap>> shareMaps_;
     mutable std::mutex mutex_;
-    std::unique_ptr<char[]> transferBuffer_;
-    uint64_t transferBufferSize_ = 0;
-    std::mutex transferMutex_;
-    bool transferBufferRegistered_ = false;
+    std::vector<TransferBufferSlot> transferBuffers_;
+    std::mutex transferBufferMutex_;
+    std::condition_variable transferBufferCv_;
     bool initialized_ = false;
 };
 

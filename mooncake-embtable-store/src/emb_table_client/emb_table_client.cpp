@@ -115,6 +115,15 @@ Status EmbTableClient::Find(const std::vector<uint64_t>& keys,
     return embTable_->Find(keys, buffers);
 }
 
+Status EmbTableClient::Find(
+    const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
+    std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    if (!embTable_) {
+        return Status::Error(ErrorCode::kInternal, "not initialized");
+    }
+    return embTable_->Find(keys, buffers, bufferHandles);
+}
+
 Status EmbTableClient::BuildIndex() {
     if (!embTable_) {
         return Status::Error(ErrorCode::kInternal, "not initialized");
