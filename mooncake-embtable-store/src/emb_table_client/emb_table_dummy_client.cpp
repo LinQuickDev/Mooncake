@@ -41,13 +41,7 @@ Status FromResponse(const EmbTableStatusResponse& response,
                          operation + " failed: " + response.errorMsg);
 }
 
-bool CheckedMultiply(uint64_t lhs, uint64_t rhs, uint64_t& result) {
-    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
-        return false;
-    }
-    result = lhs * rhs;
-    return true;
-}
+
 
 }  // namespace
 

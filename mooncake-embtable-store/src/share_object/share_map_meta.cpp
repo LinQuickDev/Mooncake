@@ -1,6 +1,8 @@
 #include "share_object/share_map_meta.h"
 
 #include <glog/logging.h>
+#include <exception>
+#include <limits>
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
@@ -55,7 +57,18 @@ Status ShareMapMeta::Deserialize() {
     s = metaObject_.Read(0, raw.size(), raw.data());
     if (!s.IsOk()) return s;
     ShareMapMetaPayload payload;
-    struct_json::from_json(payload, raw.substr(sizeof(uint64_t)));
+    try {
+        struct_json::from_json(payload, raw.substr(sizeof(uint64_t)));
+    } catch (const std::exception& e) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid ShareMap metadata JSON: " +
+                                 std::string(e.what()));
+    }
+    if (payload.bucketKey != bucketKey_ || payload.valueSize == 0 ||
+        payload.objectInfos.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid ShareMap metadata fields");
+    }
     bucketKey_ = std::move(payload.bucketKey);
     valueSize_ = payload.valueSize;
     totalSize_ = payload.totalSize;

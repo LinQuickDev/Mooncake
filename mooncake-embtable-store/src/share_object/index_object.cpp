@@ -3,6 +3,7 @@
 #include <climits>
 #include <glog/logging.h>
 #include <sstream>
+#include <exception>
 
 #include "BooPHF.h"
 
@@ -120,8 +121,20 @@ Status IndexObject::Import() {
     if (!s.IsOk()) return s;
     std::stringstream ss(raw, std::ios::in | std::ios::out | std::ios::binary);
     phf_.reset();
+    built_ = false;
     auto* loaded = new BoophfT();
-    loaded->load(ss);
+    try {
+        loaded->load(ss);
+    } catch (const std::exception& e) {
+        delete loaded;
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid serialized PHF: " +
+                                 std::string(e.what()));
+    } catch (...) {
+        delete loaded;
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid serialized PHF");
+    }
     phf_ = {loaded, deletePhf};
     built_ = true;
     return Status::OK();

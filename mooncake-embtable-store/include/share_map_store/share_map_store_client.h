@@ -74,19 +74,13 @@ class ShareMapStoreClient {
 
     // Parse a packed single-bucket result buffer (from get_buffer) into
     // StringViews. Layout: for each key [1B found flag][valueSize bytes data].
-    void ParseResultBuffer(
+    Status ParseResultBuffer(
         void* data, uint64_t dataSize, uint64_t valueSize,
         size_t numKeys, const std::vector<int8_t>& foundFlags,
         std::vector<StringView>& buffers,
         std::shared_ptr<mooncake::BufferHandle> handle);
 
-    // Parse an aggregated multi-bucket result buffer (from a single
-    // get_buffer) into per-bucket StringViews. Layout:
-    //   [bucketCount(8B)]
-    //   for each bucket: [bucketKeyLen(4B)][bucketKey][keyCount(8B)]
-    //                    for each key: [1B found flag][valueSize bytes data]
-    // Returns a map from bucketKey -> (StringViews for that bucket's keys).
-    void ParseAggregatedBuffer(
+    Status ParseAggregatedBuffer(
         void* data, uint64_t dataSize, uint64_t valueSize,
         const std::vector<std::string>& bucketKeys,
         const std::vector<std::vector<int8_t>>& foundFlagsPerBucket,

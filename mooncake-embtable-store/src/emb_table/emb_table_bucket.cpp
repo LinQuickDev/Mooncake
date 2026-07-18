@@ -184,8 +184,12 @@ Status Bucket::Flush() {
     const bool local = IsLocal();
     const auto endpoint = RpcEndpoint();
     const auto valueSize = Info().valueSize;
-    if (local || !shareMapStoreClient_) {
+    if (local) {
         s = shareMapStore_->Publish(bucketKey_, valueSize, keys, views);
+    } else if (!shareMapStoreClient_) {
+        s = Status::Error(
+            ErrorCode::kInternal,
+            "remote bucket requires ShareMapStoreClient: " + bucketKey_);
     } else {
         s = shareMapStoreClient_->Publish(endpoint, bucketKey_, valueSize, keys,
                                           views);
@@ -213,10 +217,14 @@ Status Bucket::Find(const std::vector<uint64_t>& keys,
 
     const bool local = IsLocal();
     const auto endpoint = RpcEndpoint();
-    if (local || !shareMapStoreClient_) {
-        // Local query: ShareMap returns StringViews into ShareObject memory,
-        // so no BufferHandle is needed (memory is managed by ShareMap).
+    if (local) {
+        // Local query: ShareMap returns StringViews into ShareObject memory.
         return shareMapStore_->QueryData(bucketKey_, keys, buffers);
+    }
+    if (!shareMapStoreClient_) {
+        return Status::Error(
+            ErrorCode::kInternal,
+            "remote bucket requires ShareMapStoreClient: " + bucketKey_);
     }
     // Remote query via RPC; the returned buffer is held by bufferHandles.
     s = shareMapStoreClient_->QueryData(endpoint, bucketKey_, Info().valueSize,
@@ -234,8 +242,13 @@ Status Bucket::BuildIndex() {
 
     const bool local = IsLocal();
     const auto endpoint = RpcEndpoint();
-    if (local || !shareMapStoreClient_) {
+    if (local) {
         return shareMapStore_->BuildIndex(bucketKey_);
+    }
+    if (!shareMapStoreClient_) {
+        return Status::Error(
+            ErrorCode::kInternal,
+            "remote bucket requires ShareMapStoreClient: " + bucketKey_);
     }
     s = shareMapStoreClient_->BuildIndex(endpoint, bucketKey_);
     if (!s.IsOk()) InvalidateLocality();

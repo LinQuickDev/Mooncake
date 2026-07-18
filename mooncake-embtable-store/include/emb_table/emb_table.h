@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,7 @@ class EmbTable {
     std::string localHostname_;
     uint16_t shareMapStoreRpcPort_ = 0;
     std::shared_ptr<EmbTableMeta> meta_;
+    mutable std::shared_mutex lifecycleMutex_;
     std::vector<std::shared_ptr<Bucket>> buckets_;
 };
 

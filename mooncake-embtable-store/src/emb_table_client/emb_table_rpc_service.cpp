@@ -28,17 +28,7 @@ bool IsValidShmName(const std::string& name) {
            name.find('/', 1) == std::string::npos;
 }
 
-bool IsRangeValid(uint64_t offset, uint64_t length, uint64_t capacity) {
-    return offset <= capacity && length <= capacity - offset;
-}
 
-bool CheckedMultiply(uint64_t lhs, uint64_t rhs, uint64_t& result) {
-    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
-        return false;
-    }
-    result = lhs * rhs;
-    return true;
-}
 
 }  // namespace
 

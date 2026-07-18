@@ -7,6 +7,7 @@
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace embtable {
 
@@ -29,15 +30,44 @@ ShareMap::ShareMap(const std::string& bucketKey, uint64_t valueSize,
 
 Status ShareMap::Insert(const std::vector<uint64_t>& keys,
                         const std::vector<StringView>& values) {
-    if (published_.load(std::memory_order_acquire)) {
-        return Status::Error(ErrorCode::kIndexBuilt,
-                             "ShareMap is read-only after BuildIndex");
-    }
     if (keys.size() != values.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "keys/values size mismatch");
     }
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (published_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kIndexBuilt,
+                             "ShareMap is read-only after BuildIndex");
+    }
+    if (inconsistent_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kInternal,
+                             "ShareMap is inconsistent after a failed append");
+    }
+    std::unordered_set<uint64_t> incoming;
+    incoming.reserve(keys.size());
+    for (const auto key : keys) {
+        if (!incoming.insert(key).second) {
+            return Status::Error(ErrorCode::kAlreadyExists,
+                                 "duplicate key in insert batch");
+        }
+    }
+    const uint64_t total = size_.load(std::memory_order_acquire);
+    for (uint64_t i = 0; i < total; ++i) {
+        StringView stored;
+        auto s = keyVec_->Get(i, stored);
+        if (!s.IsOk()) return s;
+        if (stored.size() != sizeof(uint64_t)) {
+            return Status::Error(ErrorCode::kInternal,
+                                 "stored key has invalid size");
+        }
+        uint64_t key = 0;
+        std::memcpy(&key, stored.data(), sizeof(key));
+        if (incoming.find(key) != incoming.end()) {
+            return Status::Error(ErrorCode::kAlreadyExists,
+                                 "key already exists in ShareMap");
+        }
+    }
+
     for (size_t i = 0; i < keys.size(); ++i) {
         if (values[i].size() != valueSize_) {
             return Status::Error(ErrorCode::kInvalidArgument,
@@ -47,8 +77,14 @@ Status ShareMap::Insert(const std::vector<uint64_t>& keys,
         auto s = keyVec_->Append(&keys[i], sizeof(uint64_t), kIdx);
         if (!s.IsOk()) return s;
         s = valueVec_->Append(values[i].data(), values[i].size(), vIdx);
-        if (!s.IsOk()) return s;
+        if (!s.IsOk()) {
+            inconsistent_.store(true, std::memory_order_release);
+            return Status::Error(
+                ErrorCode::kInternal,
+                "value append failed after key append: " + s.msg());
+        }
         if (kIdx != vIdx) {
+            inconsistent_.store(true, std::memory_order_release);
             return Status::Error(ErrorCode::kInternal,
                                  "key/value index divergence");
         }
@@ -80,11 +116,8 @@ Status ShareMap::linearLookup(const std::vector<uint64_t>& keys,
         } else {
             StringView v;
             auto s = valueVec_->Get(it->second, v);
-            if (!s.IsOk()) {
-                buffers.emplace_back();
-            } else {
-                buffers.push_back(v);
-            }
+            if (!s.IsOk()) return s;
+            buffers.push_back(v);
         }
     }
     return Status::OK();
@@ -107,48 +140,71 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
     static constexpr size_t kParallelThreshold = 128;
     static constexpr size_t kParallelism = 4;
 
+    std::atomic<int> firstError{0};
+    std::string firstErrorMessage;
+    std::mutex errorMutex;
+    auto recordError = [&](const Status& status) {
+        if (status.IsOk() || status.code() == static_cast<int>(ErrorCode::kNotFound)) {
+            return;
+        }
+        if (firstError.exchange(status.code(), std::memory_order_acq_rel) == 0) {
+            std::lock_guard<std::mutex> errorLock(errorMutex);
+            firstErrorMessage = status.msg();
+        }
+    };
+
     auto lookupOne = [&](size_t i) {
         uint64_t idx = 0;
         auto s = indexObj_->Lookup(keys[i], idx);
         if (!s.IsOk()) {
-            return;  // buffers[i] already default-constructed (empty)
+            recordError(s);
+            return;
         }
-        // Verify the key at idx matches (PHF false-positive guard).
         StringView storedKey;
         s = keyVec_->Get(idx, storedKey);
-        if (!s.IsOk() || storedKey.size() != sizeof(uint64_t) ||
+        if (!s.IsOk()) {
+            recordError(s);
+            return;
+        }
+        if (storedKey.size() != sizeof(uint64_t) ||
             std::memcmp(storedKey.data(), &keys[i], sizeof(uint64_t)) != 0) {
-            // PHF returned a wrong slot — treat as not found.
+            recordError(Status::Error(ErrorCode::kInternal,
+                                      "PHF returned a mismatched key slot"));
             return;
         }
         StringView v;
         s = valueVec_->Get(idx, v);
-        if (s.IsOk()) {
-            buffers[i] = v;
+        if (!s.IsOk()) {
+            recordError(s);
+            return;
         }
+        buffers[i] = v;
     };
 
     if (keys.size() <= kParallelThreshold) {
         for (size_t i = 0; i < keys.size(); ++i) lookupOne(i);
-        return Status::OK();
+    } else {
+        // Parallel lookup for large batches: partition keys into contiguous
+        // chunks so each worker writes to a disjoint range of `buffers`.
+        size_t total = keys.size();
+        size_t chunk = (total + kParallelism - 1) / kParallelism;
+        std::vector<std::thread> workers;
+        workers.reserve(kParallelism);
+        for (size_t w = 0; w < kParallelism; ++w) {
+            size_t start = w * chunk;
+            size_t end = std::min(start + chunk, total);
+            if (start >= end) break;
+            workers.emplace_back([&, start, end]() {
+                for (size_t i = start; i < end; ++i) lookupOne(i);
+            });
+        }
+        for (auto& t : workers) t.join();
     }
-
-    // Parallel lookup for large batches: partition keys into contiguous
-    // chunks so each worker writes to a disjoint range of `buffers` (no
-    // concurrent writes to the same slot).
-    size_t total = keys.size();
-    size_t chunk = (total + kParallelism - 1) / kParallelism;
-    std::vector<std::thread> workers;
-    workers.reserve(kParallelism);
-    for (size_t w = 0; w < kParallelism; ++w) {
-        size_t start = w * chunk;
-        size_t end = std::min(start + chunk, total);
-        if (start >= end) break;
-        workers.emplace_back([&, start, end]() {
-            for (size_t i = start; i < end; ++i) lookupOne(i);
-        });
+    if (firstError.load(std::memory_order_acquire) != 0) {
+        std::lock_guard<std::mutex> errorLock(errorMutex);
+        return Status::Error(static_cast<ErrorCode>(firstError.load()),
+                             firstErrorMessage);
     }
-    for (auto& t : workers) t.join();
     return Status::OK();
 }
 
@@ -176,7 +232,7 @@ Status ShareMap::BuildIndex() {
     s = indexObj_->Export();
     if (!s.IsOk()) return s;
     // 4. Record meta and publish.
-    ObjectInfo keyInfo{bucketKey_ + "__keys", sizeof(uint64_t), 0, "keys"};
+    ObjectInfo keyInfo{bucketKey_ + "_keys", sizeof(uint64_t), 0, "keys"};
     ObjectInfo valInfo{bucketKey_ + "_values", valueSize_, 0, "values"};
     ObjectInfo idxInfo{bucketKey_ + "_idx", 0, 0, "index"};
     meta_->SetValueSize(valueSize_);
@@ -196,6 +252,10 @@ Status ShareMap::Import() {
     if (!s.IsOk()) return s;
     uint64_t realValueSize = meta_->GetValueSize();
     uint64_t total = meta_->GetTotalSize();
+    if (realValueSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid ShareMap metadata value size");
+    }
 
     // ShareMapStore::Import creates this ShareMap with a placeholder
     // valueSize=1 (it doesn't know the real size until meta is deserialized).
@@ -225,8 +285,8 @@ Status ShareMap::Import() {
     }
     s = indexObj_->Import();
     if (!s.IsOk()) {
-        LOG(WARNING) << "IndexObject Import failed: " << s.msg()
-                     << " (PHF lookup unavailable, will use linear scan)";
+        LOG(ERROR) << "IndexObject Import failed: " << s.msg();
+        return s;
     }
     size_.store(total, std::memory_order_release);
     published_.store(true, std::memory_order_release);

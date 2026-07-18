@@ -1,6 +1,7 @@
 #include "share_map_store/share_map_store_client.h"
 
 #include <cstring>
+#include <limits>
 #include <new>
 #include <thread>
 #include <unordered_map>
@@ -80,90 +81,133 @@ coro_rpc::coro_rpc_client* ShareMapStoreClient::GetClient(
     return ptr;
 }
 
-void ShareMapStoreClient::ParseResultBuffer(
-    void* data, uint64_t dataSize, uint64_t valueSize,
-    size_t numKeys, const std::vector<int8_t>& foundFlags,
+Status ShareMapStoreClient::ParseResultBuffer(
+    void* data, uint64_t dataSize, uint64_t valueSize, size_t numKeys,
+    const std::vector<int8_t>& foundFlags,
     std::vector<StringView>& buffers,
     std::shared_ptr<mooncake::BufferHandle> handle) {
-    buffers.resize(numKeys);
-    if (!data || dataSize == 0 || valueSize == 0) return;
-
+    (void)handle;
+    if (valueSize == 0 || foundFlags.size() != numKeys) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid single query response metadata");
+    }
+    uint64_t entrySize = 0;
+    uint64_t expectedSize = 0;
+    if (!CheckedAdd(1, valueSize, entrySize) ||
+        !CheckedMultiply(numKeys, entrySize, expectedSize) ||
+        dataSize != expectedSize) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "single query response size mismatch");
+    }
+    buffers.assign(numKeys, {});
     const char* ptr = static_cast<const char*>(data);
-    uint64_t entrySize = 1 + valueSize;
     for (size_t i = 0; i < numKeys; ++i) {
-        if ((i + 1) * entrySize > dataSize) {
-            buffers[i] = StringView();
-            continue;
+        if (foundFlags[i] != 0 && foundFlags[i] != 1) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "invalid found flag");
         }
-        if (i < foundFlags.size() && foundFlags[i]) {
-            const char* entry = ptr + i * entrySize;
-            buffers[i] = StringView(entry + 1, valueSize);
-        } else {
-            buffers[i] = StringView();
+        uint64_t offset = 0;
+        if (!CheckedMultiply(i, entrySize, offset) ||
+            !IsRangeValid(offset, entrySize, dataSize)) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "single query entry is out of range");
+        }
+        if (foundFlags[i] != 0) {
+            buffers[i] = StringView(ptr + offset + 1, valueSize);
         }
     }
-    // NOTE: handle is kept alive by the caller (bufferHandles) so StringViews
-    // remain valid.
-    (void)handle;
+    return Status::OK();
 }
 
-void ShareMapStoreClient::ParseAggregatedBuffer(
+Status ShareMapStoreClient::ParseAggregatedBuffer(
     void* data, uint64_t dataSize, uint64_t valueSize,
     const std::vector<std::string>& bucketKeys,
     const std::vector<std::vector<int8_t>>& foundFlagsPerBucket,
     std::vector<std::vector<StringView>>& buffersPerBucket,
     std::shared_ptr<mooncake::BufferHandle> handle) {
-    buffersPerBucket.assign(bucketKeys.size(), {});
-    if (!data || dataSize < sizeof(uint64_t) || valueSize == 0) return;
-
-    const char* ptr = static_cast<const char*>(data);
-    const char* end = ptr + dataSize;
-    uint64_t bucketCount = 0;
-    std::memcpy(&bucketCount, ptr, sizeof(uint64_t));
-    ptr += sizeof(uint64_t);
-
-    const uint64_t entrySize = 1 + valueSize;
-    // Build a map from bucketKey -> index for fast lookup.
+    (void)handle;
+    if (!data || valueSize == 0 || bucketKeys.size() != foundFlagsPerBucket.size() ||
+        dataSize < sizeof(uint64_t)) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid batch query response metadata");
+    }
     std::unordered_map<std::string, size_t> keyToIdx;
     for (size_t i = 0; i < bucketKeys.size(); ++i) {
-        keyToIdx[bucketKeys[i]] = i;
-    }
-
-    for (uint64_t b = 0; b < bucketCount && ptr + sizeof(uint32_t) <= end;
-         ++b) {
-        uint32_t keyLen = 0;
-        std::memcpy(&keyLen, ptr, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
-        if (ptr + keyLen + sizeof(uint64_t) > end) break;
-        std::string bkey(ptr, keyLen);
-        ptr += keyLen;
-        uint64_t keyCount = 0;
-        std::memcpy(&keyCount, ptr, sizeof(uint64_t));
-        ptr += sizeof(uint64_t);
-
-        auto it = keyToIdx.find(bkey);
-        if (it == keyToIdx.end()) {
-            // Unknown bucket; skip its entries.
-            ptr += keyCount * entrySize;
-            continue;
+        if (!keyToIdx.emplace(bucketKeys[i], i).second) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "duplicate requested bucket key");
         }
-        size_t idx = it->second;
-        auto& buffers = buffersPerBucket[idx];
-        buffers.resize(keyCount);
-        const auto& flags =
-            idx < foundFlagsPerBucket.size() ? foundFlagsPerBucket[idx]
-                                             : std::vector<int8_t>{};
+    }
+    uint64_t entrySize = 0;
+    if (!CheckedAdd(1, valueSize, entrySize)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "batch entry size overflows");
+    }
+    buffersPerBucket.assign(bucketKeys.size(), {});
+    const char* ptr = static_cast<const char*>(data);
+    uint64_t bucketCount = 0;
+    std::memcpy(&bucketCount, ptr, sizeof(bucketCount));
+    ptr += sizeof(bucketCount);
+    uint64_t remaining = dataSize - sizeof(bucketCount);
+    if (bucketCount != bucketKeys.size()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "batch bucket count mismatch");
+    }
+    std::vector<bool> seen(bucketKeys.size(), false);
+    for (uint64_t b = 0; b < bucketCount; ++b) {
+        if (remaining < sizeof(uint32_t)) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "truncated batch bucket key length");
+        }
+        uint32_t keyLen = 0;
+        std::memcpy(&keyLen, ptr, sizeof(keyLen));
+        ptr += sizeof(keyLen);
+        remaining -= sizeof(keyLen);
+        if (remaining < keyLen + sizeof(uint64_t)) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "truncated batch bucket header");
+        }
+        std::string key(ptr, keyLen);
+        ptr += keyLen;
+        remaining -= keyLen;
+        uint64_t keyCount = 0;
+        std::memcpy(&keyCount, ptr, sizeof(keyCount));
+        ptr += sizeof(keyCount);
+        remaining -= sizeof(keyCount);
+        auto it = keyToIdx.find(key);
+        if (it == keyToIdx.end() || seen[it->second]) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "unknown or duplicate batch bucket");
+        }
+        const size_t idx = it->second;
+        seen[idx] = true;
+        if (keyCount != foundFlagsPerBucket[idx].size()) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "batch key count mismatch");
+        }
+        uint64_t payloadSize = 0;
+        if (!CheckedMultiply(keyCount, entrySize, payloadSize) ||
+            payloadSize > remaining) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "truncated batch bucket payload");
+        }
+        buffersPerBucket[idx].assign(keyCount, {});
         for (uint64_t k = 0; k < keyCount; ++k) {
-            if (ptr + entrySize > end) break;
-            if (k < flags.size() && flags[k]) {
-                buffers[k] = StringView(ptr + 1, valueSize);
-            } else {
-                buffers[k] = StringView();
+            const auto flag = foundFlagsPerBucket[idx][k];
+            if (flag != 0 && flag != 1) {
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "invalid batch found flag");
             }
+            if (flag != 0) buffersPerBucket[idx][k] = StringView(ptr + 1, valueSize);
             ptr += entrySize;
         }
+        remaining -= payloadSize;
     }
-    (void)handle;
+    if (remaining != 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "trailing bytes in batch query response");
+    }
+    return Status::OK();
 }
 
 Status ShareMapStoreClient::QueryData(
@@ -184,7 +228,17 @@ Status ShareMapStoreClient::QueryData(
     req.bucketKey = bucketKey;
     req.keys = keys;
     req.valueSize = valueSize;
-    const uint64_t expectedSize = keys.size() * (1 + valueSize);
+    if (valueSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "valueSize must be > 0");
+    }
+    uint64_t entrySize = 0;
+    uint64_t expectedSize = 0;
+    if (!CheckedAdd(1, valueSize, entrySize) ||
+        !CheckedMultiply(keys.size(), entrySize, expectedSize)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "query response size overflows");
+    }
     auto handle = AllocateTransferBuffer(expectedSize);
     if (!handle) {
         return Status::Error(ErrorCode::kOutOfRange,
@@ -214,8 +268,10 @@ Status ShareMapStoreClient::QueryData(
                              "remote query exceeded target buffer");
     }
 
-    ParseResultBuffer(handle->ptr(), resp.transferredSize, valueSize,
-                      keys.size(), resp.foundFlags, buffers, handle);
+    auto parseStatus = ParseResultBuffer(
+        handle->ptr(), resp.transferredSize, valueSize, keys.size(),
+        resp.foundFlags, buffers, handle);
+    if (!parseStatus.IsOk()) return parseStatus;
     bufferHandles.push_back(handle);
     return Status::OK();
 }
@@ -228,6 +284,38 @@ Status ShareMapStoreClient::BatchQueryData(
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
     buffersPerBucket.clear();
     if (bucketKeys.empty()) return Status::OK();
+    if (bucketKeys.size() != keysPerBucket.size()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "bucketKeys/keysPerBucket size mismatch");
+    }
+    if (valueSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "valueSize must be > 0");
+    }
+
+    uint64_t entrySize = 0;
+    if (!CheckedAdd(1, valueSize, entrySize)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "batch entry size overflows");
+    }
+    uint64_t expectedSize = sizeof(uint64_t);
+    for (size_t i = 0; i < bucketKeys.size(); ++i) {
+        if (bucketKeys[i].empty() ||
+            bucketKeys[i].size() > std::numeric_limits<uint32_t>::max()) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "invalid bucket key");
+        }
+        uint64_t entryBytes = 0;
+        uint64_t bucketBytes = 0;
+        if (!CheckedMultiply(keysPerBucket[i].size(), entrySize, entryBytes) ||
+            !CheckedAdd(sizeof(uint32_t), bucketKeys[i].size(), bucketBytes) ||
+            !CheckedAdd(bucketBytes, sizeof(uint64_t), bucketBytes) ||
+            !CheckedAdd(bucketBytes, entryBytes, bucketBytes) ||
+            !CheckedAdd(expectedSize, bucketBytes, expectedSize)) {
+            return Status::Error(ErrorCode::kOutOfRange,
+                                 "batch query size overflows");
+        }
+    }
 
     auto* rpcClient = GetClient(rpcEndpoint);
     if (!rpcClient) {
@@ -244,12 +332,7 @@ Status ShareMapStoreClient::BatchQueryData(
         entry.keys = keysPerBucket[i];
         req.entries.push_back(std::move(entry));
     }
-    uint64_t expectedSize = sizeof(uint64_t);
-    for (size_t i = 0; i < bucketKeys.size(); ++i) {
-        expectedSize += sizeof(uint32_t) + bucketKeys[i].size() +
-                        sizeof(uint64_t) +
-                        keysPerBucket[i].size() * (1 + valueSize);
-    }
+
     auto handle = AllocateTransferBuffer(expectedSize);
     if (!handle) {
         return Status::Error(ErrorCode::kOutOfRange,
@@ -270,22 +353,32 @@ Status ShareMapStoreClient::BatchQueryData(
         return Status::Error(ErrorCode::kInternal,
                              "Remote batch query failed: " + resp.errorMsg);
     }
+    if (resp.responses.size() != bucketKeys.size()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "remote batch response count mismatch");
+    }
 
-    buffersPerBucket.assign(bucketKeys.size(), {});
-    if (resp.responses.empty()) return Status::OK();
-
-    uint64_t transferredSize = resp.responses[0].transferredSize;
+    const uint64_t transferredSize =
+        resp.responses.empty() ? 0 : resp.responses.front().transferredSize;
+    for (const auto& response : resp.responses) {
+        if (response.transferredSize != transferredSize) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "remote batch transferred size mismatch");
+        }
+    }
     if (transferredSize > handle->size()) {
         return Status::Error(ErrorCode::kOutOfRange,
                              "remote batch query exceeded target buffer");
     }
     std::vector<std::vector<int8_t>> flagsPerBucket;
     flagsPerBucket.reserve(resp.responses.size());
-    for (const auto& r : resp.responses) {
-        flagsPerBucket.push_back(r.foundFlags);
+    for (const auto& response : resp.responses) {
+        flagsPerBucket.push_back(response.foundFlags);
     }
-    ParseAggregatedBuffer(handle->ptr(), transferredSize, valueSize,
-                          bucketKeys, flagsPerBucket, buffersPerBucket, handle);
+    auto parseStatus = ParseAggregatedBuffer(
+        handle->ptr(), transferredSize, valueSize, bucketKeys, flagsPerBucket,
+        buffersPerBucket, handle);
+    if (!parseStatus.IsOk()) return parseStatus;
     bufferHandles.push_back(handle);
     return Status::OK();
 }
@@ -295,6 +388,22 @@ Status ShareMapStoreClient::Publish(
     uint64_t valueSize, const std::vector<uint64_t>& keys,
     const std::vector<StringView>& values) {
     if (keys.empty()) return Status::OK();
+    if (bucketKey.empty() || valueSize == 0 || values.size() != keys.size()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid publish arguments");
+    }
+    uint64_t dataSize = 0;
+    if (!CheckedMultiply(keys.size(), valueSize, dataSize) ||
+        dataSize > std::numeric_limits<size_t>::max()) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "publish payload size overflows");
+    }
+    for (const auto& value : values) {
+        if (value.size() != valueSize) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "publish value size mismatch");
+        }
+    }
 
     auto* rpcClient = GetClient(rpcEndpoint);
     if (!rpcClient) {
@@ -306,12 +415,16 @@ Status ShareMapStoreClient::Publish(
     req.bucketKey = bucketKey;
     req.valueSize = valueSize;
     req.keys = keys;
-    req.valuesData.resize(keys.size() * valueSize);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i < values.size() && values[i].size() >= valueSize) {
-            std::memcpy(&req.valuesData[i * valueSize], values[i].data(),
-                        valueSize);
+    req.valuesData.resize(static_cast<size_t>(dataSize));
+    for (size_t i = 0; i < values.size(); ++i) {
+        uint64_t offset = 0;
+        if (!CheckedMultiply(i, valueSize, offset) ||
+            !IsRangeValid(offset, valueSize, dataSize)) {
+            return Status::Error(ErrorCode::kOutOfRange,
+                                 "publish value range is invalid");
         }
+        std::memcpy(req.valuesData.data() + offset, values[i].data(),
+                    static_cast<size_t>(valueSize));
     }
 
     auto result = async_simple::coro::syncAwait(

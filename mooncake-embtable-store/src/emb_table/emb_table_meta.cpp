@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <span>
+#include <exception>
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
@@ -15,15 +16,41 @@ std::string metaKey(const std::string& tableKey) {
 std::string bucketMetaKey(const std::string& bucketKey) {
     return bucketKey + "_bucketmeta";
 }
+
+Status ValidateTableMeta(const TableMetaInfo& meta) {
+    if (meta.tableKey.empty() || meta.tableName.empty() ||
+        meta.dimSize == 0 || meta.bucketNum == 0 ||
+        meta.bucketCapacity == 0 || meta.tableCapacity == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid table metadata fields");
+    }
+    uint64_t expectedCapacity = 0;
+    if (!CheckedMultiply(meta.bucketNum, meta.bucketCapacity,
+                         expectedCapacity) ||
+        meta.tableCapacity < expectedCapacity) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid table metadata capacity");
+    }
+    return Status::OK();
+}
+
+Status ValidateBucketMeta(const BucketInfo& info) {
+    if (info.bucketKey.empty() || info.tableKey.empty() ||
+        info.valueSize == 0 || info.capacity == 0 ||
+        info.currentSize > info.capacity) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid bucket metadata fields");
+    }
+    return Status::OK();
+}
 }  // namespace
 
 EmbTableMeta::EmbTableMeta(std::shared_ptr<mooncake::RealClient> realClient)
     : realClient_(std::move(realClient)) {}
 
 Status EmbTableMeta::CreateTableMeta(const TableMetaInfo& params) {
-    if (params.tableKey.empty()) {
-        return Status::Error(ErrorCode::kInvalidArgument, "empty tableKey");
-    }
+    auto validation = ValidateTableMeta(params);
+    if (!validation.IsOk()) return validation;
     // Serialize to JSON.
     std::string json;
     struct_json::to_json(params, json);
@@ -42,8 +69,9 @@ Status EmbTableMeta::CreateTableMeta(const TableMetaInfo& params) {
 
 Status EmbTableMeta::QueryTableMeta(const std::string& tableKey,
                                     TableMetaInfo& meta) {
-    if (tableKey.empty()) {
-        return Status::Error(ErrorCode::kInvalidArgument, "empty tableKey");
+    if (tableKey.empty() || !realClient_) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid table metadata query");
     }
     auto handle = realClient_->get_buffer(metaKey(tableKey));
     if (!handle) {
@@ -51,7 +79,21 @@ Status EmbTableMeta::QueryTableMeta(const std::string& tableKey,
                              "table meta not found: " + tableKey);
     }
     std::string buf(static_cast<const char*>(handle->ptr()), handle->size());
-    struct_json::from_json(meta, buf);
+    try {
+        TableMetaInfo parsed;
+        struct_json::from_json(parsed, buf);
+        auto validation = ValidateTableMeta(parsed);
+        if (!validation.IsOk()) return validation;
+        if (parsed.tableKey != tableKey) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "table metadata key mismatch");
+        }
+        meta = std::move(parsed);
+    } catch (const std::exception& e) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid table metadata JSON: " +
+                                 std::string(e.what()));
+    }
     metaInfo_ = meta;
     return Status::OK();
 }
@@ -75,9 +117,8 @@ Status EmbTableMeta::UpdateTableMeta(const TableMetaInfo& meta) {
 }
 
 Status EmbTableMeta::CreateBucketMeta(const BucketInfo& info) {
-    if (info.bucketKey.empty()) {
-        return Status::Error(ErrorCode::kInvalidArgument, "empty bucketKey");
-    }
+    auto validation = ValidateBucketMeta(info);
+    if (!validation.IsOk()) return validation;
     std::string json;
     struct_json::to_json(info, json);
     mooncake::ReplicateConfig config;
@@ -93,8 +134,9 @@ Status EmbTableMeta::CreateBucketMeta(const BucketInfo& info) {
 
 Status EmbTableMeta::QueryBucketMeta(const std::string& bucketKey,
                                      BucketInfo& info) {
-    if (bucketKey.empty()) {
-        return Status::Error(ErrorCode::kInvalidArgument, "empty bucketKey");
+    if (bucketKey.empty() || !realClient_) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid bucket metadata query");
     }
     auto handle = realClient_->get_buffer(bucketMetaKey(bucketKey));
     if (!handle) {
@@ -102,7 +144,21 @@ Status EmbTableMeta::QueryBucketMeta(const std::string& bucketKey,
                              "bucket meta not found: " + bucketKey);
     }
     std::string buf(static_cast<const char*>(handle->ptr()), handle->size());
-    struct_json::from_json(info, buf);
+    try {
+        BucketInfo parsed;
+        struct_json::from_json(parsed, buf);
+        auto validation = ValidateBucketMeta(parsed);
+        if (!validation.IsOk()) return validation;
+        if (parsed.bucketKey != bucketKey) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "bucket metadata key mismatch");
+        }
+        info = std::move(parsed);
+    } catch (const std::exception& e) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid bucket metadata JSON: " +
+                                 std::string(e.what()));
+    }
     return Status::OK();
 }
 

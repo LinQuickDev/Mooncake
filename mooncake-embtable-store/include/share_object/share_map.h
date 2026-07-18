@@ -65,6 +65,7 @@ class ShareMap {
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::atomic<uint64_t> size_{0};
     std::atomic<bool> published_{false};
+    std::atomic<bool> inconsistent_{false};
     mutable std::shared_mutex rwMutex_;
 };
 

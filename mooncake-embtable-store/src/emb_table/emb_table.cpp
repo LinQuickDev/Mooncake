@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <unordered_map>
 
 namespace embtable {
@@ -36,13 +37,22 @@ uint32_t EmbTable::RouteToBucket(uint64_t key) const {
 }
 
 Status EmbTable::Init(bool createNew) {
+    if (valueSize_ == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "valueSize must be non-zero");
+    }
+    uint64_t tableCapacity = 0;
+    if (!CheckedMultiply(numBuckets_, 1024, tableCapacity)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "table capacity overflows");
+    }
     TableMetaInfo info;
     info.tableKey = tableName_ + "_meta";
     info.tableName = tableName_;
     info.dimSize = valueSize_;
     info.bucketNum = numBuckets_;
     info.hashType = HashFunctionType::kXxHash;
-    info.tableCapacity = numBuckets_ * 1024;  // placeholder default
+    info.tableCapacity = tableCapacity;  // placeholder default
     info.bucketCapacity = 1024;
 
     Status s;
@@ -50,10 +60,17 @@ Status EmbTable::Init(bool createNew) {
         s = meta_->CreateTableMeta(info);
     } else {
         s = meta_->QueryTableMeta(info.tableKey, info);
+        if (!s.IsOk()) return s;
+        if (info.tableName != tableName_ || info.bucketNum == 0 ||
+            info.dimSize == 0 || info.bucketCapacity == 0) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "invalid persisted table metadata");
+        }
+        numBuckets_ = static_cast<uint32_t>(info.bucketNum);
+        valueSize_ = info.dimSize;
     }
     if (!s.IsOk()) return s;
-
-    // Pre-create bucket objects (local handles; ShareMap created lazily).
+    buckets_.clear();
     // For newly created tables, register bucket meta in Mooncake Store so
     // other nodes can locate the owning node from bucket-meta replica
     // placement (design doc 4.3).
@@ -70,19 +87,23 @@ Status EmbTable::Init(bool createNew) {
         } else if (!createNew) {
             BucketInfo storedInfo;
             auto queryStatus = meta_->QueryBucketMeta(bi.bucketKey, storedInfo);
-            if (queryStatus.IsOk()) {
-                bi = std::move(storedInfo);
+            if (!queryStatus.IsOk()) return queryStatus;
+            if (storedInfo.tableKey != info.tableKey ||
+                storedInfo.bucketKey != bi.bucketKey ||
+                storedInfo.valueSize != valueSize_ ||
+                storedInfo.capacity == 0 ||
+                storedInfo.currentSize > storedInfo.capacity) {
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "invalid persisted bucket metadata");
             }
+            bi = std::move(storedInfo);
         }
         buckets_.push_back(std::make_shared<Bucket>(
             bi, shareMapStore_, realClient_, shareMapStoreClient_,
             localHostname_, shareMapStoreRpcPort_));
         if (createNew) {
             auto bs = meta_->CreateBucketMeta(bi);
-            if (!bs.IsOk()) {
-                LOG(WARNING) << "CreateBucketMeta failed for " << bi.bucketKey
-                             << ": " << bs.msg();
-            }
+            if (!bs.IsOk()) return bs;
         }
     }
     return Status::OK();
@@ -90,6 +111,7 @@ Status EmbTable::Init(bool createNew) {
 
 Status EmbTable::Insert(const std::vector<uint64_t>& keys,
                         const std::vector<StringView>& values) {
+    std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
     if (keys.size() != values.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "keys/values size mismatch");
@@ -122,6 +144,7 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
                       std::vector<StringView>& buffers,
                       std::vector<std::shared_ptr<mooncake::BufferHandle>>&
                           bufferHandles) {
+    std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
     buffers.clear();
     buffers.resize(keys.size());
     bufferHandles.clear();
@@ -191,9 +214,7 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
         std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
         auto s = buckets_[bidx]->Find(localKeys[bidx], bucketVals, tmpHandles);
         if (!s.IsOk()) {
-            LOG(WARNING) << "Local Find failed for bucket "
-                         << buckets_[bidx]->BucketKey() << ": " << s.msg();
-            continue;
+            return s;
         }
         for (size_t j = 0; j < indices.size() && j < bucketVals.size(); ++j) {
             buffers[indices[j]] = bucketVals[j];
@@ -312,6 +333,7 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
 }
 
 Status EmbTable::BuildIndex() {
+    std::unique_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
     for (auto& bucket : buckets_) {
         auto s = bucket->BuildIndex();
         if (!s.IsOk()) return s;

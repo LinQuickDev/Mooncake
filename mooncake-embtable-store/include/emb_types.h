@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,6 +25,25 @@ enum class ErrorCode : int {
     kOutOfRange = 9,
     kNotSupported = 10,
 };
+
+// Checked helpers for sizes crossing RPC, allocation, and pointer boundaries.
+inline bool CheckedAdd(uint64_t lhs, uint64_t rhs, uint64_t& result) {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
+    result = lhs + rhs;
+    return true;
+}
+
+inline bool CheckedMultiply(uint64_t lhs, uint64_t rhs, uint64_t& result) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+        return false;
+    }
+    result = lhs * rhs;
+    return true;
+}
+
+inline bool IsRangeValid(uint64_t offset, uint64_t length, uint64_t capacity) {
+    return offset <= capacity && length <= capacity - offset;
+}
 
 // A simple Status type holding a code and an optional message.
 // (design doc section 8.4)

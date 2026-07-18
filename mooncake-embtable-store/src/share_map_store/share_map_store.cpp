@@ -180,8 +180,19 @@ Status ShareMapStore::QueryDataToBuffer(
     }
 
     // 2. Pack results: [1-byte found flag][valueSize bytes data]
-    uint64_t entrySize = 1 + valueSize;
-    transferredSize = keys.size() * entrySize;
+    if (valueSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "valueSize must be > 0");
+    }
+    uint64_t entrySize = 0;
+    if (!CheckedAdd(1, valueSize, entrySize)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "query entry size overflows");
+    }
+    if (!CheckedMultiply(keys.size(), entrySize, transferredSize)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "query result size overflows");
+    }
     if (transferredSize > targetCapacity ||
         transferBuffers_.empty() ||
         transferredSize > config_.transferBufferSize) {
@@ -247,9 +258,17 @@ Status ShareMapStore::BatchQueryDataToBuffer(
                              "invalid target transfer buffer");
     }
 
-    const size_t bucketCount = bucketKeys.size();
-    const uint64_t entrySize = 1 + valueSize;
+    if (valueSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "valueSize must be > 0");
+    }
+    uint64_t entrySize = 0;
+    if (!CheckedAdd(1, valueSize, entrySize)) {
+        return Status::Error(ErrorCode::kOutOfRange,
+                             "batch query entry size overflows");
+    }
 
+    const size_t bucketCount = bucketKeys.size();
     // Phase 1: Query each bucket locally and collect results.
     std::vector<std::vector<StringView>> allBuffers(bucketCount);
     for (size_t i = 0; i < bucketCount; ++i) {
@@ -266,10 +285,7 @@ Status ShareMapStore::BatchQueryDataToBuffer(
                 s = Import(bucketKey);
                 if (s.IsOk()) s = QueryData(bucketKey, keys, buffers);
             }
-            if (!s.IsOk()) {
-                LOG(WARNING) << "BatchQueryDataToBuffer: query failed for "
-                             << bucketKey << ": " << s.msg();
-            }
+            if (!s.IsOk()) return s;
         }
         allBuffers[i] = std::move(buffers);
     }
@@ -282,9 +298,21 @@ Status ShareMapStore::BatchQueryDataToBuffer(
     //     for each key: [1B found flag][valueSize bytes data]
     uint64_t requiredSize = sizeof(uint64_t);
     for (size_t i = 0; i < bucketCount; ++i) {
-        requiredSize += sizeof(uint32_t) + bucketKeys[i].size() +
-                        sizeof(uint64_t) +
-                        keysPerBucket[i].size() * entrySize;
+        if (bucketKeys[i].size() > std::numeric_limits<uint32_t>::max()) {
+            return Status::Error(ErrorCode::kOutOfRange,
+                                 "bucket key is too large");
+        }
+        uint64_t keyBytes = 0;
+        uint64_t entriesBytes = 0;
+        if (!CheckedAdd(sizeof(uint32_t), bucketKeys[i].size(), keyBytes) ||
+            !CheckedAdd(keyBytes, sizeof(uint64_t), keyBytes) ||
+            !CheckedMultiply(keysPerBucket[i].size(), entrySize,
+                             entriesBytes) ||
+            !CheckedAdd(keyBytes, entriesBytes, keyBytes) ||
+            !CheckedAdd(requiredSize, keyBytes, requiredSize)) {
+            return Status::Error(ErrorCode::kOutOfRange,
+                                 "batch query result size overflows");
+        }
     }
     if (requiredSize > targetCapacity || transferBuffers_.empty() ||
         requiredSize > config_.transferBufferSize) {
