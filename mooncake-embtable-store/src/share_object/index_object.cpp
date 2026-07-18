@@ -27,14 +27,10 @@ using BoophfT = boomphf::mphf<uint64_t, U64Hasher>;
 // pointer type. IndexObject owns the object; the cast is always safe when
 // built_ is true.
 BoophfT* asPhf(void* p) { return static_cast<BoophfT*>(p); }
-const BoophfT* asPhf(const void* p) {
-    return static_cast<const BoophfT*>(p);
-}
+const BoophfT* asPhf(const void* p) { return static_cast<const BoophfT*>(p); }
 
 // Custom deleter bridging the opaque-pointer holder to the concrete type.
-void deletePhf(void* p) {
-    delete static_cast<BoophfT*>(p);
-}
+void deletePhf(void* p) { delete static_cast<BoophfT*>(p); }
 }  // namespace
 
 IndexObject::IndexObject(const std::string& key,
@@ -51,6 +47,8 @@ IndexObject::~IndexObject() {
 Status IndexObject::Build(const std::vector<uint64_t>& keys) {
     // Release any previous PHF (reset invokes deletePhf).
     phf_.reset();
+    slotToVecIndex_.clear();
+    built_ = false;
     BoophfT* raw = nullptr;
     if (keys.empty()) {
         // Build an empty PHF; lookups will always miss.
@@ -58,7 +56,23 @@ Status IndexObject::Build(const std::vector<uint64_t>& keys) {
     } else {
         raw = new BoophfT(keys.size(), keys, 1, 2.0, false);
     }
+    std::vector<uint64_t> slotToVecIndex(keys.size(), ULLONG_MAX);
+    for (uint64_t vecIndex = 0; vecIndex < keys.size(); ++vecIndex) {
+        const uint64_t slot = raw->lookup(keys[vecIndex]);
+        if (slot == ULLONG_MAX || slot >= keys.size()) {
+            delete raw;
+            return Status::Error(ErrorCode::kInternal,
+                                 "PHF produced an invalid slot while building");
+        }
+        if (slotToVecIndex[slot] != ULLONG_MAX) {
+            delete raw;
+            return Status::Error(ErrorCode::kAlreadyExists,
+                                 "duplicate key while building PHF");
+        }
+        slotToVecIndex[slot] = vecIndex;
+    }
     phf_ = {raw, deletePhf};
+    slotToVecIndex_ = std::move(slotToVecIndex);
     built_ = true;
     return Status::OK();
 }
@@ -68,12 +82,15 @@ Status IndexObject::Lookup(uint64_t key, uint64_t& vecIndex) const {
         return Status::Error(ErrorCode::kIndexNotBuilt,
                              "index not built for key: " + key_);
     }
-    uint64_t idx = asPhf(phf_.get())->lookup(key);
+    const uint64_t idx = asPhf(phf_.get())->lookup(key);
     // BBHash returns ULLONG_MAX when the key cannot be located by the PHF.
     if (idx == ULLONG_MAX) {
         return Status::Error(ErrorCode::kNotFound, "key not in index");
     }
-    vecIndex = idx;
+    if (idx >= slotToVecIndex_.size()) {
+        return Status::Error(ErrorCode::kNotFound, "key not in index");
+    }
+    vecIndex = slotToVecIndex_[idx];
     return Status::OK();
 }
 
@@ -88,8 +105,10 @@ Status IndexObject::Export() {
     std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
     asPhf(phf_.get())->save(ss);
     std::string data = ss.str();
-    // Layout: [8-byte length][serialized PHF bytes]
-    uint64_t dataLen = data.size();
+    // Layout: [8-byte length][serialized PHF bytes]. The slot translation is
+    // reconstructed from the key vector during Import, keeping the persisted
+    // format backward compatible.
+    const uint64_t dataLen = data.size();
     if (sizeof(uint64_t) + dataLen > shareObject_.Size()) {
         return Status::Error(ErrorCode::kBufferFull,
                              "serialized PHF exceeds ShareObject capacity");
@@ -101,7 +120,7 @@ Status IndexObject::Export() {
     return shareObject_.Publish();
 }
 
-Status IndexObject::Import() {
+Status IndexObject::Import(const std::vector<uint64_t>& keys) {
     auto s = shareObject_.Create();
     if (!s.IsOk()) return s;
     s = shareObject_.Import();
@@ -112,30 +131,43 @@ Status IndexObject::Import() {
     s = shareObject_.Read(0, sizeof(uint64_t), &dataLen);
     if (!s.IsOk()) return s;
     if (dataLen == 0 || dataLen > shareObject_.Size() - sizeof(uint64_t)) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "invalid PHF payload length: " +
-                                 std::to_string(dataLen));
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "invalid PHF payload length: " + std::to_string(dataLen));
     }
     std::string raw(dataLen, '\0');
     s = shareObject_.Read(sizeof(uint64_t), dataLen, raw.data());
     if (!s.IsOk()) return s;
     std::stringstream ss(raw, std::ios::in | std::ios::out | std::ios::binary);
     phf_.reset();
+    slotToVecIndex_.clear();
     built_ = false;
     auto* loaded = new BoophfT();
     try {
         loaded->load(ss);
     } catch (const std::exception& e) {
         delete loaded;
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "invalid serialized PHF: " +
-                                 std::string(e.what()));
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "invalid serialized PHF: " + std::string(e.what()));
     } catch (...) {
         delete loaded;
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid serialized PHF");
     }
+    std::vector<uint64_t> slotToVecIndex(keys.size(), ULLONG_MAX);
+    for (uint64_t vecIndex = 0; vecIndex < keys.size(); ++vecIndex) {
+        const uint64_t slot = loaded->lookup(keys[vecIndex]);
+        if (slot == ULLONG_MAX || slot >= keys.size() ||
+            slotToVecIndex[slot] != ULLONG_MAX) {
+            delete loaded;
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "PHF does not match the imported key vector");
+        }
+        slotToVecIndex[slot] = vecIndex;
+    }
     phf_ = {loaded, deletePhf};
+    slotToVecIndex_ = std::move(slotToVecIndex);
     built_ = true;
     return Status::OK();
 }

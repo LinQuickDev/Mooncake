@@ -14,16 +14,12 @@ namespace embtable {
 ShareMap::ShareMap(const std::string& bucketKey, uint64_t valueSize,
                    std::shared_ptr<mooncake::RealClient> realClient,
                    uint64_t shareObjectSize)
-    : bucketKey_(bucketKey),
-      valueSize_(valueSize),
-      realClient_(realClient) {
+    : bucketKey_(bucketKey), valueSize_(valueSize), realClient_(realClient) {
     if (valueSize_ == 0) valueSize_ = 1;
-    keyVec_ = std::make_unique<VectorObject>(bucketKey + "_keys",
-                                             sizeof(uint64_t), realClient_,
-                                             shareObjectSize);
-    valueVec_ = std::make_unique<VectorObject>(bucketKey + "_values",
-                                               valueSize_, realClient_,
-                                               shareObjectSize);
+    keyVec_ = std::make_unique<VectorObject>(
+        bucketKey + "_keys", sizeof(uint64_t), realClient_, shareObjectSize);
+    valueVec_ = std::make_unique<VectorObject>(
+        bucketKey + "_values", valueSize_, realClient_, shareObjectSize);
     indexObj_ = std::make_unique<IndexObject>(bucketKey + "_idx", realClient_);
     meta_ = std::make_unique<ShareMapMeta>(bucketKey, realClient_);
 }
@@ -144,10 +140,13 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
     std::string firstErrorMessage;
     std::mutex errorMutex;
     auto recordError = [&](const Status& status) {
-        if (status.IsOk() || status.code() == static_cast<int>(ErrorCode::kNotFound)) {
+        if (status.IsOk() ||
+            status.code() == static_cast<int>(ErrorCode::kNotFound)) {
             return;
         }
-        if (firstError.exchange(status.code(), std::memory_order_acq_rel) == 0) {
+        int expected = 0;
+        if (firstError.compare_exchange_strong(expected, status.code(),
+                                               std::memory_order_acq_rel)) {
             std::lock_guard<std::mutex> errorLock(errorMutex);
             firstErrorMessage = status.msg();
         }
@@ -168,8 +167,9 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
         }
         if (storedKey.size() != sizeof(uint64_t) ||
             std::memcmp(storedKey.data(), &keys[i], sizeof(uint64_t)) != 0) {
-            recordError(Status::Error(ErrorCode::kInternal,
-                                      "PHF returned a mismatched key slot"));
+            // A minimal perfect hash does not prove membership: an unknown
+            // key may map to an occupied slot. Key verification converts that
+            // false positive into a normal miss.
             return;
         }
         StringView v;
@@ -264,8 +264,8 @@ Status ShareMap::Import() {
     // layout. keyVec_ always uses sizeof(uint64_t) so it is unaffected.
     if (realValueSize != 0 && realValueSize != valueSize_) {
         valueSize_ = realValueSize;
-        valueVec_ = std::make_unique<VectorObject>(
-            bucketKey_ + "_values", valueSize_, realClient_);
+        valueVec_ = std::make_unique<VectorObject>(bucketKey_ + "_values",
+                                                   valueSize_, realClient_);
     }
 
     // Reconstruct key/value/index from Mooncake Store. Each VectorObject
@@ -283,7 +283,14 @@ Status ShareMap::Import() {
                    << s.msg();
         return s;
     }
-    s = indexObj_->Import();
+    std::vector<uint64_t> importedKeys;
+    s = keyVec_->ExportToVector(importedKeys);
+    if (!s.IsOk()) {
+        LOG(ERROR) << "Export imported keys failed for " << bucketKey_ << ": "
+                   << s.msg();
+        return s;
+    }
+    s = indexObj_->Import(importedKeys);
     if (!s.IsOk()) {
         LOG(ERROR) << "IndexObject Import failed: " << s.msg();
         return s;

@@ -33,15 +33,17 @@ class IndexObject {
     // Build the PHF from the given keys. Overwrites any previous index.
     Status Build(const std::vector<uint64_t>& keys);
 
-    // Lookup a key. On success vecIndex is set to the value-vector index.
-    // Returns kNotFound if the key is not in the built set.
+    // Lookup a key. On success vecIndex is translated from BooPHF's slot to
+    // the original value-vector index. As with any MPHF, callers must still
+    // compare the stored key because an unknown key can produce a candidate.
     Status Lookup(uint64_t key, uint64_t& vecIndex) const;
 
     // Serialize the PHF into the backing ShareObject and Publish it.
     Status Export();
 
-    // Pull the PHF from Mooncake Store (so other nodes can Lookup).
-    Status Import();
+    // Pull the PHF from Mooncake Store and reconstruct its slot translation
+    // from the already imported key vector.
+    Status Import(const std::vector<uint64_t>& keys);
 
     bool IsBuilt() const { return built_; }
 
@@ -50,6 +52,9 @@ class IndexObject {
     // Opaque PHF pointer; concrete type is defined in index_object.cpp.
     // Custom deleter disposes of the boomphf::mphf object correctly.
     std::unique_ptr<void, void (*)(void*)> phf_{nullptr, nullptr};
+    // BooPHF assigns its own dense slot to every key. The slot is not the
+    // key's insertion position, so translate it back to VectorObject index.
+    std::vector<uint64_t> slotToVecIndex_;
     ShareObject shareObject_;
     bool built_ = false;
     size_t serializedCapacity_;

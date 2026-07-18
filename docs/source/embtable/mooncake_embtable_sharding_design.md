@@ -1625,7 +1625,7 @@ flowchart TD
     B --> C["获取数据大小keyVec-size"]
     C --> D["导出keys到vector"]
     D --> E["构建PHF完美哈希"]
-    E --> F["计算vecIndex=PHF(key)"]
+    E --> F["建立PHF slot到Vector下标映射"]
     F --> G["创建IndexObject"]
     G --> H["序列化PHF到ShareObject"]
     H --> I["更新Meta"]
