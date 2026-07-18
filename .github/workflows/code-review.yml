@@ -7,6 +7,8 @@ on:
 jobs:
   qoder-review:
     runs-on: ubuntu-latest
+    env:
+      QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
     permissions:
       contents: read
       pull-requests: write
@@ -14,14 +16,20 @@ jobs:
     
     steps:
       - name: Checkout repository
+        if: ${{ env.QODER_PERSONAL_ACCESS_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
       - name: Run Qoder Code Review
+        if: ${{ env.QODER_PERSONAL_ACCESS_TOKEN != '' }}
         uses: QoderAI/qoder-action@v0
         with:
-          qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+          qoder_personal_access_token: ${{ env.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review-pr
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
+
+      - name: Skip Qoder Code Review
+        if: ${{ env.QODER_PERSONAL_ACCESS_TOKEN == '' }}
+        run: echo "Qoder review skipped because QODER_PERSONAL_ACCESS_TOKEN is unavailable."
