@@ -28,6 +28,9 @@ class EmbTableRpcService {
         server.register_handler<&EmbTableRpcService::HandleInsert>(this);
         server.register_handler<&EmbTableRpcService::HandleFind>(this);
         server.register_handler<&EmbTableRpcService::HandleBuildIndex>(this);
+        server.register_handler<&EmbTableRpcService::HandleCreateTable>(this);
+        server.register_handler<&EmbTableRpcService::HandleAlterTable>(this);
+        server.register_handler<&EmbTableRpcService::HandleDeleteTable>(this);
     }
 
     EmbTableStatusResponse HandleRegisterSharedMemory(
@@ -39,6 +42,9 @@ class EmbTableRpcService {
     EmbTableFindResponse HandleFind(const EmbTableFindRequest& req);
     EmbTableStatusResponse HandleBuildIndex(
         const EmbTableBuildIndexRequest& req);
+    EmbTableStatusResponse HandleCreateTable(const EmbTableCreateRequest& req);
+    EmbTableStatusResponse HandleAlterTable(const EmbTableAlterRequest& req);
+    EmbTableStatusResponse HandleDeleteTable(const EmbTableDeleteRequest& req);
 
    private:
     struct SharedMemoryMapping;

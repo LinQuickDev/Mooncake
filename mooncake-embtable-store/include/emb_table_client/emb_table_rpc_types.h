@@ -28,9 +28,9 @@ struct EmbTableStatusResponse {
 YLT_REFL(EmbTableStatusResponse, statusCode, errorMsg);
 
 struct EmbTableInfoRequest {
-    uint8_t reserved = 0;
+    std::string tableName;
 };
-YLT_REFL(EmbTableInfoRequest, reserved);
+YLT_REFL(EmbTableInfoRequest, tableName);
 
 struct EmbTableInfoResponse {
     int32_t statusCode = 0;
@@ -41,20 +41,23 @@ struct EmbTableInfoResponse {
 YLT_REFL(EmbTableInfoResponse, statusCode, errorMsg, valueSize, numBuckets);
 
 struct EmbTableInsertRequest {
+    std::string tableName;
     std::vector<uint64_t> keys;
     std::string shmName;
     uint64_t dataOffset = 0;
     uint64_t dataSize = 0;
 };
-YLT_REFL(EmbTableInsertRequest, keys, shmName, dataOffset, dataSize);
+YLT_REFL(EmbTableInsertRequest, tableName, keys, shmName, dataOffset, dataSize);
 
 struct EmbTableFindRequest {
+    std::string tableName;
     std::vector<uint64_t> keys;
     std::string shmName;
     uint64_t targetOffset = 0;
     uint64_t targetCapacity = 0;
 };
-YLT_REFL(EmbTableFindRequest, keys, shmName, targetOffset, targetCapacity);
+YLT_REFL(EmbTableFindRequest, tableName, keys, shmName, targetOffset,
+         targetCapacity);
 
 struct EmbTableFindResponse {
     int32_t statusCode = 0;
@@ -64,8 +67,27 @@ struct EmbTableFindResponse {
 YLT_REFL(EmbTableFindResponse, statusCode, errorMsg, transferredSize);
 
 struct EmbTableBuildIndexRequest {
-    uint8_t reserved = 0;
+    std::string tableName;
 };
-YLT_REFL(EmbTableBuildIndexRequest, reserved);
+YLT_REFL(EmbTableBuildIndexRequest, tableName);
+
+struct EmbTableCreateRequest {
+    std::string tableName;
+    uint32_t numBuckets = 0;
+    uint64_t valueSize = 0;
+};
+YLT_REFL(EmbTableCreateRequest, tableName, numBuckets, valueSize);
+
+struct EmbTableAlterRequest {
+    std::string tableName;
+    uint32_t numBuckets = 0;
+    uint64_t valueSize = 0;
+};
+YLT_REFL(EmbTableAlterRequest, tableName, numBuckets, valueSize);
+
+struct EmbTableDeleteRequest {
+    std::string tableName;
+};
+YLT_REFL(EmbTableDeleteRequest, tableName);
 
 }  // namespace embtable

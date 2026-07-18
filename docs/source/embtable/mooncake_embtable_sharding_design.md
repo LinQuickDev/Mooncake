@@ -40,19 +40,20 @@
 ### 2.2 用户接口
 
 ```
-Insert(embKeys, embValues)                    // 批量插入
-Load(embKeyFiles, embValFiles, fileFormat)    // 文件加载
-Find(embKeys, buffer)                         // 批量查找
-BuildIndex()                                  // 构建完美哈希索引（全局生效）
-Delete(embKeys)                               // 删除数据
+CreateTable(tableName, numBuckets, valueSize) // 创建逻辑表
+AlterTable(tableName, numBuckets, valueSize)  // 校验/变更表结构
+DeleteTable(tableName)                        // 删除逻辑表元数据
+Insert(tableName, embKeys, embValues)         // 批量插入
+Find(tableName, embKeys, buffer)              // 批量查找
+BuildIndex(tableName)                         // 构建完美哈希索引（全局生效）
 ```
 
 ### 2.3 核心概念定义
 
 | 概念 | 定义 |
 |------|------|
-| **EmbTableClient** | 对外暴露的客户端封装，集成 EmbTable RPC 服务和 ShareMapStore RPC 服务 |
-| **EmbTableDummyClient** | 独立部署时用户侧的哑客户端，通过 SHM 与 EmbTableClient 通信 |
+| **EmbTableClient** | 多表注册中心与本地 facade；持有一个 ShareMapStore，通过 tableName 懒加载多个 EmbTable；按部署参数决定是否启动 RPC |
+| **EmbTableDummyClient** | 独立部署时用户侧客户端；DDL/keys 走 RPC，Insert values 与 Find results 走预注册 POSIX SHM |
 | **EmbTable** | 逻辑 embedding 表，按 key 哈希拆分为多个 Bucket，管理 EmbTableMeta |
 | **EmbTableMeta** | 记录 bucket 数量、分桶 hash 函数、table 名称、每个 bucket 容量规格等 |
 | **Bucket** | value 大小规格相同的数据聚合单元，按 embKey 哈希分桶；含本地写缓冲 LocalBuffer |
@@ -64,7 +65,7 @@ Delete(embKeys)                               // 删除数据
 | **IndexObject** | 完美哈希索引结构，由一整块 ShareObject 管理 |
 | **ShareMapMeta** | 记录 VectorObject 和 IndexObject 使用的 ShareObject 信息（key、大小、数据地址等） |
 | **ShareObject** | 从 Mooncake Store 获取的连续存储单元，采用"本地缓冲 + 整对象上传"模型（对外保留 offset 读写语义，内部作用于本地副本，Publish 时整对象上传），是可共享的存储底座 |
-| **RealClient** | Mooncake Store 的真实客户端，直接连接 Mooncake Master |
+| **RealClient** | Mooncake Store 的真实客户端，由 ShareMapStore 唯一创建和初始化，EmbTableClient 仅获取并复用 |
 | **DummyClient** | 独立部署时转发请求到同节点 RealClient 的哑客户端 |
 | **ReplicaInfo** | Bucket 副本信息，记录所属 nodeId 和 endpoint，用于定位 ShareMapStore 服务节点 |
 | **NodeLocator** | 节点定位器，解析 ReplicaInfo 判断目标 ShareMapStore 是否本地节点 |
@@ -73,7 +74,7 @@ Delete(embKeys)                               // 删除数据
 
 ```mermaid
 graph LR
-    ETC[EmbTableClient] -- 1:1 --> ET[EmbTable]
+    ETC[EmbTableClient] -- 1:n --> ET[EmbTable]
     ETC -- 1:1 --> SMS[ShareMapStore]
     ET -- 1:1 --> ETM[EmbTableMeta]
     ET -- 1:n --> B[Bucket]
@@ -203,7 +204,7 @@ graph LR
     H --> I[Mooncake Store]
 ```
 
-用户直接链接 EmbTableClient 的头文件和 so 库，调用本地 API，ShareMapStore 与 EmbTable 同进程，本地调用无需 RPC。
+用户直接链接 EmbTableClient 的头文件和 so 库，调用本地 API。`DeploymentConfig::enableEmbTableRpc=false`，不启动 EmbTable/ShareMapStore RPC 服务；ShareMapStore 与 EmbTable 同进程，本地调用无需 RPC。应用可通过 `Options::tableName` 选择一个默认表，也可使用带 `tableName` 的多表接口。
 
 #### 3.4.2 独立部署
 
@@ -235,7 +236,9 @@ graph TB
     F -.->|RPC| K
 ```
 
-EmbTableClient 作为独立进程，集成 EmbTable RPC 和 ShareMapStore RPC 服务。跨节点时，Bucket 通过 ShareMapStoreClient 发起 RPC 请求到远程 ShareMapStore 服务节点。
+`embtable_client` 作为独立存储节点进程启动时不创建或绑定任何表，设置 `DeploymentConfig::enableEmbTableRpc=true` 后同时提供 EmbTable RPC 和 ShareMapStore RPC。用户通过 EmbTableDummyClient 发起 CreateTable/DeleteTable 及带 `tableName` 的数据请求；节点按表名懒加载 EmbTable，因此一个进程可管理多个逻辑表。跨节点时，Bucket 通过 ShareMapStoreClient 请求远程 ShareMapStore。
+
+两种部署形态都只初始化一次 Mooncake `RealClient`：`ShareMapStore::Init` 接收 `localHostname`，调用 `setup_real`，EmbTableClient 再通过 `GetRealClient()` 复用该实例。
 
 ---
 
@@ -412,21 +415,23 @@ struct DeploymentConfig {
     std::string protocol = "tcp";
     std::string deviceNames;
     std::string metadataServer = "http://127.0.0.1:8080/metadata";
-    uint16_t rpcPort = 0;            // 0 禁用 RPC 服务（共进程形态）
+    uint64_t globalSegmentSize = 16ull * 1024 * 1024;
+    uint64_t localBufferSize = 16ull * 1024 * 1024;
+    uint16_t rpcPort = 0;
+    bool enableEmbTableRpc = false;  // 部署模式开关；共进程 false，独立节点 true
+    uint64_t transferBufferSize = 64ull * 1024 * 1024;
     uint64_t shareObjectSize = 64ull * 1024 * 1024;
-    std::string localNodeId;         // 本节点唯一标识
-    std::string localEndpoint;       // 本节点 RPC 监听地址
 };
 
 // ShareMapStore：RPC 服务端 + ShareMap 管理器
 class ShareMapStore {
 public:
-    explicit ShareMapStore(DeploymentConfig config);
+    explicit ShareMapStore(DeploymentConfig config,
+                           std::string localHostname = "");
 
-    // 初始化 RealClient 并启动 RPC 服务（rpcPort != 0 时）
+    // 唯一负责初始化 RealClient；RPC server 由 EmbTableClient 按部署模式启动
     Status Init();
-    Status StartRpcService();
-    Status StopRpcService();
+    std::shared_ptr<mooncake::RealClient> GetRealClient() const;
 
     // ===== 本地直接调用接口（同进程内调用） =====
     Status Publish(const std::string& bucketKey, uint64_t valueSize,
@@ -1802,6 +1807,20 @@ graph LR
 | `BuildIndex` | - | Status | **向所有节点发起 BuildIndex RPC**，完成后可查询 |
 | `Delete` | keys[] | Status | 删除（Published 后不支持） |
 
+### 6.5 EmbTableClient / DummyClient 多表与 DDL 接口
+
+| 接口 | 入参 | 出参 | 当前语义 |
+|------|------|------|----------|
+| `GetTableInfo` | tableName | TableMetaInfo, Status | 查询或懒加载表元数据 |
+| `CreateTable` | tableName, numBuckets, valueSize | Status | 创建 table/bucket 元数据并加入本节点表注册表；同名表返回 `kAlreadyExists` |
+| `AlterTable` | tableName, numBuckets, valueSize | Status | 相同规格幂等成功；规格变化返回 `kNotSupported`，等待完整的 re-sharding/value migration 实现 |
+| `DeleteTable` | tableName | Status | 删除 table/bucket 元数据并移出进程内注册表；ShareMap 数据对象由 Mooncake Store 的淘汰/GC 回收 |
+| `Insert` | tableName, keys[], values[] | Status | 按 tableName 路由；DummyClient 的 values 通过 SHM 传递 |
+| `Find` | tableName, keys[] | buffers[], Status | 按 tableName 路由；DummyClient 的结果通过 SHM 返回 |
+| `BuildIndex` | tableName | Status | 构建指定表索引 |
+
+所有 EmbTable 控制面 RPC request 都显式包含 `tableName`。DummyClient 的 `Options::tableName` 为空时是仅建立 RPC 连接的管理客户端，可用于 DDL；非空时在 `Init()` 查询表规格并注册 POSIX SHM 数据面。
+
 ---
 
 ## 7. 部署架构
@@ -1866,32 +1885,34 @@ graph TB
 
 ### 7.3 启动参数
 
-```bash
-# ===== 共进程部署 =====
-./user_app --embtable_mode=embedded \
-           --embtable_config=emb_table.conf \
-           --sharemapstore_rpc_port=0          # 禁用 RPC 服务
-
-# ===== 独立部署 - EmbTable 主节点 =====
-./embtable_server --mode=standalone \
-                  --port=8080 \
-                  --embtable_config=emb_table.conf \
-                  --sharemapstore_rpc_port=9090 \
-                  --node_id=node-1 \
-                  --local_endpoint=192.168.1.10:9090
-
-# ===== 独立部署 - ShareMapStore 数据节点 =====
-./sharemapstore_server --mode=store_node \
-                       --sharemapstore_rpc_port=9090 \
-                       --node_id=node-2 \
-                       --local_endpoint=192.168.1.11:9090 \
-                       --master_address=192.168.1.1:50051
-
-# ===== 独立部署 - 用户进程 =====
-./user_app --embtable_mode=dummy \
-           --embtable_server=192.168.1.10:8080 \
-           --shm_path=/tmp/embtable_shm
+共进程部署示例：
+```cpp
+EmbTableClient::Options options;
+options.tableName = "recommendation";
+options.createNew = false;
+options.deployment.enableEmbTableRpc = false;
+EmbTableClient client(options);
+client.Init();
 ```
+
+```bash
+# ===== 独立部署 - 多表存储节点（启动阶段不创建表） =====
+./mooncake-embtable-store/script/embtable_client_main.sh \
+  --embtable_rpc_port=50055 \
+  --embtable_local_hostname=192.168.1.10 \
+  --embtable_master_address=192.168.1.1:50051 \
+  --embtable_metadata_server=http://192.168.1.1:8080/metadata \
+  --embtable_global_segment_size="16 MB" \
+  --embtable_local_buffer_size="16 MB"
+
+# ===== Find benchmark（表须先通过 DummyClient::CreateTable 创建） =====
+./mooncake-embtable-store/script/embtable_cluster_bench.sh \
+  --embtable_rpc_endpoint=192.168.1.10:50055 \
+  --embtable_table_name=recommendation \
+  --embtable_mode=continuous
+```
+
+`embtable_client` 不再接受 `embtable_create_new`、`embtable_table_name`、`embtable_num_buckets` 或 `embtable_value_size` 启动参数。表结构的生命周期属于用户侧 DDL，而不是存储节点进程生命周期。
 
 ---
 
@@ -2040,16 +2061,16 @@ mooncake-embtable-store/
 
 | 模块 | 变更内容 | 状态 |
 |------|---------|------|
-| **ShareMapStore** | 新增 RPC 服务能力（Publish/Find/BuildIndex） | 待实现 |
-| **ShareMapStoreClient** | 新增 RPC 客户端（coro_rpc 封装） | 待实现 |
-| **NodeLocator** | 新增节点定位器（本地/远程判断） | 待实现 |
-| **Bucket** | 新增节点感知 + 本地/远程路由逻辑 | 待实现 |
-| **BucketMeta** | 扩展 ReplicaInfo 存储与查询 | 待实现 |
-| **EmbTable::Insert** | 更新 Flush 路由逻辑 | 待实现 |
-| **EmbTable::Find** | 重写：按节点聚合 + RPC 并行查询 + Buffer 聚合 | 待实现 |
-| **EmbTable::Load** | 新增：文件解析 + 调用 Insert 加载 | 待实现 |
-| **EmbTable::BuildIndex** | 重写：按节点聚合 + RPC 并行构建索引 | 待实现 |
-| **RPC Request/Response** | 新增所有结构体定义 | 待实现 |
+| **ShareMapStore / RealClient** | ShareMapStore 唯一初始化 RealClient，并通过 GetRealClient 供上层复用 | 已实现 |
+| **部署模式** | `enableEmbTableRpc` 控制是否启动 EmbTable/ShareMapStore RPC | 已实现 |
+| **EmbTableClient 多表注册** | 按 tableName 懒加载并缓存多个 EmbTable | 已实现 |
+| **EmbTable DDL RPC** | CreateTable / AlterTable / DeleteTable | 部分实现（Alter 规格变化待迁移能力） |
+| **EmbTable 数据 RPC** | GetInfo / Insert / Find / BuildIndex 显式携带 tableName | 已实现 |
+| **EmbTableDummyClient** | coro_rpc 控制面 + POSIX SHM 数据面，支持数据接口和 DDL | 已实现 |
+| **ShareMapStoreClient** | 远程 Query/BatchQuery，注册 Transfer Buffer | 已实现 |
+| **EmbTable::Find** | 本地直接访问、远端按 endpoint 聚合并行查询 | 已实现 |
+| **EmbTable::Load** | binary/text 文件加载 | 已实现 |
+| **embtable_client** | 无表启动的多表存储节点服务 | 已实现 |
 
 ### 12.2 构建验证策略
 
@@ -2064,16 +2085,9 @@ mooncake-embtable-store/
 
 ### 12.3 待办
 
-- [ ] `ShareMapStore` RPC 服务端实现
-- [ ] `ShareMapStoreClient` RPC 客户端实现
-- [ ] `NodeLocator` 节点定位器实现
-- [ ] `Bucket` 节点感知 + 本地/远程路由实现
-- [ ] `BucketMeta::Query` 扩展（含 ReplicaInfo 解析）
-- [ ] `EmbTable::Find` 按节点聚合 + RPC 并行查询实现
-- [ ] `EmbTable::Load` 文件解析器实现
-- [ ] `EmbTable::BuildIndex` 按节点聚合 + RPC 并行建索引实现
-- [ ] `FindMultiBucket` / `BuildIndexMultiBucket` RPC 接口实现
-- [ ] Mooncake Buffer 注册 + TE Write/Read 集成
+- [ ] AlterTable 的在线 re-sharding、value schema migration 与版本切换
+- [ ] DeleteTable 后 ShareMap 物理对象的主动级联清理（当前依赖 Mooncake Store 淘汰/GC）
+- [ ] DDL 的分布式并发控制与事务/幂等恢复
 - [ ] `tests/` 单元测试用例
 - [x] `EmbTableDummyClient` 的 SHM/coro_rpc 远程转发实现
 

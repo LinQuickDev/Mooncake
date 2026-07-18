@@ -36,38 +36,24 @@ EmbTableClient::~EmbTableClient() {
 }
 
 Status EmbTableClient::Init() {
-    if (options_.valueSize == 0) {
+    if (options_.createNew && !options_.tableName.empty() &&
+        options_.valueSize == 0) {
         return Status::Error(ErrorCode::kInvalidArgument,
-                             "valueSize must be > 0");
+                             "valueSize must be > 0 when creating a table");
     }
-    if (options_.tableName.empty()) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "tableName must be non-empty");
-    }
-    localHostname_ =
-        options_.localHostname.empty() ? getLocalHostname()
-                                       : options_.localHostname;
+    localHostname_ = options_.localHostname.empty() ? getLocalHostname()
+                                                    : options_.localHostname;
 
-    shareMapStore_ = std::make_shared<ShareMapStore>(options_.deployment);
+    shareMapStore_ =
+        std::make_shared<ShareMapStore>(options_.deployment, localHostname_);
     auto s = shareMapStore_->Init();
     if (!s.IsOk()) return s;
 
-    // Use the ShareMapStore's underlying client for metadata operations.
-    realClient_ = shareMapStore_->GetClient();
+    // ShareMapStore is the sole owner responsible for RealClient setup.
+    realClient_ = shareMapStore_->GetRealClient();
     if (!realClient_) {
-        // Fallback: create a dedicated client.
-        realClient_ = std::make_shared<mooncake::RealClient>();
-        int ret = realClient_->setup_real(
-            localHostname_, options_.deployment.metadataServer,
-            options_.deployment.globalSegmentSize,
-            options_.deployment.localBufferSize,
-            options_.deployment.protocol, options_.deployment.deviceNames,
-            options_.deployment.masterAddress);
-        if (ret != 0) {
-            return Status::Error(
-                ErrorCode::kInternal,
-                "EmbTableClient RealClient setup_real failed");
-        }
+        return Status::Error(ErrorCode::kInternal,
+                             "ShareMapStore did not initialize RealClient");
     }
 
     // Create the ShareMapStoreClient for remote RPC calls.
@@ -75,15 +61,19 @@ Status EmbTableClient::Init() {
     s = shareMapStoreClient_->Init(options_.deployment.transferBufferSize);
     if (!s.IsOk()) return s;
 
-    embTable_ = std::make_shared<EmbTable>(
-        options_.tableName, options_.numBuckets, options_.valueSize,
-        shareMapStore_, realClient_, shareMapStoreClient_, localHostname_,
-        options_.deployment.rpcPort);
-    s = embTable_->Init(options_.createNew);
-    if (!s.IsOk()) return s;
+    // Co-process callers may select a default table. A standalone storage
+    // node starts tableless and opens tables lazily through DDL/data RPCs.
+    if (!options_.tableName.empty()) {
+        s = OpenTable(options_.tableName, options_.numBuckets,
+                      options_.valueSize, options_.createNew, embTable_);
+        if (!s.IsOk()) return s;
+    }
 
-    // Start both RPC services only after EmbTable is fully initialized.
-    if (options_.deployment.rpcPort != 0) {
+    if (options_.deployment.enableEmbTableRpc) {
+        if (options_.deployment.rpcPort == 0) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "RPC is enabled but rpcPort is zero");
+        }
         shareMapRpcService_ =
             std::make_unique<ShareMapStoreRpcService>(*shareMapStore_);
         embTableRpcService_ = std::make_unique<EmbTableRpcService>(*this);
@@ -146,6 +136,125 @@ Status EmbTableClient::Load(const std::vector<std::string>& keyFiles,
         return Status::Error(ErrorCode::kInternal, "not initialized");
     }
     return embTable_->Load(keyFiles, valueFiles, format);
+}
+
+Status EmbTableClient::OpenTable(const std::string& tableName,
+                                 uint32_t numBuckets, uint64_t valueSize,
+                                 bool createNew,
+                                 std::shared_ptr<EmbTable>& table) {
+    if (tableName.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "tableName must be non-empty");
+    }
+    if (!shareMapStore_ || !realClient_ || !shareMapStoreClient_) {
+        return Status::Error(ErrorCode::kInternal,
+                             "EmbTableClient is not initialized");
+    }
+    if (createNew && (numBuckets == 0 || valueSize == 0)) {
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "numBuckets and valueSize must be non-zero when creating a table");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(tablesMutex_);
+        auto it = tables_.find(tableName);
+        if (it != tables_.end()) {
+            if (createNew) {
+                return Status::Error(ErrorCode::kAlreadyExists,
+                                     "table already exists: " + tableName);
+            }
+            table = it->second;
+            return Status::OK();
+        }
+    }
+
+    auto opened = std::make_shared<EmbTable>(
+        tableName, numBuckets, valueSize, shareMapStore_, realClient_,
+        shareMapStoreClient_, localHostname_, options_.deployment.rpcPort);
+    auto status = opened->Init(createNew);
+    if (!status.IsOk()) return status;
+
+    std::lock_guard<std::mutex> lock(tablesMutex_);
+    auto [it, inserted] = tables_.emplace(tableName, opened);
+    table = inserted ? std::move(opened) : it->second;
+    return Status::OK();
+}
+
+Status EmbTableClient::GetOrLoadTable(const std::string& tableName,
+                                      std::shared_ptr<EmbTable>& table) {
+    return OpenTable(tableName, /*numBuckets=*/1, /*valueSize=*/0,
+                     /*createNew=*/false, table);
+}
+
+Status EmbTableClient::Insert(const std::string& tableName,
+                              const std::vector<uint64_t>& keys,
+                              const std::vector<StringView>& values) {
+    std::shared_ptr<EmbTable> table;
+    auto status = GetOrLoadTable(tableName, table);
+    return status.IsOk() ? table->Insert(keys, values) : status;
+}
+
+Status EmbTableClient::Find(
+    const std::string& tableName, const std::vector<uint64_t>& keys,
+    std::vector<StringView>& buffers,
+    std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    std::shared_ptr<EmbTable> table;
+    auto status = GetOrLoadTable(tableName, table);
+    return status.IsOk() ? table->Find(keys, buffers, bufferHandles) : status;
+}
+
+Status EmbTableClient::BuildIndex(const std::string& tableName) {
+    std::shared_ptr<EmbTable> table;
+    auto status = GetOrLoadTable(tableName, table);
+    return status.IsOk() ? table->BuildIndex() : status;
+}
+
+Status EmbTableClient::GetTableInfo(const std::string& tableName,
+                                    TableMetaInfo& info) {
+    std::shared_ptr<EmbTable> table;
+    auto status = GetOrLoadTable(tableName, table);
+    if (!status.IsOk()) return status;
+    info = table->MetaInfo();
+    return Status::OK();
+}
+
+Status EmbTableClient::CreateTable(const std::string& tableName,
+                                   uint32_t numBuckets, uint64_t valueSize) {
+    std::shared_ptr<EmbTable> table;
+    return OpenTable(tableName, numBuckets, valueSize, /*createNew=*/true,
+                     table);
+}
+
+Status EmbTableClient::AlterTable(const std::string& tableName,
+                                  uint32_t numBuckets, uint64_t valueSize) {
+    if (numBuckets == 0 || valueSize == 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "numBuckets and valueSize must be non-zero");
+    }
+    TableMetaInfo info;
+    auto status = GetTableInfo(tableName, info);
+    if (!status.IsOk()) return status;
+    if (info.bucketNum == numBuckets && info.dimSize == valueSize) {
+        return Status::OK();
+    }
+    return Status::Error(
+        ErrorCode::kNotSupported,
+        "online AlterTable requires bucket re-sharding/value migration");
+}
+
+Status EmbTableClient::DeleteTable(const std::string& tableName) {
+    std::shared_ptr<EmbTable> table;
+    auto status = GetOrLoadTable(tableName, table);
+    if (!status.IsOk()) return status;
+    status = table->Drop();
+    if (!status.IsOk()) return status;
+
+    std::lock_guard<std::mutex> lock(tablesMutex_);
+    auto it = tables_.find(tableName);
+    if (it != tables_.end() && it->second == table) tables_.erase(it);
+    if (embTable_ == table) embTable_.reset();
+    return Status::OK();
 }
 
 uint32_t EmbTableClient::NumBuckets() const {

@@ -28,8 +28,6 @@ bool IsValidShmName(const std::string& name) {
            name.find('/', 1) == std::string::npos;
 }
 
-
-
 }  // namespace
 
 struct EmbTableRpcService::SharedMemoryMapping {
@@ -122,20 +120,26 @@ EmbTableStatusResponse EmbTableRpcService::HandleUnregisterSharedMemory(
 }
 
 EmbTableInfoResponse EmbTableRpcService::HandleGetInfo(
-    const EmbTableInfoRequest&) {
+    const EmbTableInfoRequest& req) {
     EmbTableInfoResponse response;
-    response.valueSize = client_.ValueSize();
-    response.numBuckets = client_.NumBuckets();
-    if (response.valueSize == 0 || response.numBuckets == 0) {
-        response.statusCode = static_cast<int32_t>(ErrorCode::kInternal);
-        response.errorMsg = "EmbTable is not initialized";
+    TableMetaInfo info;
+    auto status = client_.GetTableInfo(req.tableName, info);
+    if (!status.IsOk()) {
+        response.statusCode = status.code();
+        response.errorMsg = status.msg();
+        return response;
     }
+    response.valueSize = info.dimSize;
+    response.numBuckets = static_cast<uint32_t>(info.bucketNum);
     return response;
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleInsert(
     const EmbTableInsertRequest& req) {
-    const uint64_t valueSize = client_.ValueSize();
+    TableMetaInfo info;
+    auto status = client_.GetTableInfo(req.tableName, info);
+    if (!status.IsOk()) return ToResponse(status);
+    const uint64_t valueSize = info.dimSize;
     uint64_t expectedSize = 0;
     if (!CheckedMultiply(req.keys.size(), valueSize, expectedSize) ||
         req.dataSize != expectedSize) {
@@ -156,13 +160,20 @@ EmbTableStatusResponse EmbTableRpcService::HandleInsert(
     for (size_t i = 0; i < req.keys.size(); ++i) {
         values.emplace_back(data + i * valueSize, valueSize);
     }
-    return ToResponse(client_.Insert(req.keys, values));
+    return ToResponse(client_.Insert(req.tableName, req.keys, values));
 }
 
 EmbTableFindResponse EmbTableRpcService::HandleFind(
     const EmbTableFindRequest& req) {
     EmbTableFindResponse response;
-    const uint64_t valueSize = client_.ValueSize();
+    TableMetaInfo info;
+    auto infoStatus = client_.GetTableInfo(req.tableName, info);
+    if (!infoStatus.IsOk()) {
+        response.statusCode = infoStatus.code();
+        response.errorMsg = infoStatus.msg();
+        return response;
+    }
+    const uint64_t valueSize = info.dimSize;
     uint64_t entrySize = valueSize + 1;
     uint64_t requiredSize = 0;
     if (entrySize == 0 ||
@@ -184,7 +195,7 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
 
     std::vector<StringView> values;
     std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
-    Status status = client_.Find(req.keys, values, handles);
+    Status status = client_.Find(req.tableName, req.keys, values, handles);
     if (!status.IsOk()) {
         response.statusCode = status.code();
         response.errorMsg = status.msg();
@@ -208,8 +219,25 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleBuildIndex(
-    const EmbTableBuildIndexRequest&) {
-    return ToResponse(client_.BuildIndex());
+    const EmbTableBuildIndexRequest& req) {
+    return ToResponse(client_.BuildIndex(req.tableName));
+}
+
+EmbTableStatusResponse EmbTableRpcService::HandleCreateTable(
+    const EmbTableCreateRequest& req) {
+    return ToResponse(
+        client_.CreateTable(req.tableName, req.numBuckets, req.valueSize));
+}
+
+EmbTableStatusResponse EmbTableRpcService::HandleAlterTable(
+    const EmbTableAlterRequest& req) {
+    return ToResponse(
+        client_.AlterTable(req.tableName, req.numBuckets, req.valueSize));
+}
+
+EmbTableStatusResponse EmbTableRpcService::HandleDeleteTable(
+    const EmbTableDeleteRequest& req) {
+    return ToResponse(client_.DeleteTable(req.tableName));
 }
 
 }  // namespace embtable

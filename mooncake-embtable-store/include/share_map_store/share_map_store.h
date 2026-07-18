@@ -26,8 +26,11 @@ struct DeploymentConfig {
     uint64_t globalSegmentSize = 16ull * 1024 * 1024;
     uint64_t localBufferSize = 16ull * 1024 * 1024;
     // RPC service port for EmbTableClient to reach this ShareMapStore.
-    // 0 disables the RPC server (local-only mode).
+    // Used only when enableEmbTableRpc is true.
     uint16_t rpcPort = 0;
+    // Enable the EmbTable/ShareMapStore RPC services. Keep false for
+    // co-process deployments; the standalone storage node enables it.
+    bool enableEmbTableRpc = false;
     // Registered staging buffer used by the ShareMapStore RPC service for
     // direct Transfer Engine writes to remote EmbTable clients.
     uint64_t transferBufferSize = 64ull * 1024 * 1024;
@@ -48,7 +51,8 @@ struct DeploymentConfig {
 // without a running RPC stack.
 class ShareMapStore {
    public:
-    explicit ShareMapStore(DeploymentConfig config);
+    explicit ShareMapStore(DeploymentConfig config,
+                           std::string localHostname = "");
 
     ~ShareMapStore();
 
@@ -90,8 +94,7 @@ class ShareMapStore {
                              const std::vector<uint64_t>& keys,
                              uint64_t valueSize,
                              const std::string& targetEndpoint,
-                             uint64_t targetAddress,
-                             uint64_t targetCapacity,
+                             uint64_t targetAddress, uint64_t targetCapacity,
                              uint64_t& transferredSize,
                              std::vector<int8_t>& foundFlags);
 
@@ -104,15 +107,16 @@ class ShareMapStore {
     Status BatchQueryDataToBuffer(
         const std::vector<std::string>& bucketKeys,
         const std::vector<std::vector<uint64_t>>& keysPerBucket,
-        uint64_t valueSize,
-        const std::string& targetEndpoint,
-        uint64_t targetAddress,
-        uint64_t targetCapacity,
+        uint64_t valueSize, const std::string& targetEndpoint,
+        uint64_t targetAddress, uint64_t targetCapacity,
         uint64_t& transferredSize,
         std::vector<std::vector<int8_t>>& foundFlagsPerBucket);
 
     // Expose the underlying Mooncake client (used by RPC service and Bucket).
     std::shared_ptr<mooncake::RealClient> GetClient() const {
+        return realClient_;
+    }
+    std::shared_ptr<mooncake::RealClient> GetRealClient() const {
         return realClient_;
     }
 
@@ -132,11 +136,11 @@ class ShareMapStore {
     // Get-or-create a ShareMap for the given bucket. valueSize is required
     // when creating a new ShareMap; passing 0 keeps any existing ShareMap's
     // valueSize and returns an error if the bucket does not exist.
-    Status getOrCreateShareMap(const std::string& bucketKey,
-                               uint64_t valueSize,
+    Status getOrCreateShareMap(const std::string& bucketKey, uint64_t valueSize,
                                std::shared_ptr<ShareMap>& out);
 
     DeploymentConfig config_;
+    std::string localHostname_;
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::unordered_map<std::string, std::shared_ptr<ShareMap>> shareMaps_;
     mutable std::mutex mutex_;

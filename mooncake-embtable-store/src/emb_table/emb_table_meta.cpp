@@ -18,9 +18,9 @@ std::string bucketMetaKey(const std::string& bucketKey) {
 }
 
 Status ValidateTableMeta(const TableMetaInfo& meta) {
-    if (meta.tableKey.empty() || meta.tableName.empty() ||
-        meta.dimSize == 0 || meta.bucketNum == 0 ||
-        meta.bucketCapacity == 0 || meta.tableCapacity == 0) {
+    if (meta.tableKey.empty() || meta.tableName.empty() || meta.dimSize == 0 ||
+        meta.bucketNum == 0 || meta.bucketCapacity == 0 ||
+        meta.tableCapacity == 0) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid table metadata fields");
     }
@@ -51,14 +51,27 @@ EmbTableMeta::EmbTableMeta(std::shared_ptr<mooncake::RealClient> realClient)
 Status EmbTableMeta::CreateTableMeta(const TableMetaInfo& params) {
     auto validation = ValidateTableMeta(params);
     if (!validation.IsOk()) return validation;
+    if (!realClient_) {
+        return Status::Error(ErrorCode::kInternal,
+                             "RealClient is not initialized");
+    }
+    const int exists = realClient_->isExist(metaKey(params.tableKey));
+    if (exists > 0) {
+        return Status::Error(ErrorCode::kAlreadyExists,
+                             "table already exists: " + params.tableName);
+    }
+    if (exists < 0) {
+        return Status::Error(ErrorCode::kIOError,
+                             "failed to check table metadata existence");
+    }
     // Serialize to JSON.
     std::string json;
     struct_json::to_json(params, json);
 
     mooncake::ReplicateConfig config;
-    int ret = realClient_->put(
-        metaKey(params.tableKey),
-        std::span<const char>(json.data(), json.size()), config);
+    int ret = realClient_->put(metaKey(params.tableKey),
+                               std::span<const char>(json.data(), json.size()),
+                               config);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
                              "put failed for table meta: " + params.tableKey);
@@ -90,9 +103,9 @@ Status EmbTableMeta::QueryTableMeta(const std::string& tableKey,
         }
         meta = std::move(parsed);
     } catch (const std::exception& e) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "invalid table metadata JSON: " +
-                                 std::string(e.what()));
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "invalid table metadata JSON: " + std::string(e.what()));
     }
     metaInfo_ = meta;
     return Status::OK();
@@ -105,14 +118,27 @@ Status EmbTableMeta::UpdateTableMeta(const TableMetaInfo& meta) {
     std::string json;
     struct_json::to_json(meta, json);
     mooncake::ReplicateConfig config;
-    int ret = realClient_->put(
-        metaKey(meta.tableKey),
-        std::span<const char>(json.data(), json.size()), config);
+    int ret = realClient_->put(metaKey(meta.tableKey),
+                               std::span<const char>(json.data(), json.size()),
+                               config);
     if (ret != 0) {
-        return Status::Error(ErrorCode::kIOError,
-                             "put (update) failed for table meta: " + meta.tableKey);
+        return Status::Error(
+            ErrorCode::kIOError,
+            "put (update) failed for table meta: " + meta.tableKey);
     }
     metaInfo_ = meta;
+    return Status::OK();
+}
+
+Status EmbTableMeta::DeleteTableMeta(const std::string& tableKey) {
+    if (tableKey.empty() || !realClient_) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "invalid table metadata delete");
+    }
+    if (realClient_->remove(metaKey(tableKey)) != 0) {
+        return Status::Error(ErrorCode::kIOError,
+                             "remove failed for table meta: " + tableKey);
+    }
     return Status::OK();
 }
 
@@ -122,9 +148,9 @@ Status EmbTableMeta::CreateBucketMeta(const BucketInfo& info) {
     std::string json;
     struct_json::to_json(info, json);
     mooncake::ReplicateConfig config;
-    int ret = realClient_->put(
-        bucketMetaKey(info.bucketKey),
-        std::span<const char>(json.data(), json.size()), config);
+    int ret = realClient_->put(bucketMetaKey(info.bucketKey),
+                               std::span<const char>(json.data(), json.size()),
+                               config);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
                              "put failed for bucket meta: " + info.bucketKey);
@@ -155,9 +181,21 @@ Status EmbTableMeta::QueryBucketMeta(const std::string& bucketKey,
         }
         info = std::move(parsed);
     } catch (const std::exception& e) {
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "invalid bucket metadata JSON: " + std::string(e.what()));
+    }
+    return Status::OK();
+}
+
+Status EmbTableMeta::DeleteBucketMeta(const std::string& bucketKey) {
+    if (bucketKey.empty() || !realClient_) {
         return Status::Error(ErrorCode::kInvalidArgument,
-                             "invalid bucket metadata JSON: " +
-                                 std::string(e.what()));
+                             "invalid bucket metadata delete");
+    }
+    if (realClient_->remove(bucketMetaKey(bucketKey)) != 0) {
+        return Status::Error(ErrorCode::kIOError,
+                             "remove failed for bucket meta: " + bucketKey);
     }
     return Status::OK();
 }

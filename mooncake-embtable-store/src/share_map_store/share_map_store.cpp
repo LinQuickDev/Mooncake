@@ -10,8 +10,8 @@
 
 namespace embtable {
 
-ShareMapStore::ShareMapStore(DeploymentConfig config)
-    : config_(std::move(config)) {}
+ShareMapStore::ShareMapStore(DeploymentConfig config, std::string localHostname)
+    : config_(std::move(config)), localHostname_(std::move(localHostname)) {}
 
 ShareMapStore::~ShareMapStore() {
     for (auto& slot : transferBuffers_) {
@@ -25,13 +25,13 @@ Status ShareMapStore::Init() {
     if (initialized_) return Status::OK();
     realClient_ = std::make_shared<mooncake::RealClient>();
     int ret = realClient_->setup_real(
-        /*local_hostname=*/"", config_.metadataServer,
-        config_.globalSegmentSize, config_.localBufferSize,
-        config_.protocol, config_.deviceNames,
+        localHostname_, config_.metadataServer, config_.globalSegmentSize,
+        config_.localBufferSize, config_.protocol, config_.deviceNames,
         config_.masterAddress);
     if (ret != 0) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RealClient setup_real failed: " + config_.masterAddress);
+        return Status::Error(
+            ErrorCode::kInternal,
+            "RealClient setup_real failed: " + config_.masterAddress);
     }
     if (config_.transferBufferSize == 0) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -88,8 +88,9 @@ Status ShareMapStore::getOrCreateShareMap(const std::string& bucketKey,
         return Status::OK();
     }
     if (valueSize == 0) {
-        return Status::Error(ErrorCode::kNotFound,
-                             "ShareMap not found and valueSize==0: " + bucketKey);
+        return Status::Error(
+            ErrorCode::kNotFound,
+            "ShareMap not found and valueSize==0: " + bucketKey);
     }
     auto sm = std::make_shared<ShareMap>(bucketKey, valueSize, realClient_,
                                          config_.shareObjectSize);
@@ -102,7 +103,8 @@ Status ShareMapStore::Publish(const std::string& bucketKey, uint64_t valueSize,
                               const std::vector<uint64_t>& keys,
                               const std::vector<StringView>& values) {
     if (!initialized_) {
-        return Status::Error(ErrorCode::kInternal, "ShareMapStore not initialized");
+        return Status::Error(ErrorCode::kInternal,
+                             "ShareMapStore not initialized");
     }
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, valueSize, sm);
@@ -114,7 +116,8 @@ Status ShareMapStore::QueryData(const std::string& bucketKey,
                                 const std::vector<uint64_t>& keys,
                                 std::vector<StringView>& buffers) {
     if (!initialized_) {
-        return Status::Error(ErrorCode::kInternal, "ShareMapStore not initialized");
+        return Status::Error(ErrorCode::kInternal,
+                             "ShareMapStore not initialized");
     }
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, 0, sm);
@@ -124,7 +127,8 @@ Status ShareMapStore::QueryData(const std::string& bucketKey,
 
 Status ShareMapStore::BuildIndex(const std::string& bucketKey) {
     if (!initialized_) {
-        return Status::Error(ErrorCode::kInternal, "ShareMapStore not initialized");
+        return Status::Error(ErrorCode::kInternal,
+                             "ShareMapStore not initialized");
     }
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, 0, sm);
@@ -134,7 +138,8 @@ Status ShareMapStore::BuildIndex(const std::string& bucketKey) {
 
 Status ShareMapStore::Import(const std::string& bucketKey) {
     if (!initialized_) {
-        return Status::Error(ErrorCode::kInternal, "ShareMapStore not initialized");
+        return Status::Error(ErrorCode::kInternal,
+                             "ShareMapStore not initialized");
     }
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, 1, sm);
@@ -153,8 +158,8 @@ std::shared_ptr<ShareMap> ShareMapStore::GetShareMap(
 Status ShareMapStore::QueryDataToBuffer(
     const std::string& bucketKey, const std::vector<uint64_t>& keys,
     uint64_t valueSize, const std::string& targetEndpoint,
-    uint64_t targetAddress, uint64_t targetCapacity,
-    uint64_t& transferredSize, std::vector<int8_t>& foundFlags) {
+    uint64_t targetAddress, uint64_t targetCapacity, uint64_t& transferredSize,
+    std::vector<int8_t>& foundFlags) {
     if (!initialized_) {
         return Status::Error(ErrorCode::kInternal,
                              "ShareMapStore not initialized");
@@ -193,8 +198,7 @@ Status ShareMapStore::QueryDataToBuffer(
         return Status::Error(ErrorCode::kOutOfRange,
                              "query result size overflows");
     }
-    if (transferredSize > targetCapacity ||
-        transferBuffers_.empty() ||
+    if (transferredSize > targetCapacity || transferBuffers_.empty() ||
         transferredSize > config_.transferBufferSize) {
         return Status::Error(
             ErrorCode::kOutOfRange,
@@ -207,8 +211,7 @@ Status ShareMapStore::QueryDataToBuffer(
                              "no ShareMapStore transfer buffer available");
     }
     auto& transferAllocator = transferBuffers_[bufferIndex].allocator;
-    auto* transferBuffer =
-        static_cast<char*>(transferAllocator->getBase());
+    auto* transferBuffer = static_cast<char*>(transferAllocator->getBase());
     foundFlags.resize(keys.size(), 0);
 
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -225,8 +228,8 @@ Status ShareMapStore::QueryDataToBuffer(
     }
 
     // 3. Data plane: write directly into the caller's registered buffer.
-    int ret = realClient_->subTransferTask(
-        transferBuffer, transferredSize, targetEndpoint, targetAddress);
+    int ret = realClient_->subTransferTask(transferBuffer, transferredSize,
+                                           targetEndpoint, targetAddress);
     ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
@@ -237,10 +240,9 @@ Status ShareMapStore::QueryDataToBuffer(
 
 Status ShareMapStore::BatchQueryDataToBuffer(
     const std::vector<std::string>& bucketKeys,
-    const std::vector<std::vector<uint64_t>>& keysPerBucket,
-    uint64_t valueSize, const std::string& targetEndpoint,
-    uint64_t targetAddress, uint64_t targetCapacity,
-    uint64_t& transferredSize,
+    const std::vector<std::vector<uint64_t>>& keysPerBucket, uint64_t valueSize,
+    const std::string& targetEndpoint, uint64_t targetAddress,
+    uint64_t targetCapacity, uint64_t& transferredSize,
     std::vector<std::vector<int8_t>>& foundFlagsPerBucket) {
     if (!initialized_) {
         return Status::Error(ErrorCode::kInternal,
@@ -327,8 +329,7 @@ Status ShareMapStore::BatchQueryDataToBuffer(
                              "no ShareMapStore transfer buffer available");
     }
     auto& transferAllocator = transferBuffers_[bufferIndex].allocator;
-    auto* transferBuffer =
-        static_cast<char*>(transferAllocator->getBase());
+    auto* transferBuffer = static_cast<char*>(transferAllocator->getBase());
     char* writePtr = transferBuffer;
     uint64_t bucketCountValue = bucketCount;
     std::memcpy(writePtr, &bucketCountValue, sizeof(uint64_t));
@@ -370,8 +371,8 @@ Status ShareMapStore::BatchQueryDataToBuffer(
 
     // Phase 3: Single direct TE write for the entire aggregated buffer.
     transferredSize = requiredSize;
-    int ret = realClient_->subTransferTask(
-        transferBuffer, transferredSize, targetEndpoint, targetAddress);
+    int ret = realClient_->subTransferTask(transferBuffer, transferredSize,
+                                           targetEndpoint, targetAddress);
     ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,

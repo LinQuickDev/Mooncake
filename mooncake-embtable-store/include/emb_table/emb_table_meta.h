@@ -18,18 +18,18 @@ struct TableMetaInfo {
     std::string tableKey;
     int tableIndex = 0;
     std::string tableName;
-    uint64_t dimSize = 0;          // value size in bytes (8B-512B)
+    uint64_t dimSize = 0;  // value size in bytes (8B-512B)
     uint64_t tableCapacity = 0;
     uint64_t bucketNum = 0;
     HashFunctionType hashType = HashFunctionType::kXxHash;
     uint64_t bucketCapacity = 0;
 };
-YLT_REFL(TableMetaInfo, tableKey, tableIndex, tableName, dimSize,
-         tableCapacity, bucketNum, hashType, bucketCapacity);
+YLT_REFL(TableMetaInfo, tableKey, tableIndex, tableName, dimSize, tableCapacity,
+         bucketNum, hashType, bucketCapacity);
 
 struct BucketInfo {
     std::string bucketKey;
-    uint64_t valueSize = 0;        // 8B-512B
+    uint64_t valueSize = 0;  // 8B-512B
     uint64_t capacity = 0;
     uint64_t currentSize = 0;
     std::string tableKey;
@@ -64,12 +64,16 @@ class EmbTableMeta {
     // Update an existing TableMetaInfo (e.g. after adding buckets).
     Status UpdateTableMeta(const TableMetaInfo& meta);
 
+    Status DeleteTableMeta(const std::string& tableKey);
+
     // Store BucketInfo in Mooncake Store under bucketKey + "_bucketmeta".
     // Other nodes query this to find the rpcEndpoint of the owning node.
     Status CreateBucketMeta(const BucketInfo& info);
 
     // Query BucketInfo from Mooncake Store.
     Status QueryBucketMeta(const std::string& bucketKey, BucketInfo& info);
+
+    Status DeleteBucketMeta(const std::string& bucketKey);
 
     const TableMetaInfo& GetLocalMeta() const { return metaInfo_; }
 

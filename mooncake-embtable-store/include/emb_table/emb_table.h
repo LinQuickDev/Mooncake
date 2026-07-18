@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
@@ -32,8 +33,7 @@ namespace embtable {
 class EmbTable {
    public:
     EmbTable(const std::string& tableName, uint32_t numBuckets,
-             uint64_t valueSize,
-             std::shared_ptr<ShareMapStore> shareMapStore,
+             uint64_t valueSize, std::shared_ptr<ShareMapStore> shareMapStore,
              std::shared_ptr<mooncake::RealClient> realClient,
              std::shared_ptr<ShareMapStoreClient> shareMapStoreClient = nullptr,
              const std::string& localHostname = "",
@@ -50,10 +50,9 @@ class EmbTable {
     // Batch find across all buckets. Values are returned in the same order
     // as keys; missing keys yield empty StringViews.
     // bufferHandles (optional) keeps backing memory for remote results alive.
-    Status Find(const std::vector<uint64_t>& keys,
-                std::vector<StringView>& buffers,
-                std::vector<std::shared_ptr<mooncake::BufferHandle>>&
-                    bufferHandles);
+    Status Find(
+        const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
+        std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles);
 
     // Convenience overload. Keeps remote transfer-buffer handles alive until
     // the next Find call on the same calling thread. For independent result
@@ -71,6 +70,10 @@ class EmbTable {
 
     // Delete is not supported after BuildIndex (read-only).
     Status Delete(const std::vector<uint64_t>& keys);
+
+    // Drop table and bucket metadata. Data objects remain in Mooncake Store
+    // for asynchronous store-side reclamation.
+    Status Drop();
 
     const std::string& TableName() const { return tableName_; }
     uint32_t NumBuckets() const { return numBuckets_; }
@@ -91,6 +94,7 @@ class EmbTable {
     uint16_t shareMapStoreRpcPort_ = 0;
     std::shared_ptr<EmbTableMeta> meta_;
     mutable std::shared_mutex lifecycleMutex_;
+    std::atomic<bool> dropped_{false};
     std::vector<std::shared_ptr<Bucket>> buckets_;
 };
 

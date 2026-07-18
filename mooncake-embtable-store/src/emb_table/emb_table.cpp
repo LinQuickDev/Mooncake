@@ -37,7 +37,7 @@ uint32_t EmbTable::RouteToBucket(uint64_t key) const {
 }
 
 Status EmbTable::Init(bool createNew) {
-    if (valueSize_ == 0) {
+    if (createNew && valueSize_ == 0) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "valueSize must be non-zero");
     }
@@ -62,6 +62,7 @@ Status EmbTable::Init(bool createNew) {
         s = meta_->QueryTableMeta(info.tableKey, info);
         if (!s.IsOk()) return s;
         if (info.tableName != tableName_ || info.bucketNum == 0 ||
+            info.bucketNum > std::numeric_limits<uint32_t>::max() ||
             info.dimSize == 0 || info.bucketCapacity == 0) {
             return Status::Error(ErrorCode::kInvalidArgument,
                                  "invalid persisted table metadata");
@@ -71,6 +72,7 @@ Status EmbTable::Init(bool createNew) {
     }
     if (!s.IsOk()) return s;
     buckets_.clear();
+    std::vector<std::string> createdBucketMetaKeys;
     // For newly created tables, register bucket meta in Mooncake Store so
     // other nodes can locate the owning node from bucket-meta replica
     // placement (design doc 4.3).
@@ -103,7 +105,15 @@ Status EmbTable::Init(bool createNew) {
             localHostname_, shareMapStoreRpcPort_));
         if (createNew) {
             auto bs = meta_->CreateBucketMeta(bi);
-            if (!bs.IsOk()) return bs;
+            if (!bs.IsOk()) {
+                for (const auto& bucketKey : createdBucketMetaKeys) {
+                    (void)meta_->DeleteBucketMeta(bucketKey);
+                }
+                (void)meta_->DeleteTableMeta(info.tableKey);
+                buckets_.clear();
+                return bs;
+            }
+            createdBucketMetaKeys.push_back(bi.bucketKey);
         }
     }
     return Status::OK();
@@ -112,13 +122,17 @@ Status EmbTable::Init(bool createNew) {
 Status EmbTable::Insert(const std::vector<uint64_t>& keys,
                         const std::vector<StringView>& values) {
     std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
+    if (dropped_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kNotFound,
+                             "table has been deleted: " + tableName_);
+    }
     if (keys.size() != values.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "keys/values size mismatch");
     }
     // Group by bucket index for batched inserts.
-    std::unordered_map<uint32_t,
-                       std::pair<std::vector<uint64_t>, std::vector<StringView>>>
+    std::unordered_map<
+        uint32_t, std::pair<std::vector<uint64_t>, std::vector<StringView>>>
         grouped;
     for (size_t i = 0; i < keys.size(); ++i) {
         uint32_t bidx = RouteToBucket(keys[i]);
@@ -140,11 +154,14 @@ Status EmbTable::Insert(const std::vector<uint64_t>& keys,
     return Status::OK();
 }
 
-Status EmbTable::Find(const std::vector<uint64_t>& keys,
-                      std::vector<StringView>& buffers,
-                      std::vector<std::shared_ptr<mooncake::BufferHandle>>&
-                          bufferHandles) {
+Status EmbTable::Find(
+    const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
+    std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
     std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
+    if (dropped_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kNotFound,
+                             "table has been deleted: " + tableName_);
+    }
     buffers.clear();
     buffers.resize(keys.size());
     bufferHandles.clear();
@@ -167,8 +184,7 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
         std::vector<size_t> indices;
         std::vector<uint64_t> keys;
     };
-    std::unordered_map<std::string, std::vector<RemoteBucketTask>>
-        remoteGroups;
+    std::unordered_map<std::string, std::vector<RemoteBucketTask>> remoteGroups;
     // Local tasks: bucketIdx -> (indices, keys)
     std::vector<std::pair<uint32_t, std::vector<size_t>>> localTasks;
     std::unordered_map<uint32_t, std::vector<uint64_t>> localKeys;
@@ -283,11 +299,12 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
             return result.status;
         }
         for (size_t t = 0;
-             t < result.tasks.size() && t < result.buffersPerBucket.size(); ++t) {
+             t < result.tasks.size() && t < result.buffersPerBucket.size();
+             ++t) {
             const auto& task = result.tasks[t];
             const auto& bucketVals = result.buffersPerBucket[t];
-            for (size_t j = 0;
-                 j < task.indices.size() && j < bucketVals.size(); ++j) {
+            for (size_t j = 0; j < task.indices.size() && j < bucketVals.size();
+                 ++j) {
                 buffers[task.indices[j]] = bucketVals[j];
             }
         }
@@ -305,8 +322,8 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
         std::vector<std::future<RemoteQueryResult>> futures;
         futures.reserve(remoteGroups.size());
         for (auto& [endpoint, tasks] : remoteGroups) {
-            futures.emplace_back(std::async(
-                std::launch::async, queryRemote, endpoint, std::move(tasks)));
+            futures.emplace_back(std::async(std::launch::async, queryRemote,
+                                            endpoint, std::move(tasks)));
         }
         for (auto& future : futures) {
             auto s = mergeRemote(future.get());
@@ -324,8 +341,7 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
     // result storage. For independent lifetimes, use the explicit handles
     // overload.
     thread_local std::unordered_map<
-        const EmbTable*,
-        std::vector<std::shared_ptr<mooncake::BufferHandle>>>
+        const EmbTable*, std::vector<std::shared_ptr<mooncake::BufferHandle>>>
         threadFindHandles;
     auto& handles = threadFindHandles[this];
     handles.clear();
@@ -334,6 +350,10 @@ Status EmbTable::Find(const std::vector<uint64_t>& keys,
 
 Status EmbTable::BuildIndex() {
     std::unique_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
+    if (dropped_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kNotFound,
+                             "table has been deleted: " + tableName_);
+    }
     for (auto& bucket : buckets_) {
         auto s = bucket->BuildIndex();
         if (!s.IsOk()) return s;
@@ -344,14 +364,18 @@ Status EmbTable::BuildIndex() {
 Status EmbTable::Load(const std::vector<std::string>& keyFiles,
                       const std::vector<std::string>& valueFiles,
                       const std::string& format) {
+    if (dropped_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kNotFound,
+                             "table has been deleted: " + tableName_);
+    }
     if (keyFiles.size() != valueFiles.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "keyFiles/valueFiles size mismatch");
     }
     if (format != "binary" && format != "text") {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "unsupported format: " + format +
-                                 " (only 'binary' or 'text')");
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "unsupported format: " + format + " (only 'binary' or 'text')");
     }
 
     const uint64_t valueSize = valueSize_;
@@ -423,6 +447,25 @@ Status EmbTable::Load(const std::vector<std::string>& keyFiles,
 Status EmbTable::Delete(const std::vector<uint64_t>& keys) {
     return Status::Error(ErrorCode::kNotSupported,
                          "Delete not supported (read-only after BuildIndex)");
+}
+
+Status EmbTable::Drop() {
+    std::unique_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
+    if (dropped_.load(std::memory_order_relaxed)) return Status::OK();
+    auto status = meta_->DeleteTableMeta(meta_->GetLocalMeta().tableKey);
+    if (!status.IsOk()) return status;
+    dropped_.store(true, std::memory_order_release);
+
+    // The table metadata is the discoverability boundary. Bucket metadata is
+    // cleanup-only after that point and must not make a logical drop fail.
+    for (const auto& bucket : buckets_) {
+        auto s = meta_->DeleteBucketMeta(bucket->Info().bucketKey);
+        if (!s.IsOk()) {
+            LOG(WARNING) << "Failed to clean bucket metadata after dropping "
+                         << tableName_ << ": " << s.msg();
+        }
+    }
+    return Status::OK();
 }
 
 const TableMetaInfo& EmbTable::MetaInfo() const {

@@ -19,6 +19,9 @@ class EmbTableDummyClient {
    public:
     struct Options {
         std::string rpcEndpoint = "127.0.0.1:50055";
+        // Empty creates an admin-only client for DDL. Data operations require
+        // a table name and initialize a shared-memory data plane.
+        std::string tableName;
         uint64_t sharedMemorySize = 64ull * 1024 * 1024;
     };
 
@@ -44,6 +47,12 @@ class EmbTableDummyClient {
                 std::vector<StringView>& buffers);
 
     Status BuildIndex();
+
+    Status CreateTable(const std::string& tableName, uint32_t numBuckets,
+                       uint64_t valueSize);
+    Status AlterTable(const std::string& tableName, uint32_t numBuckets,
+                      uint64_t valueSize);
+    Status DeleteTable(const std::string& tableName);
 
     uint64_t ValueSize() const { return valueSize_; }
 

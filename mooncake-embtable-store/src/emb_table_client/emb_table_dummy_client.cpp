@@ -30,6 +30,7 @@ EmbTableDummyClient::Options MakeDummyOptions(
         options.localHostname.empty() ? "127.0.0.1" : options.localHostname;
     dummyOptions.rpcEndpoint =
         host + ":" + std::to_string(options.deployment.rpcPort);
+    dummyOptions.tableName = options.tableName;
     dummyOptions.sharedMemorySize = options.deployment.transferBufferSize;
     return dummyOptions;
 }
@@ -40,8 +41,6 @@ Status FromResponse(const EmbTableStatusResponse& response,
     return Status::Error(static_cast<ErrorCode>(response.statusCode),
                          operation + " failed: " + response.errorMsg);
 }
-
-
 
 }  // namespace
 
@@ -57,12 +56,17 @@ EmbTableDummyClient::~EmbTableDummyClient() {
 }
 
 Status EmbTableDummyClient::Init() {
-    if (sharedMemoryRegistered_) return Status::OK();
-    if (options_.rpcEndpoint.empty() || options_.sharedMemorySize == 0 ||
-        options_.sharedMemorySize >
-            static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-        options_.sharedMemorySize >
-            static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    if (rpcClient_) return Status::OK();
+    if (options_.rpcEndpoint.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "RPC endpoint must be non-empty");
+    }
+    if (!options_.tableName.empty() &&
+        (options_.sharedMemorySize == 0 ||
+         options_.sharedMemorySize >
+             static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+         options_.sharedMemorySize >
+             static_cast<uint64_t>(std::numeric_limits<size_t>::max()))) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid DummyClient options");
     }
@@ -72,12 +76,15 @@ Status EmbTableDummyClient::Init() {
         rpcClient_->connect(options_.rpcEndpoint));
     if (connectError) {
         rpcClient_.reset();
-        return Status::Error(ErrorCode::kIOError,
-                             "RPC connect failed: " +
-                                 std::string(connectError.message()));
+        return Status::Error(
+            ErrorCode::kIOError,
+            "RPC connect failed: " + std::string(connectError.message()));
     }
 
+    if (options_.tableName.empty()) return Status::OK();
+
     EmbTableInfoRequest infoRequest;
+    infoRequest.tableName = options_.tableName;
     auto infoResult = async_simple::coro::syncAwait(
         rpcClient_->call<&EmbTableRpcService::HandleGetInfo>(infoRequest));
     if (!infoResult) {
@@ -86,11 +93,16 @@ Status EmbTableDummyClient::Init() {
         return Status::Error(ErrorCode::kIOError,
                              "GetInfo RPC failed: " + error);
     }
-    if (infoResult.value().statusCode != 0 ||
-        infoResult.value().valueSize == 0) {
-        const std::string error = infoResult.value().errorMsg;
+    if (infoResult.value().statusCode != 0) {
+        const auto response = infoResult.value();
         CleanupSharedMemory();
-        return Status::Error(ErrorCode::kInternal, "GetInfo failed: " + error);
+        return Status::Error(static_cast<ErrorCode>(response.statusCode),
+                             "GetInfo failed: " + response.errorMsg);
+    }
+    if (infoResult.value().valueSize == 0) {
+        CleanupSharedMemory();
+        return Status::Error(ErrorCode::kInternal,
+                             "GetInfo returned an invalid value size");
     }
     valueSize_ = infoResult.value().valueSize;
 
@@ -164,7 +176,7 @@ EmbTableDummyClient::AllocateSharedBuffer(uint64_t size) {
 
 Status EmbTableDummyClient::Insert(const std::vector<uint64_t>& keys,
                                    const std::vector<StringView>& values) {
-    if (!rpcClient_ || !sharedMemoryRegistered_) {
+    if (!rpcClient_ || !sharedMemoryRegistered_ || options_.tableName.empty()) {
         return Status::Error(ErrorCode::kInternal, "not initialized");
     }
     if (keys.size() != values.size()) {
@@ -193,6 +205,7 @@ Status EmbTableDummyClient::Insert(const std::vector<uint64_t>& keys,
     }
 
     EmbTableInsertRequest request;
+    request.tableName = options_.tableName;
     request.keys = keys;
     request.shmName = shmName_;
     request.dataOffset = static_cast<uint64_t>(
@@ -210,7 +223,7 @@ Status EmbTableDummyClient::Insert(const std::vector<uint64_t>& keys,
 Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
                                  std::vector<StringView>& buffers) {
     buffers.clear();
-    if (!rpcClient_ || !sharedMemoryRegistered_) {
+    if (!rpcClient_ || !sharedMemoryRegistered_ || options_.tableName.empty()) {
         return Status::Error(ErrorCode::kInternal, "not initialized");
     }
     if (keys.empty()) return Status::OK();
@@ -230,6 +243,7 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
     }
 
     EmbTableFindRequest request;
+    request.tableName = options_.tableName;
     request.keys = keys;
     request.shmName = shmName_;
     request.targetOffset = static_cast<uint64_t>(
@@ -274,10 +288,11 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
 }
 
 Status EmbTableDummyClient::BuildIndex() {
-    if (!rpcClient_) {
+    if (!rpcClient_ || options_.tableName.empty()) {
         return Status::Error(ErrorCode::kInternal, "not initialized");
     }
     EmbTableBuildIndexRequest request;
+    request.tableName = options_.tableName;
     auto result = async_simple::coro::syncAwait(
         rpcClient_->call<&EmbTableRpcService::HandleBuildIndex>(request));
     if (!result) {
@@ -285,6 +300,59 @@ Status EmbTableDummyClient::BuildIndex() {
                              "BuildIndex RPC failed: " + result.error().msg);
     }
     return FromResponse(result.value(), "BuildIndex");
+}
+
+Status EmbTableDummyClient::CreateTable(const std::string& tableName,
+                                        uint32_t numBuckets,
+                                        uint64_t valueSize) {
+    if (!rpcClient_) {
+        return Status::Error(ErrorCode::kInternal, "not initialized");
+    }
+    EmbTableCreateRequest request;
+    request.tableName = tableName;
+    request.numBuckets = numBuckets;
+    request.valueSize = valueSize;
+    auto result = async_simple::coro::syncAwait(
+        rpcClient_->call<&EmbTableRpcService::HandleCreateTable>(request));
+    if (!result) {
+        return Status::Error(ErrorCode::kIOError,
+                             "CreateTable RPC failed: " + result.error().msg);
+    }
+    return FromResponse(result.value(), "CreateTable");
+}
+
+Status EmbTableDummyClient::AlterTable(const std::string& tableName,
+                                       uint32_t numBuckets,
+                                       uint64_t valueSize) {
+    if (!rpcClient_) {
+        return Status::Error(ErrorCode::kInternal, "not initialized");
+    }
+    EmbTableAlterRequest request;
+    request.tableName = tableName;
+    request.numBuckets = numBuckets;
+    request.valueSize = valueSize;
+    auto result = async_simple::coro::syncAwait(
+        rpcClient_->call<&EmbTableRpcService::HandleAlterTable>(request));
+    if (!result) {
+        return Status::Error(ErrorCode::kIOError,
+                             "AlterTable RPC failed: " + result.error().msg);
+    }
+    return FromResponse(result.value(), "AlterTable");
+}
+
+Status EmbTableDummyClient::DeleteTable(const std::string& tableName) {
+    if (!rpcClient_) {
+        return Status::Error(ErrorCode::kInternal, "not initialized");
+    }
+    EmbTableDeleteRequest request;
+    request.tableName = tableName;
+    auto result = async_simple::coro::syncAwait(
+        rpcClient_->call<&EmbTableRpcService::HandleDeleteTable>(request));
+    if (!result) {
+        return Status::Error(ErrorCode::kIOError,
+                             "DeleteTable RPC failed: " + result.error().msg);
+    }
+    return FromResponse(result.value(), "DeleteTable");
 }
 
 void EmbTableDummyClient::CleanupSharedMemory() {

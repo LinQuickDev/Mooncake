@@ -22,6 +22,7 @@
 
 DEFINE_string(embtable_rpc_endpoint, "127.0.0.1:50055",
               "EmbTableClient RPC endpoint in host:port form");
+DEFINE_string(embtable_table_name, "", "Embedding table to benchmark");
 DEFINE_string(embtable_shared_memory_size, "64 MB",
               "POSIX shared-memory size for every dummy client");
 DEFINE_uint64(embtable_num_keys, 1 << 20,
@@ -149,6 +150,7 @@ bool CheckedMultiply(uint64_t lhs, uint64_t rhs, uint64_t& result) {
 embtable::EmbTableDummyClient::Options DummyOptions() {
     embtable::EmbTableDummyClient::Options options;
     options.rpcEndpoint = FLAGS_embtable_rpc_endpoint;
+    options.tableName = FLAGS_embtable_table_name;
     options.sharedMemorySize =
         mooncake::string_to_byte_size(FLAGS_embtable_shared_memory_size);
     return options;
@@ -296,7 +298,8 @@ int main(int argc, char* argv[]) {
 
     const uint64_t shared_memory_size =
         mooncake::string_to_byte_size(FLAGS_embtable_shared_memory_size);
-    if (FLAGS_embtable_rpc_endpoint.empty() || shared_memory_size == 0 ||
+    if (FLAGS_embtable_rpc_endpoint.empty() ||
+        FLAGS_embtable_table_name.empty() || shared_memory_size == 0 ||
         FLAGS_embtable_num_keys == 0 || FLAGS_embtable_request_keys == 0 ||
         FLAGS_embtable_request_keys > FLAGS_embtable_num_keys ||
         FLAGS_embtable_insert_batch_size == 0 || FLAGS_embtable_threads == 0) {
