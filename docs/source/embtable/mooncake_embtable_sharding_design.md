@@ -1905,12 +1905,16 @@ client.Init();
   --embtable_global_segment_size="16 MB" \
   --embtable_local_buffer_size="16 MB"
 
-# ===== Find benchmark（表须先通过 DummyClient::CreateTable 创建） =====
+# ===== Find benchmark（表不存在时自动通过 DDL 创建） =====
 ./mooncake-embtable-store/script/embtable_cluster_bench.sh \
   --embtable_rpc_endpoint=192.168.1.10:50055 \
   --embtable_table_name=recommendation \
+  --embtable_value_size=128 \
+  --embtable_num_buckets=16 \
   --embtable_mode=continuous
 ```
+
+benchmark 默认启用 `--embtable_create_table_if_missing=true`。当 GetInfo 返回 `kNotFound` 时，它先建立不绑定表的管理型 DummyClient，调用 CreateTable，再初始化共享内存数据客户端。若需要自动建表，`embtable_value_size` 必须大于 0；已有表仍可使用 `embtable_value_size=0` 自动读取服务端规格。
 
 `embtable_client` 不再接受 `embtable_create_new`、`embtable_table_name`、`embtable_num_buckets` 或 `embtable_value_size` 启动参数。表结构的生命周期属于用户侧 DDL，而不是存储节点进程生命周期。
 

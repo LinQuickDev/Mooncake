@@ -33,6 +33,10 @@ DEFINE_uint64(embtable_insert_batch_size, 1024,
               "Number of key/value pairs in each preparation Insert call");
 DEFINE_uint64(embtable_value_size, 0,
               "Value size in bytes; 0 uses the size reported by the server");
+DEFINE_bool(embtable_create_table_if_missing, true,
+            "Create the benchmark table when GetInfo returns not found");
+DEFINE_uint32(embtable_num_buckets, 16,
+              "Bucket count used when creating a missing table");
 DEFINE_uint64(embtable_threads, 1, "Number of concurrent dummy clients");
 DEFINE_string(embtable_mode, "once", "Benchmark mode: once or continuous");
 DEFINE_uint64(embtable_iterations, 100000, "Total Find requests in once mode");
@@ -332,6 +336,40 @@ int main(int argc, char* argv[]) {
     auto probe =
         std::make_unique<embtable::EmbTableDummyClient>(DummyOptions());
     auto status = probe->Init();
+    if (!status.IsOk() &&
+        status.code() == static_cast<int>(embtable::ErrorCode::kNotFound) &&
+        FLAGS_embtable_create_table_if_missing) {
+        if (FLAGS_embtable_value_size == 0 || FLAGS_embtable_num_buckets == 0) {
+            LOG(ERROR) << "creating a missing table requires "
+                          "--embtable_value_size and --embtable_num_buckets "
+                          "to be greater than zero";
+            return 1;
+        }
+
+        auto admin_options = DummyOptions();
+        admin_options.tableName.clear();
+        embtable::EmbTableDummyClient admin_client(std::move(admin_options));
+        status = admin_client.Init();
+        if (!status.IsOk()) {
+            LOG(ERROR) << "admin client Init failed: " << status.msg();
+            return 1;
+        }
+        status = admin_client.CreateTable(FLAGS_embtable_table_name,
+                                          FLAGS_embtable_num_buckets,
+                                          FLAGS_embtable_value_size);
+        if (!status.IsOk() &&
+            status.code() !=
+                static_cast<int>(embtable::ErrorCode::kAlreadyExists)) {
+            LOG(ERROR) << "CreateTable failed: " << status.msg();
+            return 1;
+        }
+        LOG(INFO) << "Benchmark table is ready: " << FLAGS_embtable_table_name
+                  << ", buckets=" << FLAGS_embtable_num_buckets
+                  << ", value_size=" << FLAGS_embtable_value_size;
+
+        probe = std::make_unique<embtable::EmbTableDummyClient>(DummyOptions());
+        status = probe->Init();
+    }
     if (!status.IsOk()) {
         LOG(ERROR) << "probe client Init failed: " << status.msg();
         return 1;
