@@ -101,6 +101,7 @@ class RealClient : public PyClient {
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
 
+    // Register user memory for local operations and peer Transfer Engine I/O.
     int register_buffer(void *buffer, size_t size);
 
     int unregister_buffer(void *buffer);

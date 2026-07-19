@@ -16,4 +16,9 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-exec "${BIN}" "$@"
+exec "${BIN}" \
+  --logtostderr=1 \
+  --stderrthreshold=0 \
+  --minloglevel=0 \
+  --colorlogtostderr=1 \
+  "$@"

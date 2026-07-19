@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -18,7 +19,7 @@ DEFINE_string(embtable_master_address, "127.0.0.1:50051",
               "Mooncake Store master address");
 DEFINE_string(embtable_protocol, "tcp", "Transfer protocol");
 DEFINE_string(embtable_device_names, "", "Transfer device names");
-DEFINE_string(embtable_global_segment_size, "16 MB",
+DEFINE_string(embtable_global_segment_size, "4 GB",
               "Mooncake Store global segment size");
 DEFINE_string(embtable_local_buffer_size, "16 MB",
               "Mooncake Store local buffer size");
@@ -59,6 +60,22 @@ int main(int argc, char* argv[]) {
         mooncake::string_to_byte_size(FLAGS_embtable_transfer_buffer_size);
     options.deployment.shareObjectSize =
         mooncake::string_to_byte_size(FLAGS_embtable_share_object_size);
+
+    // Every ShareObject is published as one Mooncake Store object. Reject an
+    // impossible configuration at startup instead of failing later during
+    // BuildIndex with an opaque put_from/insufficient-space error.
+    constexpr uint64_t kIndexObjectSize = 16ull * 1024 * 1024;
+    const uint64_t largestObjectSize =
+        std::max(options.deployment.shareObjectSize, kIndexObjectSize);
+    if (options.deployment.globalSegmentSize < largestObjectSize) {
+        LOG(ERROR) << "--embtable_global_segment_size ("
+                   << options.deployment.globalSegmentSize
+                   << " bytes) must be at least the largest EmbTable object ("
+                   << largestObjectSize
+                   << " bytes); increase global segment size or reduce "
+                      "--embtable_share_object_size";
+        return 1;
+    }
 
     embtable::EmbTableClient client(std::move(options));
     auto status = client.Init();

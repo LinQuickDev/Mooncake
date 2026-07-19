@@ -233,7 +233,10 @@ Status ShareMapStore::QueryDataToBuffer(
     ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
-                             "Transfer Engine query result write failed");
+                             "Transfer Engine query result write failed: ret=" +
+                                 std::to_string(ret) +
+                                 ", target=" + targetEndpoint +
+                                 ", size=" + std::to_string(transferredSize));
     }
     return Status::OK();
 }
@@ -376,7 +379,10 @@ Status ShareMapStore::BatchQueryDataToBuffer(
     ReleaseTransferBuffer(bufferIndex);
     if (ret != 0) {
         return Status::Error(ErrorCode::kIOError,
-                             "Transfer Engine batch query write failed");
+                             "Transfer Engine batch query write failed: ret=" +
+                                 std::to_string(ret) +
+                                 ", target=" + targetEndpoint +
+                                 ", size=" + std::to_string(transferredSize));
     }
     return Status::OK();
 }

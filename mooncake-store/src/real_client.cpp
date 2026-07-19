@@ -2586,8 +2586,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
             return nullptr;
         }
         return std::make_shared<BufferHandle>(
-            reinterpret_cast<void *>(descriptor.buffer_address_),
-            total_length, []() {});
+            reinterpret_cast<void *>(descriptor.buffer_address_), total_length,
+            []() {});
     }
 
     // Allocate buffer
@@ -3050,8 +3050,11 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Explicitly registered user buffers may be advertised as peer Transfer
+    // Engine targets. This also subsumes the former register_transfer_buffer
+    // API, so callers can use one registration path for local and remote I/O.
     auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
-                                               false, true);
+                                               true, true);
     if (!result) {
         return result;
     }
@@ -3077,8 +3080,8 @@ int RealClient::subTransferTask(void *source, size_t size,
         return to_py_ret(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::INVALID_PARAMS)));
     }
-    return to_py_ret(client_->SubmitTransferTask(
-        source, size, target_endpoint, target_address));
+    return to_py_ret(client_->SubmitTransferTask(source, size, target_endpoint,
+                                                 target_address));
 }
 
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(

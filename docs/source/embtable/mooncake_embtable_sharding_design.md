@@ -1902,7 +1902,7 @@ client.Init();
   --embtable_local_hostname=192.168.1.10 \
   --embtable_master_address=192.168.1.1:50051 \
   --embtable_metadata_server=http://192.168.1.1:8080/metadata \
-  --embtable_global_segment_size="16 MB" \
+  --embtable_global_segment_size="4 GB" \
   --embtable_local_buffer_size="16 MB"
 
 # ===== Find benchmark（表不存在时自动通过 DDL 创建） =====
@@ -1915,6 +1915,12 @@ client.Init();
 ```
 
 benchmark 默认启用 `--embtable_create_table_if_missing=true`。当 GetInfo 返回 `kNotFound` 时，它先建立不绑定表的管理型 DummyClient，调用 CreateTable，再初始化共享内存数据客户端。若需要自动建表，`embtable_value_size` 必须大于 0；已有表仍可使用 `embtable_value_size=0` 自动读取服务端规格。
+
+每次 benchmark 启动都会抽查首、中、末 sentinel key 及其 value：数据完整时跳过 Insert，并确认索引已经构建；数据缺失且 `embtable_prepare_data=true` 时才执行分批 Insert、打印进度、BuildIndex 并再次校验。两个 script 默认传入 glog 的 `logtostderr/minloglevel` 参数，因此 INFO 日志直接显示在终端。
+
+`embtable_client` 默认挂载 4 GB global segment。由于 VectorObject 的单个 ShareObject 和 IndexObject 都会作为一个完整 Mooncake Store 对象发布，启动时要求 global segment 至少能够容纳最大的单对象；不满足时直接报告配置错误，避免在 BuildIndex 阶段才出现 `put_from failed`。
+
+ShareMapStoreClient 的目标 transfer buffer 使用 `RealClient::register_buffer` 注册为 `remote_accessible=true`，供远端 ShareMapStore 通过 Transfer Engine WRITE 写入；该语义覆盖原 `register_transfer_buffer` 的功能。
 
 `embtable_client` 不再接受 `embtable_create_new`、`embtable_table_name`、`embtable_num_buckets` 或 `embtable_value_size` 启动参数。表结构的生命周期属于用户侧 DDL，而不是存储节点进程生命周期。
 

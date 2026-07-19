@@ -20,14 +20,19 @@ bool IsSameHost(const std::string& lhs, const std::string& rhs) {
     return ExtractHostname(lhs) == ExtractHostname(rhs);
 }
 
+bool IsTerminalPublishError(const Status& status) {
+    return status.code() == static_cast<int>(ErrorCode::kIndexBuilt) ||
+           status.code() == static_cast<int>(ErrorCode::kAlreadyExists) ||
+           status.code() == static_cast<int>(ErrorCode::kInvalidArgument) ||
+           status.code() == static_cast<int>(ErrorCode::kNotSupported);
+}
+
 }  // namespace
 
-Bucket::Bucket(BucketInfo info,
-               std::shared_ptr<ShareMapStore> shareMapStore,
+Bucket::Bucket(BucketInfo info, std::shared_ptr<ShareMapStore> shareMapStore,
                std::shared_ptr<mooncake::RealClient> realClient,
                std::shared_ptr<ShareMapStoreClient> shareMapStoreClient,
-               const std::string& localHostname,
-               uint16_t shareMapStoreRpcPort)
+               const std::string& localHostname, uint16_t shareMapStoreRpcPort)
     : info_(std::move(info)),
       bucketKey_(info_.bucketKey),
       shareMapStore_(std::move(shareMapStore)),
@@ -120,8 +125,7 @@ void Bucket::InvalidateLocality() {
 }
 
 Status Bucket::Insert(const std::vector<uint64_t>& keys,
-                      const std::vector<StringView>& values,
-                      bool& wouldFlush) {
+                      const std::vector<StringView>& values, bool& wouldFlush) {
     wouldFlush = false;
     if (keys.size() != values.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -196,9 +200,16 @@ Status Bucket::Flush() {
     }
     if (!s.IsOk()) {
         InvalidateLocality();
-        std::lock_guard<std::mutex> lock(bufferMutex_);
-        localKeys_.insert(localKeys_.begin(), keys.begin(), keys.end());
-        localValues_.insert(localValues_.begin(), values.begin(), values.end());
+        if (IsTerminalPublishError(s)) {
+            LOG(WARNING) << "Discarding permanently rejected pending batch for "
+                         << bucketKey_ << ", keys=" << keys.size()
+                         << ", error=" << s.msg();
+        } else {
+            std::lock_guard<std::mutex> lock(bufferMutex_);
+            localKeys_.insert(localKeys_.begin(), keys.begin(), keys.end());
+            localValues_.insert(localValues_.begin(), values.begin(),
+                                values.end());
+        }
         return s;
     }
     {
@@ -208,10 +219,9 @@ Status Bucket::Flush() {
     return Status::OK();
 }
 
-Status Bucket::Find(const std::vector<uint64_t>& keys,
-                    std::vector<StringView>& buffers,
-                    std::vector<std::shared_ptr<mooncake::BufferHandle>>&
-                        bufferHandles) {
+Status Bucket::Find(
+    const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
+    std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
     auto s = ResolveLocality();
     if (!s.IsOk()) return s;
 

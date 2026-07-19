@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <iterator>
@@ -160,6 +161,58 @@ embtable::EmbTableDummyClient::Options DummyOptions() {
     return options;
 }
 
+std::string MakeBenchmarkValue(uint64_t value_size) {
+    std::string value(value_size, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>((i * 31 + 17) & 0xff);
+    }
+    return value;
+}
+
+embtable::Status ProbePreparedData(embtable::EmbTableDummyClient& client,
+                                   uint64_t value_size, bool& ready) {
+    ready = false;
+    std::vector<uint64_t> offsets = {0, FLAGS_embtable_num_keys / 2,
+                                     FLAGS_embtable_num_keys - 1};
+    std::sort(offsets.begin(), offsets.end());
+    offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+
+    std::vector<uint64_t> keys;
+    keys.reserve(offsets.size());
+    for (const uint64_t offset : offsets) {
+        uint64_t key = 0;
+        if (!CheckedAdd(FLAGS_embtable_key_start, offset, key)) {
+            return embtable::Status::Error(embtable::ErrorCode::kOutOfRange,
+                                           "probe key range overflows");
+        }
+        keys.push_back(key);
+    }
+
+    std::vector<embtable::StringView> buffers;
+    auto status = client.Find(keys, buffers);
+    if (!status.IsOk()) {
+        if (status.code() == static_cast<int>(embtable::ErrorCode::kNotFound)) {
+            return embtable::Status::OK();
+        }
+        return status;
+    }
+    if (buffers.size() != keys.size()) {
+        return embtable::Status::Error(
+            embtable::ErrorCode::kInternal,
+            "prepared-data probe returned an unexpected result count");
+    }
+
+    const std::string expected = MakeBenchmarkValue(value_size);
+    for (const auto& buffer : buffers) {
+        if (buffer.size() != expected.size() ||
+            std::memcmp(buffer.data(), expected.data(), expected.size()) != 0) {
+            return embtable::Status::OK();
+        }
+    }
+    ready = true;
+    return embtable::Status::OK();
+}
+
 bool PrepareData(uint64_t value_size) {
     embtable::EmbTableDummyClient client(DummyOptions());
     auto status = client.Init();
@@ -168,12 +221,12 @@ bool PrepareData(uint64_t value_size) {
         return false;
     }
 
-    std::string value(value_size, '\0');
-    for (size_t i = 0; i < value.size(); ++i) {
-        value[i] = static_cast<char>((i * 31 + 17) & 0xff);
-    }
+    const std::string value = MakeBenchmarkValue(value_size);
     const uint64_t batch_size =
         std::min(FLAGS_embtable_insert_batch_size, FLAGS_embtable_num_keys);
+    LOG(INFO) << "Preparing EmbTable data: table=" << FLAGS_embtable_table_name
+              << ", total_keys=" << FLAGS_embtable_num_keys
+              << ", batch_size=" << batch_size << ", value_size=" << value_size;
     std::vector<uint64_t> keys;
     std::vector<embtable::StringView> values;
     keys.reserve(batch_size);
@@ -195,15 +248,29 @@ bool PrepareData(uint64_t value_size) {
         }
         status = client.Insert(keys, values);
         if (!status.IsOk()) {
+            if (status.code() ==
+                static_cast<int>(embtable::ErrorCode::kIndexBuilt)) {
+                LOG(ERROR) << "The table is already read-only but benchmark "
+                              "sentinel data is missing; use a new table name "
+                              "or recreate the table before preparing data";
+            }
             LOG(ERROR) << "Preparation Insert failed: " << status.msg();
             return false;
         }
+        LOG(INFO) << "Insert batch completed: table="
+                  << FLAGS_embtable_table_name << ", batch_keys=" << count
+                  << ", inserted=" << (offset + count) << "/"
+                  << FLAGS_embtable_num_keys;
     }
+    LOG(INFO) << "All benchmark data inserted, building index for table="
+              << FLAGS_embtable_table_name;
     status = client.BuildIndex();
     if (!status.IsOk()) {
         LOG(ERROR) << "Preparation BuildIndex failed: " << status.msg();
         return false;
     }
+    LOG(INFO) << "Benchmark data preparation completed: table="
+              << FLAGS_embtable_table_name;
     return true;
 }
 
@@ -388,7 +455,14 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "shared memory is too small for one Find request";
         return 1;
     }
-    if (FLAGS_embtable_prepare_data) {
+    bool data_ready = false;
+    status = ProbePreparedData(*probe, value_size, data_ready);
+    if (!status.IsOk()) {
+        LOG(ERROR) << "failed to probe benchmark data: " << status.msg();
+        return 1;
+    }
+
+    if (!data_ready && FLAGS_embtable_prepare_data) {
         uint64_t insert_buffer_size = 0;
         const uint64_t insert_batch_size =
             std::min(FLAGS_embtable_insert_batch_size, FLAGS_embtable_num_keys);
@@ -399,9 +473,47 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    if (FLAGS_embtable_prepare_data) {
+
+    if (data_ready) {
+        LOG(INFO) << "Benchmark data already exists; skipping Insert for table="
+                  << FLAGS_embtable_table_name;
+        status = probe->BuildIndex();
+        if (!status.IsOk() &&
+            status.code() !=
+                static_cast<int>(embtable::ErrorCode::kIndexBuilt)) {
+            LOG(ERROR) << "BuildIndex readiness check failed: " << status.msg();
+            return 1;
+        }
+        if (status.IsOk()) {
+            LOG(INFO) << "Existing data was not indexed; BuildIndex completed";
+        } else {
+            LOG(INFO) << "Existing table index is already built";
+        }
+    } else if (!FLAGS_embtable_prepare_data) {
+        LOG(ERROR) << "benchmark data is missing or incompatible and "
+                      "--embtable_prepare_data=false";
+        return 1;
+    } else {
+        LOG(INFO) << "Benchmark data is missing; starting Insert preparation";
         probe.reset();
         if (!PrepareData(value_size)) return 1;
+
+        auto validation_client =
+            std::make_unique<embtable::EmbTableDummyClient>(DummyOptions());
+        status = validation_client->Init();
+        if (!status.IsOk()) {
+            LOG(ERROR) << "validation client Init failed: " << status.msg();
+            return 1;
+        }
+        data_ready = false;
+        status = ProbePreparedData(*validation_client, value_size, data_ready);
+        if (!status.IsOk() || !data_ready) {
+            LOG(ERROR) << "prepared data validation failed: "
+                       << (status.IsOk() ? "sentinel keys are missing"
+                                         : status.msg());
+            return 1;
+        }
+        LOG(INFO) << "Prepared data validation succeeded";
     }
 
     std::vector<std::unique_ptr<WorkerStats>> stats;

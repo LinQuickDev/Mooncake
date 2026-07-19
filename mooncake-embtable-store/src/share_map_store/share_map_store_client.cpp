@@ -11,6 +11,22 @@
 
 namespace embtable {
 
+namespace {
+
+Status FromRemoteStatus(int32_t statusCode, const std::string& operation,
+                        const std::string& message) {
+    if (statusCode <= static_cast<int32_t>(ErrorCode::kOk) ||
+        statusCode > static_cast<int32_t>(ErrorCode::kNotSupported)) {
+        return Status::Error(ErrorCode::kInternal,
+                             operation + " returned invalid status " +
+                                 std::to_string(statusCode) + ": " + message);
+    }
+    return Status::Error(static_cast<ErrorCode>(statusCode),
+                         operation + " failed: " + message);
+}
+
+}  // namespace
+
 ShareMapStoreClient::~ShareMapStoreClient() {
     if (transferBufferRegistered_ && transferAllocator_ && client_) {
         client_->unregister_buffer(transferAllocator_->getBase());
@@ -83,8 +99,7 @@ coro_rpc::coro_rpc_client* ShareMapStoreClient::GetClient(
 
 Status ShareMapStoreClient::ParseResultBuffer(
     void* data, uint64_t dataSize, uint64_t valueSize, size_t numKeys,
-    const std::vector<int8_t>& foundFlags,
-    std::vector<StringView>& buffers,
+    const std::vector<int8_t>& foundFlags, std::vector<StringView>& buffers,
     std::shared_ptr<mooncake::BufferHandle> handle) {
     (void)handle;
     if (valueSize == 0 || foundFlags.size() != numKeys) {
@@ -126,7 +141,8 @@ Status ShareMapStoreClient::ParseAggregatedBuffer(
     std::vector<std::vector<StringView>>& buffersPerBucket,
     std::shared_ptr<mooncake::BufferHandle> handle) {
     (void)handle;
-    if (!data || valueSize == 0 || bucketKeys.size() != foundFlagsPerBucket.size() ||
+    if (!data || valueSize == 0 ||
+        bucketKeys.size() != foundFlagsPerBucket.size() ||
         dataSize < sizeof(uint64_t)) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid batch query response metadata");
@@ -198,7 +214,8 @@ Status ShareMapStoreClient::ParseAggregatedBuffer(
                 return Status::Error(ErrorCode::kInvalidArgument,
                                      "invalid batch found flag");
             }
-            if (flag != 0) buffersPerBucket[idx][k] = StringView(ptr + 1, valueSize);
+            if (flag != 0)
+                buffersPerBucket[idx][k] = StringView(ptr + 1, valueSize);
             ptr += entrySize;
         }
         remaining -= payloadSize;
@@ -256,8 +273,7 @@ Status ShareMapStoreClient::QueryData(
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
-        return Status::Error(ErrorCode::kInternal,
-                             "Remote query failed: " + resp.errorMsg);
+        return FromRemoteStatus(resp.statusCode, "Remote query", resp.errorMsg);
     }
 
     if (resp.transferredSize == 0) {
@@ -268,18 +284,17 @@ Status ShareMapStoreClient::QueryData(
                              "remote query exceeded target buffer");
     }
 
-    auto parseStatus = ParseResultBuffer(
-        handle->ptr(), resp.transferredSize, valueSize, keys.size(),
-        resp.foundFlags, buffers, handle);
+    auto parseStatus =
+        ParseResultBuffer(handle->ptr(), resp.transferredSize, valueSize,
+                          keys.size(), resp.foundFlags, buffers, handle);
     if (!parseStatus.IsOk()) return parseStatus;
     bufferHandles.push_back(handle);
     return Status::OK();
 }
 
 Status ShareMapStoreClient::BatchQueryData(
-    const std::string& rpcEndpoint,
-    const std::vector<std::string>& bucketKeys, uint64_t valueSize,
-    const std::vector<std::vector<uint64_t>>& keysPerBucket,
+    const std::string& rpcEndpoint, const std::vector<std::string>& bucketKeys,
+    uint64_t valueSize, const std::vector<std::vector<uint64_t>>& keysPerBucket,
     std::vector<std::vector<StringView>>& buffersPerBucket,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
     buffersPerBucket.clear();
@@ -350,8 +365,8 @@ Status ShareMapStoreClient::BatchQueryData(
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
-        return Status::Error(ErrorCode::kInternal,
-                             "Remote batch query failed: " + resp.errorMsg);
+        return FromRemoteStatus(resp.statusCode, "Remote batch query",
+                                resp.errorMsg);
     }
     if (resp.responses.size() != bucketKeys.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -383,10 +398,11 @@ Status ShareMapStoreClient::BatchQueryData(
     return Status::OK();
 }
 
-Status ShareMapStoreClient::Publish(
-    const std::string& rpcEndpoint, const std::string& bucketKey,
-    uint64_t valueSize, const std::vector<uint64_t>& keys,
-    const std::vector<StringView>& values) {
+Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
+                                    const std::string& bucketKey,
+                                    uint64_t valueSize,
+                                    const std::vector<uint64_t>& keys,
+                                    const std::vector<StringView>& values) {
     if (keys.empty()) return Status::OK();
     if (bucketKey.empty() || valueSize == 0 || values.size() != keys.size()) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -434,8 +450,8 @@ Status ShareMapStoreClient::Publish(
                              "RPC call failed: " + result.error().msg);
     }
     if (result.value().statusCode != 0) {
-        return Status::Error(ErrorCode::kInternal,
-                             "Remote publish failed: " + result.value().errorMsg);
+        return FromRemoteStatus(result.value().statusCode, "Remote publish",
+                                result.value().errorMsg);
     }
     return Status::OK();
 }
@@ -458,9 +474,8 @@ Status ShareMapStoreClient::BuildIndex(const std::string& rpcEndpoint,
                              "RPC call failed: " + result.error().msg);
     }
     if (result.value().statusCode != 0) {
-        return Status::Error(ErrorCode::kInternal,
-                             "Remote build index failed: " +
-                                 result.value().errorMsg);
+        return FromRemoteStatus(result.value().statusCode, "Remote build index",
+                                result.value().errorMsg);
     }
     return Status::OK();
 }
