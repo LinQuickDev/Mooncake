@@ -25,10 +25,10 @@ QueryDataResponse ShareMapStoreRpcService::HandleQueryData(
         resp.errorMsg = "query request size exceeds target capacity";
         return resp;
     }
-    Status s = store_.QueryDataToBuffer(
-        req.bucketKey, req.keys, req.valueSize, req.targetEndpoint,
-        req.targetAddress, req.targetCapacity, resp.transferredSize,
-        resp.foundFlags);
+    Status s = store_.QueryDataToBuffer(req.bucketKey, req.keys, req.valueSize,
+                                        req.targetEndpoint, req.targetAddress,
+                                        req.targetCapacity,
+                                        resp.transferredSize, resp.foundFlags);
     if (!s.IsOk()) {
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
@@ -48,7 +48,8 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
     }
     std::unordered_set<std::string> bucketSet;
     for (const auto& entry : req.entries) {
-        if (entry.bucketKey.empty() || !bucketSet.insert(entry.bucketKey).second) {
+        if (entry.bucketKey.empty() ||
+            !bucketSet.insert(entry.bucketKey).second) {
             resp.statusCode = static_cast<int32_t>(ErrorCode::kInvalidArgument);
             resp.errorMsg = "duplicate or empty bucket key";
             return resp;

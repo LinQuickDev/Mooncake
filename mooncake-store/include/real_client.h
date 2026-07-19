@@ -106,9 +106,10 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
-    // Return the local Transfer Engine endpoint used in peer buffer
-    // descriptors.
-    std::string get_transfer_endpoint() const;
+    // Return the logical Transfer Engine segment endpoint used to publish
+    // registered buffers in metadata. Peers must pass this value to
+    // openSegment(); it is intentionally not the TE RPC mapping endpoint.
+    std::string get_segment_endpoint() const;
 
     // Submit a synchronous Transfer Engine WRITE from a registered local
     // buffer to a registered peer buffer.

@@ -98,9 +98,9 @@ class ShareMapStore {
                              uint64_t& transferredSize,
                              std::vector<int8_t>& foundFlags);
 
-    // Batch query: query multiple buckets on this node, pack all results
-    // into ONE aggregated buffer, and write it directly to the client's
-    // registered buffer with one TE transfer. Layout:
+    // Batch query: query multiple buckets on this node, pack all results into
+    // ONE aggregated buffer, and write it directly to the client's registered
+    // buffer with one TE transfer. Layout:
     //   [bucketCount(8B)]
     //   for each bucket: [bucketKeyLen(4B)][bucketKey][keyCount(8B)]
     //                    for each key: [1B found flag][valueSize bytes data]

@@ -3,7 +3,6 @@
 #include <cstring>
 #include <limits>
 #include <new>
-#include <thread>
 #include <unordered_map>
 
 #include <async_simple/coro/SyncAwait.h>
@@ -60,8 +59,20 @@ Status ShareMapStoreClient::Init(uint64_t transferBufferSize) {
             ErrorCode::kIOError,
             "failed to register ShareMapStoreClient transfer buffer");
     }
+    transferSegmentEndpoint_ = client_->get_segment_endpoint();
+    if (transferSegmentEndpoint_.empty()) {
+        client_->unregister_buffer(transferAllocator_->getBase());
+        transferAllocator_.reset();
+        return Status::Error(
+            ErrorCode::kInternal,
+            "ShareMapStoreClient transfer segment endpoint is empty");
+    }
     transferBufferSize_ = transferBufferSize;
     transferBufferRegistered_ = true;
+    LOG(INFO) << "ShareMapStoreClient transfer buffer registered: segment="
+              << transferSegmentEndpoint_ << ", address="
+              << reinterpret_cast<uint64_t>(transferAllocator_->getBase())
+              << ", size=" << transferBufferSize_;
     return Status::OK();
 }
 
@@ -78,31 +89,47 @@ ShareMapStoreClient::AllocateTransferBuffer(uint64_t size) {
         std::move(allocation.value()));
 }
 
-coro_rpc::coro_rpc_client* ShareMapStoreClient::GetClient(
-    const std::string& rpcEndpoint) {
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    auto it = clientCache_.find(rpcEndpoint);
-    if (it != clientCache_.end()) return it->second.get();
+ShareMapStoreClient::RpcClientLease::~RpcClientLease() {
+    if (owner_ && slot_) owner_->ReleaseClient(slot_);
+}
 
-    auto client = std::make_unique<coro_rpc::coro_rpc_client>();
+void ShareMapStoreClient::ReleaseClient(
+    const std::shared_ptr<RpcClientSlot>& slot) {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (slot) slot->inUse = false;
+}
+
+std::optional<ShareMapStoreClient::RpcClientLease>
+ShareMapStoreClient::AcquireClient(const std::string& rpcEndpoint) {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    auto& slots = clientCache_[rpcEndpoint];
+    for (auto& slot : slots) {
+        if (!slot->inUse) {
+            slot->inUse = true;
+            return RpcClientLease(this, slot);
+        }
+    }
+
+    auto slot = std::make_shared<RpcClientSlot>();
+    slot->client = std::make_unique<coro_rpc::coro_rpc_client>();
+    slot->inUse = true;
     // coro_rpc::err_code: operator bool() returns true on error.
-    auto ec = async_simple::coro::syncAwait(client->connect(rpcEndpoint));
+    auto ec = async_simple::coro::syncAwait(slot->client->connect(rpcEndpoint));
     if (ec) {
         LOG(ERROR) << "Failed to connect to ShareMapStore RPC endpoint: "
                    << rpcEndpoint << ", error: " << ec.message();
-        return nullptr;
+        return std::nullopt;
     }
-    auto* ptr = client.get();
-    clientCache_[rpcEndpoint] = std::move(client);
-    return ptr;
+    slots.push_back(slot);
+    return RpcClientLease(this, std::move(slot));
 }
 
 Status ShareMapStoreClient::ParseResultBuffer(
     void* data, uint64_t dataSize, uint64_t valueSize, size_t numKeys,
-    const std::vector<int8_t>& foundFlags, std::vector<StringView>& buffers,
+    std::vector<StringView>& buffers,
     std::shared_ptr<mooncake::BufferHandle> handle) {
     (void)handle;
-    if (valueSize == 0 || foundFlags.size() != numKeys) {
+    if (!data || valueSize == 0) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid single query response metadata");
     }
@@ -117,17 +144,18 @@ Status ShareMapStoreClient::ParseResultBuffer(
     buffers.assign(numKeys, {});
     const char* ptr = static_cast<const char*>(data);
     for (size_t i = 0; i < numKeys; ++i) {
-        if (foundFlags[i] != 0 && foundFlags[i] != 1) {
-            return Status::Error(ErrorCode::kInvalidArgument,
-                                 "invalid found flag");
-        }
         uint64_t offset = 0;
         if (!CheckedMultiply(i, entrySize, offset) ||
             !IsRangeValid(offset, entrySize, dataSize)) {
             return Status::Error(ErrorCode::kInvalidArgument,
                                  "single query entry is out of range");
         }
-        if (foundFlags[i] != 0) {
+        const auto found = static_cast<uint8_t>(ptr[offset]);
+        if (found > 1) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "invalid found flag in transfer buffer");
+        }
+        if (found != 0) {
             buffers[i] = StringView(ptr + offset + 1, valueSize);
         }
     }
@@ -137,12 +165,11 @@ Status ShareMapStoreClient::ParseResultBuffer(
 Status ShareMapStoreClient::ParseAggregatedBuffer(
     void* data, uint64_t dataSize, uint64_t valueSize,
     const std::vector<std::string>& bucketKeys,
-    const std::vector<std::vector<int8_t>>& foundFlagsPerBucket,
+    const std::vector<std::vector<uint64_t>>& keysPerBucket,
     std::vector<std::vector<StringView>>& buffersPerBucket,
     std::shared_ptr<mooncake::BufferHandle> handle) {
     (void)handle;
-    if (!data || valueSize == 0 ||
-        bucketKeys.size() != foundFlagsPerBucket.size() ||
+    if (!data || valueSize == 0 || bucketKeys.size() != keysPerBucket.size() ||
         dataSize < sizeof(uint64_t)) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid batch query response metadata");
@@ -197,9 +224,13 @@ Status ShareMapStoreClient::ParseAggregatedBuffer(
         }
         const size_t idx = it->second;
         seen[idx] = true;
-        if (keyCount != foundFlagsPerBucket[idx].size()) {
-            return Status::Error(ErrorCode::kInvalidArgument,
-                                 "batch key count mismatch");
+        if (keyCount != keysPerBucket[idx].size()) {
+            return Status::Error(
+                ErrorCode::kInvalidArgument,
+                "batch key count mismatch: bucket=" + key +
+                    ", expected=" + std::to_string(keysPerBucket[idx].size()) +
+                    ", actual=" + std::to_string(keyCount) + ", buffer=" +
+                    std::to_string(reinterpret_cast<uint64_t>(data)));
         }
         uint64_t payloadSize = 0;
         if (!CheckedMultiply(keyCount, entrySize, payloadSize) ||
@@ -209,12 +240,13 @@ Status ShareMapStoreClient::ParseAggregatedBuffer(
         }
         buffersPerBucket[idx].assign(keyCount, {});
         for (uint64_t k = 0; k < keyCount; ++k) {
-            const auto flag = foundFlagsPerBucket[idx][k];
-            if (flag != 0 && flag != 1) {
+            const auto found = static_cast<uint8_t>(ptr[0]);
+            if (found > 1) {
                 return Status::Error(ErrorCode::kInvalidArgument,
-                                     "invalid batch found flag");
+                                     "invalid found flag in batch transfer "
+                                     "buffer");
             }
-            if (flag != 0)
+            if (found != 0)
                 buffersPerBucket[idx][k] = StringView(ptr + 1, valueSize);
             ptr += entrySize;
         }
@@ -235,7 +267,7 @@ Status ShareMapStoreClient::QueryData(
     buffers.clear();
     if (keys.empty()) return Status::OK();
 
-    auto* rpcClient = GetClient(rpcEndpoint);
+    auto rpcClient = AcquireClient(rpcEndpoint);
     if (!rpcClient) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC client connect failed: " + rpcEndpoint);
@@ -261,12 +293,12 @@ Status ShareMapStoreClient::QueryData(
         return Status::Error(ErrorCode::kOutOfRange,
                              "client transfer buffer exhausted");
     }
-    req.targetEndpoint = client_->get_transfer_endpoint();
+    req.targetEndpoint = transferSegmentEndpoint_;
     req.targetAddress = reinterpret_cast<uint64_t>(handle->ptr());
     req.targetCapacity = handle->size();
 
     auto result = async_simple::coro::syncAwait(
-        rpcClient->call<&ShareMapStoreRpcService::HandleQueryData>(req));
+        rpcClient->get()->call<&ShareMapStoreRpcService::HandleQueryData>(req));
     if (!result) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC call failed: " + result.error().msg);
@@ -286,7 +318,7 @@ Status ShareMapStoreClient::QueryData(
 
     auto parseStatus =
         ParseResultBuffer(handle->ptr(), resp.transferredSize, valueSize,
-                          keys.size(), resp.foundFlags, buffers, handle);
+                          keys.size(), buffers, handle);
     if (!parseStatus.IsOk()) return parseStatus;
     bufferHandles.push_back(handle);
     return Status::OK();
@@ -332,7 +364,7 @@ Status ShareMapStoreClient::BatchQueryData(
         }
     }
 
-    auto* rpcClient = GetClient(rpcEndpoint);
+    auto rpcClient = AcquireClient(rpcEndpoint);
     if (!rpcClient) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC client connect failed: " + rpcEndpoint);
@@ -353,12 +385,13 @@ Status ShareMapStoreClient::BatchQueryData(
         return Status::Error(ErrorCode::kOutOfRange,
                              "client transfer buffer exhausted");
     }
-    req.targetEndpoint = client_->get_transfer_endpoint();
+    req.targetEndpoint = transferSegmentEndpoint_;
     req.targetAddress = reinterpret_cast<uint64_t>(handle->ptr());
     req.targetCapacity = handle->size();
 
     auto result = async_simple::coro::syncAwait(
-        rpcClient->call<&ShareMapStoreRpcService::HandleBatchQueryData>(req));
+        rpcClient->get()->call<&ShareMapStoreRpcService::HandleBatchQueryData>(
+            req));
     if (!result) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC batch call failed: " + result.error().msg);
@@ -373,6 +406,17 @@ Status ShareMapStoreClient::BatchQueryData(
                              "remote batch response count mismatch");
     }
 
+    for (size_t i = 0; i < resp.responses.size(); ++i) {
+        if (resp.responses[i].foundFlags.size() != keysPerBucket[i].size()) {
+            return Status::Error(
+                ErrorCode::kInvalidArgument,
+                "remote batch control key count mismatch: bucket=" +
+                    bucketKeys[i] + ", expected=" +
+                    std::to_string(keysPerBucket[i].size()) + ", actual=" +
+                    std::to_string(resp.responses[i].foundFlags.size()));
+        }
+    }
+
     const uint64_t transferredSize =
         resp.responses.empty() ? 0 : resp.responses.front().transferredSize;
     for (const auto& response : resp.responses) {
@@ -385,13 +429,8 @@ Status ShareMapStoreClient::BatchQueryData(
         return Status::Error(ErrorCode::kOutOfRange,
                              "remote batch query exceeded target buffer");
     }
-    std::vector<std::vector<int8_t>> flagsPerBucket;
-    flagsPerBucket.reserve(resp.responses.size());
-    for (const auto& response : resp.responses) {
-        flagsPerBucket.push_back(response.foundFlags);
-    }
     auto parseStatus = ParseAggregatedBuffer(
-        handle->ptr(), transferredSize, valueSize, bucketKeys, flagsPerBucket,
+        handle->ptr(), transferredSize, valueSize, bucketKeys, keysPerBucket,
         buffersPerBucket, handle);
     if (!parseStatus.IsOk()) return parseStatus;
     bufferHandles.push_back(handle);
@@ -421,7 +460,7 @@ Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
         }
     }
 
-    auto* rpcClient = GetClient(rpcEndpoint);
+    auto rpcClient = AcquireClient(rpcEndpoint);
     if (!rpcClient) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC client connect failed: " + rpcEndpoint);
@@ -444,7 +483,7 @@ Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
     }
 
     auto result = async_simple::coro::syncAwait(
-        rpcClient->call<&ShareMapStoreRpcService::HandlePublish>(req));
+        rpcClient->get()->call<&ShareMapStoreRpcService::HandlePublish>(req));
     if (!result) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC call failed: " + result.error().msg);
@@ -458,7 +497,7 @@ Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
 
 Status ShareMapStoreClient::BuildIndex(const std::string& rpcEndpoint,
                                        const std::string& bucketKey) {
-    auto* rpcClient = GetClient(rpcEndpoint);
+    auto rpcClient = AcquireClient(rpcEndpoint);
     if (!rpcClient) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC client connect failed: " + rpcEndpoint);
@@ -468,7 +507,8 @@ Status ShareMapStoreClient::BuildIndex(const std::string& rpcEndpoint,
     req.bucketKey = bucketKey;
 
     auto result = async_simple::coro::syncAwait(
-        rpcClient->call<&ShareMapStoreRpcService::HandleBuildIndex>(req));
+        rpcClient->get()->call<&ShareMapStoreRpcService::HandleBuildIndex>(
+            req));
     if (!result) {
         return Status::Error(ErrorCode::kInternal,
                              "RPC call failed: " + result.error().msg);

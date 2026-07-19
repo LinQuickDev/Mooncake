@@ -262,7 +262,6 @@ Status ShareMapStore::BatchQueryDataToBuffer(
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid target transfer buffer");
     }
-
     if (valueSize == 0) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "valueSize must be > 0");

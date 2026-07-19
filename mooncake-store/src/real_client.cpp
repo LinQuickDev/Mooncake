@@ -3069,8 +3069,8 @@ int RealClient::register_buffer(void *buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
 }
 
-std::string RealClient::get_transfer_endpoint() const {
-    return client_ ? client_->GetTransportEndpoint() : std::string();
+std::string RealClient::get_segment_endpoint() const {
+    return client_ ? client_->GetSegmentEndpoint() : std::string();
 }
 
 int RealClient::subTransferTask(void *source, size_t size,

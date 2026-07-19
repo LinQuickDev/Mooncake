@@ -25,11 +25,11 @@ class ShareMapStoreRpcService {
     void RegisterHandlers(coro_rpc::coro_rpc_server& server) {
         server.register_handler<&ShareMapStoreRpcService::HandleQueryData>(
             this);
-        server.register_handler<
-            &ShareMapStoreRpcService::HandleBatchQueryData>(this);
+        server.register_handler<&ShareMapStoreRpcService::HandleBatchQueryData>(
+            this);
         server.register_handler<&ShareMapStoreRpcService::HandlePublish>(this);
-        server.register_handler<
-            &ShareMapStoreRpcService::HandleBuildIndex>(this);
+        server.register_handler<&ShareMapStoreRpcService::HandleBuildIndex>(
+            this);
     }
 
     // ---- RPC handlers (called by coro_rpc) ----

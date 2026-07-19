@@ -52,7 +52,18 @@ Status Bucket::ResolveLocality() {
     std::string ownerHost;
     bool replicaResolved = false;
 
-    if (realClient_ && realClient_->client_) {
+    // rpcEndpoint is the authoritative ShareMap owner recorded when the
+    // bucket is created. The Mooncake Store replica holding the small bucket
+    // metadata object may be placed on any node and must not override it.
+    if (!info_.rpcEndpoint.empty()) {
+        ownerHost = ExtractHostname(info_.rpcEndpoint);
+        isLocal_ = IsSameHost(ownerHost, localHostname_);
+        replicaResolved = true;
+    }
+
+    // Legacy metadata may not contain rpcEndpoint. Fall back to replica
+    // placement only for those entries.
+    if (!replicaResolved && realClient_ && realClient_->client_) {
         auto queryResult =
             realClient_->batch_query({bucketKey_ + "_bucketmeta"});
         if (!queryResult.empty() && queryResult[0].has_value()) {
@@ -82,13 +93,6 @@ Status Bucket::ResolveLocality() {
         }
     }
 
-    if (!replicaResolved && !info_.rpcEndpoint.empty()) {
-        ownerHost = ExtractHostname(info_.rpcEndpoint);
-        isLocal_ = IsSameHost(ownerHost, localHostname_) ||
-                   ownerHost == "127.0.0.1" || ownerHost == "localhost";
-        replicaResolved = true;
-    }
-
     if (!replicaResolved) {
         // Local-only deployments have no RPC routing requirement.
         if (!shareMapStoreClient_ || shareMapStoreRpcPort_ == 0) {
@@ -102,14 +106,28 @@ Status Bucket::ResolveLocality() {
     }
 
     if (!isLocal_) {
-        if (ownerHost.empty() || shareMapStoreRpcPort_ == 0) {
-            return Status::Error(
-                ErrorCode::kInvalidArgument,
-                "remote bucket has no ShareMapStore RPC endpoint: " +
-                    bucketKey_);
+        if (!info_.rpcEndpoint.empty()) {
+            const auto rpcHost = ExtractHostname(info_.rpcEndpoint);
+            if (!ownerHost.empty() && !IsSameHost(rpcHost, ownerHost)) {
+                return Status::Error(
+                    ErrorCode::kInvalidArgument,
+                    "bucket replica owner does not match persisted RPC "
+                    "endpoint: " +
+                        bucketKey_);
+            }
+        } else {
+            // Compatibility for metadata written before rpcEndpoint was
+            // persisted. New metadata must retain the owner's full endpoint;
+            // the local node's RPC port is not necessarily the owner's port.
+            if (ownerHost.empty() || shareMapStoreRpcPort_ == 0) {
+                return Status::Error(
+                    ErrorCode::kInvalidArgument,
+                    "remote bucket has no ShareMapStore RPC endpoint: " +
+                        bucketKey_);
+            }
+            info_.rpcEndpoint =
+                ownerHost + ":" + std::to_string(shareMapStoreRpcPort_);
         }
-        info_.rpcEndpoint =
-            ownerHost + ":" + std::to_string(shareMapStoreRpcPort_);
     } else if (info_.rpcEndpoint.empty() && shareMapStoreRpcPort_ != 0) {
         info_.rpcEndpoint =
             localHostname_ + ":" + std::to_string(shareMapStoreRpcPort_);

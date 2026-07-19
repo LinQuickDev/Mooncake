@@ -1922,6 +1922,8 @@ benchmark 默认启用 `--embtable_create_table_if_missing=true`。当 GetInfo �
 
 ShareMapStoreClient 的目标 transfer buffer 使用 `RealClient::register_buffer` 注册为 `remote_accessible=true`，供远端 ShareMapStore 通过 Transfer Engine WRITE 写入；该语义覆盖原 `register_transfer_buffer` 的功能。
 
+RPC 控制面携带的 `targetEndpoint` 必须是该 buffer 发布到 metadata 时使用的逻辑 **segment endpoint**（`RealClient::get_segment_endpoint()`），不能使用 TE 独立分配的 RPC mapping 地址。HTTP metadata 模式下两者通常不同；远端 `subTransferTask` 会用 segment endpoint 调用 `openSegment()`，再以 `targetAddress` 定位已注册 buffer。该机制与 `batch_get_into_offload_object_internal` 中 owner 返回 `Client::GetSegmentEndpoint()` 的做法一致。
+
 `embtable_client` 不再接受 `embtable_create_new`、`embtable_table_name`、`embtable_num_buckets` 或 `embtable_value_size` 启动参数。表结构的生命周期属于用户侧 DDL，而不是存储节点进程生命周期。
 
 ---
