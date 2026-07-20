@@ -1090,14 +1090,18 @@ int UrmaEndpoint::submitPostSend(
     std::vector<Transport::Slice*>& failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
-    const size_t incoming = slice_list.size();
-    const uint64_t trace_id =
-        slice_list.empty() ? 0 : slice_list.front()->trace_id;
     const bool queue_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+        !slice_list.empty() &&
+        mooncake::logging::ShouldSampleHiFreqLog(slice_list.front()->trace_id);
     int jetty_index = SimpleRandom::Get().next(jetty_list_.size());
-    const int jetty_before = wr_depth_list_[jetty_index];
-    const int jfc_before = *jfc_outstanding_;
+    size_t incoming = 0;
+    int jetty_before = 0;
+    int jfc_before = 0;
+    if (queue_log) {
+        incoming = slice_list.size();
+        jetty_before = wr_depth_list_[jetty_index];
+        jfc_before = *jfc_outstanding_;
+    }
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[jetty_index],
                             (int)slice_list.size());
     wr_count =
@@ -1133,12 +1137,8 @@ int UrmaEndpoint::submitPostSend(
     urma_sge_t l_sge_list[wr_count];
     urma_sge_t r_sge_list[wr_count];
     memset(wr_list, 0, sizeof(urma_jfs_wr_t) * wr_count);
-    uint64_t total_bytes = 0;
-    uint32_t retry_count_max = 0;
     for (int i = 0; i < wr_count; ++i) {
         auto slice = slice_list[i];
-        total_bytes += slice->length;
-        retry_count_max = std::max(retry_count_max, slice->ub.retry_cnt);
         auto& l_sge = l_sge_list[i];
         auto& r_sge = r_sge_list[i];
         l_sge.addr = (uint64_t)slice->source_addr;
@@ -1200,6 +1200,13 @@ int UrmaEndpoint::submitPostSend(
         }
     }
     if (queue_log) {
+        uint64_t total_bytes = 0;
+        uint32_t retry_count_max = 0;
+        for (int i = 0; i < wr_count; ++i) {
+            total_bytes += slice_list[i]->length;
+            retry_count_max =
+                std::max(retry_count_max, slice_list[i]->ub.retry_cnt);
+        }
         MC_LOG(INFO)
             << "urma_queue_depth direction="
             << (slice_list.front()->opcode == Transport::TransferRequest::READ
