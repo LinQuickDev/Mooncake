@@ -19,6 +19,7 @@
 #include <asio/ip/v6_only.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <chrono>
@@ -27,6 +28,8 @@
 #include <cstdlib>
 #include <memory>
 #include <random>
+
+#include <asio/steady_timer.hpp>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -54,7 +57,56 @@ struct SessionHeader {
     uint64_t size;
     uint64_t addr;
     uint8_t opcode;
+    uint8_t version;
+    uint16_t flags;
+    uint32_t magic;
+    uint64_t request_id;
 };
+
+struct SessionAck {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t status;
+    uint64_t request_id;
+    uint64_t transferred_bytes;
+};
+
+static_assert(sizeof(SessionHeader) == 32,
+              "TCP session header must have a stable wire size");
+static_assert(sizeof(SessionAck) == 24,
+              "TCP session ack must have a stable wire size");
+
+constexpr uint32_t kTcpSessionHeaderMagic = 0x4d435448;  // "MCTH"
+constexpr uint32_t kTcpSessionAckMagic = 0x4d434143;     // "MCAC"
+constexpr uint16_t kTcpSessionProtocolVersion = 1;
+static std::atomic<uint64_t> g_tcp_request_id{1};
+
+static uint64_t nextTcpRequestId() {
+    uint64_t id = g_tcp_request_id.fetch_add(1, std::memory_order_relaxed);
+    return id == 0 ? g_tcp_request_id.fetch_add(1, std::memory_order_relaxed)
+                   : id;
+}
+
+static std::chrono::milliseconds getTcpAckTimeout() {
+    static const auto timeout = [] {
+        const char* env = std::getenv("MC_TCP_ACK_TIMEOUT_MS");
+        if (env) {
+            try {
+                auto value = std::stoull(env);
+                if (value > 0) return std::chrono::milliseconds(value);
+            } catch (const std::exception&) {
+                LOG(WARNING) << "Invalid MC_TCP_ACK_TIMEOUT_MS: " << env;
+            }
+        }
+        return std::chrono::milliseconds(5000);
+    }();
+    return timeout;
+}
+
+static bool tcpAckTraceEnabled() {
+    static const bool enabled = std::getenv("MC_TCP_ACK_TRACE") != nullptr;
+    return enabled;
+}
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
@@ -110,6 +162,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     std::shared_ptr<tcpsocket> socket_;
     ValidateAddrFn validate_addr_;
     SessionHeader header_;
+    SessionAck ack_{};
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
     std::function<void(TransferStatusEnum)> on_finalize_;
@@ -138,21 +191,90 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     return;
                 }
 
+                if (le32toh(header_.magic) != kTcpSessionHeaderMagic ||
+                    header_.version != kTcpSessionProtocolVersion) {
+                    LOG(ERROR)
+                        << "ServerSession: invalid TCP session header"
+                        << ", magic=" << le32toh(header_.magic)
+                        << ", version=" << static_cast<int>(header_.version);
+                    asio::error_code close_ec;
+                    socket_->close(close_ec);
+                    session_mutex_.unlock();
+                    return;
+                }
+
+                if (tcpAckTraceEnabled()) {
+                    LOG(INFO)
+                        << "ServerSession received TCP transfer header"
+                        << ", request_id=" << le64toh(header_.request_id)
+                        << ", opcode=" << static_cast<int>(header_.opcode)
+                        << ", size=" << le64toh(header_.size)
+                        << ", target=" << static_cast<void*>(local_buffer_);
+                }
+
                 local_buffer_ = (char*)(le64toh(header_.addr));
                 uint64_t size = le64toh(header_.size);
+                if (tcpAckTraceEnabled()) {
+                    LOG(INFO)
+                        << "ServerSession decoded TCP transfer header"
+                        << ", request_id=" << le64toh(header_.request_id)
+                        << ", target=" << static_cast<void*>(local_buffer_)
+                        << ", size=" << size;
+                }
                 if (validate_addr_ &&
                     !validate_addr_((uint64_t)local_buffer_, size)) {
                     LOG(ERROR) << "ServerSession: remote-supplied address 0x"
                                << std::hex << (uint64_t)local_buffer_
                                << std::dec << " with size " << size
                                << " is not within any registered buffer";
-                    session_mutex_.unlock();
+                    if (header_.opcode == (uint8_t)TransferRequest::WRITE) {
+                        sendAck(TransferStatusEnum::FAILED, 0);
+                    } else {
+                        session_mutex_.unlock();
+                    }
                     return;
+                }
+                if (tcpAckTraceEnabled()) {
+                    LOG(INFO) << "ServerSession accepted TCP transfer target"
+                              << ", request_id=" << le64toh(header_.request_id);
                 }
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
                     readBody();
-                else
+                else if (header_.opcode == (uint8_t)TransferRequest::READ)
                     writeBody();
+                else {
+                    LOG(ERROR) << "ServerSession: unsupported transfer opcode: "
+                               << static_cast<int>(header_.opcode);
+                    session_mutex_.unlock();
+                }
+            });
+    }
+
+    void sendAck(TransferStatusEnum status, uint64_t transferred_bytes) {
+        auto self(shared_from_this());
+        ack_.magic = htole32(kTcpSessionAckMagic);
+        ack_.version = htole16(kTcpSessionProtocolVersion);
+        ack_.status = htole16(static_cast<uint16_t>(status));
+        ack_.request_id = header_.request_id;
+        ack_.transferred_bytes = htole64(transferred_bytes);
+
+        asio::async_write(
+            *socket_, asio::buffer(&ack_, sizeof(ack_)),
+            [this, self](const asio::error_code& ec, std::size_t len) {
+                if (ec || len != sizeof(SessionAck)) {
+                    LOG(ERROR) << "ServerSession::sendAck failed. Error: "
+                               << ec.message() << " (value: " << ec.value()
+                               << "), bytes written: " << len;
+                    asio::error_code close_ec;
+                    socket_->close(close_ec);
+                    session_mutex_.unlock();
+                    return;
+                }
+
+                // The next request is read only after the ACK has been sent,
+                // keeping the persistent connection strictly ordered.
+                session_mutex_.unlock();
+                start();
             });
     }
 
@@ -165,7 +287,8 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             session_mutex_.unlock();
-            // Transfer complete, wait for next request on this connection
+            // READ transfers keep the original stream semantics: the client
+            // observes completion after receiving the requested bytes.
             start();
             return;
         }
@@ -233,14 +356,29 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            session_mutex_.unlock();
-            // Transfer complete, wait for next request on this connection
-            start();
+            if (tcpAckTraceEnabled()) {
+                LOG(INFO) << "ServerSession received complete TCP WRITE"
+                          << ", request_id=" << le64toh(header_.request_id)
+                          << ", bytes=" << total_transferred_bytes_;
+            }
+            sendAck(TransferStatusEnum::COMPLETED, total_transferred_bytes_);
             return;
+        }
+
+        if (tcpAckTraceEnabled()) {
+            LOG(INFO) << "ServerSession posting TCP WRITE body read"
+                      << ", request_id=" << le64toh(header_.request_id)
+                      << ", bytes=" << buffer_size;
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
+
+        if (tcpAckTraceEnabled()) {
+            LOG(INFO) << "ServerSession starting TCP WRITE body read"
+                      << ", request_id=" << le64toh(header_.request_id)
+                      << ", bytes=" << buffer_size;
+        }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
@@ -270,6 +408,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     session_mutex_.unlock();
                     if (cuda_device >= 0) delete[] dram_buffer;
                     return;  // Connection will be closed
+                }
+                if (tcpAckTraceEnabled()) {
+                    LOG(INFO) << "ServerSession received TCP WRITE chunk"
+                              << ", request_id=" << le64toh(header_.request_id)
+                              << ", bytes=" << transferred_bytes;
                 }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
@@ -307,29 +450,131 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 // Client-side session: initiates one transfer request
 struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     explicit ClientSession(std::shared_ptr<tcpsocket> socket,
-                           std::function<void()> on_complete = nullptr)
-        : socket_(std::move(socket)), on_complete_(std::move(on_complete)) {}
+                           std::function<void(bool)> on_complete = nullptr)
+        : socket_(std::move(socket)),
+          ack_timer_(socket_->get_executor()),
+          on_complete_(std::move(on_complete)) {}
 
     std::shared_ptr<tcpsocket> socket_;
     SessionHeader header_;
+    SessionAck ack_{};
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
     std::function<void(TransferStatusEnum)> on_finalize_;
-    std::function<void()> on_complete_;  // Callback when transfer completes
+    asio::steady_timer ack_timer_;
+    std::function<void(bool)> on_complete_;  // Callback when transfer completes
     std::mutex session_mutex_;
+    bool completion_started_ = false;
 
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
         session_mutex_.lock();
+        header_ = {};
         local_buffer_ = (char*)buffer;
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode;
+        header_.version = kTcpSessionProtocolVersion;
+        header_.flags = htole16(0);
+        header_.magic = htole32(kTcpSessionHeaderMagic);
+        header_.request_id = htole64(nextTcpRequestId());
         total_transferred_bytes_ = 0;
+        if (tcpAckTraceEnabled()) {
+            LOG(INFO) << "ClientSession sending TCP transfer header"
+                      << ", request_id=" << le64toh(header_.request_id)
+                      << ", opcode=" << static_cast<int>(header_.opcode)
+                      << ", size=" << size << ", target=0x" << std::hex
+                      << dest_addr << std::dec;
+        }
         writeHeader();
     }
 
    private:
+    void finish(TransferStatusEnum status, bool reusable) {
+        if (completion_started_) return;
+        completion_started_ = true;
+        asio::error_code timer_ec;
+        ack_timer_.cancel(timer_ec);
+
+        auto self(shared_from_this());
+        asio::post(socket_->get_executor(),
+                   [this, self, status, reusable,
+                    on_finalize = std::move(on_finalize_),
+                    on_complete = std::move(on_complete_)]() {
+                       if (on_finalize) on_finalize(status);
+                       session_mutex_.unlock();
+                       if (on_complete) on_complete(reusable);
+                   });
+    }
+
+    void startAckTimer() {
+        auto self(shared_from_this());
+        ack_timer_.expires_after(getTcpAckTimeout());
+        ack_timer_.async_wait([this, self](const asio::error_code& ec) {
+            if (ec == asio::error::operation_aborted) return;
+            if (ec) {
+                LOG(ERROR) << "ClientSession ACK timer failed: "
+                           << ec.message();
+                finish(TransferStatusEnum::FAILED, false);
+                return;
+            }
+            LOG(ERROR) << "ClientSession timed out waiting for remote write ACK"
+                       << ", request_id=" << le64toh(header_.request_id);
+            finish(TransferStatusEnum::TIMEOUT, false);
+        });
+    }
+
+    void readAck() {
+        auto self(shared_from_this());
+        startAckTimer();
+        asio::async_read(
+            *socket_, asio::buffer(&ack_, sizeof(ack_)),
+            [this, self](const asio::error_code& ec, std::size_t len) {
+                // The ACK read is cancelled when the timeout or another
+                // failure path has already finalized this session.
+                if (completion_started_) return;
+                if (ec || len != sizeof(SessionAck)) {
+                    LOG(ERROR) << "ClientSession::readAck failed. Error: "
+                               << ec.message() << " (value: " << ec.value()
+                               << "), bytes read: " << len;
+                    finish(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                if (tcpAckTraceEnabled()) {
+                    LOG(INFO) << "ClientSession received TCP write ACK"
+                              << ", request_id=" << le64toh(ack_.request_id)
+                              << ", bytes=" << le64toh(ack_.transferred_bytes);
+                }
+
+                const auto magic = le32toh(ack_.magic);
+                const auto version = le16toh(ack_.version);
+                const auto status = le16toh(ack_.status);
+                const auto request_id = le64toh(ack_.request_id);
+                const auto transferred_bytes = le64toh(ack_.transferred_bytes);
+                const auto expected_request_id = le64toh(header_.request_id);
+
+                if (magic != kTcpSessionAckMagic ||
+                    version != kTcpSessionProtocolVersion ||
+                    request_id != expected_request_id ||
+                    status !=
+                        static_cast<uint16_t>(TransferStatusEnum::COMPLETED) ||
+                    transferred_bytes != le64toh(header_.size)) {
+                    LOG(ERROR)
+                        << "ClientSession::readAck received invalid ACK"
+                        << ", magic=" << magic << ", version=" << version
+                        << ", status=" << status
+                        << ", request_id=" << request_id
+                        << ", expected_request_id=" << expected_request_id
+                        << ", transferred_bytes=" << transferred_bytes
+                        << ", expected_bytes=" << le64toh(header_.size);
+                    finish(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+
+                finish(TransferStatusEnum::COMPLETED, true);
+            });
+    }
+
     void writeHeader() {
         auto self(shared_from_this());
         asio::async_write(
@@ -340,15 +585,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << "ClientSession::writeHeader failed. Error: "
                         << ec.message() << " (value: " << ec.value() << ")"
                         << ", bytes written: " << len;
-                    asio::post(
-                        socket_->get_executor(),
-                        [this, self, on_finalize = std::move(on_finalize_),
-                         on_complete = std::move(on_complete_)]() {
-                            if (on_finalize)
-                                on_finalize(TransferStatusEnum::FAILED);
-                            session_mutex_.unlock();
-                            if (on_complete) on_complete();
-                        });
+                    finish(TransferStatusEnum::FAILED, false);
                     return;
                 }
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
@@ -366,14 +603,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            asio::post(socket_->get_executor(),
-                       [this, self, on_finalize = std::move(on_finalize_),
-                        on_complete = std::move(on_complete_)]() {
-                           if (on_finalize)
-                               on_finalize(TransferStatusEnum::COMPLETED);
-                           session_mutex_.unlock();
-                           if (on_complete) on_complete();
-                       });
+            finish(TransferStatusEnum::COMPLETED, true);
             return;
         }
 
@@ -414,7 +644,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                                    if (cuda_device >= 0) delete[] dram_buffer;
 #endif
                                    session_mutex_.unlock();
-                                   if (on_complete) on_complete();
+                                   if (on_complete) on_complete(false);
                                });
                     return;
                 }
@@ -449,7 +679,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                                     on_finalize(TransferStatusEnum::FAILED);
                                 delete[] dram_buffer;
                                 session_mutex_.unlock();
-                                if (on_complete) on_complete();
+                                if (on_complete) on_complete(false);
                             });
                         return;
                     }
@@ -468,16 +698,16 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
+        if (tcpAckTraceEnabled()) {
+            LOG(INFO) << "ClientSession preparing TCP WRITE chunk"
+                      << ", request_id=" << le64toh(header_.request_id)
+                      << ", offset=" << total_transferred_bytes_
+                      << ", bytes=" << buffer_size;
+        }
         if (buffer_size == 0) {
-            // Post cleanup to ensure it runs after callback returns
-            asio::post(socket_->get_executor(),
-                       [this, self, on_finalize = std::move(on_finalize_),
-                        on_complete = std::move(on_complete_)]() {
-                           if (on_finalize)
-                               on_finalize(TransferStatusEnum::COMPLETED);
-                           session_mutex_.unlock();
-                           if (on_complete) on_complete();
-                       });
+            // Local socket completion is not remote completion. Wait for the
+            // receiver's ACK before publishing Slice::SUCCESS.
+            readAck();
             return;
         }
 
@@ -512,7 +742,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                                    on_finalize(TransferStatusEnum::FAILED);
                                delete[] dram_buffer;
                                session_mutex_.unlock();
-                               if (on_complete) on_complete();
+                               if (on_complete) on_complete(false);
                            });
                 return;
             }
@@ -542,9 +772,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             if (on_finalize)
                                 on_finalize(TransferStatusEnum::FAILED);
                             session_mutex_.unlock();
-                            if (on_complete) on_complete();
+                            if (on_complete) on_complete(false);
                         });
                     return;
+                }
+                if (tcpAckTraceEnabled()) {
+                    LOG(INFO) << "ClientSession completed TCP WRITE chunk"
+                              << ", request_id=" << le64toh(header_.request_id)
+                              << ", bytes=" << transferred_bytes;
                 }
                 total_transferred_bytes_ += transferred_bytes;
                 writeBody();
@@ -1042,6 +1277,15 @@ void TcpTransport::startTransfer(Slice* slice) {
         return;
     }
 
+    if (tcpAckTraceEnabled()) {
+        LOG(INFO) << "TcpTransport::startTransfer target="
+                  << meta_entry.ip_or_host_name << ":" << desc->tcp_data_port
+                  << ", source=" << static_cast<void*>(slice->source_addr)
+                  << ", target_address=0x" << std::hex << slice->tcp.dest_addr
+                  << std::dec << ", size=" << slice->length
+                  << ", opcode=" << static_cast<int>(slice->opcode);
+    }
+
     try {
         auto session = std::make_shared<ClientSession>(socket);
 
@@ -1056,11 +1300,16 @@ void TcpTransport::startTransfer(Slice* slice) {
         // disabled
         if (enable_connection_pool_) {
             session->on_complete_ = [this, host = meta_entry.ip_or_host_name,
-                                     port = desc->tcp_data_port, socket]() {
+                                     port = desc->tcp_data_port,
+                                     socket](bool reusable) {
+                if (!reusable && socket && socket->is_open()) {
+                    asio::error_code ec;
+                    socket->close(ec);
+                }
                 returnConnection(host, port, socket);
             };
         } else {
-            session->on_complete_ = [socket]() {
+            session->on_complete_ = [socket](bool) {
                 // Close connection immediately after transfer
                 if (socket && socket->is_open()) {
                     asio::error_code ec;
