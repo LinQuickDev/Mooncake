@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "ylt/coro_rpc/impl/coro_rpc_server.hpp"
+#include "embtable_perf.h"
 
 namespace embtable {
 
@@ -107,19 +108,35 @@ Status EmbTableClient::Insert(const std::vector<uint64_t>& keys,
 
 Status EmbTableClient::Find(const std::vector<uint64_t>& keys,
                             std::vector<StringView>& buffers) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RD_CLIENT_FIND_TOTAL,
+                            UbDiag::PerfLevel::SUB_SYSTEM);
+    point.Start();
     if (!embTable_) {
-        return Status::Error(ErrorCode::kInternal, "not initialized");
+        auto status =
+            Status::Error(ErrorCode::kInternal, "not initialized");
+        point.End(status.code());
+        return status;
     }
-    return embTable_->Find(keys, buffers);
+    auto status = embTable_->Find(keys, buffers);
+    point.End(status.IsOk() ? 0 : status.code());
+    return status;
 }
 
 Status EmbTableClient::Find(
     const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RD_CLIENT_FIND_TOTAL,
+                            UbDiag::PerfLevel::SUB_SYSTEM);
+    point.Start();
     if (!embTable_) {
-        return Status::Error(ErrorCode::kInternal, "not initialized");
+        auto status =
+            Status::Error(ErrorCode::kInternal, "not initialized");
+        point.End(status.code());
+        return status;
     }
-    return embTable_->Find(keys, buffers, bufferHandles);
+    auto status = embTable_->Find(keys, buffers, bufferHandles);
+    point.End(status.IsOk() ? 0 : status.code());
+    return status;
 }
 
 Status EmbTableClient::BuildIndex() {
@@ -199,9 +216,16 @@ Status EmbTableClient::Find(
     const std::string& tableName, const std::vector<uint64_t>& keys,
     std::vector<StringView>& buffers,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RD_CLIENT_FIND_TOTAL,
+                            UbDiag::PerfLevel::SUB_SYSTEM);
+    point.Start();
     std::shared_ptr<EmbTable> table;
     auto status = GetOrLoadTable(tableName, table);
-    return status.IsOk() ? table->Find(keys, buffers, bufferHandles) : status;
+    if (status.IsOk()) {
+        status = table->Find(keys, buffers, bufferHandles);
+    }
+    point.End(status.IsOk() ? 0 : status.code());
+    return status;
 }
 
 Status EmbTableClient::BuildIndex(const std::string& tableName) {

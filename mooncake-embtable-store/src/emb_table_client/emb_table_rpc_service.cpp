@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "emb_table_client/emb_table_client.h"
+#include "embtable_perf.h"
 
 namespace embtable {
 
@@ -148,7 +149,12 @@ EmbTableStatusResponse EmbTableRpcService::HandleInsert(
     }
     if (req.keys.empty()) return EmbTableStatusResponse{};
 
+    UbDiag::PerfPoint resolvePoint(PerfKey::EMB_RD_DUMMY_RPC_SHM_RESOLVE,
+                                   UbDiag::PerfLevel::MODULE);
+    resolvePoint.Start();
     auto mapping = ResolveSharedMemory(req.shmName);
+    resolvePoint.End(mapping ? 0
+                             : static_cast<int>(ErrorCode::kNotFound));
     if (!mapping ||
         !IsRangeValid(req.dataOffset, req.dataSize, mapping->size)) {
         return ToResponse(Status::Error(
@@ -165,12 +171,20 @@ EmbTableStatusResponse EmbTableRpcService::HandleInsert(
 
 EmbTableFindResponse EmbTableRpcService::HandleFind(
     const EmbTableFindRequest& req) {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_DUMMY_RPC_HANDLE_TOTAL,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    totalPoint.Start();
     EmbTableFindResponse response;
     TableMetaInfo info;
+    UbDiag::PerfPoint metaPoint(PerfKey::EMB_RD_DUMMY_RPC_META,
+                                UbDiag::PerfLevel::MODULE);
+    metaPoint.Start();
     auto infoStatus = client_.GetTableInfo(req.tableName, info);
+    metaPoint.End(infoStatus.IsOk() ? 0 : infoStatus.code());
     if (!infoStatus.IsOk()) {
         response.statusCode = infoStatus.code();
         response.errorMsg = infoStatus.msg();
+        totalPoint.End(response.statusCode);
         return response;
     }
     const uint64_t valueSize = info.dimSize;
@@ -181,27 +195,40 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
         req.targetCapacity < requiredSize) {
         response.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
         response.errorMsg = "Find shared memory capacity is insufficient";
+        totalPoint.End(response.statusCode);
         return response;
     }
-    if (req.keys.empty()) return response;
+    if (req.keys.empty()) {
+        totalPoint.End(0);
+        return response;
+    }
 
     auto mapping = ResolveSharedMemory(req.shmName);
     if (!mapping ||
         !IsRangeValid(req.targetOffset, requiredSize, mapping->size)) {
         response.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
         response.errorMsg = "Find shared memory range is invalid";
+        totalPoint.End(response.statusCode);
         return response;
     }
 
     std::vector<StringView> values;
     std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
+    UbDiag::PerfPoint findPoint(PerfKey::EMB_RD_DUMMY_RPC_CORE_FIND,
+                                UbDiag::PerfLevel::KEY_MODULE);
+    findPoint.Start();
     Status status = client_.Find(req.tableName, req.keys, values, handles);
+    findPoint.End(status.IsOk() ? 0 : status.code());
     if (!status.IsOk()) {
         response.statusCode = status.code();
         response.errorMsg = status.msg();
+        totalPoint.End(response.statusCode);
         return response;
     }
 
+    UbDiag::PerfPoint packPoint(PerfKey::EMB_RD_DUMMY_RPC_SHM_PACK,
+                                UbDiag::PerfLevel::MODULE);
+    packPoint.Start();
     char* target = static_cast<char*>(mapping->base) + req.targetOffset;
     for (size_t i = 0; i < req.keys.size(); ++i) {
         char* entry = target + i * entrySize;
@@ -214,7 +241,9 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
             std::memset(entry + 1, 0, valueSize);
         }
     }
+    packPoint.End(0);
     response.transferredSize = requiredSize;
+    totalPoint.End(0);
     return response;
 }
 

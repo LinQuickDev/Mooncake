@@ -9,6 +9,8 @@
 #include <limits>
 #include <unordered_map>
 
+#include "embtable_perf.h"
+
 namespace embtable {
 
 EmbTable::EmbTable(const std::string& tableName, uint32_t numBuckets,
@@ -157,22 +159,33 @@ Status EmbTable::Insert(const std::vector<uint64_t>& keys,
 Status EmbTable::Find(
     const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_TABLE_FIND_TOTAL,
+                                 UbDiag::PerfLevel::SUB_SYSTEM);
+    totalPoint.Start();
+    auto finish = [&totalPoint](Status status) {
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
+    };
     std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
     if (dropped_.load(std::memory_order_acquire)) {
-        return Status::Error(ErrorCode::kNotFound,
-                             "table has been deleted: " + tableName_);
+        return finish(Status::Error(ErrorCode::kNotFound,
+                                    "table has been deleted: " + tableName_));
     }
     buffers.clear();
     buffers.resize(keys.size());
     bufferHandles.clear();
-    if (keys.empty()) return Status::OK();
+    if (keys.empty()) return finish(Status::OK());
 
     // Step 1: Group keys by target bucket index.
+    UbDiag::PerfPoint routePoint(PerfKey::EMB_RD_TABLE_ROUTE,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    routePoint.Start();
     std::unordered_map<uint32_t, std::vector<size_t>> indexGroups;
     for (size_t i = 0; i < keys.size(); ++i) {
         uint32_t bidx = RouteToBucket(keys[i]);
         indexGroups[bidx].push_back(i);
     }
+    routePoint.End(0);
 
     // Step 2: For each bucket, resolve locality (local vs. remote node).
     // Group remote buckets by rpcEndpoint so we can batch RPC calls to the
@@ -189,19 +202,24 @@ Status EmbTable::Find(
     std::vector<std::pair<uint32_t, std::vector<size_t>>> localTasks;
     std::unordered_map<uint32_t, std::vector<uint64_t>> localKeys;
 
+    UbDiag::PerfPoint localityPoint(PerfKey::EMB_RD_TABLE_LOCALITY,
+                                    UbDiag::PerfLevel::KEY_MODULE);
+    localityPoint.Start();
     for (auto& [bidx, indices] : indexGroups) {
         // Force locality resolution on the bucket.
         auto& bucket = buckets_[bidx];
         auto s = bucket->Flush();  // ensure pending data is flushed first
         if (!s.IsOk()) {
-            return s;
+            localityPoint.End(s.code());
+            return finish(s);
         }
 
         // Bucket owns locality resolution so routing and endpoint construction
         // are consistent across Find, Flush, and BuildIndex.
         auto localityStatus = bucket->ResolveLocality();
         if (!localityStatus.IsOk()) {
-            return localityStatus;
+            localityPoint.End(localityStatus.code());
+            return finish(localityStatus);
         }
         bool isLocal = bucket->IsLocal();
         std::string endpoint = bucket->RpcEndpoint();
@@ -215,23 +233,33 @@ Status EmbTable::Find(
             localKeys[bidx] = std::move(bkeys);
         } else {
             if (endpoint.empty()) {
-                return Status::Error(
+                auto status = Status::Error(
                     ErrorCode::kNotFound,
                     "remote bucket endpoint is empty: " + bucket->BucketKey());
+                localityPoint.End(status.code());
+                return finish(status);
             }
             remoteGroups[endpoint].push_back(
                 RemoteBucketTask{bidx, indices, std::move(bkeys)});
         }
     }
+    localityPoint.End(0);
 
     // Step 3: Execute local queries (direct ShareMapStore::QueryData).
     for (auto& [bidx, indices] : localTasks) {
         std::vector<StringView> bucketVals;
         std::vector<std::shared_ptr<mooncake::BufferHandle>> tmpHandles;
+        UbDiag::PerfPoint localPoint(PerfKey::EMB_RD_TABLE_LOCAL_QUERY,
+                                     UbDiag::PerfLevel::KEY_MODULE);
+        localPoint.Start();
         auto s = buckets_[bidx]->Find(localKeys[bidx], bucketVals, tmpHandles);
+        localPoint.End(s.IsOk() ? 0 : s.code());
         if (!s.IsOk()) {
-            return s;
+            return finish(s);
         }
+        UbDiag::PerfPoint mergePoint(PerfKey::EMB_RD_TABLE_MERGE,
+                                     UbDiag::PerfLevel::MODULE);
+        mergePoint.Start();
         for (size_t j = 0; j < indices.size() && j < bucketVals.size(); ++j) {
             buffers[indices[j]] = bucketVals[j];
         }
@@ -239,6 +267,7 @@ Status EmbTable::Find(
         bufferHandles.insert(bufferHandles.end(),
                              std::make_move_iterator(tmpHandles.begin()),
                              std::make_move_iterator(tmpHandles.end()));
+        mergePoint.End(0);
     }
 
     // Step 4: Execute remote queries grouped by endpoint. Each endpoint is
@@ -320,6 +349,9 @@ Status EmbTable::Find(
             }
             result.status = Status::OK();
         }
+        UbDiag::PerfPoint mergePoint(PerfKey::EMB_RD_TABLE_MERGE,
+                                     UbDiag::PerfLevel::MODULE);
+        mergePoint.Start();
         for (size_t t = 0;
              t < result.tasks.size() && t < result.buffersPerBucket.size();
              ++t) {
@@ -333,27 +365,42 @@ Status EmbTable::Find(
         bufferHandles.insert(bufferHandles.end(),
                              std::make_move_iterator(result.handles.begin()),
                              std::make_move_iterator(result.handles.end()));
+        mergePoint.End(0);
         return Status::OK();
     };
 
-    if (remoteGroups.size() == 1) {
-        auto it = remoteGroups.begin();
-        auto s = mergeRemote(queryRemote(it->first, std::move(it->second)));
-        if (!s.IsOk()) return s;
-    } else if (!remoteGroups.empty()) {
-        std::vector<std::future<RemoteQueryResult>> futures;
-        futures.reserve(remoteGroups.size());
-        for (auto& [endpoint, tasks] : remoteGroups) {
-            futures.emplace_back(std::async(std::launch::async, queryRemote,
-                                            endpoint, std::move(tasks)));
+    if (!remoteGroups.empty()) {
+        UbDiag::PerfPoint remotePoint(PerfKey::EMB_RD_TABLE_REMOTE_QUERY,
+                                      UbDiag::PerfLevel::KEY_MODULE);
+        remotePoint.Start();
+        if (remoteGroups.size() == 1) {
+            auto it = remoteGroups.begin();
+            auto s =
+                mergeRemote(queryRemote(it->first, std::move(it->second)));
+            if (!s.IsOk()) {
+                remotePoint.End(s.code());
+                return finish(s);
+            }
+        } else {
+            std::vector<std::future<RemoteQueryResult>> futures;
+            futures.reserve(remoteGroups.size());
+            for (auto& [endpoint, tasks] : remoteGroups) {
+                futures.emplace_back(std::async(std::launch::async,
+                                                queryRemote, endpoint,
+                                                std::move(tasks)));
+            }
+            for (auto& future : futures) {
+                auto s = mergeRemote(future.get());
+                if (!s.IsOk()) {
+                    remotePoint.End(s.code());
+                    return finish(s);
+                }
+            }
         }
-        for (auto& future : futures) {
-            auto s = mergeRemote(future.get());
-            if (!s.IsOk()) return s;
-        }
+        remotePoint.End(0);
     }
 
-    return Status::OK();
+    return finish(Status::OK());
 }
 
 Status EmbTable::Find(const std::vector<uint64_t>& keys,

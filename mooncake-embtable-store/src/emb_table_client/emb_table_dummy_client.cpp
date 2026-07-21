@@ -13,6 +13,8 @@
 
 #include <async_simple/coro/SyncAwait.h>
 
+#include "embtable_perf.h"
+
 namespace embtable {
 
 namespace {
@@ -222,24 +224,37 @@ Status EmbTableDummyClient::Insert(const std::vector<uint64_t>& keys,
 
 Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
                                  std::vector<StringView>& buffers) {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_DUMMY_FIND_TOTAL,
+                                 UbDiag::PerfLevel::SUB_SYSTEM);
+    totalPoint.Start();
+    auto finish = [&totalPoint](Status status) {
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
+    };
     buffers.clear();
     if (!rpcClient_ || !sharedMemoryRegistered_ || options_.tableName.empty()) {
-        return Status::Error(ErrorCode::kInternal, "not initialized");
+        return finish(
+            Status::Error(ErrorCode::kInternal, "not initialized"));
     }
-    if (keys.empty()) return Status::OK();
+    if (keys.empty()) return finish(Status::OK());
 
     // Release this thread's previous result before allocating its next slot.
     gFindBuffers.erase(this);
     uint64_t targetSize = 0;
     if (valueSize_ == std::numeric_limits<uint64_t>::max() ||
         !CheckedMultiply(keys.size(), valueSize_ + 1, targetSize)) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "Find result size overflow");
+        return finish(Status::Error(ErrorCode::kOutOfRange,
+                                    "Find result size overflow"));
     }
+    UbDiag::PerfPoint allocPoint(PerfKey::EMB_RD_DUMMY_SHM_ALLOC,
+                                 UbDiag::PerfLevel::MODULE);
+    allocPoint.Start();
     auto handle = AllocateSharedBuffer(targetSize);
+    allocPoint.End(handle ? 0
+                          : static_cast<int>(ErrorCode::kBufferFull));
     if (!handle) {
-        return Status::Error(ErrorCode::kBufferFull,
-                             "shared memory allocator exhausted");
+        return finish(Status::Error(ErrorCode::kBufferFull,
+                                    "shared memory allocator exhausted"));
     }
 
     EmbTableFindRequest request;
@@ -249,31 +264,49 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
     request.targetOffset = static_cast<uint64_t>(
         static_cast<char*>(handle->ptr()) - static_cast<char*>(shmBase_));
     request.targetCapacity = handle->size();
+    UbDiag::PerfPoint rpcPoint(PerfKey::EMB_RD_DUMMY_RPC_WAIT,
+                               UbDiag::PerfLevel::KEY_MODULE);
+    rpcPoint.Start();
     auto result = async_simple::coro::syncAwait(
         rpcClient_->call<&EmbTableRpcService::HandleFind>(request));
+    rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
-        return Status::Error(ErrorCode::kIOError,
-                             "Find RPC failed: " + result.error().msg);
+        return finish(Status::Error(
+            ErrorCode::kIOError,
+            "Find RPC failed: " + result.error().msg));
     }
     const auto& response = result.value();
     if (response.statusCode != 0) {
-        return Status::Error(static_cast<ErrorCode>(response.statusCode),
-                             "Find failed: " + response.errorMsg);
+        return finish(Status::Error(
+            static_cast<ErrorCode>(response.statusCode),
+            "Find failed: " + response.errorMsg));
     }
+    UbDiag::PerfPoint parsePoint(PerfKey::EMB_RD_DUMMY_SHM_PARSE,
+                                 UbDiag::PerfLevel::MODULE);
+    parsePoint.Start();
     if (response.transferredSize != targetSize ||
         response.transferredSize > handle->size() ||
         response.transferredSize % keys.size() != 0) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "invalid Find shared memory response size");
+        auto status = Status::Error(
+            ErrorCode::kOutOfRange,
+            "invalid Find shared memory response size");
+        parsePoint.End(status.code());
+        return finish(status);
     }
 
     const uint64_t entrySize = response.transferredSize / keys.size();
     if (entrySize <= 1) {
-        return Status::Error(ErrorCode::kInternal, "invalid Find entry size");
+        auto status =
+            Status::Error(ErrorCode::kInternal, "invalid Find entry size");
+        parsePoint.End(status.code());
+        return finish(status);
     }
     if (entrySize != valueSize_ + 1) {
-        return Status::Error(ErrorCode::kInternal,
-                             "Find entry size does not match table metadata");
+        auto status = Status::Error(
+            ErrorCode::kInternal,
+            "Find entry size does not match table metadata");
+        parsePoint.End(status.code());
+        return finish(status);
     }
     const char* data = static_cast<const char*>(handle->ptr());
     buffers.resize(keys.size());
@@ -283,8 +316,9 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
             buffers[i] = StringView(entry + 1, valueSize_);
         }
     }
+    parsePoint.End(0);
     gFindBuffers[this] = std::move(handle);
-    return Status::OK();
+    return finish(Status::OK());
 }
 
 Status EmbTableDummyClient::BuildIndex() {
