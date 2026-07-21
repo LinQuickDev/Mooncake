@@ -1,8 +1,10 @@
 #include "emb_table/emb_table_meta.h"
 
-#include <glog/logging.h>
-#include <span>
 #include <exception>
+#include <glog/logging.h>
+#include <random>
+#include <span>
+
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 
@@ -41,6 +43,41 @@ Status ValidateBucketMeta(const BucketInfo& info) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "invalid bucket metadata fields");
     }
+    return Status::OK();
+}
+
+Status ConfigurePreferredSegment(
+    const std::shared_ptr<mooncake::RealClient>& realClient,
+    mooncake::ReplicateConfig& config, const std::string& bucketKey) {
+    auto segments = realClient->get_all_segments();
+    if (!segments) {
+        LOG(ERROR) << "CreateBucketMeta failed to query registered segments"
+                   << ", bucket_key=" << bucketKey
+                   << ", error=" << mooncake::toString(segments.error());
+        return Status::Error(ErrorCode::kIOError,
+                             "failed to query registered segments");
+    }
+
+    std::vector<std::string> available;
+    available.reserve(segments.value().size());
+    for (const auto& segment : segments.value()) {
+        if (!segment.empty()) available.push_back(segment);
+    }
+    if (available.empty()) {
+        LOG(ERROR) << "CreateBucketMeta found no registered memory segments"
+                   << ", bucket_key=" << bucketKey;
+        return Status::Error(ErrorCode::kIOError,
+                             "no registered memory segments available");
+    }
+
+    thread_local std::mt19937 generator(std::random_device{}());
+    std::uniform_int_distribution<size_t> distribution(0, available.size() - 1);
+    const auto& selected = available[distribution(generator)];
+    config.preferred_segments = {selected};
+    LOG(INFO) << "CreateBucketMeta selected preferred segment"
+              << ", bucket_key=" << bucketKey
+              << ", selected_segment=" << selected
+              << ", registered_segment_count=" << available.size();
     return Status::OK();
 }
 }  // namespace
@@ -145,9 +182,16 @@ Status EmbTableMeta::DeleteTableMeta(const std::string& tableKey) {
 Status EmbTableMeta::CreateBucketMeta(const BucketInfo& info) {
     auto validation = ValidateBucketMeta(info);
     if (!validation.IsOk()) return validation;
+    if (!realClient_) {
+        return Status::Error(ErrorCode::kInternal,
+                             "RealClient is not initialized");
+    }
     std::string json;
     struct_json::to_json(info, json);
     mooncake::ReplicateConfig config;
+    auto segmentStatus =
+        ConfigurePreferredSegment(realClient_, config, info.bucketKey);
+    if (!segmentStatus.IsOk()) return segmentStatus;
     int ret = realClient_->put(bucketMetaKey(info.bucketKey),
                                std::span<const char>(json.data(), json.size()),
                                config);

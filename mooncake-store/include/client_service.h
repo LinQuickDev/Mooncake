@@ -601,6 +601,12 @@ class Client {
         return endpoints;
     }
 
+    // Get all memory segments currently registered in the cluster.
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments() {
+        return master_client_.GetAllSegments();
+    }
+
     /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise

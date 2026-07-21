@@ -386,6 +386,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
     GetAllNoFSegments();
 
+    // Gets all currently registered memory segment names in the cluster.
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments();
+
     /**
      * @brief Gets all mounted NoF segments that match a segment name together
      * with their owner client ids.

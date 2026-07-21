@@ -788,6 +788,14 @@ WrappedMasterService::GetAllNoFSegments() {
         [] {});
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::GetAllSegments() {
+    return execute_rpc(
+        "GetAllSegments", [&] { return master_service_.GetAllSegments(); },
+        [&](auto& timer) { timer.LogRequest("Get all memory segments"); },
+        [] {}, [] {});
+}
+
 tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
 WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
     return execute_rpc(
@@ -1251,6 +1259,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::UnmountNoFSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetAllSegments>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(

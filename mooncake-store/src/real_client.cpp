@@ -3073,6 +3073,14 @@ std::string RealClient::get_segment_endpoint() const {
     return client_ ? client_->GetSegmentEndpoint() : std::string();
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+RealClient::get_all_segments() {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->GetAllSegments();
+}
+
 int RealClient::subTransferTask(void *source, size_t size,
                                 const std::string &target_endpoint,
                                 uint64_t target_address) {

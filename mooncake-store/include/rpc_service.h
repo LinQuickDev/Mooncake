@@ -155,6 +155,9 @@ class WrappedMasterService {
     [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
     GetAllNoFSegments();
 
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments();
+
     [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
     GetNoFSegmentsByName(const std::string& segment_name);
 
