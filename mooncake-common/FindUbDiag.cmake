@@ -22,7 +22,7 @@ set(MOONCAKE_UBDIAG_GIT_REPOSITORY
     "https://github.com/LinQuickDev/ubdiag.git"
     CACHE STRING "ubdiag Git repository")
 set(MOONCAKE_UBDIAG_GIT_TAG
-    "705c6c37da45df2be4bc64c134dca0b7f30b2113"
+    "v0.5.1"
     CACHE STRING "ubdiag 版本(tag/branch/commit)")
 set(MOONCAKE_UBDIAG_SOURCE_DIR "" CACHE PATH "本地 ubdiag 源码目录(离线用,为空则 FetchContent)")
 
