@@ -5,15 +5,21 @@
 #include <unordered_set>
 #include <glog/logging.h>
 
+#include "embtable_perf.h"
+
 namespace embtable {
 
 QueryDataResponse ShareMapStoreRpcService::HandleQueryData(
     const QueryDataRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RD_STORE_RPC_HANDLE_QUERY,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     QueryDataResponse resp;
     if (req.bucketKey.empty() || req.valueSize == 0 ||
         req.targetEndpoint.empty() || req.targetAddress == 0) {
         resp.statusCode = static_cast<int32_t>(ErrorCode::kInvalidArgument);
         resp.errorMsg = "invalid query request";
+        point.End(resp.statusCode);
         return resp;
     }
     uint64_t entrySize = 0;
@@ -23,6 +29,7 @@ QueryDataResponse ShareMapStoreRpcService::HandleQueryData(
         expectedSize > req.targetCapacity) {
         resp.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
         resp.errorMsg = "query request size exceeds target capacity";
+        point.End(resp.statusCode);
         return resp;
     }
     Status s = store_.QueryDataToBuffer(req.bucketKey, req.keys, req.valueSize,
@@ -33,17 +40,25 @@ QueryDataResponse ShareMapStoreRpcService::HandleQueryData(
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
     }
+    point.End(resp.statusCode);
     return resp;
 }
 
 BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
     const BatchQueryDataRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RD_STORE_RPC_HANDLE_BATCH,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     BatchQueryDataResponse resp;
-    if (req.entries.empty()) return resp;
+    if (req.entries.empty()) {
+        point.End(0);
+        return resp;
+    }
     if (req.valueSize == 0 || req.targetEndpoint.empty() ||
         req.targetAddress == 0) {
         resp.statusCode = static_cast<int32_t>(ErrorCode::kInvalidArgument);
         resp.errorMsg = "invalid batch query request";
+        point.End(resp.statusCode);
         return resp;
     }
     std::unordered_set<std::string> bucketSet;
@@ -52,6 +67,7 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
             !bucketSet.insert(entry.bucketKey).second) {
             resp.statusCode = static_cast<int32_t>(ErrorCode::kInvalidArgument);
             resp.errorMsg = "duplicate or empty bucket key";
+            point.End(resp.statusCode);
             return resp;
         }
     }
@@ -75,12 +91,14 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
     if (!s.IsOk()) {
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
+        point.End(resp.statusCode);
         return resp;
     }
 
     if (foundFlagsPerBucket.size() != req.entries.size()) {
         resp.statusCode = static_cast<int32_t>(ErrorCode::kInternal);
         resp.errorMsg = "batch query returned mismatched bucket count";
+        point.End(resp.statusCode);
         return resp;
     }
     // Return one control response per bucket; all data already resides in the
@@ -94,6 +112,7 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
         }
         resp.responses.push_back(std::move(single));
     }
+    point.End(0);
     return resp;
 }
 

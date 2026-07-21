@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "embtable_perf.h"
+
 namespace embtable {
 
 ShareMap::ShareMap(const std::string& bucketKey, uint64_t valueSize,
@@ -121,10 +123,26 @@ Status ShareMap::linearLookup(const std::vector<uint64_t>& keys,
 
 Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
                         std::vector<StringView>& buffers) const {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_SHAREMAP_LOOKUP_TOTAL,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    totalPoint.Start();
+    UbDiag::PerfPoint lockPoint(PerfKey::EMB_RD_SHAREMAP_LOCK_WAIT,
+                                UbDiag::PerfLevel::MODULE);
+    lockPoint.Start();
     std::shared_lock<std::shared_mutex> lock(rwMutex_);
+    lockPoint.End(0);
     if (!published_.load(std::memory_order_acquire)) {
-        return linearLookup(keys, buffers);
+        UbDiag::PerfPoint linearPoint(PerfKey::EMB_RD_SHAREMAP_LINEAR,
+                                      UbDiag::PerfLevel::KEY_MODULE);
+        linearPoint.Start();
+        auto status = linearLookup(keys, buffers);
+        linearPoint.End(status.IsOk() ? 0 : status.code());
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
     }
+    UbDiag::PerfPoint phfPoint(PerfKey::EMB_RD_SHAREMAP_PHF,
+                               UbDiag::PerfLevel::KEY_MODULE);
+    phfPoint.Start();
     buffers.clear();
     buffers.resize(keys.size());
 
@@ -202,9 +220,14 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
     }
     if (firstError.load(std::memory_order_acquire) != 0) {
         std::lock_guard<std::mutex> errorLock(errorMutex);
-        return Status::Error(static_cast<ErrorCode>(firstError.load()),
-                             firstErrorMessage);
+        auto status = Status::Error(
+            static_cast<ErrorCode>(firstError.load()), firstErrorMessage);
+        phfPoint.End(status.code());
+        totalPoint.End(status.code());
+        return status;
     }
+    phfPoint.End(0);
+    totalPoint.End(0);
     return Status::OK();
 }
 
