@@ -34,14 +34,31 @@ endif()
 
 # ===== Layer 0: UBDIAG_DISABLE 模式(默认) =====
 if(NOT MOONCAKE_ENABLE_UBDIAG)
-  FetchContent_MakeAvailable(ubdiag)
+  # Populate the source tree only. FetchContent_MakeAvailable() would also add
+  # UbDiag's library, CLI, tests and examples to the Mooncake build.
+  FetchContent_GetProperties(ubdiag)
+  if(NOT ubdiag_POPULATED)
+    FetchContent_Populate(ubdiag)
+  endif()
 
-  # PerfPoint 变成 constexpr 空函数,编译器完全优化掉
-  add_compile_definitions(UBDIAG_DISABLE)
+  set(_MOONCAKE_UBDIAG_PERF_POINT_HEADER
+      "${ubdiag_SOURCE_DIR}/include/ubdiag/perf_point.h")
+  if(NOT EXISTS "${_MOONCAKE_UBDIAG_PERF_POINT_HEADER}")
+    message(FATAL_ERROR
+      "UbDiag ${MOONCAKE_UBDIAG_GIT_TAG} is missing include/ubdiag/perf_point.h")
+  endif()
+  file(STRINGS "${_MOONCAKE_UBDIAG_PERF_POINT_HEADER}"
+       _MOONCAKE_UBDIAG_DISABLE_LINES REGEX "UBDIAG_DISABLE")
+  if(NOT _MOONCAKE_UBDIAG_DISABLE_LINES)
+    message(FATAL_ERROR
+      "UbDiag ${MOONCAKE_UBDIAG_GIT_TAG} does not support UBDIAG_DISABLE. "
+      "Select an UbDiag release that contains the compile-time disabled PerfPoint implementation.")
+  endif()
 
-  # 提供头文件路径
+  # Consumers inherit both the source include path and the compile-time switch.
   add_library(ubdiag_mock INTERFACE)
   target_include_directories(ubdiag_mock INTERFACE ${ubdiag_SOURCE_DIR}/include)
+  target_compile_definitions(ubdiag_mock INTERFACE UBDIAG_DISABLE)
   add_library(UbDiag::ubdiag_lib ALIAS ubdiag_mock)
 
   set(MOONCAKE_UBDIAG_ACTIVE_LAYER "mock" CACHE STRING "" FORCE)
