@@ -59,6 +59,8 @@ class ShareMap {
    private:
     Status linearLookup(const std::vector<uint64_t>& keys,
                         std::vector<StringView>& buffers) const;
+    Status publishedLookup(const std::vector<uint64_t>& keys,
+                           std::vector<StringView>& buffers) const;
 
     std::string bucketKey_;
     uint64_t valueSize_;

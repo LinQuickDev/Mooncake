@@ -52,6 +52,10 @@ Status VectorObject::ensureShareObjects(uint64_t neededElements) {
 
 Status VectorObject::Reserve(uint64_t capacity) {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (sealed_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kIndexBuilt,
+                             "VectorObject is sealed");
+    }
     if (capacity != 0 && capacity < size_.load(std::memory_order_acquire)) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "capacity is smaller than current size");
@@ -66,6 +70,10 @@ Status VectorObject::Append(const void* data, size_t len, uint64_t& index) {
                              "Append len != elemSize");
     }
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (sealed_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kIndexBuilt,
+                             "VectorObject is sealed");
+    }
     uint64_t next = size_.load(std::memory_order_relaxed);
     if (next == std::numeric_limits<uint64_t>::max()) {
         return Status::Error(ErrorCode::kOutOfRange,
@@ -89,6 +97,24 @@ Status VectorObject::Append(const void* data, size_t len, uint64_t& index) {
 
 Status VectorObject::Get(uint64_t index, StringView& out) const {
     std::shared_lock<std::shared_mutex> lock(rwMutex_);
+    return getImpl(index, out);
+}
+
+Status VectorObject::Seal() {
+    std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    sealed_.store(true, std::memory_order_release);
+    return Status::OK();
+}
+
+Status VectorObject::GetSealed(uint64_t index, StringView& out) const {
+    if (!sealed_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kInternal,
+                             "VectorObject is not sealed");
+    }
+    return getImpl(index, out);
+}
+
+Status VectorObject::getImpl(uint64_t index, StringView& out) const {
     if (index >= size_.load(std::memory_order_acquire)) {
         return Status::Error(ErrorCode::kOutOfRange, "Get index out of range");
     }
@@ -151,6 +177,10 @@ Status VectorObject::PublishAll() {
 
 Status VectorObject::ImportAll(uint64_t dataNum) {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (sealed_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kIndexBuilt,
+                             "VectorObject is sealed");
+    }
     if (dataNum == 0) {
         shareObjects_.clear();
         size_.store(0, std::memory_order_release);

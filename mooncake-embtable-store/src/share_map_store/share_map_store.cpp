@@ -166,7 +166,17 @@ Status ShareMapStore::Import(const std::string& bucketKey) {
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, 1, sm);
     if (!s.IsOk()) return s;
-    return sm->Import();
+    s = sm->Import();
+    // Concurrent queries may miss the same bucket and race to import it. The
+    // first importer publishes the local ShareMap; later importers must not
+    // mutate that published instance, but can treat the completed import as
+    // success and continue with their lookup retry.
+    if (!s.IsOk() &&
+        s.code() == static_cast<int>(ErrorCode::kIndexBuilt) &&
+        sm->IsPublished()) {
+        return Status::OK();
+    }
+    return s;
 }
 
 std::shared_ptr<ShareMap> ShareMapStore::GetShareMap(

@@ -135,20 +135,42 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
     UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_SHAREMAP_LOOKUP_TOTAL,
                                  UbDiag::PerfLevel::KEY_MODULE);
     totalPoint.Start();
+
+    auto finish = [&totalPoint](Status status) {
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
+    };
+
+    // Published is an irreversible state. Once observed with acquire
+    // semantics, key/value/index storage is immutable and the outer ShareMap
+    // lock is no longer needed.
+    if (published_.load(std::memory_order_acquire)) {
+        return finish(publishedLookup(keys, buffers));
+    }
+
     UbDiag::PerfPoint lockPoint(PerfKey::EMB_RD_SHAREMAP_LOCK_WAIT,
                                 UbDiag::PerfLevel::MODULE);
     lockPoint.Start();
     std::shared_lock<std::shared_mutex> lock(rwMutex_);
     lockPoint.End(0);
+
+    // BuildIndex() or Import() may have completed while this thread waited
+    // for the shared lock.
     if (!published_.load(std::memory_order_acquire)) {
         UbDiag::PerfPoint linearPoint(PerfKey::EMB_RD_SHAREMAP_LINEAR,
                                       UbDiag::PerfLevel::KEY_MODULE);
         linearPoint.Start();
         auto status = linearLookup(keys, buffers);
         linearPoint.End(status.IsOk() ? 0 : status.code());
-        totalPoint.End(status.IsOk() ? 0 : status.code());
-        return status;
+        return finish(status);
     }
+
+    lock.unlock();
+    return finish(publishedLookup(keys, buffers));
+}
+
+Status ShareMap::publishedLookup(const std::vector<uint64_t>& keys,
+                                 std::vector<StringView>& buffers) const {
     UbDiag::PerfPoint phfPoint(PerfKey::EMB_RD_SHAREMAP_PHF,
                                UbDiag::PerfLevel::KEY_MODULE);
     phfPoint.Start();
@@ -185,7 +207,7 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
             return;
         }
         StringView storedKey;
-        s = keyVec_->Get(idx, storedKey);
+        s = keyVec_->GetSealed(idx, storedKey);
         if (!s.IsOk()) {
             recordError(s);
             return;
@@ -198,7 +220,7 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
             return;
         }
         StringView v;
-        s = valueVec_->Get(idx, v);
+        s = valueVec_->GetSealed(idx, v);
         if (!s.IsOk()) {
             recordError(s);
             return;
@@ -233,11 +255,9 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
         auto status = Status::Error(
             static_cast<ErrorCode>(firstError.load()), firstErrorMessage);
         phfPoint.End(status.code());
-        totalPoint.End(status.code());
         return status;
     }
     phfPoint.End(0);
-    totalPoint.End(0);
     return Status::OK();
 }
 
@@ -275,12 +295,20 @@ Status ShareMap::BuildIndex() {
     meta_->AddObjectInfo(idxInfo);
     s = meta_->Serialize();
     if (!s.IsOk()) return s;
+    s = keyVec_->Seal();
+    if (!s.IsOk()) return s;
+    s = valueVec_->Seal();
+    if (!s.IsOk()) return s;
     published_.store(true, std::memory_order_release);
     return Status::OK();
 }
 
 Status ShareMap::Import() {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (published_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kIndexBuilt,
+                             "ShareMap is already published");
+    }
     auto s = meta_->Deserialize();
     if (!s.IsOk()) return s;
     uint64_t realValueSize = meta_->GetValueSize();
@@ -329,6 +357,10 @@ Status ShareMap::Import() {
         return s;
     }
     size_.store(total, std::memory_order_release);
+    s = keyVec_->Seal();
+    if (!s.IsOk()) return s;
+    s = valueVec_->Seal();
+    if (!s.IsOk()) return s;
     published_.store(true, std::memory_order_release);
     return Status::OK();
 }
