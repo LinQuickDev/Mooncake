@@ -78,38 +78,46 @@ else()
     GIT_TAG ${MOONCAKE_UBDIAG_GIT_TAG})
 endif()
 
-set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(UBDIAG_BUILD_SHARED ON CACHE BOOL "" FORCE)
 set(ENABLE_PERCENTILE ON CACHE BOOL "" FORCE)
 set(ENABLE_PERFLOG ON CACHE BOOL "" FORCE)
 set(ENABLE_OB_MEMORY OFF CACHE BOOL "" FORCE)
 set(ENABLE_OB_CACHE OFF CACHE BOOL "" FORCE)
 set(ENABLE_MEMPOINT OFF CACHE BOOL "" FORCE)
+set(UBDIAG_ENABLE_CACHEPOINT OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(ubdiag)
+function(_mooncake_make_ubdiag_available)
+  # UbDiag still exposes generic BUILD_* options. Keep the overrides inside a
+  # function scope so Mooncake's own BUILD_EXAMPLES value is not changed.
+  set(BUILD_TESTS OFF)
+  set(BUILD_EXAMPLES OFF)
+  FetchContent_MakeAvailable(ubdiag)
+  set(ubdiag_SOURCE_DIR "${ubdiag_SOURCE_DIR}" PARENT_SCOPE)
+endfunction()
+_mooncake_make_ubdiag_available()
 
-if(TARGET ubdiag_lib)
-  # UbDiag master still uses CMAKE_SOURCE_DIR internally. When consumed by
-  # FetchContent that variable points at Mooncake, so add the real source paths
-  # to every UbDiag target without modifying the mirrored upstream sources.
-  foreach(_MOONCAKE_UBDIAG_LIB_TARGET
-          ubdiag_logger ubdiag_lib ubdiag_runtime_lib ubdiag_manager_lib
-          ubdiag_bpf_loader)
-    if(TARGET ${_MOONCAKE_UBDIAG_LIB_TARGET})
-      target_include_directories(${_MOONCAKE_UBDIAG_LIB_TARGET} PUBLIC
-        $<BUILD_INTERFACE:${ubdiag_SOURCE_DIR}/include>
-        $<BUILD_INTERFACE:${ubdiag_SOURCE_DIR}/src>)
-    endif()
-  endforeach()
-  if(TARGET ubdiag)
-    target_include_directories(ubdiag PRIVATE
-      ${ubdiag_SOURCE_DIR}/include
-      ${ubdiag_SOURCE_DIR}/src
-      ${ubdiag_SOURCE_DIR}/src/cli)
-  endif()
-
-  add_library(UbDiag::ubdiag_lib ALIAS ubdiag_lib)
-  set(MOONCAKE_UBDIAG_ACTIVE_LAYER "vendored" CACHE STRING "" FORCE)
-  message(STATUS "UbDiag: FetchContent 编译 ${MOONCAKE_UBDIAG_GIT_TAG}(库+CLI)")
+if(NOT TARGET ubdiag_lib OR NOT TARGET ubdiag)
+  message(FATAL_ERROR
+    "UbDiag ${MOONCAKE_UBDIAG_GIT_TAG} did not create both ubdiag_lib and CLI targets")
 endif()
+
+# UbDiag master still uses CMAKE_SOURCE_DIR internally. When consumed by
+# FetchContent that variable points at Mooncake, so add the real source paths
+# to every UbDiag target without modifying the mirrored upstream sources.
+foreach(_MOONCAKE_UBDIAG_LIB_TARGET
+        ubdiag_logger ubdiag_lib ubdiag_runtime_lib ubdiag_manager_lib
+        ubdiag_bpf_loader)
+  if(TARGET ${_MOONCAKE_UBDIAG_LIB_TARGET})
+    target_include_directories(${_MOONCAKE_UBDIAG_LIB_TARGET} PUBLIC
+      $<BUILD_INTERFACE:${ubdiag_SOURCE_DIR}/include>
+      $<BUILD_INTERFACE:${ubdiag_SOURCE_DIR}/src>)
+  endif()
+endforeach()
+target_include_directories(ubdiag PRIVATE
+  ${ubdiag_SOURCE_DIR}/include
+  ${ubdiag_SOURCE_DIR}/src
+  ${ubdiag_SOURCE_DIR}/src/cli)
+
+add_library(UbDiag::ubdiag_lib ALIAS ubdiag_lib)
+set(MOONCAKE_UBDIAG_ACTIVE_LAYER "vendored" CACHE STRING "" FORCE)
+message(STATUS "UbDiag: FetchContent 编译 ${MOONCAKE_UBDIAG_GIT_TAG}(库+CLI)")
