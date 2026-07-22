@@ -95,7 +95,8 @@ Status ShareMapStore::getOrCreateShareMap(const std::string& bucketKey,
             "ShareMap not found and valueSize==0: " + bucketKey);
     }
     auto sm = std::make_shared<ShareMap>(bucketKey, valueSize, realClient_,
-                                         config_.shareObjectSize);
+                                         config_.shareObjectSize,
+                                         config_.phfLookupConcurrency);
     shareMaps_.emplace(bucketKey, sm);
     out = sm;
     return Status::OK();

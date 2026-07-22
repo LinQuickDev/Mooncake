@@ -15,8 +15,11 @@ namespace embtable {
 
 ShareMap::ShareMap(const std::string& bucketKey, uint64_t valueSize,
                    std::shared_ptr<mooncake::RealClient> realClient,
-                   uint64_t shareObjectSize)
-    : bucketKey_(bucketKey), valueSize_(valueSize), realClient_(realClient) {
+                   uint64_t shareObjectSize, uint32_t phfLookupConcurrency)
+    : bucketKey_(bucketKey),
+      valueSize_(valueSize),
+      realClient_(realClient),
+      phfLookupConcurrency_(std::max<uint32_t>(1, phfLookupConcurrency)) {
     if (valueSize_ == 0) valueSize_ = 1;
     keyVec_ = std::make_unique<VectorObject>(
         bucketKey + "_keys", sizeof(uint64_t), realClient_, shareObjectSize);
@@ -152,8 +155,6 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
     //   2. Read key at vecIndex from keyVec and memcmp against query key
     //   3. Only if matched, read value at vecIndex from valueVec
     static constexpr size_t kParallelThreshold = 128;
-    static constexpr size_t kParallelism = 4;
-
     std::atomic<int> firstError{0};
     std::string firstErrorMessage;
     std::mutex errorMutex;
@@ -199,16 +200,18 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
         buffers[i] = v;
     };
 
-    if (keys.size() <= kParallelThreshold) {
+    const size_t parallelism = std::min<size_t>(
+        keys.size(), static_cast<size_t>(phfLookupConcurrency_));
+    if (keys.size() <= kParallelThreshold || parallelism == 1) {
         for (size_t i = 0; i < keys.size(); ++i) lookupOne(i);
     } else {
         // Parallel lookup for large batches: partition keys into contiguous
         // chunks so each worker writes to a disjoint range of `buffers`.
         size_t total = keys.size();
-        size_t chunk = (total + kParallelism - 1) / kParallelism;
+        size_t chunk = (total + parallelism - 1) / parallelism;
         std::vector<std::thread> workers;
-        workers.reserve(kParallelism);
-        for (size_t w = 0; w < kParallelism; ++w) {
+        workers.reserve(parallelism);
+        for (size_t w = 0; w < parallelism; ++w) {
             size_t start = w * chunk;
             size_t end = std::min(start + chunk, total);
             if (start >= end) break;

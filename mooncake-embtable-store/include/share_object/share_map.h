@@ -28,7 +28,8 @@ class ShareMap {
    public:
     ShareMap(const std::string& bucketKey, uint64_t valueSize,
              std::shared_ptr<mooncake::RealClient> realClient,
-             uint64_t shareObjectSize = 64ull * 1024 * 1024);
+             uint64_t shareObjectSize = 64ull * 1024 * 1024,
+             uint32_t phfLookupConcurrency = 4);
 
     // Append key/value records. Fails after BuildIndex().
     Status Insert(const std::vector<uint64_t>& keys,
@@ -63,6 +64,7 @@ class ShareMap {
     std::unique_ptr<IndexObject> indexObj_;
     std::unique_ptr<ShareMapMeta> meta_;
     std::shared_ptr<mooncake::RealClient> realClient_;
+    uint32_t phfLookupConcurrency_;
     std::atomic<uint64_t> size_{0};
     std::atomic<bool> published_{false};
     std::atomic<bool> inconsistent_{false};
