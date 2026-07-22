@@ -1,0 +1,155 @@
+# Mooncake UbDiag 两层分发使用指南
+
+Mooncake 通过统一的 CMake 接口提供 UbDiag 两层分发能力。默认模式将
+PerfPoint 编译为空实现；启用模式从同一份 UbDiag 源码同步构建 SDK 动态库
+与命令行工具，供 Mooncake 性能采集与分析使用。
+
+## 1. 模式选择
+
+| 模式 | CMake 选项 | 适用场景 | 构建产物 |
+|------|------------|----------|----------|
+| Layer 0：禁用模式 | `MOONCAKE_ENABLE_UBDIAG=OFF`（默认） | 不需要性能采集，保持零运行时依赖 | 仅使用 UbDiag 头文件；不生成或链接 `libubdiag` |
+| Layer 1：启用模式 | `MOONCAKE_ENABLE_UBDIAG=ON` | 使用 PerfPoint、分位数、PerfLog 和 CSV 分析 Mooncake | 同步生成 `libubdiag.so` 与 `ubdiag` CLI |
+
+模式由编译期选项决定，不能在运行时切换。建议为两种模式使用独立构建目录。
+
+## 2. 默认禁用模式
+
+未指定 `MOONCAKE_ENABLE_UBDIAG` 时，Mooncake 默认使用 Layer 0：
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+也可以显式指定：
+
+```bash
+cmake -S . -B build -DMOONCAKE_ENABLE_UBDIAG=OFF
+cmake --build build -j
+```
+
+CMake 配置阶段应输出：
+
+```text
+UbDiag: UBDIAG_DISABLE(空函数,零依赖)
+```
+
+该模式使用 UbDiag `v0.5.1` 的同一份公共头文件，并通过
+`UBDIAG_DISABLE` 将 PerfPoint 编译为空函数。Mooncake 无需启动 UbDiag，
+也不需要安装 CLI 或动态库。可使用以下命令确认目标程序未链接 UbDiag：
+
+```bash
+ldd <mooncake-binary> | grep libubdiag
+```
+
+命令应无输出。
+
+## 3. 启用 UbDiag
+
+需要采集 Mooncake PerfPoint 数据时，使用独立目录重新配置并构建：
+
+```bash
+cmake -S . -B build-ubdiag -DMOONCAKE_ENABLE_UBDIAG=ON
+cmake --build build-ubdiag -j
+```
+
+CMake 配置阶段应输出：
+
+```text
+UbDiag: FetchContent 编译 v0.5.1(库+CLI)
+```
+
+默认构建目录下的关键产物为：
+
+```text
+build-ubdiag/_deps/ubdiag-build/src/sdk/libubdiag.so
+build-ubdiag/_deps/ubdiag-build/src/cli/ubdiag
+```
+
+运行前应使用本次构建生成的 CLI 和动态库：
+
+```bash
+export UBDIAG_BUILD="$PWD/build-ubdiag/_deps/ubdiag-build"
+export UBDIAG_CLI="$UBDIAG_BUILD/src/cli/ubdiag"
+export LD_LIBRARY_PATH="$UBDIAG_BUILD/src/sdk${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+不得混用系统中其他版本的 `ubdiag` CLI 或 `libubdiag.so`。CLI 与 SDK
+必须来自同一源码版本和同一次构建，以保证共享内存布局及功能开关一致。
+
+## 4. 采集与分析
+
+启动 UbDiag 共享内存，并启用 PerfLog：
+
+```bash
+"$UBDIAG_CLI" start --perflog
+"$UBDIAG_CLI" status
+```
+
+随后按 Mooncake 原有方式启动服务和业务负载。负载运行期间可执行：
+
+```bash
+"$UBDIAG_CLI" show
+"$UBDIAG_CLI" show --detail
+"$UBDIAG_CLI" show --perflog
+"$UBDIAG_CLI" watch --interval 1000
+"$UBDIAG_CLI" history -n 5
+```
+
+其中 `show` 输出聚合统计及 P99/P999/P9999，`show --detail` 输出按核数据，
+`show --perflog` 输出最近的单次探针记录。`watch` 使用 `Ctrl+C` 结束。
+
+将分析结果导出为 CSV：
+
+```bash
+mkdir -p ./ubdiag-results
+"$UBDIAG_CLI" show --csv ./ubdiag-results
+"$UBDIAG_CLI" show --detail --csv ./ubdiag-results
+"$UBDIAG_CLI" history --csv ./ubdiag-results
+```
+
+分析结束后销毁共享内存：
+
+```bash
+"$UBDIAG_CLI" stop
+```
+
+## 5. 离线源码
+
+构建环境无法访问 GitHub 时，预先准备精确版本的 UbDiag 源码，并通过
+`MOONCAKE_UBDIAG_SOURCE_DIR` 指定绝对路径：
+
+```bash
+git clone --branch v0.5.1 https://github.com/LinQuickDev/ubdiag.git /opt/src/ubdiag
+cmake -S . -B build-ubdiag \
+  -DMOONCAKE_ENABLE_UBDIAG=ON \
+  -DMOONCAKE_UBDIAG_SOURCE_DIR=/opt/src/ubdiag
+cmake --build build-ubdiag -j
+```
+
+`MOONCAKE_UBDIAG_SOURCE_DIR` 同样适用于默认禁用模式；将上述命令中的
+`MOONCAKE_ENABLE_UBDIAG` 改为 `OFF` 即可。两种模式均不会在已指定本地
+源码时访问 UbDiag 远端仓库。
+
+推荐校验源码版本：
+
+```bash
+git -C /opt/src/ubdiag rev-parse HEAD
+```
+
+预期提交为 `705c6c37da45df2be4bc64c134dca0b7f30b2113`。
+
+## 6. 验收标准
+
+| 检查项 | Layer 0 | Layer 1 |
+|--------|---------|---------|
+| Mooncake 可正常编译和运行 | 必须 | 必须 |
+| 目标程序链接 `libubdiag` | 否 | 是 |
+| 生成 `ubdiag` CLI | 否 | 是 |
+| `show` 返回 Mooncake PerfPoint 数据 | 不适用 | 必须 |
+| P99/P999/P9999、PerfLog、CSV | 不适用 | 必须 |
+
+若启用模式下 CLI 无数据，应依次确认共享内存已启动、Mooncake 使用的是
+`build-ubdiag` 产物、运行时加载的是同目录 `libubdiag.so`，以及业务负载已
+实际经过 Mooncake PerfPoint 打点路径。
