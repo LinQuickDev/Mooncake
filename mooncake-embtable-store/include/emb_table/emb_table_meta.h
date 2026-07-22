@@ -67,8 +67,23 @@ class EmbTableMeta {
     Status DeleteTableMeta(const std::string& tableKey);
 
     // Store BucketInfo in Mooncake Store under bucketKey + "_bucketmeta".
-    // Other nodes query this to find the rpcEndpoint of the owning node.
-    Status CreateBucketMeta(const BucketInfo& info);
+    // The RPC endpoint is selected from a deduplicated cluster-host list.
+    Status CreateBucketMeta(BucketInfo& info);
+
+    // Update bucket metadata after a routing endpoint changes.
+    Status UpdateBucketMeta(const BucketInfo& info);
+
+    // Select an available host from registered segments, excluding the host
+    // currently used by the bucket when possible.
+    Status SelectRandomRpcEndpoint(const std::string& currentEndpoint,
+                                   uint16_t rpcPort,
+                                   std::string& rpcEndpoint) const;
+
+    // Variant used by rerouting to exclude hosts that have already failed a
+    // connectivity probe during the current selection attempt.
+    Status SelectRandomRpcEndpoint(
+        const std::vector<std::string>& excludedEndpoints, uint16_t rpcPort,
+        std::string& rpcEndpoint) const;
 
     // Query BucketInfo from Mooncake Store.
     Status QueryBucketMeta(const std::string& bucketKey, BucketInfo& info);

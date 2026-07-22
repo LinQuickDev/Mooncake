@@ -23,8 +23,7 @@ namespace embtable {
 //
 // Find routing (design doc 4.3):
 //   1. Hash each key to determine its target bucket.
-//   2. Group (bucket, key) pairs by the owning node (resolved via bucket
-//      meta / Mooncake Client Query).
+//   2. Group (bucket, key) pairs by the persisted BucketInfo::rpcEndpoint.
 //   3. For local buckets, call ShareMapStore::QueryData directly.
 //   4. For remote buckets, call ShareMapStoreClient::QueryData via RPC; the
 //      RPC carries control metadata and the remote service uses TE to write

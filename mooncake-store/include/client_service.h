@@ -603,7 +603,7 @@ class Client {
 
     // Get all memory segments currently registered in the cluster.
     [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
-    GetAllSegments() {
+    get_all_segments() {
         return master_client_.GetAllSegments();
     }
 

@@ -63,6 +63,9 @@ class ShareMapStoreClient {
     Status BuildIndex(const std::string& rpcEndpoint,
                       const std::string& bucketKey);
 
+    // Establish or reuse a connection to an EmbTable RPC endpoint.
+    Status CheckEndpoint(const std::string& rpcEndpoint);
+
    private:
     struct RpcClientSlot {
         std::unique_ptr<coro_rpc::coro_rpc_client> client;

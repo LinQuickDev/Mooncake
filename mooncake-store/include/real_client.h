@@ -111,9 +111,6 @@ class RealClient : public PyClient {
     // openSegment(); it is intentionally not the TE RPC mapping endpoint.
     std::string get_segment_endpoint() const;
 
-    // Return all memory segments currently registered in the cluster.
-    tl::expected<std::vector<std::string>, ErrorCode> get_all_segments();
-
     // Submit a synchronous Transfer Engine WRITE from a registered local
     // buffer to a registered peer buffer.
     int subTransferTask(void *source, size_t size,

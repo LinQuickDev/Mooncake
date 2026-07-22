@@ -100,9 +100,6 @@ Status EmbTable::Init(bool createNew) {
             }
             bi = std::move(storedInfo);
         }
-        buckets_.push_back(std::make_shared<Bucket>(
-            bi, shareMapStore_, realClient_, shareMapStoreClient_,
-            localHostname_, shareMapStoreRpcPort_));
         if (createNew) {
             auto bs = meta_->CreateBucketMeta(bi);
             if (!bs.IsOk()) {
@@ -115,6 +112,9 @@ Status EmbTable::Init(bool createNew) {
             }
             createdBucketMetaKeys.push_back(bi.bucketKey);
         }
+        buckets_.push_back(std::make_shared<Bucket>(
+            bi, shareMapStore_, realClient_, shareMapStoreClient_,
+            localHostname_, shareMapStoreRpcPort_));
     }
     return Status::OK();
 }
@@ -296,7 +296,29 @@ Status EmbTable::Find(
         if (!result.status.IsOk()) {
             LOG(WARNING) << "Remote query failed for endpoint "
                          << result.endpoint << ": " << result.status.msg();
-            return result.status;
+            // A failed endpoint may be stale even when the bucket metadata
+            // object itself is readable. Re-route each affected bucket and
+            // retry once so one unavailable ShareMapStore node does not make
+            // the whole aggregated Find fail immediately.
+            result.buffersPerBucket.clear();
+            result.handles.clear();
+            result.buffersPerBucket.reserve(result.tasks.size());
+            for (const auto& task : result.tasks) {
+                auto& bucket = buckets_[task.bucketIdx];
+                auto rerouteStatus = bucket->Reroute(result.endpoint);
+                if (!rerouteStatus.IsOk()) {
+                    return result.status;
+                }
+                std::vector<StringView> bucketVals;
+                auto queryStatus = shareMapStoreClient_->QueryData(
+                    bucket->RpcEndpoint(), bucket->BucketKey(), valueSize_,
+                    task.keys, bucketVals, result.handles);
+                if (!queryStatus.IsOk()) {
+                    return queryStatus;
+                }
+                result.buffersPerBucket.push_back(std::move(bucketVals));
+            }
+            result.status = Status::OK();
         }
         for (size_t t = 0;
              t < result.tasks.size() && t < result.buffersPerBucket.size();

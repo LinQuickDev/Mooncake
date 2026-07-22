@@ -124,6 +124,19 @@ ShareMapStoreClient::AcquireClient(const std::string& rpcEndpoint) {
     return RpcClientLease(this, std::move(slot));
 }
 
+Status ShareMapStoreClient::CheckEndpoint(const std::string& rpcEndpoint) {
+    if (rpcEndpoint.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "empty ShareMapStore RPC endpoint");
+    }
+    auto rpcClient = AcquireClient(rpcEndpoint);
+    if (!rpcClient) {
+        return Status::Error(ErrorCode::kInternal,
+                             "RPC client connect failed: " + rpcEndpoint);
+    }
+    return Status::OK();
+}
+
 Status ShareMapStoreClient::ParseResultBuffer(
     void* data, uint64_t dataSize, uint64_t valueSize, size_t numKeys,
     std::vector<StringView>& buffers,

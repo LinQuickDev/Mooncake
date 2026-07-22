@@ -21,15 +21,15 @@ namespace embtable {
 // ShareMapStore for Publish / QueryData / BuildIndex.
 //
 // Node awareness:
-//   - On first Find/Flush/BuildIndex, the bucket determines whether its data
-//     is stored locally or on a remote node by querying bucket meta.
+//   - BucketInfo::rpcEndpoint is the authoritative ShareMapStore route.
+//   - On Find/Flush/BuildIndex, the bucket compares the endpoint host with the
+//     local host and probes remote endpoint connectivity.
 //   - If local, it calls the local ShareMapStore directly.
 //   - If remote, it uses ShareMapStoreClient to make RPC calls to the remote
 //     ShareMapStore service.
 class Bucket {
    public:
-    Bucket(BucketInfo info,
-           std::shared_ptr<ShareMapStore> shareMapStore,
+    Bucket(BucketInfo info, std::shared_ptr<ShareMapStore> shareMapStore,
            std::shared_ptr<mooncake::RealClient> realClient,
            std::shared_ptr<ShareMapStoreClient> shareMapStoreClient = nullptr,
            const std::string& localHostname = "",
@@ -39,8 +39,7 @@ class Bucket {
     // info_.valueSize bytes. Sets wouldFlush=true when the local buffer
     // reaches the configured capacity threshold (design doc 4.1.4).
     Status Insert(const std::vector<uint64_t>& keys,
-                  const std::vector<StringView>& values,
-                  bool& wouldFlush);
+                  const std::vector<StringView>& values, bool& wouldFlush);
 
     // Convenience overload (ignores wouldFlush signal).
     Status Insert(const std::vector<uint64_t>& keys,
@@ -54,10 +53,9 @@ class Bucket {
 
     // Query already-published data via ShareMapStore::QueryData.
     // Keeps bufferHandles alive so returned StringViews remain valid.
-    Status Find(const std::vector<uint64_t>& keys,
-                std::vector<StringView>& buffers,
-                std::vector<std::shared_ptr<mooncake::BufferHandle>>&
-                    bufferHandles);
+    Status Find(
+        const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
+        std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles);
 
     // Build the perfect-hash index for this bucket (flushes first).
     Status BuildIndex();
@@ -68,13 +66,17 @@ class Bucket {
     uint64_t FlushThreshold() const;
     void SetFlushThreshold(uint64_t threshold);
 
-    // Resolve the current owner from bucket-meta replica placement. This is
-    // intentionally re-evaluated so bucket relocation is observed.
+    // Resolve locality from the persisted RPC endpoint and verify remote
+    // connectivity. Mooncake replica transport endpoints are not routes.
     Status ResolveLocality();
 
     // Whether this bucket's data is stored locally on this node.
     bool IsLocal() const;
     std::string RpcEndpoint() const;
+
+    // Select another registered host after the current RPC endpoint becomes
+    // unavailable and persist the new route in bucket metadata.
+    Status Reroute(const std::string& failedEndpoint);
 
    private:
     void InvalidateLocality();
