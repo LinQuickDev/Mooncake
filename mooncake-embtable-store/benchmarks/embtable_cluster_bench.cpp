@@ -39,6 +39,9 @@ DEFINE_bool(embtable_create_table_if_missing, true,
 DEFINE_uint32(embtable_num_buckets, 16,
               "Bucket count used when creating a missing table");
 DEFINE_uint64(embtable_threads, 1, "Number of concurrent dummy clients");
+DEFINE_uint64(embtable_slow_rpc_threshold_us, 50000,
+              "Log correlated timing for Find RPCs at or above this latency; "
+              "0 disables slow-RPC logging");
 DEFINE_string(embtable_mode, "once", "Benchmark mode: once or continuous");
 DEFINE_uint64(embtable_iterations, 100000, "Total Find requests in once mode");
 DEFINE_uint64(embtable_duration_sec, 30,
@@ -158,6 +161,7 @@ embtable::EmbTableDummyClient::Options DummyOptions() {
     options.tableName = FLAGS_embtable_table_name;
     options.sharedMemorySize =
         mooncake::string_to_byte_size(FLAGS_embtable_shared_memory_size);
+    options.slowRpcThresholdUs = FLAGS_embtable_slow_rpc_threshold_us;
     return options;
 }
 

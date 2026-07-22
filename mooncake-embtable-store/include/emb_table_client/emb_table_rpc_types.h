@@ -50,21 +50,26 @@ struct EmbTableInsertRequest {
 YLT_REFL(EmbTableInsertRequest, tableName, keys, shmName, dataOffset, dataSize);
 
 struct EmbTableFindRequest {
+    uint64_t requestId = 0;
     std::string tableName;
     std::vector<uint64_t> keys;
     std::string shmName;
     uint64_t targetOffset = 0;
     uint64_t targetCapacity = 0;
 };
-YLT_REFL(EmbTableFindRequest, tableName, keys, shmName, targetOffset,
+YLT_REFL(EmbTableFindRequest, requestId, tableName, keys, shmName, targetOffset,
          targetCapacity);
 
 struct EmbTableFindResponse {
+    uint64_t requestId = 0;
+    uint64_t handlerEnterNs = 0;
+    uint64_t handlerExitNs = 0;
     int32_t statusCode = 0;
     std::string errorMsg;
     uint64_t transferredSize = 0;
 };
-YLT_REFL(EmbTableFindResponse, statusCode, errorMsg, transferredSize);
+YLT_REFL(EmbTableFindResponse, requestId, handlerEnterNs, handlerExitNs,
+         statusCode, errorMsg, transferredSize);
 
 struct EmbTableBuildIndexRequest {
     std::string tableName;

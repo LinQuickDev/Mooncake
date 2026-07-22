@@ -1,6 +1,7 @@
 #include "emb_table_client/emb_table_dummy_client.h"
 
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -18,6 +19,21 @@
 namespace embtable {
 
 namespace {
+
+uint64_t MonotonicNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+uint64_t NextRequestId() {
+    static const uint64_t processPrefix =
+        (static_cast<uint64_t>(getpid()) << 32) ^ MonotonicNowNs();
+    static std::atomic<uint64_t> sequence{1};
+    return processPrefix +
+           sequence.fetch_add(1, std::memory_order_relaxed);
+}
 
 std::atomic<uint64_t> gSharedMemorySequence{0};
 
@@ -258,6 +274,7 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
     }
 
     EmbTableFindRequest request;
+    request.requestId = NextRequestId();
     request.tableName = options_.tableName;
     request.keys = keys;
     request.shmName = shmName_;
@@ -266,9 +283,11 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
     request.targetCapacity = handle->size();
     UbDiag::PerfPoint rpcPoint(PerfKey::EMB_RD_DUMMY_RPC_WAIT,
                                UbDiag::PerfLevel::KEY_MODULE);
+    const uint64_t clientStartNs = MonotonicNowNs();
     rpcPoint.Start();
     auto result = async_simple::coro::syncAwait(
         rpcClient_->call<&EmbTableRpcService::HandleFind>(request));
+    const uint64_t clientReturnNs = MonotonicNowNs();
     rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
         return finish(Status::Error(
@@ -276,6 +295,35 @@ Status EmbTableDummyClient::Find(const std::vector<uint64_t>& keys,
             "Find RPC failed: " + result.error().msg));
     }
     const auto& response = result.value();
+    if (response.requestId != request.requestId) {
+        return finish(Status::Error(ErrorCode::kInternal,
+                                    "Find RPC request ID mismatch"));
+    }
+    const uint64_t clientRpcNs = clientReturnNs - clientStartNs;
+    const bool validHandlerTimes =
+        response.handlerExitNs >= response.handlerEnterNs;
+    const uint64_t handlerNs =
+        validHandlerTimes
+            ? response.handlerExitNs - response.handlerEnterNs
+            : 0;
+    const uint64_t outsideHandlerNs =
+        validHandlerTimes && clientRpcNs >= handlerNs
+            ? clientRpcNs - handlerNs
+            : 0;
+    if (options_.slowRpcThresholdUs != 0 &&
+        clientRpcNs / 1000 >= options_.slowRpcThresholdUs) {
+        LOG(WARNING) << "embtable_dummy_rpc_slow"
+                     << " request_id=" << request.requestId
+                     << " client_start_ns=" << clientStartNs
+                     << " handler_enter_ns=" << response.handlerEnterNs
+                     << " handler_exit_ns=" << response.handlerExitNs
+                     << " client_return_ns=" << clientReturnNs
+                     << " client_rpc_us=" << clientRpcNs / 1000
+                     << " server_handler_us=" << handlerNs / 1000
+                     << " outside_handler_us=" << outsideHandlerNs / 1000
+                     << " key_count=" << keys.size()
+                     << " status=" << response.statusCode;
+    }
     if (response.statusCode != 0) {
         return finish(Status::Error(
             static_cast<ErrorCode>(response.statusCode),
