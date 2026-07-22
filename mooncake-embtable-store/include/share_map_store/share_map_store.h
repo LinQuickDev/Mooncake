@@ -37,7 +37,7 @@ struct DeploymentConfig {
     // Number of independently registered staging buffers available to
     // concurrent RPC handlers. A value of zero is treated as one.
     uint32_t transferBufferCount = 4;
-    // Maximum number of workers used for a large per-bucket PHF lookup.
+    // Number of persistent workers shared by all per-bucket PHF lookups.
     // A concurrency of zero is treated as one.
     uint32_t phfLookupConcurrency = 4;
     // Default per-bucket ShareObject size (design doc 8.2).
@@ -145,6 +145,7 @@ class ShareMapStore {
     DeploymentConfig config_;
     std::string localHostname_;
     std::shared_ptr<mooncake::RealClient> realClient_;
+    std::shared_ptr<PhfLookupThreadPool> phfLookupThreadPool_;
     std::unordered_map<std::string, std::shared_ptr<ShareMap>> shareMaps_;
     mutable std::mutex mutex_;
     std::vector<TransferBufferSlot> transferBuffers_;

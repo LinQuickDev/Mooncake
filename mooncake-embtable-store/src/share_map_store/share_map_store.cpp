@@ -25,6 +25,10 @@ ShareMapStore::~ShareMapStore() {
 
 Status ShareMapStore::Init() {
     if (initialized_) return Status::OK();
+    phfLookupThreadPool_ = std::make_shared<PhfLookupThreadPool>(
+        config_.phfLookupConcurrency);
+    LOG(INFO) << "PHF lookup thread pool started with "
+              << phfLookupThreadPool_->Size() << " workers";
     realClient_ = std::make_shared<mooncake::RealClient>();
     int ret = realClient_->setup_real(
         localHostname_, config_.metadataServer, config_.globalSegmentSize,
@@ -96,7 +100,8 @@ Status ShareMapStore::getOrCreateShareMap(const std::string& bucketKey,
     }
     auto sm = std::make_shared<ShareMap>(bucketKey, valueSize, realClient_,
                                          config_.shareObjectSize,
-                                         config_.phfLookupConcurrency);
+                                         config_.phfLookupConcurrency,
+                                         phfLookupThreadPool_);
     shareMaps_.emplace(bucketKey, sm);
     out = sm;
     return Status::OK();

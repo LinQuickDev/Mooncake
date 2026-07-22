@@ -29,7 +29,7 @@ DEFINE_uint32(embtable_rpc_threads, 4, "EmbTable RPC worker threads");
 DEFINE_string(embtable_transfer_buffer_size, "64 MB",
               "Registered RPC data-plane transfer buffer size");
 DEFINE_uint32(embtable_phf_lookup_concurrency, 4,
-              "Maximum key lookup workers used inside one bucket; "
+              "Persistent workers shared by all PHF bucket lookups; "
               "0 or 1 selects serial lookup");
 DEFINE_string(embtable_share_object_size, "64 MB", "Default ShareObject size");
 

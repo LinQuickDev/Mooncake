@@ -23,6 +23,7 @@ add_library(embtable_share_object OBJECT
     share_object/share_object.cpp
     share_object/vector_object.cpp
     share_object/index_object.cpp
+    share_object/phf_lookup_thread_pool.cpp
     share_object/share_map_meta.cpp
     share_object/share_map.cpp
 )

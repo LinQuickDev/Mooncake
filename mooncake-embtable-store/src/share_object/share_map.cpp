@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <thread>
+#include <future>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -15,11 +15,17 @@ namespace embtable {
 
 ShareMap::ShareMap(const std::string& bucketKey, uint64_t valueSize,
                    std::shared_ptr<mooncake::RealClient> realClient,
-                   uint64_t shareObjectSize, uint32_t phfLookupConcurrency)
+                   uint64_t shareObjectSize, uint32_t phfLookupConcurrency,
+                   std::shared_ptr<PhfLookupThreadPool> phfLookupThreadPool)
     : bucketKey_(bucketKey),
       valueSize_(valueSize),
       realClient_(realClient),
-      phfLookupConcurrency_(std::max<uint32_t>(1, phfLookupConcurrency)) {
+      phfLookupConcurrency_(std::max<uint32_t>(1, phfLookupConcurrency)),
+      phfLookupThreadPool_(std::move(phfLookupThreadPool)) {
+    if (!phfLookupThreadPool_) {
+        phfLookupThreadPool_ =
+            std::make_shared<PhfLookupThreadPool>(phfLookupConcurrency_);
+    }
     if (valueSize_ == 0) valueSize_ = 1;
     keyVec_ = std::make_unique<VectorObject>(
         bucketKey + "_keys", sizeof(uint64_t), realClient_, shareObjectSize);
@@ -209,17 +215,18 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
         // chunks so each worker writes to a disjoint range of `buffers`.
         size_t total = keys.size();
         size_t chunk = (total + parallelism - 1) / parallelism;
-        std::vector<std::thread> workers;
-        workers.reserve(parallelism);
+        std::vector<std::future<void>> futures;
+        futures.reserve(parallelism);
         for (size_t w = 0; w < parallelism; ++w) {
             size_t start = w * chunk;
             size_t end = std::min(start + chunk, total);
             if (start >= end) break;
-            workers.emplace_back([&, start, end]() {
-                for (size_t i = start; i < end; ++i) lookupOne(i);
-            });
+            futures.emplace_back(phfLookupThreadPool_->Submit(
+                [&, start, end]() {
+                    for (size_t i = start; i < end; ++i) lookupOne(i);
+                }));
         }
-        for (auto& t : workers) t.join();
+        for (auto& future : futures) future.get();
     }
     if (firstError.load(std::memory_order_acquire) != 0) {
         std::lock_guard<std::mutex> errorLock(errorMutex);
