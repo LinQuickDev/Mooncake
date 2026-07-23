@@ -67,16 +67,14 @@ class Bucket {
     void SetFlushThreshold(uint64_t threshold);
 
     // Resolve locality from the persisted RPC endpoint and verify remote
-    // connectivity. Mooncake replica transport endpoints are not routes.
-    Status ResolveLocality();
+    // connectivity. If requestError is a transport-level RPC error, select a
+    // reachable alternate host, persist the new endpoint, and update the
+    // in-memory route. Mooncake replica transport endpoints are not routes.
+    Status ResolveLocality(const Status* requestError = nullptr);
 
     // Whether this bucket's data is stored locally on this node.
     bool IsLocal() const;
     std::string RpcEndpoint() const;
-
-    // Select another registered host after the current RPC endpoint becomes
-    // unavailable and persist the new route in bucket metadata.
-    Status Reroute(const std::string& failedEndpoint);
 
    private:
     void InvalidateLocality();

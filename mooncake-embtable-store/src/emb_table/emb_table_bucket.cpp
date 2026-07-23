@@ -25,6 +25,8 @@ bool IsTerminalPublishError(const Status& status) {
            status.code() == static_cast<int>(ErrorCode::kNotSupported);
 }
 
+bool IsNetworkRpcError(const Status& status) { return status.IsNetworkError(); }
+
 }  // namespace
 
 Bucket::Bucket(BucketInfo info, std::shared_ptr<ShareMapStore> shareMapStore,
@@ -39,10 +41,14 @@ Bucket::Bucket(BucketInfo info, std::shared_ptr<ShareMapStore> shareMapStore,
       localHostname_(localHostname),
       shareMapStoreRpcPort_(shareMapStoreRpcPort) {}
 
-Status Bucket::ResolveLocality() {
+Status Bucket::ResolveLocality(const Status* requestError) {
+    const bool rerouteRequested =
+        requestError && IsNetworkRpcError(*requestError);
+    if (requestError && !rerouteRequested) return *requestError;
+
     std::unique_lock<std::mutex> localityLock(localityMutex_);
     const auto now = std::chrono::steady_clock::now();
-    if (localityResolved_ &&
+    if (!rerouteRequested && localityResolved_ &&
         now - localityResolvedAt_ < std::chrono::seconds(1)) {
         const auto endpoint = info_.rpcEndpoint;
         const bool local = isLocal_;
@@ -56,7 +62,9 @@ Status Bucket::ResolveLocality() {
                      << ", bucket_key=" << bucketKey_
                      << ", endpoint=" << endpoint
                      << ", error=" << endpointStatus.msg();
-        return Reroute(endpoint);
+        if (!IsNetworkRpcError(endpointStatus)) return endpointStatus;
+        // Fall through to the same endpoint selection path used after a
+        // failed request.
     }
 
     // rpcEndpoint is the only authoritative ShareMap owner route. The
@@ -81,16 +89,78 @@ Status Bucket::ResolveLocality() {
     const auto endpoint = info_.rpcEndpoint;
     const bool local = isLocal_;
     localityLock.unlock();
-    if (!local && !endpoint.empty() && shareMapStoreClient_) {
+    if (!local && !endpoint.empty() && shareMapStoreClient_ &&
+        !rerouteRequested) {
         auto endpointStatus = shareMapStoreClient_->CheckEndpoint(endpoint);
-        if (!endpointStatus.IsOk()) {
-            LOG(WARNING) << "Bucket RPC endpoint is unavailable"
-                         << ", bucket_key=" << bucketKey_
-                         << ", endpoint=" << endpoint
-                         << ", error=" << endpointStatus.msg();
-            return Reroute(endpoint);
-        }
+        if (endpointStatus.IsOk()) return Status::OK();
+        LOG(WARNING) << "Bucket RPC endpoint is unavailable"
+                     << ", bucket_key=" << bucketKey_
+                     << ", endpoint=" << endpoint
+                     << ", error=" << endpointStatus.msg();
+        if (!IsNetworkRpcError(endpointStatus)) return endpointStatus;
     }
+
+    if (local) return Status::OK();
+    if (!realClient_ || !shareMapStoreClient_ || shareMapStoreRpcPort_ == 0) {
+        return Status::Error(
+            ErrorCode::kInternal,
+            "cannot reroute bucket without RealClient and RPC client: " +
+                bucketKey_);
+    }
+
+    EmbTableMeta meta(realClient_);
+    std::string newEndpoint;
+    std::vector<std::string> excludedEndpoints{endpoint};
+    while (true) {
+        auto routeStatus = meta.SelectRandomRpcEndpoint(
+            excludedEndpoints, shareMapStoreRpcPort_, newEndpoint);
+        if (!routeStatus.IsOk()) {
+            LOG(ERROR) << "Bucket reroute failed to select endpoint"
+                       << ", bucket_key=" << bucketKey_
+                       << ", failed_endpoint=" << endpoint
+                       << ", error=" << routeStatus.msg();
+            return routeStatus;
+        }
+        auto endpointStatus = shareMapStoreClient_->CheckEndpoint(newEndpoint);
+        if (endpointStatus.IsOk()) break;
+        if (!IsNetworkRpcError(endpointStatus)) return endpointStatus;
+        LOG(WARNING) << "Selected reroute endpoint is unavailable"
+                     << ", bucket_key=" << bucketKey_
+                     << ", endpoint=" << newEndpoint
+                     << ", error=" << endpointStatus.msg();
+        excludedEndpoints.push_back(newEndpoint);
+    }
+
+    BucketInfo updated;
+    {
+        std::lock_guard<std::mutex> lock(localityMutex_);
+        updated = info_;
+    }
+    updated.rpcEndpoint = newEndpoint;
+    LOG(WARNING) << "Rerouting bucket"
+                 << ", bucket_key=" << bucketKey_
+                 << ", failed_endpoint=" << endpoint
+                 << ", new_endpoint=" << newEndpoint;
+    auto updateStatus = meta.UpdateBucketMeta(updated);
+    if (!updateStatus.IsOk()) {
+        LOG(ERROR) << "Bucket reroute failed to update metadata"
+                   << ", bucket_key=" << bucketKey_
+                   << ", new_endpoint=" << newEndpoint
+                   << ", error=" << updateStatus.msg();
+        return updateStatus;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(localityMutex_);
+        info_ = std::move(updated);
+        isLocal_ =
+            IsSameHost(ExtractHostname(info_.rpcEndpoint), localHostname_);
+        localityResolved_ = true;
+        localityResolvedAt_ = std::chrono::steady_clock::now();
+    }
+    LOG(INFO) << "Bucket reroute succeeded"
+              << ", bucket_key=" << bucketKey_
+              << ", rpc_endpoint=" << newEndpoint << ", is_local=" << IsLocal();
     return Status::OK();
 }
 
@@ -173,9 +243,8 @@ Status Bucket::Flush() {
         s = shareMapStoreClient_->Publish(endpoint, bucketKey_, valueSize, keys,
                                           views);
     }
-    if (!s.IsOk() && !local && !endpoint.empty()) {
-        InvalidateLocality();
-        auto rerouteStatus = Reroute(endpoint);
+    if (!s.IsOk() && !local && !endpoint.empty() && IsNetworkRpcError(s)) {
+        auto rerouteStatus = ResolveLocality(&s);
         if (rerouteStatus.IsOk()) {
             const auto reroutedEndpoint = RpcEndpoint();
             if (IsLocal()) {
@@ -227,9 +296,8 @@ Status Bucket::Find(
     // Remote query via RPC; the returned buffer is held by bufferHandles.
     s = shareMapStoreClient_->QueryData(endpoint, bucketKey_, Info().valueSize,
                                         keys, buffers, bufferHandles);
-    if (!s) {
-        InvalidateLocality();
-        auto rerouteStatus = Reroute(endpoint);
+    if (!s.IsOk() && IsNetworkRpcError(s)) {
+        auto rerouteStatus = ResolveLocality(&s);
         if (rerouteStatus.IsOk()) {
             if (IsLocal()) {
                 s = shareMapStore_->QueryData(bucketKey_, keys, buffers);
@@ -262,9 +330,8 @@ Status Bucket::BuildIndex() {
             "remote bucket requires ShareMapStoreClient: " + bucketKey_);
     }
     s = shareMapStoreClient_->BuildIndex(endpoint, bucketKey_);
-    if (!s.IsOk()) {
-        InvalidateLocality();
-        auto rerouteStatus = Reroute(endpoint);
+    if (!s.IsOk() && IsNetworkRpcError(s)) {
+        auto rerouteStatus = ResolveLocality(&s);
         if (rerouteStatus.IsOk()) {
             if (IsLocal()) {
                 s = shareMapStore_->BuildIndex(bucketKey_);
@@ -275,66 +342,6 @@ Status Bucket::BuildIndex() {
     }
     if (!s.IsOk()) InvalidateLocality();
     return s;
-}
-
-Status Bucket::Reroute(const std::string& failedEndpoint) {
-    if (!realClient_ || !shareMapStoreClient_ || shareMapStoreRpcPort_ == 0) {
-        return Status::Error(
-            ErrorCode::kInternal,
-            "cannot reroute bucket without RealClient and RPC client: " +
-                bucketKey_);
-    }
-
-    EmbTableMeta meta(realClient_);
-    std::string newEndpoint;
-    std::vector<std::string> excludedEndpoints{failedEndpoint};
-    Status routeStatus;
-    while (true) {
-        routeStatus = meta.SelectRandomRpcEndpoint(
-            excludedEndpoints, shareMapStoreRpcPort_, newEndpoint);
-        if (!routeStatus.IsOk()) {
-            LOG(ERROR) << "Bucket reroute failed to select endpoint"
-                       << ", bucket_key=" << bucketKey_
-                       << ", failed_endpoint=" << failedEndpoint
-                       << ", error=" << routeStatus.msg();
-            return routeStatus;
-        }
-        auto endpointStatus = shareMapStoreClient_->CheckEndpoint(newEndpoint);
-        if (endpointStatus.IsOk()) break;
-        LOG(WARNING) << "Selected reroute endpoint is unavailable"
-                     << ", bucket_key=" << bucketKey_
-                     << ", endpoint=" << newEndpoint
-                     << ", error=" << endpointStatus.msg();
-        excludedEndpoints.push_back(newEndpoint);
-    }
-
-    BucketInfo updated = Info();
-    updated.rpcEndpoint = newEndpoint;
-    LOG(WARNING) << "Rerouting bucket"
-                 << ", bucket_key=" << bucketKey_
-                 << ", failed_endpoint=" << failedEndpoint
-                 << ", new_endpoint=" << newEndpoint;
-    auto updateStatus = meta.UpdateBucketMeta(updated);
-    if (!updateStatus.IsOk()) {
-        LOG(ERROR) << "Bucket reroute failed to update metadata"
-                   << ", bucket_key=" << bucketKey_
-                   << ", new_endpoint=" << newEndpoint
-                   << ", error=" << updateStatus.msg();
-        return updateStatus;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(localityMutex_);
-        info_ = std::move(updated);
-        isLocal_ =
-            IsSameHost(ExtractHostname(info_.rpcEndpoint), localHostname_);
-        localityResolved_ = true;
-        localityResolvedAt_ = std::chrono::steady_clock::now();
-    }
-    LOG(INFO) << "Bucket reroute succeeded"
-              << ", bucket_key=" << bucketKey_
-              << ", rpc_endpoint=" << newEndpoint << ", is_local=" << IsLocal();
-    return Status::OK();
 }
 
 BucketInfo Bucket::Info() const {

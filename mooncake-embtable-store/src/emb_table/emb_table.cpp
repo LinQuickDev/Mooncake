@@ -305,7 +305,7 @@ Status EmbTable::Find(
             result.buffersPerBucket.reserve(result.tasks.size());
             for (const auto& task : result.tasks) {
                 auto& bucket = buckets_[task.bucketIdx];
-                auto rerouteStatus = bucket->Reroute(result.endpoint);
+                auto rerouteStatus = bucket->ResolveLocality(&result.status);
                 if (!rerouteStatus.IsOk()) {
                     return result.status;
                 }

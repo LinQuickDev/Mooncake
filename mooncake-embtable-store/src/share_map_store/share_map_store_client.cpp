@@ -1,5 +1,6 @@
 #include "share_map_store/share_map_store_client.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -7,6 +8,7 @@
 
 #include <async_simple/coro/SyncAwait.h>
 #include <glog/logging.h>
+#include <ylt/coro_rpc/impl/errno.h>
 
 namespace embtable {
 
@@ -22,6 +24,30 @@ Status FromRemoteStatus(int32_t statusCode, const std::string& operation,
     }
     return Status::Error(static_cast<ErrorCode>(statusCode),
                          operation + " failed: " + message);
+}
+
+bool IsNetworkRpcCode(coro_rpc::errc code) {
+    return code == coro_rpc::errc::io_error ||
+           code == coro_rpc::errc::not_connected ||
+           code == coro_rpc::errc::timed_out ||
+           code == coro_rpc::errc::open_error;
+}
+
+Status MakeRpcConnectionStatus(const std::string& rpcEndpoint,
+                               coro_rpc::errc code) {
+    const auto message =
+        "RPC client connect failed: " + rpcEndpoint +
+        ", error=" + std::string(coro_rpc::make_error_message(code));
+    if (IsNetworkRpcCode(code)) return Status::NetworkError(message);
+    return Status::Error(ErrorCode::kInternal, message);
+}
+
+Status MakeRpcCallStatus(const std::string& operation,
+                         const coro_rpc::rpc_error& error) {
+    const auto code = static_cast<coro_rpc::errc>(error.code);
+    const auto message = operation + ": " + error.msg;
+    if (IsNetworkRpcCode(code)) return Status::NetworkError(message);
+    return Status::Error(ErrorCode::kInternal, message);
 }
 
 }  // namespace
@@ -93,34 +119,66 @@ ShareMapStoreClient::RpcClientLease::~RpcClientLease() {
     if (owner_ && slot_) owner_->ReleaseClient(slot_);
 }
 
+void ShareMapStoreClient::RpcClientLease::Invalidate() {
+    if (owner_ && slot_) {
+        owner_->DiscardClient(slot_);
+        owner_ = nullptr;
+    }
+    slot_.reset();
+}
+
 void ShareMapStoreClient::ReleaseClient(
     const std::shared_ptr<RpcClientSlot>& slot) {
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (slot) slot->inUse = false;
 }
 
-std::optional<ShareMapStoreClient::RpcClientLease>
-ShareMapStoreClient::AcquireClient(const std::string& rpcEndpoint) {
+void ShareMapStoreClient::DiscardClient(
+    const std::shared_ptr<RpcClientSlot>& slot) {
+    if (!slot) return;
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    auto& slots = clientCache_[rpcEndpoint];
-    for (auto& slot : slots) {
-        if (!slot->inUse) {
-            slot->inUse = true;
-            return RpcClientLease(this, slot);
+    auto it = clientCache_.find(slot->endpoint);
+    if (it == clientCache_.end()) return;
+    auto& slots = it->second;
+    slots.erase(std::remove_if(slots.begin(), slots.end(),
+                               [&slot](const auto& candidate) {
+                                   return candidate == slot;
+                               }),
+                slots.end());
+    if (slots.empty()) clientCache_.erase(it);
+}
+
+std::optional<ShareMapStoreClient::RpcClientLease>
+ShareMapStoreClient::AcquireClient(const std::string& rpcEndpoint,
+                                   coro_rpc::errc* connectionError) {
+    if (connectionError) *connectionError = coro_rpc::errc::ok;
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    auto cacheIt = clientCache_.find(rpcEndpoint);
+    if (cacheIt != clientCache_.end()) {
+        for (auto& slot : cacheIt->second) {
+            if (!slot->inUse) {
+                slot->inUse = true;
+                return RpcClientLease(this, slot);
+            }
         }
     }
 
     auto slot = std::make_shared<RpcClientSlot>();
     slot->client = std::make_unique<coro_rpc::coro_rpc_client>();
+    slot->endpoint = rpcEndpoint;
     slot->inUse = true;
     // coro_rpc::err_code: operator bool() returns true on error.
     auto ec = async_simple::coro::syncAwait(slot->client->connect(rpcEndpoint));
     if (ec) {
+        if (connectionError) {
+            *connectionError = static_cast<coro_rpc::errc>(ec);
+        }
         LOG(ERROR) << "Failed to connect to ShareMapStore RPC endpoint: "
                    << rpcEndpoint << ", error: " << ec.message();
         return std::nullopt;
     }
-    slots.push_back(slot);
+    auto insertedIt = clientCache_.try_emplace(rpcEndpoint).first;
+    insertedIt->second.push_back(slot);
     return RpcClientLease(this, std::move(slot));
 }
 
@@ -129,10 +187,10 @@ Status ShareMapStoreClient::CheckEndpoint(const std::string& rpcEndpoint) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "empty ShareMapStore RPC endpoint");
     }
-    auto rpcClient = AcquireClient(rpcEndpoint);
+    coro_rpc::errc connectionError = coro_rpc::errc::ok;
+    auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
     if (!rpcClient) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC client connect failed: " + rpcEndpoint);
+        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
     }
     return Status::OK();
 }
@@ -280,10 +338,10 @@ Status ShareMapStoreClient::QueryData(
     buffers.clear();
     if (keys.empty()) return Status::OK();
 
-    auto rpcClient = AcquireClient(rpcEndpoint);
+    coro_rpc::errc connectionError = coro_rpc::errc::ok;
+    auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
     if (!rpcClient) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC client connect failed: " + rpcEndpoint);
+        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
     }
 
     QueryDataRequest req;
@@ -313,8 +371,8 @@ Status ShareMapStoreClient::QueryData(
     auto result = async_simple::coro::syncAwait(
         rpcClient->get()->call<&ShareMapStoreRpcService::HandleQueryData>(req));
     if (!result) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC call failed: " + result.error().msg);
+        rpcClient->Invalidate();
+        return MakeRpcCallStatus("RPC call failed", result.error());
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
@@ -377,10 +435,10 @@ Status ShareMapStoreClient::BatchQueryData(
         }
     }
 
-    auto rpcClient = AcquireClient(rpcEndpoint);
+    coro_rpc::errc connectionError = coro_rpc::errc::ok;
+    auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
     if (!rpcClient) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC client connect failed: " + rpcEndpoint);
+        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
     }
 
     BatchQueryDataRequest req;
@@ -406,8 +464,8 @@ Status ShareMapStoreClient::BatchQueryData(
         rpcClient->get()->call<&ShareMapStoreRpcService::HandleBatchQueryData>(
             req));
     if (!result) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC batch call failed: " + result.error().msg);
+        rpcClient->Invalidate();
+        return MakeRpcCallStatus("RPC batch call failed", result.error());
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
@@ -473,10 +531,10 @@ Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
         }
     }
 
-    auto rpcClient = AcquireClient(rpcEndpoint);
+    coro_rpc::errc connectionError = coro_rpc::errc::ok;
+    auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
     if (!rpcClient) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC client connect failed: " + rpcEndpoint);
+        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
     }
 
     PublishRequest req;
@@ -498,8 +556,8 @@ Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
     auto result = async_simple::coro::syncAwait(
         rpcClient->get()->call<&ShareMapStoreRpcService::HandlePublish>(req));
     if (!result) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC call failed: " + result.error().msg);
+        rpcClient->Invalidate();
+        return MakeRpcCallStatus("RPC call failed", result.error());
     }
     if (result.value().statusCode != 0) {
         return FromRemoteStatus(result.value().statusCode, "Remote publish",
@@ -510,10 +568,10 @@ Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
 
 Status ShareMapStoreClient::BuildIndex(const std::string& rpcEndpoint,
                                        const std::string& bucketKey) {
-    auto rpcClient = AcquireClient(rpcEndpoint);
+    coro_rpc::errc connectionError = coro_rpc::errc::ok;
+    auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
     if (!rpcClient) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC client connect failed: " + rpcEndpoint);
+        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
     }
 
     BuildIndexRequest req;
@@ -523,8 +581,8 @@ Status ShareMapStoreClient::BuildIndex(const std::string& rpcEndpoint,
         rpcClient->get()->call<&ShareMapStoreRpcService::HandleBuildIndex>(
             req));
     if (!result) {
-        return Status::Error(ErrorCode::kInternal,
-                             "RPC call failed: " + result.error().msg);
+        rpcClient->Invalidate();
+        return MakeRpcCallStatus("RPC call failed", result.error());
     }
     if (result.value().statusCode != 0) {
         return FromRemoteStatus(result.value().statusCode, "Remote build index",

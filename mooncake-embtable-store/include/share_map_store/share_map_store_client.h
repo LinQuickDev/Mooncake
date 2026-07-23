@@ -14,6 +14,7 @@
 #include "real_client.h"
 #include "client_buffer.hpp"
 #include "ylt/coro_rpc/impl/coro_rpc_client.hpp"
+#include "ylt/coro_rpc/impl/errno.h"
 
 namespace embtable {
 
@@ -69,6 +70,7 @@ class ShareMapStoreClient {
    private:
     struct RpcClientSlot {
         std::unique_ptr<coro_rpc::coro_rpc_client> client;
+        std::string endpoint;
         bool inUse = false;
     };
 
@@ -90,6 +92,10 @@ class ShareMapStoreClient {
             return slot_ ? slot_->client.get() : nullptr;
         }
 
+        // Drop a connection that failed at the transport layer instead of
+        // returning it to the idle connection pool.
+        void Invalidate();
+
        private:
         ShareMapStoreClient* owner_ = nullptr;
         std::shared_ptr<RpcClientSlot> slot_;
@@ -97,8 +103,11 @@ class ShareMapStoreClient {
 
     // Lease an exclusive coro_rpc_client for one in-flight request. The pool
     // grows with endpoint concurrency and reuses idle connections.
-    std::optional<RpcClientLease> AcquireClient(const std::string& rpcEndpoint);
+    std::optional<RpcClientLease> AcquireClient(
+        const std::string& rpcEndpoint,
+        coro_rpc::errc* connectionError = nullptr);
     void ReleaseClient(const std::shared_ptr<RpcClientSlot>& slot);
+    void DiscardClient(const std::shared_ptr<RpcClientSlot>& slot);
 
     // Parse a packed single-bucket result buffer (from get_buffer) into
     // StringViews. Layout: for each key [1B found flag][valueSize bytes data].

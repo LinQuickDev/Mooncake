@@ -18,7 +18,7 @@ enum class ErrorCode : int {
     kNotFound = 2,
     kAlreadyExists = 3,
     kIndexNotBuilt = 4,
-    kIndexBuilt = 5,        // ShareMap is read-only after BuildIndex
+    kIndexBuilt = 5,  // ShareMap is read-only after BuildIndex
     kInternal = 6,
     kIOError = 7,
     kBufferFull = 8,
@@ -59,10 +59,20 @@ class Status {
         return Status(code, std::move(msg));
     }
 
+    // Transport-level error returned by an RPC client. This remains encoded
+    // as kIOError for compatibility with the existing RPC status wire format,
+    // while callers can distinguish it from storage and application errors.
+    static Status NetworkError(std::string msg) {
+        Status status(ErrorCode::kIOError, std::move(msg));
+        status.networkError_ = true;
+        return status;
+    }
+
     bool IsOk() const { return code_ == 0; }
     bool IsError() const { return code_ != 0; }
     int code() const { return code_; }
     const std::string& msg() const { return msg_; }
+    bool IsNetworkError() const { return networkError_; }
 
     // Allow `if (status)` idiom.
     explicit operator bool() const { return IsOk(); }
@@ -70,6 +80,7 @@ class Status {
    private:
     int code_ = 0;
     std::string msg_;
+    bool networkError_ = false;
 };
 
 // Hash function selector (design doc section 8.4)
