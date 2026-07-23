@@ -344,15 +344,15 @@ Status EmbTableMeta::UpdateBucketMeta(const BucketInfo& info) {
               << ", replica_num=" << config.replica_num;
     std::string json;
     struct_json::to_json(info, json);
-    int ret = realClient_->put(bucketMetaKey(info.bucketKey),
-                               std::span<const char>(json.data(), json.size()),
-                               config);
+    int ret = realClient_->upsert(
+        bucketMetaKey(info.bucketKey),
+        std::span<const char>(json.data(), json.size()), config);
     if (ret != 0) {
         LOG(ERROR) << "UpdateBucketMeta failed"
                    << ", bucket_key=" << info.bucketKey << ", ret=" << ret;
         return Status::Error(
             ErrorCode::kIOError,
-            "put (update) failed for bucket meta: " + info.bucketKey);
+            "upsert (update) failed for bucket meta: " + info.bucketKey);
     }
     LOG(INFO) << "UpdateBucketMeta succeeded"
               << ", bucket_key=" << info.bucketKey
