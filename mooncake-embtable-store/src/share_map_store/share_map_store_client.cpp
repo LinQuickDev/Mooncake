@@ -396,7 +396,8 @@ Status ShareMapStoreClient::QueryData(
     rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
         rpcClient->Invalidate();
-        return finish(MakeRpcCallStatus("RPC call failed", result.error()));
+        return finish(
+            MakeRpcCallStatus("RPC call failed", result.error()));
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
