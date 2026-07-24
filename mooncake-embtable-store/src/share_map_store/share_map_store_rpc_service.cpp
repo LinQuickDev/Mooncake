@@ -3,6 +3,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 #include <glog/logging.h>
 
 #include "embtable_perf.h"
@@ -118,20 +119,27 @@ BatchQueryDataResponse ShareMapStoreRpcService::HandleBatchQueryData(
 
 PublishResponse ShareMapStoreRpcService::HandlePublish(
     const PublishRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_STORE_RPC_HANDLE_PUBLISH,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     PublishResponse resp;
+    auto finish = [&point](PublishResponse response) {
+        point.End(response.statusCode);
+        return response;
+    };
     if (req.bucketKey.empty() || req.valueSize == 0) {
         resp.statusCode = static_cast<int32_t>(ErrorCode::kInvalidArgument);
         resp.errorMsg = "invalid publish request";
-        return resp;
+        return finish(std::move(resp));
     }
     uint64_t expectedSize = 0;
     if (!CheckedMultiply(req.keys.size(), req.valueSize, expectedSize) ||
         expectedSize != req.valuesData.size()) {
         resp.statusCode = static_cast<int32_t>(ErrorCode::kInvalidArgument);
         resp.errorMsg = "publish valuesData size mismatch";
-        return resp;
+        return finish(std::move(resp));
     }
-    if (req.keys.empty()) return resp;
+    if (req.keys.empty()) return finish(std::move(resp));
 
     std::vector<StringView> values;
     values.reserve(req.keys.size());
@@ -142,7 +150,7 @@ PublishResponse ShareMapStoreRpcService::HandlePublish(
             !IsRangeValid(offset, req.valueSize, req.valuesData.size())) {
             resp.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
             resp.errorMsg = "publish value range is invalid";
-            return resp;
+            return finish(std::move(resp));
         }
         values.emplace_back(data + offset, req.valueSize);
     }
@@ -151,17 +159,21 @@ PublishResponse ShareMapStoreRpcService::HandlePublish(
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
     }
-    return resp;
+    return finish(std::move(resp));
 }
 
 BuildIndexResponse ShareMapStoreRpcService::HandleBuildIndex(
     const BuildIndexRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_STORE_RPC_HANDLE_BUILD,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     BuildIndexResponse resp;
     Status s = store_.BuildIndex(req.bucketKey);
     if (!s.IsOk()) {
         resp.statusCode = s.code();
         resp.errorMsg = s.msg();
     }
+    point.End(resp.statusCode);
     return resp;
 }
 

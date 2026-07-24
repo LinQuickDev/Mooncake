@@ -10,6 +10,14 @@ PERF_KEY_DEF(EMB_RD_DUMMY_RPC_META,          "EmbTableRpcService::HandleFind",  
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_SHM_RESOLVE,   "EmbTableRpcService::HandleFind",     "ResolveSharedMemory")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_CORE_FIND,     "EmbTableRpcService::HandleFind",     "CoreFind")
 PERF_KEY_DEF(EMB_RD_DUMMY_RPC_SHM_PACK,      "EmbTableRpcService::HandleFind",     "ShmResultPack")
+PERF_KEY_DEF(EMB_RPC_REGISTER_SHM_TOTAL,      "EmbTableRpcService",                 "HandleRegisterSharedMemory")
+PERF_KEY_DEF(EMB_RPC_UNREGISTER_SHM_TOTAL,    "EmbTableRpcService",                 "HandleUnregisterSharedMemory")
+PERF_KEY_DEF(EMB_RPC_GET_INFO_TOTAL,          "EmbTableRpcService",                 "HandleGetInfo")
+PERF_KEY_DEF(EMB_RPC_INSERT_TOTAL,            "EmbTableRpcService",                 "HandleInsert")
+PERF_KEY_DEF(EMB_RPC_BUILD_INDEX_TOTAL,       "EmbTableRpcService",                 "HandleBuildIndex")
+PERF_KEY_DEF(EMB_RPC_CREATE_TABLE_TOTAL,      "EmbTableRpcService",                 "HandleCreateTable")
+PERF_KEY_DEF(EMB_RPC_ALTER_TABLE_TOTAL,       "EmbTableRpcService",                 "HandleAlterTable")
+PERF_KEY_DEF(EMB_RPC_DELETE_TABLE_TOTAL,      "EmbTableRpcService",                 "HandleDeleteTable")
 
 PERF_KEY_DEF(EMB_RD_CLIENT_FIND_TOTAL,       "EmbTableClient::Find",               "FindTotal")
 PERF_KEY_DEF(EMB_RD_TABLE_FIND_TOTAL,        "EmbTable::Find",                     "FindTotal")
@@ -29,6 +37,8 @@ PERF_KEY_DEF(EMB_RD_REMOTE_PARSE,            "ShareMapStoreClient",             
 
 PERF_KEY_DEF(EMB_RD_STORE_RPC_HANDLE_QUERY,  "ShareMapStoreRpcService",            "HandleQuery")
 PERF_KEY_DEF(EMB_RD_STORE_RPC_HANDLE_BATCH,  "ShareMapStoreRpcService",            "HandleBatchQuery")
+PERF_KEY_DEF(EMB_STORE_RPC_HANDLE_PUBLISH,    "ShareMapStoreRpcService",            "HandlePublish")
+PERF_KEY_DEF(EMB_STORE_RPC_HANDLE_BUILD,      "ShareMapStoreRpcService",            "HandleBuildIndex")
 PERF_KEY_DEF(EMB_RD_STORE_QUERY_TOTAL,       "ShareMapStore::QueryData",           "QueryTotal")
 PERF_KEY_DEF(EMB_RD_STORE_GET_SHARE_MAP,     "ShareMapStore::QueryData",           "GetShareMap")
 PERF_KEY_DEF(EMB_RD_SERVER_QUERY_TOTAL,      "ShareMapStore::QueryDataToBuffer",   "QueryToBufferTotal")
