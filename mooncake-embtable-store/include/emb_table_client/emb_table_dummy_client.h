@@ -23,9 +23,6 @@ class EmbTableDummyClient {
         // a table name and initialize a shared-memory data plane.
         std::string tableName;
         uint64_t sharedMemorySize = 64ull * 1024 * 1024;
-        // Emit one structured warning for Find RPCs at or above this latency.
-        // Zero disables slow-RPC logging.
-        uint64_t slowRpcThresholdUs = 50'000;
     };
 
     explicit EmbTableDummyClient(Options options);
