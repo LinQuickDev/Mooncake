@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake_embtable_store VERSION 0.1.0 LANGUAGES CXX)
 
+find_package(UbDiag REQUIRED)
+
 # This module builds on top of the parent Mooncake project's mooncake_store
 # target (design doc section 8.9). It is added as a subdirectory of the
 # top-level Mooncake CMakeLists.txt, so global options (C++20, glog, yalantinglibs,

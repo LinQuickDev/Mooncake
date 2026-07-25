@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 #include <mutex>
 
+#include "client_service.h"
+#include "embtable_perf.h"
+#include "replica.h"
+
 namespace embtable {
 
 namespace {
@@ -279,19 +283,29 @@ Status Bucket::Flush() {
 Status Bucket::Find(
     const std::vector<uint64_t>& keys, std::vector<StringView>& buffers,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RD_BUCKET_FIND_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     auto s = ResolveLocality();
-    if (!s.IsOk()) return s;
+    if (!s.IsOk()) {
+        point.End(s.code());
+        return s;
+    }
 
     const bool local = IsLocal();
     const auto endpoint = RpcEndpoint();
     if (local) {
         // Local query: ShareMap returns StringViews into ShareObject memory.
-        return shareMapStore_->QueryData(bucketKey_, keys, buffers);
+        s = shareMapStore_->QueryData(bucketKey_, keys, buffers);
+        point.End(s.IsOk() ? 0 : s.code());
+        return s;
     }
     if (!shareMapStoreClient_) {
-        return Status::Error(
+        auto status = Status::Error(
             ErrorCode::kInternal,
             "remote bucket requires ShareMapStoreClient: " + bucketKey_);
+        point.End(status.code());
+        return status;
     }
     // Remote query via RPC; the returned buffer is held by bufferHandles.
     s = shareMapStoreClient_->QueryData(endpoint, bucketKey_, Info().valueSize,
@@ -309,6 +323,7 @@ Status Bucket::Find(
         }
     }
     if (!s.IsOk()) InvalidateLocality();
+    point.End(s.IsOk() ? 0 : s.code());
     return s;
 }
 

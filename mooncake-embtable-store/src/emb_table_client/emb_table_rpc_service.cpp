@@ -7,8 +7,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 #include "emb_table_client/emb_table_client.h"
+#include "embtable_perf.h"
 
 namespace embtable {
 
@@ -55,10 +57,17 @@ EmbTableRpcService::ResolveSharedMemory(const std::string& name) {
 
 EmbTableStatusResponse EmbTableRpcService::HandleRegisterSharedMemory(
     const RegisterEmbTableShmRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_REGISTER_SHM_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
+    auto finish = [&point](EmbTableStatusResponse response) {
+        point.End(response.statusCode);
+        return response;
+    };
     if (!IsValidShmName(req.shmName) || req.shmSize == 0 ||
         req.shmSize > std::numeric_limits<size_t>::max()) {
-        return ToResponse(Status::Error(ErrorCode::kInvalidArgument,
-                                        "invalid shared memory descriptor"));
+        return finish(ToResponse(Status::Error(
+            ErrorCode::kInvalidArgument, "invalid shared memory descriptor")));
     }
 
     {
@@ -66,35 +75,35 @@ EmbTableStatusResponse EmbTableRpcService::HandleRegisterSharedMemory(
         auto it = mappings_.find(req.shmName);
         if (it != mappings_.end()) {
             if (it->second->size == req.shmSize) {
-                return EmbTableStatusResponse{};
+                return finish(EmbTableStatusResponse{});
             }
-            return ToResponse(Status::Error(
+            return finish(ToResponse(Status::Error(
                 ErrorCode::kAlreadyExists,
-                "shared memory name already registered with another size"));
+                "shared memory name already registered with another size")));
         }
     }
 
     int fd = shm_open(req.shmName.c_str(), O_RDWR, 0);
     if (fd < 0) {
-        return ToResponse(Status::Error(
+        return finish(ToResponse(Status::Error(
             ErrorCode::kIOError,
-            "shm_open failed: " + std::string(std::strerror(errno))));
+            "shm_open failed: " + std::string(std::strerror(errno)))));
     }
     struct stat statBuffer{};
     if (fstat(fd, &statBuffer) != 0 || statBuffer.st_size < 0 ||
         static_cast<uint64_t>(statBuffer.st_size) < req.shmSize) {
         close(fd);
-        return ToResponse(Status::Error(
+        return finish(ToResponse(Status::Error(
             ErrorCode::kInvalidArgument,
-            "shared memory object is smaller than requested mapping"));
+            "shared memory object is smaller than requested mapping")));
     }
     void* base = mmap(nullptr, static_cast<size_t>(req.shmSize),
                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (base == MAP_FAILED) {
-        return ToResponse(
+        return finish(ToResponse(
             Status::Error(ErrorCode::kIOError,
-                          "mmap failed: " + std::string(std::strerror(errno))));
+                          "mmap failed: " + std::string(std::strerror(errno)))));
     }
 
     auto mapping = std::make_shared<SharedMemoryMapping>();
@@ -104,55 +113,79 @@ EmbTableStatusResponse EmbTableRpcService::HandleRegisterSharedMemory(
         std::lock_guard<std::mutex> lock(mappingsMutex_);
         auto [it, inserted] = mappings_.emplace(req.shmName, mapping);
         if (!inserted && it->second->size != req.shmSize) {
-            return ToResponse(
+            return finish(ToResponse(
                 Status::Error(ErrorCode::kAlreadyExists,
-                              "shared memory name concurrently registered"));
+                              "shared memory name concurrently registered")));
         }
     }
-    return EmbTableStatusResponse{};
+    return finish(EmbTableStatusResponse{});
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleUnregisterSharedMemory(
     const UnregisterEmbTableShmRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_UNREGISTER_SHM_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     std::lock_guard<std::mutex> lock(mappingsMutex_);
     mappings_.erase(req.shmName);
+    point.End(0);
     return EmbTableStatusResponse{};
 }
 
 EmbTableInfoResponse EmbTableRpcService::HandleGetInfo(
     const EmbTableInfoRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_GET_INFO_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
     EmbTableInfoResponse response;
+    auto finish = [&point](EmbTableInfoResponse result) {
+        point.End(result.statusCode);
+        return result;
+    };
     TableMetaInfo info;
     auto status = client_.GetTableInfo(req.tableName, info);
     if (!status.IsOk()) {
         response.statusCode = status.code();
         response.errorMsg = status.msg();
-        return response;
+        return finish(std::move(response));
     }
     response.valueSize = info.dimSize;
     response.numBuckets = static_cast<uint32_t>(info.bucketNum);
-    return response;
+    return finish(std::move(response));
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleInsert(
     const EmbTableInsertRequest& req) {
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_INSERT_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
+    auto finish = [&point](EmbTableStatusResponse response) {
+        point.End(response.statusCode);
+        return response;
+    };
     TableMetaInfo info;
     auto status = client_.GetTableInfo(req.tableName, info);
-    if (!status.IsOk()) return ToResponse(status);
+    if (!status.IsOk()) return finish(ToResponse(status));
     const uint64_t valueSize = info.dimSize;
     uint64_t expectedSize = 0;
     if (!CheckedMultiply(req.keys.size(), valueSize, expectedSize) ||
         req.dataSize != expectedSize) {
-        return ToResponse(Status::Error(ErrorCode::kInvalidArgument,
-                                        "invalid Insert shared memory size"));
+        return finish(ToResponse(Status::Error(
+            ErrorCode::kInvalidArgument, "invalid Insert shared memory size")));
     }
-    if (req.keys.empty()) return EmbTableStatusResponse{};
+    if (req.keys.empty()) return finish(EmbTableStatusResponse{});
 
+    UbDiag::PerfPoint resolvePoint(PerfKey::EMB_RD_DUMMY_RPC_SHM_RESOLVE,
+                                   UbDiag::PerfLevel::MODULE);
+    resolvePoint.Start();
     auto mapping = ResolveSharedMemory(req.shmName);
+    resolvePoint.End(mapping ? 0
+                             : static_cast<int>(ErrorCode::kNotFound));
     if (!mapping ||
         !IsRangeValid(req.dataOffset, req.dataSize, mapping->size)) {
-        return ToResponse(Status::Error(
-            ErrorCode::kOutOfRange, "Insert shared memory range is invalid"));
+        return finish(ToResponse(Status::Error(
+            ErrorCode::kOutOfRange,
+            "Insert shared memory range is invalid")));
     }
     const char* data = static_cast<const char*>(mapping->base) + req.dataOffset;
     std::vector<StringView> values;
@@ -160,17 +193,25 @@ EmbTableStatusResponse EmbTableRpcService::HandleInsert(
     for (size_t i = 0; i < req.keys.size(); ++i) {
         values.emplace_back(data + i * valueSize, valueSize);
     }
-    return ToResponse(client_.Insert(req.tableName, req.keys, values));
+    return finish(ToResponse(client_.Insert(req.tableName, req.keys, values)));
 }
 
 EmbTableFindResponse EmbTableRpcService::HandleFind(
     const EmbTableFindRequest& req) {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_DUMMY_RPC_HANDLE_TOTAL,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    totalPoint.Start();
     EmbTableFindResponse response;
     TableMetaInfo info;
+    UbDiag::PerfPoint metaPoint(PerfKey::EMB_RD_DUMMY_RPC_META,
+                                UbDiag::PerfLevel::MODULE);
+    metaPoint.Start();
     auto infoStatus = client_.GetTableInfo(req.tableName, info);
+    metaPoint.End(infoStatus.IsOk() ? 0 : infoStatus.code());
     if (!infoStatus.IsOk()) {
         response.statusCode = infoStatus.code();
         response.errorMsg = infoStatus.msg();
+        totalPoint.End(response.statusCode);
         return response;
     }
     const uint64_t valueSize = info.dimSize;
@@ -181,27 +222,45 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
         req.targetCapacity < requiredSize) {
         response.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
         response.errorMsg = "Find shared memory capacity is insufficient";
+        totalPoint.End(response.statusCode);
         return response;
     }
-    if (req.keys.empty()) return response;
+    if (req.keys.empty()) {
+        totalPoint.End(0);
+        return response;
+    }
 
+    UbDiag::PerfPoint resolvePoint(PerfKey::EMB_RD_DUMMY_RPC_SHM_RESOLVE,
+                                   UbDiag::PerfLevel::MODULE);
+    resolvePoint.Start();
     auto mapping = ResolveSharedMemory(req.shmName);
+    resolvePoint.End(mapping ? 0
+                             : static_cast<int>(ErrorCode::kNotFound));
     if (!mapping ||
         !IsRangeValid(req.targetOffset, requiredSize, mapping->size)) {
         response.statusCode = static_cast<int32_t>(ErrorCode::kOutOfRange);
         response.errorMsg = "Find shared memory range is invalid";
+        totalPoint.End(response.statusCode);
         return response;
     }
 
     std::vector<StringView> values;
     std::vector<std::shared_ptr<mooncake::BufferHandle>> handles;
+    UbDiag::PerfPoint findPoint(PerfKey::EMB_RD_DUMMY_RPC_CORE_FIND,
+                                UbDiag::PerfLevel::KEY_MODULE);
+    findPoint.Start();
     Status status = client_.Find(req.tableName, req.keys, values, handles);
+    findPoint.End(status.IsOk() ? 0 : status.code());
     if (!status.IsOk()) {
         response.statusCode = status.code();
         response.errorMsg = status.msg();
+        totalPoint.End(response.statusCode);
         return response;
     }
 
+    UbDiag::PerfPoint packPoint(PerfKey::EMB_RD_DUMMY_RPC_SHM_PACK,
+                                UbDiag::PerfLevel::MODULE);
+    packPoint.Start();
     char* target = static_cast<char*>(mapping->base) + req.targetOffset;
     for (size_t i = 0; i < req.keys.size(); ++i) {
         char* entry = target + i * entrySize;
@@ -214,30 +273,52 @@ EmbTableFindResponse EmbTableRpcService::HandleFind(
             std::memset(entry + 1, 0, valueSize);
         }
     }
+    packPoint.End(0);
     response.transferredSize = requiredSize;
+    totalPoint.End(0);
     return response;
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleBuildIndex(
     const EmbTableBuildIndexRequest& req) {
-    return ToResponse(client_.BuildIndex(req.tableName));
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_BUILD_INDEX_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
+    auto response = ToResponse(client_.BuildIndex(req.tableName));
+    point.End(response.statusCode);
+    return response;
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleCreateTable(
     const EmbTableCreateRequest& req) {
-    return ToResponse(
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_CREATE_TABLE_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
+    auto response = ToResponse(
         client_.CreateTable(req.tableName, req.numBuckets, req.valueSize));
+    point.End(response.statusCode);
+    return response;
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleAlterTable(
     const EmbTableAlterRequest& req) {
-    return ToResponse(
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_ALTER_TABLE_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
+    auto response = ToResponse(
         client_.AlterTable(req.tableName, req.numBuckets, req.valueSize));
+    point.End(response.statusCode);
+    return response;
 }
 
 EmbTableStatusResponse EmbTableRpcService::HandleDeleteTable(
     const EmbTableDeleteRequest& req) {
-    return ToResponse(client_.DeleteTable(req.tableName));
+    UbDiag::PerfPoint point(PerfKey::EMB_RPC_DELETE_TABLE_TOTAL,
+                            UbDiag::PerfLevel::KEY_MODULE);
+    point.Start();
+    auto response = ToResponse(client_.DeleteTable(req.tableName));
+    point.End(response.statusCode);
+    return response;
 }
 
 }  // namespace embtable

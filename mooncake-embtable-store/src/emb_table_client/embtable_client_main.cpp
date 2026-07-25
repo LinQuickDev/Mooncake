@@ -28,6 +28,9 @@ DEFINE_uint32(embtable_rpc_port, 50055,
 DEFINE_uint32(embtable_rpc_threads, 4, "EmbTable RPC worker threads");
 DEFINE_string(embtable_transfer_buffer_size, "64 MB",
               "Registered RPC data-plane transfer buffer size");
+DEFINE_uint32(embtable_phf_lookup_concurrency, 4,
+              "Persistent workers shared by all PHF bucket lookups; "
+              "0 or 1 selects serial lookup");
 DEFINE_string(embtable_share_object_size, "64 MB", "Default ShareObject size");
 
 int main(int argc, char* argv[]) {
@@ -58,6 +61,8 @@ int main(int argc, char* argv[]) {
     options.deployment.enableEmbTableRpc = true;
     options.deployment.transferBufferSize =
         mooncake::string_to_byte_size(FLAGS_embtable_transfer_buffer_size);
+    options.deployment.phfLookupConcurrency =
+        FLAGS_embtable_phf_lookup_concurrency;
     options.deployment.shareObjectSize =
         mooncake::string_to_byte_size(FLAGS_embtable_share_object_size);
 

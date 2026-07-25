@@ -36,6 +36,15 @@ class VectorObject {
     // buffer of the backing ShareObject; no copy).
     Status Get(uint64_t index, StringView& out) const;
 
+    // Permanently transition this vector to read-only state. Once sealed,
+    // mutating operations fail and GetSealed() may read without taking
+    // rwMutex_.
+    Status Seal();
+
+    // Lock-free read for a sealed vector. The returned StringView remains
+    // valid for the lifetime of this VectorObject.
+    Status GetSealed(uint64_t index, StringView& out) const;
+
     // Export all 8-byte keys into the provided vector (used by IndexObject
     // before Build). Only meaningful when elemSize_ == sizeof(uint64_t).
     Status ExportToVector(std::vector<uint64_t>& out) const;
@@ -59,12 +68,14 @@ class VectorObject {
     size_t CalculateShareObjectNum(uint64_t capacity) const;
     std::string GetShareObjectName(size_t idx) const;
     Status ensureShareObjects(uint64_t neededElements);
+    Status getImpl(uint64_t index, StringView& out) const;
 
     std::string key_;
     uint64_t elemSize_;                  // bytes per element (8-512)
     uint64_t shareObjectSize_;           // bytes per backing ShareObject
     std::atomic<uint64_t> capacity_{0};  // configured limit; 0 = unlimited
     std::atomic<uint64_t> size_{0};
+    std::atomic<bool> sealed_{false};
     std::vector<std::unique_ptr<ShareObject>> shareObjects_;
     mutable std::shared_mutex rwMutex_;
     std::shared_ptr<mooncake::RealClient> realClient_;

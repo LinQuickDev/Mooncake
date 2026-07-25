@@ -23,6 +23,7 @@ add_library(embtable_share_object OBJECT
     share_object/share_object.cpp
     share_object/vector_object.cpp
     share_object/index_object.cpp
+    share_object/phf_lookup_thread_pool.cpp
     share_object/share_map_meta.cpp
     share_object/share_map.cpp
 )
@@ -32,7 +33,8 @@ target_include_directories(embtable_share_object PUBLIC
     ${MOONCAKE_STORE_INCLUDE_DIRS}
     ${MOONCAKE_TE_INCLUDE_DIR}
 )
-target_link_libraries(embtable_share_object PUBLIC mooncake_store glog::glog)
+target_link_libraries(embtable_share_object PUBLIC
+    mooncake_store glog::glog UbDiag::ubdiag_lib)
 
 # ---- ShareMapStore layer (depends on ShareObject) ----
 add_library(embtable_share_map_store OBJECT
@@ -45,7 +47,8 @@ target_include_directories(embtable_share_map_store PUBLIC
     ${MOONCAKE_STORE_INCLUDE_DIRS}
     ${MOONCAKE_TE_INCLUDE_DIR}
 )
-target_link_libraries(embtable_share_map_store PUBLIC embtable_share_object)
+target_link_libraries(embtable_share_map_store PUBLIC
+    embtable_share_object UbDiag::ubdiag_lib)
 
 # ---- EmbTable layer (depends on ShareMapStore) ----
 add_library(embtable_emb_table OBJECT
@@ -58,7 +61,8 @@ target_include_directories(embtable_emb_table PUBLIC
     ${MOONCAKE_STORE_INCLUDE_DIRS}
     ${MOONCAKE_TE_INCLUDE_DIR}
 )
-target_link_libraries(embtable_emb_table PUBLIC embtable_share_map_store)
+target_link_libraries(embtable_emb_table PUBLIC
+    embtable_share_map_store UbDiag::ubdiag_lib)
 
 # ---- EmbTableClient layer (depends on EmbTable + ShareMapStore) ----
 add_library(embtable_emb_table_client OBJECT
@@ -72,7 +76,7 @@ target_include_directories(embtable_emb_table_client PUBLIC
     ${MOONCAKE_TE_INCLUDE_DIR}
 )
 target_link_libraries(embtable_emb_table_client PUBLIC
-    embtable_emb_table embtable_share_map_store)
+    embtable_emb_table embtable_share_map_store UbDiag::ubdiag_lib)
 
 # ---- Final library aggregating all layers (updated as layers are added) ----
 add_library(mooncake_embtable_store
@@ -88,7 +92,7 @@ target_include_directories(mooncake_embtable_store PUBLIC
     ${MOONCAKE_TE_INCLUDE_DIR}
 )
 target_link_libraries(mooncake_embtable_store PUBLIC
-    mooncake_store glog::glog)
+    mooncake_store glog::glog UbDiag::ubdiag_lib)
 
 add_executable(embtable_client
     emb_table_client/embtable_client_main.cpp

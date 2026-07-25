@@ -5,16 +5,27 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <thread>
+#include <future>
 #include <unordered_map>
 #include <unordered_set>
+
+#include "embtable_perf.h"
 
 namespace embtable {
 
 ShareMap::ShareMap(const std::string& bucketKey, uint64_t valueSize,
                    std::shared_ptr<mooncake::RealClient> realClient,
-                   uint64_t shareObjectSize)
-    : bucketKey_(bucketKey), valueSize_(valueSize), realClient_(realClient) {
+                   uint64_t shareObjectSize, uint32_t phfLookupConcurrency,
+                   std::shared_ptr<PhfLookupThreadPool> phfLookupThreadPool)
+    : bucketKey_(bucketKey),
+      valueSize_(valueSize),
+      realClient_(realClient),
+      phfLookupConcurrency_(std::max<uint32_t>(1, phfLookupConcurrency)),
+      phfLookupThreadPool_(std::move(phfLookupThreadPool)) {
+    if (!phfLookupThreadPool_) {
+        phfLookupThreadPool_ =
+            std::make_shared<PhfLookupThreadPool>(phfLookupConcurrency_);
+    }
     if (valueSize_ == 0) valueSize_ = 1;
     keyVec_ = std::make_unique<VectorObject>(
         bucketKey + "_keys", sizeof(uint64_t), realClient_, shareObjectSize);
@@ -121,10 +132,48 @@ Status ShareMap::linearLookup(const std::vector<uint64_t>& keys,
 
 Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
                         std::vector<StringView>& buffers) const {
-    std::shared_lock<std::shared_mutex> lock(rwMutex_);
-    if (!published_.load(std::memory_order_acquire)) {
-        return linearLookup(keys, buffers);
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_SHAREMAP_LOOKUP_TOTAL,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    totalPoint.Start();
+
+    auto finish = [&totalPoint](Status status) {
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
+    };
+
+    // Published is an irreversible state. Once observed with acquire
+    // semantics, key/value/index storage is immutable and the outer ShareMap
+    // lock is no longer needed.
+    if (published_.load(std::memory_order_acquire)) {
+        return finish(publishedLookup(keys, buffers));
     }
+
+    UbDiag::PerfPoint lockPoint(PerfKey::EMB_RD_SHAREMAP_LOCK_WAIT,
+                                UbDiag::PerfLevel::MODULE);
+    lockPoint.Start();
+    std::shared_lock<std::shared_mutex> lock(rwMutex_);
+    lockPoint.End(0);
+
+    // BuildIndex() or Import() may have completed while this thread waited
+    // for the shared lock.
+    if (!published_.load(std::memory_order_acquire)) {
+        UbDiag::PerfPoint linearPoint(PerfKey::EMB_RD_SHAREMAP_LINEAR,
+                                      UbDiag::PerfLevel::KEY_MODULE);
+        linearPoint.Start();
+        auto status = linearLookup(keys, buffers);
+        linearPoint.End(status.IsOk() ? 0 : status.code());
+        return finish(status);
+    }
+
+    lock.unlock();
+    return finish(publishedLookup(keys, buffers));
+}
+
+Status ShareMap::publishedLookup(const std::vector<uint64_t>& keys,
+                                 std::vector<StringView>& buffers) const {
+    UbDiag::PerfPoint phfPoint(PerfKey::EMB_RD_SHAREMAP_PHF,
+                               UbDiag::PerfLevel::KEY_MODULE);
+    phfPoint.Start();
     buffers.clear();
     buffers.resize(keys.size());
 
@@ -134,8 +183,6 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
     //   2. Read key at vecIndex from keyVec and memcmp against query key
     //   3. Only if matched, read value at vecIndex from valueVec
     static constexpr size_t kParallelThreshold = 128;
-    static constexpr size_t kParallelism = 4;
-
     std::atomic<int> firstError{0};
     std::string firstErrorMessage;
     std::mutex errorMutex;
@@ -160,7 +207,7 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
             return;
         }
         StringView storedKey;
-        s = keyVec_->Get(idx, storedKey);
+        s = keyVec_->GetSealed(idx, storedKey);
         if (!s.IsOk()) {
             recordError(s);
             return;
@@ -173,7 +220,7 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
             return;
         }
         StringView v;
-        s = valueVec_->Get(idx, v);
+        s = valueVec_->GetSealed(idx, v);
         if (!s.IsOk()) {
             recordError(s);
             return;
@@ -181,30 +228,36 @@ Status ShareMap::Lookup(const std::vector<uint64_t>& keys,
         buffers[i] = v;
     };
 
-    if (keys.size() <= kParallelThreshold) {
+    const size_t parallelism = std::min<size_t>(
+        keys.size(), static_cast<size_t>(phfLookupConcurrency_));
+    if (keys.size() <= kParallelThreshold || parallelism == 1) {
         for (size_t i = 0; i < keys.size(); ++i) lookupOne(i);
     } else {
         // Parallel lookup for large batches: partition keys into contiguous
         // chunks so each worker writes to a disjoint range of `buffers`.
         size_t total = keys.size();
-        size_t chunk = (total + kParallelism - 1) / kParallelism;
-        std::vector<std::thread> workers;
-        workers.reserve(kParallelism);
-        for (size_t w = 0; w < kParallelism; ++w) {
+        size_t chunk = (total + parallelism - 1) / parallelism;
+        std::vector<std::future<void>> futures;
+        futures.reserve(parallelism);
+        for (size_t w = 0; w < parallelism; ++w) {
             size_t start = w * chunk;
             size_t end = std::min(start + chunk, total);
             if (start >= end) break;
-            workers.emplace_back([&, start, end]() {
-                for (size_t i = start; i < end; ++i) lookupOne(i);
-            });
+            futures.emplace_back(phfLookupThreadPool_->Submit(
+                [&, start, end]() {
+                    for (size_t i = start; i < end; ++i) lookupOne(i);
+                }));
         }
-        for (auto& t : workers) t.join();
+        for (auto& future : futures) future.get();
     }
     if (firstError.load(std::memory_order_acquire) != 0) {
         std::lock_guard<std::mutex> errorLock(errorMutex);
-        return Status::Error(static_cast<ErrorCode>(firstError.load()),
-                             firstErrorMessage);
+        auto status = Status::Error(
+            static_cast<ErrorCode>(firstError.load()), firstErrorMessage);
+        phfPoint.End(status.code());
+        return status;
     }
+    phfPoint.End(0);
     return Status::OK();
 }
 
@@ -242,12 +295,20 @@ Status ShareMap::BuildIndex() {
     meta_->AddObjectInfo(idxInfo);
     s = meta_->Serialize();
     if (!s.IsOk()) return s;
+    s = keyVec_->Seal();
+    if (!s.IsOk()) return s;
+    s = valueVec_->Seal();
+    if (!s.IsOk()) return s;
     published_.store(true, std::memory_order_release);
     return Status::OK();
 }
 
 Status ShareMap::Import() {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    if (published_.load(std::memory_order_acquire)) {
+        return Status::Error(ErrorCode::kIndexBuilt,
+                             "ShareMap is already published");
+    }
     auto s = meta_->Deserialize();
     if (!s.IsOk()) return s;
     uint64_t realValueSize = meta_->GetValueSize();
@@ -296,6 +357,10 @@ Status ShareMap::Import() {
         return s;
     }
     size_.store(total, std::memory_order_release);
+    s = keyVec_->Seal();
+    if (!s.IsOk()) return s;
+    s = valueVec_->Seal();
+    if (!s.IsOk()) return s;
     published_.store(true, std::memory_order_release);
     return Status::OK();
 }

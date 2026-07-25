@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "share_object/index_object.h"
+#include "share_object/phf_lookup_thread_pool.h"
 #include "share_object/share_map_meta.h"
 #include "share_object/vector_object.h"
 #include "emb_types.h"
@@ -28,7 +29,10 @@ class ShareMap {
    public:
     ShareMap(const std::string& bucketKey, uint64_t valueSize,
              std::shared_ptr<mooncake::RealClient> realClient,
-             uint64_t shareObjectSize = 64ull * 1024 * 1024);
+             uint64_t shareObjectSize = 64ull * 1024 * 1024,
+             uint32_t phfLookupConcurrency = 4,
+             std::shared_ptr<PhfLookupThreadPool> phfLookupThreadPool =
+                 nullptr);
 
     // Append key/value records. Fails after BuildIndex().
     Status Insert(const std::vector<uint64_t>& keys,
@@ -55,6 +59,8 @@ class ShareMap {
    private:
     Status linearLookup(const std::vector<uint64_t>& keys,
                         std::vector<StringView>& buffers) const;
+    Status publishedLookup(const std::vector<uint64_t>& keys,
+                           std::vector<StringView>& buffers) const;
 
     std::string bucketKey_;
     uint64_t valueSize_;
@@ -63,6 +69,8 @@ class ShareMap {
     std::unique_ptr<IndexObject> indexObj_;
     std::unique_ptr<ShareMapMeta> meta_;
     std::shared_ptr<mooncake::RealClient> realClient_;
+    uint32_t phfLookupConcurrency_;
+    std::shared_ptr<PhfLookupThreadPool> phfLookupThreadPool_;
     std::atomic<uint64_t> size_{0};
     std::atomic<bool> published_{false};
     std::atomic<bool> inconsistent_{false};

@@ -10,6 +10,8 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/impl/errno.h>
 
+#include "embtable_perf.h"
+
 namespace embtable {
 
 namespace {
@@ -335,13 +337,26 @@ Status ShareMapStoreClient::QueryData(
     uint64_t valueSize, const std::vector<uint64_t>& keys,
     std::vector<StringView>& buffers,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_REMOTE_QUERY_TOTAL,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    totalPoint.Start();
+    auto finish = [&totalPoint](Status status) {
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
+    };
     buffers.clear();
-    if (keys.empty()) return Status::OK();
+    if (keys.empty()) return finish(Status::OK());
 
+    UbDiag::PerfPoint acquirePoint(PerfKey::EMB_RD_REMOTE_ACQUIRE_CLIENT,
+                                   UbDiag::PerfLevel::MODULE);
+    acquirePoint.Start();
     coro_rpc::errc connectionError = coro_rpc::errc::ok;
     auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
+    acquirePoint.End(rpcClient ? 0
+                               : static_cast<int>(ErrorCode::kInternal));
     if (!rpcClient) {
-        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
+        return finish(
+            MakeRpcConnectionStatus(rpcEndpoint, connectionError));
     }
 
     QueryDataRequest req;
@@ -349,50 +364,66 @@ Status ShareMapStoreClient::QueryData(
     req.keys = keys;
     req.valueSize = valueSize;
     if (valueSize == 0) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "valueSize must be > 0");
+        return finish(Status::Error(ErrorCode::kInvalidArgument,
+                                    "valueSize must be > 0"));
     }
     uint64_t entrySize = 0;
     uint64_t expectedSize = 0;
     if (!CheckedAdd(1, valueSize, entrySize) ||
         !CheckedMultiply(keys.size(), entrySize, expectedSize)) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "query response size overflows");
+        return finish(Status::Error(ErrorCode::kOutOfRange,
+                                    "query response size overflows"));
     }
+    UbDiag::PerfPoint allocPoint(PerfKey::EMB_RD_REMOTE_BUFFER_ALLOC,
+                                 UbDiag::PerfLevel::MODULE);
+    allocPoint.Start();
     auto handle = AllocateTransferBuffer(expectedSize);
+    allocPoint.End(handle ? 0
+                          : static_cast<int>(ErrorCode::kOutOfRange));
     if (!handle) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "client transfer buffer exhausted");
+        return finish(Status::Error(ErrorCode::kOutOfRange,
+                                    "client transfer buffer exhausted"));
     }
     req.targetEndpoint = transferSegmentEndpoint_;
     req.targetAddress = reinterpret_cast<uint64_t>(handle->ptr());
     req.targetCapacity = handle->size();
 
+    UbDiag::PerfPoint rpcPoint(PerfKey::EMB_RD_REMOTE_RPC_WAIT,
+                               UbDiag::PerfLevel::KEY_MODULE);
+    rpcPoint.Start();
     auto result = async_simple::coro::syncAwait(
         rpcClient->get()->call<&ShareMapStoreRpcService::HandleQueryData>(req));
+    rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
         rpcClient->Invalidate();
-        return MakeRpcCallStatus("RPC call failed", result.error());
+        return finish(
+            MakeRpcCallStatus("RPC call failed", result.error()));
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
-        return FromRemoteStatus(resp.statusCode, "Remote query", resp.errorMsg);
+        return finish(
+            FromRemoteStatus(resp.statusCode, "Remote query", resp.errorMsg));
     }
 
     if (resp.transferredSize == 0) {
-        return Status::OK();
+        return finish(Status::OK());
     }
     if (resp.transferredSize > handle->size()) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "remote query exceeded target buffer");
+        return finish(Status::Error(
+            ErrorCode::kOutOfRange,
+            "remote query exceeded target buffer"));
     }
 
+    UbDiag::PerfPoint parsePoint(PerfKey::EMB_RD_REMOTE_PARSE,
+                                 UbDiag::PerfLevel::MODULE);
+    parsePoint.Start();
     auto parseStatus =
         ParseResultBuffer(handle->ptr(), resp.transferredSize, valueSize,
                           keys.size(), buffers, handle);
-    if (!parseStatus.IsOk()) return parseStatus;
+    parsePoint.End(parseStatus.IsOk() ? 0 : parseStatus.code());
+    if (!parseStatus.IsOk()) return finish(parseStatus);
     bufferHandles.push_back(handle);
-    return Status::OK();
+    return finish(Status::OK());
 }
 
 Status ShareMapStoreClient::BatchQueryData(
@@ -400,28 +431,36 @@ Status ShareMapStoreClient::BatchQueryData(
     uint64_t valueSize, const std::vector<std::vector<uint64_t>>& keysPerBucket,
     std::vector<std::vector<StringView>>& buffersPerBucket,
     std::vector<std::shared_ptr<mooncake::BufferHandle>>& bufferHandles) {
+    UbDiag::PerfPoint totalPoint(PerfKey::EMB_RD_REMOTE_BATCH_TOTAL,
+                                 UbDiag::PerfLevel::KEY_MODULE);
+    totalPoint.Start();
+    auto finish = [&totalPoint](Status status) {
+        totalPoint.End(status.IsOk() ? 0 : status.code());
+        return status;
+    };
     buffersPerBucket.clear();
-    if (bucketKeys.empty()) return Status::OK();
+    if (bucketKeys.empty()) return finish(Status::OK());
     if (bucketKeys.size() != keysPerBucket.size()) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "bucketKeys/keysPerBucket size mismatch");
+        return finish(Status::Error(
+            ErrorCode::kInvalidArgument,
+            "bucketKeys/keysPerBucket size mismatch"));
     }
     if (valueSize == 0) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "valueSize must be > 0");
+        return finish(Status::Error(ErrorCode::kInvalidArgument,
+                                    "valueSize must be > 0"));
     }
 
     uint64_t entrySize = 0;
     if (!CheckedAdd(1, valueSize, entrySize)) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "batch entry size overflows");
+        return finish(Status::Error(ErrorCode::kOutOfRange,
+                                    "batch entry size overflows"));
     }
     uint64_t expectedSize = sizeof(uint64_t);
     for (size_t i = 0; i < bucketKeys.size(); ++i) {
         if (bucketKeys[i].empty() ||
             bucketKeys[i].size() > std::numeric_limits<uint32_t>::max()) {
-            return Status::Error(ErrorCode::kInvalidArgument,
-                                 "invalid bucket key");
+            return finish(Status::Error(ErrorCode::kInvalidArgument,
+                                        "invalid bucket key"));
         }
         uint64_t entryBytes = 0;
         uint64_t bucketBytes = 0;
@@ -430,15 +469,21 @@ Status ShareMapStoreClient::BatchQueryData(
             !CheckedAdd(bucketBytes, sizeof(uint64_t), bucketBytes) ||
             !CheckedAdd(bucketBytes, entryBytes, bucketBytes) ||
             !CheckedAdd(expectedSize, bucketBytes, expectedSize)) {
-            return Status::Error(ErrorCode::kOutOfRange,
-                                 "batch query size overflows");
+            return finish(Status::Error(ErrorCode::kOutOfRange,
+                                        "batch query size overflows"));
         }
     }
 
+    UbDiag::PerfPoint acquirePoint(PerfKey::EMB_RD_REMOTE_ACQUIRE_CLIENT,
+                                   UbDiag::PerfLevel::MODULE);
+    acquirePoint.Start();
     coro_rpc::errc connectionError = coro_rpc::errc::ok;
     auto rpcClient = AcquireClient(rpcEndpoint, &connectionError);
+    acquirePoint.End(rpcClient ? 0
+                               : static_cast<int>(ErrorCode::kInternal));
     if (!rpcClient) {
-        return MakeRpcConnectionStatus(rpcEndpoint, connectionError);
+        return finish(
+            MakeRpcConnectionStatus(rpcEndpoint, connectionError));
     }
 
     BatchQueryDataRequest req;
@@ -451,40 +496,51 @@ Status ShareMapStoreClient::BatchQueryData(
         req.entries.push_back(std::move(entry));
     }
 
+    UbDiag::PerfPoint allocPoint(PerfKey::EMB_RD_REMOTE_BUFFER_ALLOC,
+                                 UbDiag::PerfLevel::MODULE);
+    allocPoint.Start();
     auto handle = AllocateTransferBuffer(expectedSize);
+    allocPoint.End(handle ? 0
+                          : static_cast<int>(ErrorCode::kOutOfRange));
     if (!handle) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "client transfer buffer exhausted");
+        return finish(Status::Error(ErrorCode::kOutOfRange,
+                                    "client transfer buffer exhausted"));
     }
     req.targetEndpoint = transferSegmentEndpoint_;
     req.targetAddress = reinterpret_cast<uint64_t>(handle->ptr());
     req.targetCapacity = handle->size();
 
+    UbDiag::PerfPoint rpcPoint(PerfKey::EMB_RD_REMOTE_RPC_WAIT,
+                               UbDiag::PerfLevel::KEY_MODULE);
+    rpcPoint.Start();
     auto result = async_simple::coro::syncAwait(
         rpcClient->get()->call<&ShareMapStoreRpcService::HandleBatchQueryData>(
             req));
+    rpcPoint.End(result ? 0 : static_cast<int>(ErrorCode::kIOError));
     if (!result) {
         rpcClient->Invalidate();
-        return MakeRpcCallStatus("RPC batch call failed", result.error());
+        return finish(
+            MakeRpcCallStatus("RPC batch call failed", result.error()));
     }
     const auto& resp = result.value();
     if (resp.statusCode != 0) {
-        return FromRemoteStatus(resp.statusCode, "Remote batch query",
-                                resp.errorMsg);
+        return finish(FromRemoteStatus(resp.statusCode, "Remote batch query",
+                                       resp.errorMsg));
     }
     if (resp.responses.size() != bucketKeys.size()) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "remote batch response count mismatch");
+        return finish(Status::Error(
+            ErrorCode::kInvalidArgument,
+            "remote batch response count mismatch"));
     }
 
     for (size_t i = 0; i < resp.responses.size(); ++i) {
         if (resp.responses[i].foundFlags.size() != keysPerBucket[i].size()) {
-            return Status::Error(
+            return finish(Status::Error(
                 ErrorCode::kInvalidArgument,
                 "remote batch control key count mismatch: bucket=" +
                     bucketKeys[i] + ", expected=" +
                     std::to_string(keysPerBucket[i].size()) + ", actual=" +
-                    std::to_string(resp.responses[i].foundFlags.size()));
+                    std::to_string(resp.responses[i].foundFlags.size())));
         }
     }
 
@@ -492,20 +548,26 @@ Status ShareMapStoreClient::BatchQueryData(
         resp.responses.empty() ? 0 : resp.responses.front().transferredSize;
     for (const auto& response : resp.responses) {
         if (response.transferredSize != transferredSize) {
-            return Status::Error(ErrorCode::kInvalidArgument,
-                                 "remote batch transferred size mismatch");
+            return finish(Status::Error(
+                ErrorCode::kInvalidArgument,
+                "remote batch transferred size mismatch"));
         }
     }
     if (transferredSize > handle->size()) {
-        return Status::Error(ErrorCode::kOutOfRange,
-                             "remote batch query exceeded target buffer");
+        return finish(Status::Error(
+            ErrorCode::kOutOfRange,
+            "remote batch query exceeded target buffer"));
     }
+    UbDiag::PerfPoint parsePoint(PerfKey::EMB_RD_REMOTE_PARSE,
+                                 UbDiag::PerfLevel::MODULE);
+    parsePoint.Start();
     auto parseStatus = ParseAggregatedBuffer(
         handle->ptr(), transferredSize, valueSize, bucketKeys, keysPerBucket,
         buffersPerBucket, handle);
-    if (!parseStatus.IsOk()) return parseStatus;
+    parsePoint.End(parseStatus.IsOk() ? 0 : parseStatus.code());
+    if (!parseStatus.IsOk()) return finish(parseStatus);
     bufferHandles.push_back(handle);
-    return Status::OK();
+    return finish(Status::OK());
 }
 
 Status ShareMapStoreClient::Publish(const std::string& rpcEndpoint,
