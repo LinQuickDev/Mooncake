@@ -46,10 +46,114 @@ echo "Cleaning previous RPM build..."
 rm -rf rpmbuild/
 rm -rf ${OUTPUT_DIR}/
 
+fail_ubdiag_packaging() {
+    echo "Error: UbDiag RPM provenance check failed: $*" >&2
+    return 1
+}
+
+load_ubdiag_rpm_manifest() {
+    local manifest=$1
+    local key=""
+    local value=""
+
+    if [ ! -f "${manifest}" ]; then
+        fail_ubdiag_packaging "manifest not found: ${manifest}"
+        return 1
+    fi
+
+    while IFS='=' read -r key value || [ -n "${key}" ]; do
+        value="${value%$'\r'}"
+        case "${key}" in
+            MOONCAKE_UBDIAG_LAYER|MOONCAKE_UBDIAG_GIT_REPOSITORY|\
+            MOONCAKE_UBDIAG_GIT_TAG|MOONCAKE_UBDIAG_EXPECTED_COMMIT|\
+            MOONCAKE_UBDIAG_RESOLVED_COMMIT|MOONCAKE_UBDIAG_SOURCE_DIR)
+                printf -v "${key}" '%s' "${value}"
+                ;;
+            "")
+                ;;
+            *)
+                fail_ubdiag_packaging \
+                    "unknown key '${key}' in ${manifest}"
+                return 1
+                ;;
+        esac
+    done < "${manifest}"
+}
+
+verify_ubdiag_source_provenance() {
+    local source_dir=""
+    local current_commit=""
+    local dirty=""
+    local required_tool=""
+
+    for required_tool in git readelf readlink sha256sum; do
+        if ! command -v "${required_tool}" >/dev/null 2>&1; then
+            fail_ubdiag_packaging \
+                "required tool is unavailable: ${required_tool}"
+            return 1
+        fi
+    done
+
+    case "${MOONCAKE_UBDIAG_LAYER}" in
+        mock|vendored)
+            ;;
+        *)
+            fail_ubdiag_packaging \
+                "unsupported layer '${MOONCAKE_UBDIAG_LAYER:-unset}'"
+            return 1
+            ;;
+    esac
+
+    if [[ ! "${MOONCAKE_UBDIAG_EXPECTED_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        fail_ubdiag_packaging \
+            "expected commit is not a full SHA: ${MOONCAKE_UBDIAG_EXPECTED_COMMIT}"
+        return 1
+    fi
+    if [ "${MOONCAKE_UBDIAG_EXPECTED_COMMIT,,}" != \
+         "${MOONCAKE_UBDIAG_RESOLVED_COMMIT,,}" ]; then
+        fail_ubdiag_packaging \
+            "configured commit ${MOONCAKE_UBDIAG_RESOLVED_COMMIT} does not match expected ${MOONCAKE_UBDIAG_EXPECTED_COMMIT}"
+        return 1
+    fi
+
+    source_dir="$(readlink -f "${MOONCAKE_UBDIAG_SOURCE_DIR}" 2>/dev/null || true)"
+    if [ -z "${source_dir}" ] || [ ! -f "${source_dir}/CMakeLists.txt" ]; then
+        fail_ubdiag_packaging \
+            "verified source directory is unavailable: ${MOONCAKE_UBDIAG_SOURCE_DIR}"
+        return 1
+    fi
+
+    current_commit="$(
+        git -C "${source_dir}" rev-parse --verify HEAD 2>/dev/null || true
+    )"
+    if [ "${current_commit,,}" != "${MOONCAKE_UBDIAG_EXPECTED_COMMIT,,}" ]; then
+        fail_ubdiag_packaging \
+            "source changed after CMake configure: expected ${MOONCAKE_UBDIAG_EXPECTED_COMMIT}, found ${current_commit}"
+        return 1
+    fi
+    dirty="$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
+    if [ -n "${dirty}" ]; then
+        fail_ubdiag_packaging \
+            "source worktree changed after CMake configure: ${source_dir}"
+        printf '%s\n' "${dirty}" >&2
+        return 1
+    fi
+
+    MOONCAKE_UBDIAG_SOURCE_DIR="${source_dir}"
+    MOONCAKE_UBDIAG_RESOLVED_COMMIT="${current_commit,,}"
+}
+
 # Function to build RPM for a specific platform
 build_rpm_for_platform() {
     local PLATFORM=$1
     local LIB_DIR="lib64"
+    local UBDIAG_RPM_FILES=""
+    local MOONCAKE_UBDIAG_LAYER=""
+    local MOONCAKE_UBDIAG_GIT_REPOSITORY=""
+    local MOONCAKE_UBDIAG_GIT_TAG=""
+    local MOONCAKE_UBDIAG_EXPECTED_COMMIT=""
+    local MOONCAKE_UBDIAG_RESOLVED_COMMIT=""
+    local MOONCAKE_UBDIAG_SOURCE_DIR=""
     
     echo "Building RPM for platform: ${PLATFORM}"
     
@@ -68,7 +172,7 @@ build_rpm_for_platform() {
     mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}
     
     # Create target directories in BUILDROOT
-    mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/{usr/{bin,${LIB_DIR},include},etc/mooncake}
+    mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/{usr/{bin,${LIB_DIR},include,share/doc/mooncake},etc/{mooncake,ubdiag}}
     
     # -------------------------------------------------------------------------
     # Copy executables
@@ -82,6 +186,11 @@ build_rpm_for_platform() {
         PLATFORM_BUILD_DIR="${BUILD_DIR}-${PLATFORM}"
         echo "Cross-compilation detected, looking in ${PLATFORM_BUILD_DIR}"
     fi
+
+    local UBDIAG_RPM_MANIFEST="${PLATFORM_BUILD_DIR}/mooncake_ubdiag_rpm.env"
+    echo "Reading verified UbDiag RPM manifest: ${UBDIAG_RPM_MANIFEST}"
+    load_ubdiag_rpm_manifest "${UBDIAG_RPM_MANIFEST}"
+    verify_ubdiag_source_provenance
     
     # mooncake_master
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-store/src/mooncake_master ]; then
@@ -169,6 +278,99 @@ build_rpm_for_platform() {
         cp ${PLATFORM_BUILD_DIR}/mooncake-integration/store.*.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/libmooncake_store_python.so
     else
         echo "Warning: store.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
+    fi
+
+    # -------------------------------------------------------------------------
+    # Copy the verified UbDiag runtime selected by Mooncake
+    # -------------------------------------------------------------------------
+    local BUILDROOT="rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}"
+    if [ "${MOONCAKE_UBDIAG_LAYER}" = "vendored" ]; then
+        local ubdiag_binary_dir
+        local ubdiag_cli
+        local ubdiag_library_dir
+        local ubdiag_config
+        local ubdiag_library_real
+        local staged_library_real
+        local ubdiag_cli_sha256=""
+        local ubdiag_library_sha256=""
+
+        ubdiag_binary_dir="$(
+            readlink -f "${PLATFORM_BUILD_DIR}/_deps/ubdiag-build" 2>/dev/null ||
+                true
+        )"
+        ubdiag_cli="${ubdiag_binary_dir}/src/cli/ubdiag"
+        ubdiag_library_dir="${ubdiag_binary_dir}/src/sdk"
+        ubdiag_config="${MOONCAKE_UBDIAG_SOURCE_DIR}/config/ubdiag.conf.example"
+
+        if [ -z "${ubdiag_binary_dir}" ] ||
+           [ "$(tr -d '[:space:]' < "${ubdiag_binary_dir}/mooncake-source-commit.txt" 2>/dev/null || true)" !=
+             "${MOONCAKE_UBDIAG_RESOLVED_COMMIT}" ]; then
+            fail_ubdiag_packaging \
+                "current _deps/ubdiag-build has no matching source-commit marker"
+            return 1
+        fi
+        if [ ! -x "${ubdiag_cli}" ] ||
+           [ ! -f "${ubdiag_config}" ] ||
+           ! compgen -G "${ubdiag_library_dir}/libubdiag.so*" >/dev/null ||
+           ! readelf -d "${ubdiag_cli}" 2>/dev/null |
+             grep -q 'Shared library:.*libubdiag\.so'; then
+            fail_ubdiag_packaging \
+                "Mooncake-built CLI, library, or config is missing/inconsistent"
+            return 1
+        fi
+        ubdiag_library_real="$(readlink -f "${ubdiag_library_dir}/libubdiag.so")"
+        case "${ubdiag_library_real}" in
+            "${ubdiag_library_dir}"/*)
+                ;;
+            *)
+                fail_ubdiag_packaging "libubdiag.so escapes its build directory"
+                return 1
+                ;;
+        esac
+
+        cp "${ubdiag_cli}" "${BUILDROOT}/usr/bin/ubdiag"
+        chmod 755 "${BUILDROOT}/usr/bin/ubdiag"
+        cp -a "${ubdiag_library_dir}"/libubdiag.so* \
+            "${BUILDROOT}/usr/${LIB_DIR}/"
+        cp "${ubdiag_config}" "${BUILDROOT}/etc/ubdiag/ubdiag.conf"
+
+        cmp -s "${ubdiag_cli}" "${BUILDROOT}/usr/bin/ubdiag" ||
+            {
+                fail_ubdiag_packaging "staged CLI differs from build output"
+                return 1
+            }
+        staged_library_real="$(
+            readlink -f "${BUILDROOT}/usr/${LIB_DIR}/libubdiag.so"
+        )"
+        cmp -s "${ubdiag_library_real}" "${staged_library_real}" ||
+            {
+                fail_ubdiag_packaging "staged library differs from build output"
+                return 1
+            }
+        ubdiag_cli_sha256="$(sha256sum "${ubdiag_cli}" | awk '{print $1}')"
+        ubdiag_library_sha256="$(sha256sum "${ubdiag_library_real}" | awk '{print $1}')"
+        cat > "${BUILDROOT}/usr/share/doc/mooncake/ubdiag-provenance.txt" << EOF
+layer=vendored
+repository=${MOONCAKE_UBDIAG_GIT_REPOSITORY}
+tag=${MOONCAKE_UBDIAG_GIT_TAG}
+commit=${MOONCAKE_UBDIAG_RESOLVED_COMMIT}
+cli_sha256=${ubdiag_cli_sha256}
+library_file=$(basename "${ubdiag_library_real}")
+library_sha256=${ubdiag_library_sha256}
+EOF
+        UBDIAG_RPM_FILES="
+/usr/bin/ubdiag
+/usr/${LIB_DIR}/libubdiag.so*
+%config(noreplace) /etc/ubdiag/ubdiag.conf
+/usr/share/doc/mooncake/ubdiag-provenance.txt"
+        echo "UbDiag RPM source verified: ${MOONCAKE_UBDIAG_RESOLVED_COMMIT}"
+    else
+        if compgen -G "${BUILDROOT}/usr/${LIB_DIR}/libubdiag.so*" >/dev/null ||
+           [ -e "${BUILDROOT}/usr/bin/ubdiag" ]; then
+            fail_ubdiag_packaging \
+                "mock layer must not stage any UbDiag CLI or shared library"
+            return 1
+        fi
     fi
     
     # -------------------------------------------------------------------------
@@ -274,6 +476,32 @@ build_rpm_for_platform() {
     if [ -f mooncake-store/conf/master.json ]; then
         cp mooncake-store/conf/master.json rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/etc/mooncake/
     fi
+
+    local staged_elf=""
+    local staged_ubdiag_dependency_count=0
+    while IFS= read -r -d '' staged_elf; do
+        case "${staged_elf}" in
+            */usr/bin/ubdiag|*/usr/${LIB_DIR}/libubdiag.so*)
+                continue
+                ;;
+        esac
+        if readelf -d "${staged_elf}" 2>/dev/null |
+           grep -q 'Shared library:.*libubdiag\.so'; then
+            staged_ubdiag_dependency_count=$((staged_ubdiag_dependency_count + 1))
+        fi
+    done < <(find "${BUILDROOT}" -type f -print0)
+    if [ "${MOONCAKE_UBDIAG_LAYER}" = "mock" ] &&
+       [ "${staged_ubdiag_dependency_count}" -ne 0 ]; then
+        fail_ubdiag_packaging \
+            "mock RPM contains ${staged_ubdiag_dependency_count} ELF file(s) linked to libubdiag"
+        return 1
+    fi
+    if [ "${MOONCAKE_UBDIAG_LAYER}" = "vendored" ] &&
+       [ "${staged_ubdiag_dependency_count}" -eq 0 ]; then
+        fail_ubdiag_packaging \
+            "vendored RPM has no ELF consumer linked to the packaged libubdiag"
+        return 1
+    fi
     
     # -------------------------------------------------------------------------
     # Create RPM spec file
@@ -324,6 +552,7 @@ ${PACKAGE_DESCRIPTION}
 /usr/${LIB_DIR}/libetcd_wrapper.so
 /usr/${LIB_DIR}/libmooncake_engine.so
 /usr/${LIB_DIR}/libmooncake_store_python.so
+${UBDIAG_RPM_FILES}
 /usr/include/mooncake/*.h
 /usr/include/mooncake/*.hpp
 /etc/mooncake/master.yaml

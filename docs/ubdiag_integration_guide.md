@@ -29,10 +29,10 @@ cmake -S . -B build -DMOONCAKE_ENABLE_UBDIAG=OFF
 cmake --build build -j
 ```
 
-CMake 配置阶段应输出：
+CMake 配置阶段应输出（末尾同时打印已验证提交）：
 
 ```text
-UbDiag: UBDIAG_DISABLE(空函数,零依赖)
+UbDiag: UBDIAG_DISABLE(空函数,零依赖), verified 705c6c37da45df2be4bc64c134dca0b7f30b2113
 ```
 
 该模式使用 UbDiag `v0.5.1` 的同一份公共头文件，并通过
@@ -54,10 +54,10 @@ cmake -S . -B build-ubdiag -DMOONCAKE_ENABLE_UBDIAG=ON
 cmake --build build-ubdiag -j
 ```
 
-CMake 配置阶段应输出：
+CMake 配置阶段应输出（末尾同时打印已验证提交）：
 
 ```text
-UbDiag: FetchContent 编译 v0.5.1(库+CLI)
+UbDiag: FetchContent 编译 v0.5.1(库+CLI), verified 705c6c37da45df2be4bc64c134dca0b7f30b2113
 ```
 
 默认构建目录下的关键产物为：
@@ -117,8 +117,8 @@ mkdir -p ./ubdiag-results
 
 ## 5. 离线源码
 
-构建环境无法访问 GitHub 时，预先准备精确版本的 UbDiag 源码，并通过
-`MOONCAKE_UBDIAG_SOURCE_DIR` 指定绝对路径：
+构建环境无法访问 GitHub 时，预先准备精确版本且保留 `.git` 元数据的
+UbDiag 洁净工作树，并通过 `MOONCAKE_UBDIAG_SOURCE_DIR` 指定绝对路径：
 
 ```bash
 git clone --branch v0.5.1 https://github.com/LinQuickDev/ubdiag.git /opt/src/ubdiag
@@ -132,15 +132,63 @@ cmake --build build-ubdiag -j
 `MOONCAKE_ENABLE_UBDIAG` 改为 `OFF` 即可。两种模式均不会在已指定本地
 源码时访问 UbDiag 远端仓库。
 
-推荐校验源码版本：
+配置阶段会自动执行以下等价校验，不需要人工确认：
 
 ```bash
 git -C /opt/src/ubdiag rev-parse HEAD
+git -C /opt/src/ubdiag status --porcelain --untracked-files=all
 ```
 
-预期提交为 `705c6c37da45df2be4bc64c134dca0b7f30b2113`。
+提交必须为 `705c6c37da45df2be4bc64c134dca0b7f30b2113`，工作树必须无修改和
+未跟踪文件。升级 UbDiag 版本时，必须同时更新
+`MOONCAKE_UBDIAG_GIT_TAG` 和完整的
+`MOONCAKE_UBDIAG_EXPECTED_COMMIT`，不能只更换标签。
 
-## 6. 验收标准
+## 6. RPM 打包与来源保证
+
+CMake 每次配置都会在当前构建目录生成
+`mooncake_ubdiag_rpm.env`。该清单记录当前层、UbDiag 源码目录、期望提交
+和实际提交。CLI 与动态库路径固定从当前 Mooncake build 的
+`_deps/ubdiag-build` 推导，清单不能把它们重定向到其他目录。
+
+完成构建后执行：
+
+```bash
+bash scripts/build_rpm.sh build-ubdiag rpm-output "$(uname -m)"
+```
+
+打包脚本不会搜索 `$PATH`、`LD_LIBRARY_PATH`、`/usr/bin`、`/usr/lib64`
+或 `/usr/local` 中的 UbDiag，也不会使用 `find_package(UbDiag)`。它只接受
+CMake 清单指定的 FetchContent 源码和构建产物，并在出包前再次执行以下
+硬校验：
+
+1. 源码仓当前提交、配置时解析的提交和期望提交三者完全一致。
+2. 源码工作树保持洁净，避免同一 SHA 下混入本地修改。
+3. UbDiag 子构建目录的提交标记与当前源码一致；版本变化时只清理并重建
+   该子目录。
+4. CLI 和全部 `libubdiag.so*` 位于当前 Mooncake build 的
+   `_deps/ubdiag-build` 内。
+5. CLI 确实依赖同一构建目录生成的 `libubdiag.so`。
+6. 复制到 RPM BUILDROOT 后逐文件比较，防止打包阶段替换产物。
+
+Layer 0 的 RPM 不包含 UbDiag CLI 或动态库，并检查待打包 ELF 不依赖
+`libubdiag.so`。Layer 1 的 RPM 包含同一次构建生成的 CLI、动态库和配置，
+同时写入 `/usr/share/doc/mooncake/ubdiag-provenance.txt`，记录提交 SHA
+以及 CLI、动态库 SHA256。
+
+同一构建目录先配置 Layer 0、后续再切换到 Layer 1 时，必须重新执行 CMake
+配置和构建，再执行 RPM 脚本：
+
+```bash
+cmake -S . -B build -DMOONCAKE_ENABLE_UBDIAG=ON
+cmake --build build -j
+bash scripts/build_rpm.sh build rpm-output "$(uname -m)"
+```
+
+重新配置会刷新来源清单；打包脚本只按最新清单处理。反向切回 Layer 0 时，
+即使构建目录残留旧的 `libubdiag.so`，也不会将其打入 RPM。
+
+## 7. 验收标准
 
 | 检查项 | Layer 0 | Layer 1 |
 |--------|---------|---------|
