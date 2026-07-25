@@ -10,10 +10,17 @@ set -x
 
 # Get build directory from environment variable or argument
 BUILD_DIR="${BUILD_DIR:-${1:-build}}"
-BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+if [[ "${BUILD_DIR}" = /* ]]; then
+    BUILD_DIR_ABS="${BUILD_DIR}"
+else
+    BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+fi
 
 # Get output directory from environment variable or argument
 OUTPUT_DIR="${OUTPUT_DIR:-${2:-rpm-output}}"
+if [[ "${OUTPUT_DIR}" != /* ]]; then
+    OUTPUT_DIR="$(pwd)/${OUTPUT_DIR}"
+fi
 
 # Detect current host architecture
 HOST_ARCH=$(uname -m)
@@ -180,10 +187,10 @@ build_rpm_for_platform() {
     echo "Copying executables..."
     
     # Determine build subdirectory based on platform
-    local PLATFORM_BUILD_DIR="${BUILD_DIR}"
+    local PLATFORM_BUILD_DIR="${BUILD_DIR_ABS}"
     if [ "${PLATFORM}" != "${HOST_ARCH}" ]; then
         # Cross-compilation path
-        PLATFORM_BUILD_DIR="${BUILD_DIR}-${PLATFORM}"
+        PLATFORM_BUILD_DIR="${BUILD_DIR_ABS}-${PLATFORM}"
         echo "Cross-compilation detected, looking in ${PLATFORM_BUILD_DIR}"
     fi
 
@@ -291,6 +298,7 @@ build_rpm_for_platform() {
         local ubdiag_config
         local ubdiag_library_real
         local staged_library_real
+        local build_source_commit
         local ubdiag_cli_sha256=""
         local ubdiag_library_sha256=""
 
@@ -301,10 +309,14 @@ build_rpm_for_platform() {
         ubdiag_cli="${ubdiag_binary_dir}/src/cli/ubdiag"
         ubdiag_library_dir="${ubdiag_binary_dir}/src/sdk"
         ubdiag_config="${MOONCAKE_UBDIAG_SOURCE_DIR}/config/ubdiag.conf.example"
+        build_source_commit="$(
+            tr -d '[:space:]' \
+                < "${ubdiag_binary_dir}/mooncake-source-commit.txt" \
+                2>/dev/null || true
+        )"
 
         if [ -z "${ubdiag_binary_dir}" ] ||
-           [ "$(tr -d '[:space:]' < "${ubdiag_binary_dir}/mooncake-source-commit.txt" 2>/dev/null || true)" !=
-             "${MOONCAKE_UBDIAG_RESOLVED_COMMIT}" ]; then
+           [ "${build_source_commit}" != "${MOONCAKE_UBDIAG_RESOLVED_COMMIT}" ]; then
             fail_ubdiag_packaging \
                 "current _deps/ubdiag-build has no matching source-commit marker"
             return 1
@@ -502,6 +514,21 @@ EOF
             "vendored RPM has no ELF consumer linked to the packaged libubdiag"
         return 1
     fi
+
+    local OPTIONAL_RPM_FILES=""
+    local optional_rpm_file=""
+    for optional_rpm_file in \
+        /usr/bin/transfer_engine_bench \
+        /usr/${LIB_DIR}/libmooncake_store.so \
+        /usr/${LIB_DIR}/libtransfer_engine.so \
+        /usr/${LIB_DIR}/libmooncake_common.so \
+        /usr/${LIB_DIR}/libetcd_wrapper.so \
+        /usr/${LIB_DIR}/libmooncake_engine.so \
+        /usr/${LIB_DIR}/libmooncake_store_python.so; do
+        if [ -e "${BUILDROOT}${optional_rpm_file}" ]; then
+            OPTIONAL_RPM_FILES+="${optional_rpm_file}"$'\n'
+        fi
+    done
     
     # -------------------------------------------------------------------------
     # Create RPM spec file
@@ -544,14 +571,8 @@ ${PACKAGE_DESCRIPTION}
 /usr/bin/mooncake_master
 /usr/bin/mooncake_client
 /usr/bin/stress_cluster_bench
-/usr/bin/transfer_engine_bench
-/usr/${LIB_DIR}/libmooncake_store.so
-/usr/${LIB_DIR}/libtransfer_engine.so
-/usr/${LIB_DIR}/libmooncake_common.so
 /usr/${LIB_DIR}/libasio.so
-/usr/${LIB_DIR}/libetcd_wrapper.so
-/usr/${LIB_DIR}/libmooncake_engine.so
-/usr/${LIB_DIR}/libmooncake_store_python.so
+${OPTIONAL_RPM_FILES}
 ${UBDIAG_RPM_FILES}
 /usr/include/mooncake/*.h
 /usr/include/mooncake/*.hpp
@@ -586,7 +607,7 @@ EOF
     # Build the RPM
     rpmbuild -bb \
         --define "_topdir $(pwd)/rpmbuild" \
-        --define "_rpmdir $(pwd)/${OUTPUT_DIR}" \
+        --define "_rpmdir ${OUTPUT_DIR}" \
         rpmbuild/SPECS/${PACKAGE_NAME}-${PLATFORM}.spec
     
     # Move RPM to platform-specific directory
