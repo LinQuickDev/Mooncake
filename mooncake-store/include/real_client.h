@@ -506,7 +506,8 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        size_t offload_rpc_thread_num = 8);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -532,7 +533,12 @@ class RealClient : public PyClient {
         uint64_t total_size;
         int64_t query_us;
         int64_t select_us;
+        int64_t local_endpoints_us;
+        int64_t select_replica_us;
         std::string replica_type;
+        size_t replica_count{0};
+        std::string local_endpoint{"-"};
+        std::string remote_endpoint{"-"};
     };
 
     tl::expected<RangedReadMetadata, ErrorCode>
@@ -680,7 +686,8 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             uint64_t trace_id = 0);
 
     /**
      * @brief Push-mode offload handler, run on the data owner. Reads the
@@ -702,7 +709,7 @@ class RealClient : public PyClient {
      * @param batch_id The unique identifier of the batch to release
      * @return true if batch was found and released, false otherwise
      */
-    bool release_offload_buffer(uint64_t batch_id);
+    bool release_offload_buffer(uint64_t batch_id, uint64_t trace_id = 0);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.

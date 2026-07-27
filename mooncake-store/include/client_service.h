@@ -140,6 +140,11 @@ class Client {
     QueryByRegex(const std::string& str);
 
     /**
+     * @brief Returns unique offload RPC endpoints currently known by master.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> GetOffloadEndpoints();
+
+    /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
      * @return Vector of QueryResult objects containing replicas and lease

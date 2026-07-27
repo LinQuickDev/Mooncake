@@ -5,7 +5,9 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include <csignal>
+#include <future>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -239,6 +241,11 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetOffloadEndpoints> {
+    static constexpr const char* value = "GetOffloadEndpoints";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
     static constexpr const char* value = "PromotionObjectHeartbeat";
 };
@@ -325,7 +332,19 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto total_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     auto pool = client_accessor_.GetClientPool();
+    const auto pool_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    uint64_t rpc_call_us = 0;
+    uint64_t result_get_us = 0;
+    uint64_t result_parse_us = 0;
 
     // Increment RPC counter
     if (metrics_) {
@@ -333,7 +352,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    return async_simple::coro::syncAwait(
+    auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
@@ -341,11 +360,26 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            if (breakdown_log) {
+                rpc_call_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - pool_end)
+                        .count();
+            }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
+            const auto result_get_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             auto result = co_await std::move(ret.value());
+            if (breakdown_log) {
+                result_get_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_get_start)
+                        .count();
+            }
             if (!result) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -358,8 +392,48 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                 metrics_->rpc_latency.observe(
                     {RpcNameTraits<ServiceMethod>::value}, latency.count());
             }
-            co_return result->result();
+            const auto result_parse_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            if constexpr (std::is_void_v<ReturnType>) {
+                result->result();
+                if (breakdown_log) {
+                    result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() -
+                            result_parse_start)
+                            .count();
+                }
+                co_return tl::expected<void, ErrorCode>{};
+            } else {
+                auto response = result->result();
+                if (breakdown_log) {
+                    result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() -
+                            result_parse_start)
+                            .count();
+                }
+                co_return std::move(response);
+            }
         }());
+    if (breakdown_log) {
+        MC_LOG(INFO) << "master_rpc_client_breakdown method="
+                     << RpcNameTraits<ServiceMethod>::value
+                     << " pool_lookup_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            pool_end - total_start)
+                            .count()
+                     << " rpc_call_us=" << rpc_call_us
+                     << " result_get_us=" << result_get_us
+                     << " result_parse_us=" << result_parse_us
+                     << " total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - total_start)
+                            .count()
+                     << " status=" << (rpc_result ? "ok" : "rpc_fail");
+    }
+    return rpc_result;
 }
 
 template <auto ServiceMethod, typename ResultType, typename... Args>
@@ -412,6 +486,46 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 MasterClient::~MasterClient() = default;
 
+void MasterClient::WarmupRpcPool() {
+    auto pool = client_accessor_.GetClientPool();
+    if (!pool) {
+        return;
+    }
+    if (!Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        LOG(INFO) << "Master RPC pool warmup disabled by "
+                  << "MC_YLT_RPC_POOL_WARMUP";
+        return;
+    }
+    const size_t target_connections = Environ::Get().GetYltRpcPoolWarmupConnections(
+        pool->get_pool_config().max_connection);
+    if (target_connections == 0) {
+        LOG(INFO) << "Master RPC pool warmup disabled: target_connections=0";
+        return;
+    }
+
+    LOG(INFO) << "Warming up master RPC pool to " << target_connections
+              << " connection(s), max_connection="
+              << pool->get_pool_config().max_connection;
+    std::vector<std::future<bool>> futures;
+    futures.reserve(target_connections);
+    for (size_t i = 0; i < target_connections; ++i) {
+        futures.emplace_back(std::async(std::launch::async, [this]() {
+            auto result =
+                invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
+            return result.has_value();
+        }));
+    }
+
+    size_t ok_count = 0;
+    for (auto& future : futures) {
+        if (future.get()) {
+            ++ok_count;
+        }
+    }
+    LOG(INFO) << "Master RPC pool warmup completed: " << ok_count << "/"
+              << target_connections << " succeeded";
+}
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
@@ -442,6 +556,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
     }
+    WarmupRpcPool();
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
@@ -1036,6 +1151,17 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+MasterClient::GetOffloadEndpoints() {
+    ScopedVLogTimer timer(1, "MasterClient::GetOffloadEndpoints");
+    timer.LogRequest("action=get_offload_endpoints");
+
+    auto result = invoke_rpc<&WrappedMasterService::GetOffloadEndpoints,
+                             std::vector<std::string>>();
     timer.LogResponseExpected(result);
     return result;
 }

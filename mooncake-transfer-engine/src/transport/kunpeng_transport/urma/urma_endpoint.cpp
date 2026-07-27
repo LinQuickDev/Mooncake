@@ -1090,12 +1090,48 @@ int UrmaEndpoint::submitPostSend(
     std::vector<Transport::Slice*>& failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
+    const bool queue_log =
+        !slice_list.empty() &&
+        mooncake::logging::ShouldSampleHiFreqLog(slice_list.front()->trace_id);
     int jetty_index = SimpleRandom::Get().next(jetty_list_.size());
+    size_t incoming = 0;
+    int jetty_before = 0;
+    int jfc_before = 0;
+    if (queue_log) {
+        incoming = slice_list.size();
+        jetty_before = wr_depth_list_[jetty_index];
+        jfc_before = *jfc_outstanding_;
+    }
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[jetty_index],
                             (int)slice_list.size());
     wr_count =
         std::min(int(globalConfig().max_jfc_e) - *jfc_outstanding_, wr_count);
-    if (wr_count <= 0) return 0;
+    if (wr_count <= 0) {
+        if (queue_log) {
+            const char* status =
+                jetty_before >= max_wr_depth_ ? "jetty_full" : "jfc_full";
+            MC_LOG(INFO)
+                << "urma_queue_depth direction="
+                << (slice_list.front()->opcode ==
+                            Transport::TransferRequest::READ
+                        ? "read"
+                        : "write")
+                << " local_nic=" << context_->nicPath()
+                << " remote_nic=" << peer_nic_path_
+                << " incoming=" << incoming
+                << " posted=0 software_remaining=" << incoming
+                << " software_pending=" << context_->pendingSliceCount()
+                << " jetty_index=" << jetty_index
+                << " jetty_depth_before=" << jetty_before
+                << " jetty_depth_after=" << jetty_before
+                << " jetty_depth_max=" << max_wr_depth_
+                << " jfc_outstanding_before=" << jfc_before
+                << " jfc_outstanding_after=" << jfc_before
+                << " jfc_depth_max=" << globalConfig().max_jfc_e
+                << " total_bytes=0 retry_count_max=0 status=" << status;
+        }
+        return 0;
+    }
 
     urma_jfs_wr_t wr_list[wr_count], *bad_wr = nullptr;
     urma_sge_t l_sge_list[wr_count];
@@ -1150,16 +1186,48 @@ int UrmaEndpoint::submitPostSend(
     }
     int rc =
         urma_post_jetty_send_wr(jetty_list_[jetty_index], wr_list, &bad_wr);
+    int failed_post_count = 0;
     if (rc) {
         PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
         while (bad_wr) {
             int i = bad_wr - wr_list;
+            ++failed_post_count;
             LOG(ERROR) << "slice (" << i << ") post send failed.";
             failed_slice_list.push_back(slice_list[i]);
             __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
             __sync_fetch_and_sub(jfc_outstanding_, 1);
             bad_wr = bad_wr->next;
         }
+    }
+    if (queue_log) {
+        uint64_t total_bytes = 0;
+        uint32_t retry_count_max = 0;
+        for (int i = 0; i < wr_count; ++i) {
+            total_bytes += slice_list[i]->length;
+            retry_count_max =
+                std::max(retry_count_max, slice_list[i]->ub.retry_cnt);
+        }
+        MC_LOG(INFO)
+            << "urma_queue_depth direction="
+            << (slice_list.front()->opcode == Transport::TransferRequest::READ
+                    ? "read"
+                    : "write")
+            << " local_nic=" << context_->nicPath()
+            << " remote_nic=" << peer_nic_path_ << " incoming=" << incoming
+            << " posted=" << (wr_count - failed_post_count)
+            << " software_remaining="
+            << (incoming - wr_count + failed_post_count)
+            << " software_pending=" << context_->pendingSliceCount()
+            << " jetty_index=" << jetty_index
+            << " jetty_depth_before=" << jetty_before
+            << " jetty_depth_after=" << wr_depth_list_[jetty_index]
+            << " jetty_depth_max=" << max_wr_depth_
+            << " jfc_outstanding_before=" << jfc_before
+            << " jfc_outstanding_after=" << *jfc_outstanding_
+            << " jfc_depth_max=" << globalConfig().max_jfc_e
+            << " total_bytes=" << total_bytes
+            << " retry_count_max=" << retry_count_max
+            << " status=" << (rc ? "post_fail" : "posted");
     }
     slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);
     return 0;

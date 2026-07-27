@@ -296,11 +296,12 @@ struct BatchGetOffloadObjectPushRequest {
     std::vector<int64_t> sizes;     // total bytes per key (for FileStorage)
     std::string requester_te_addr;  // requester's transfer engine endpoint
     std::vector<std::vector<OffloadDstSlice>> dst_slices;  // per-key dst slices
+    uint64_t trace_id{0};
 
     BatchGetOffloadObjectPushRequest() = default;
 };
 YLT_REFL(BatchGetOffloadObjectPushRequest, keys, sizes, requester_te_addr,
-         dst_slices);
+         dst_slices, trace_id);
 
 struct BatchGetOffloadObjectPushResponse {
     ErrorCode error_code;  // overall result; data is already in requester memory

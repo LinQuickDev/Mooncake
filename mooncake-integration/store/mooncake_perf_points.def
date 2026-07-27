@@ -105,6 +105,9 @@ PERF_KEY_DEF(PUT_BATCH_COLLECT_RESULTS,      "client_service.cpp::BatchPut",    
 
 // === batch_get_into_offload_object_internal 子步骤 (SSD read) ===
 PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC,            "real_client.cpp::batch_get_into_offload_object_internal",  "OffloadRpc")
+PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_POOL,       "real_client.cpp::ClientRequester::invoke_rpc",             "RpcPoolLookup")
+PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_CALL,       "real_client.cpp::ClientRequester::invoke_rpc",             "RpcCall")
+PERF_KEY_DEF(GET_SSD_OFFLOAD_RPC_RESULT_GET, "real_client.cpp::ClientRequester::invoke_rpc",             "RpcResultGet")
 PERF_KEY_DEF(GET_SSD_TRANSFER_DATA,          "real_client.cpp::batch_get_into_offload_object_internal",  "TransferData")
 PERF_KEY_DEF(GET_SSD_RELEASE_BUFFER,         "real_client.cpp::batch_get_into_offload_object_internal",  "ReleaseBuffer")
 
@@ -116,6 +119,9 @@ PERF_KEY_DEF(GET_SSD_OWNER_LOAD_PLAN,        "storage_backend.cpp::BatchLoad",  
 PERF_KEY_DEF(GET_SSD_OWNER_LOAD_URING,       "storage_backend.cpp::BatchLoad",                           "OwnerLoadUring")
 PERF_KEY_DEF(GET_SSD_OWNER_LOAD_POSIX,       "storage_backend.cpp::BatchLoad",                           "OwnerLoadPosix")
 PERF_KEY_DEF(GET_SSD_OWNER_PUSH_WRITE,       "real_client.cpp::batch_get_offload_object_push",           "OwnerPushWrite")
+PERF_KEY_DEF(GET_SSD_OWNER_RPC_QUEUE,        "real_client.cpp::batch_get_offload_object",                "OwnerRpcQueue")
+PERF_KEY_DEF(GET_SSD_OWNER_RPC_BATCH_GET,    "real_client.cpp::batch_get_offload_object",                "OwnerRpcBatchGet")
+PERF_KEY_DEF(GET_SSD_OWNER_RPC_RESUME,       "real_client.cpp::batch_get_offload_object",                "OwnerRpcResume")
 PERF_KEY_DEF(GET_SSD_OWNER_RELEASE,          "file_storage.cpp::ReleaseBuffer",                          "OwnerReleaseBuffer")
 
 // === UB / URMA endpoint first connection path ===
