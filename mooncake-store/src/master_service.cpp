@@ -1026,6 +1026,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
             bool ambiguous_endpoint = false;
             bool unsupported_cxl = false;
+            // Track pre-remount readability so the first successful recovery
+            // starts a fresh lease without extending already-readable objects.
             std::unordered_map<ObjectMetadata*, bool> restored_objects;
             for (size_t shard_index = 0; shard_index < kNumShards;
                  ++shard_index) {
@@ -8290,6 +8292,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
+    // Only kPersisted permits local metadata mutation. kSkipObject leaves the
+    // object unchanged; kStopCycle also propagates reservation backpressure.
     enum class PersistEvictResult { kPersisted, kSkipObject, kStopCycle };
 
     // HA strong-consistency: persist the post-eviction state BEFORE the
@@ -8800,6 +8804,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     if (stop_eviction) {
+        // Reservation backpressure is transient; retry remaining work later.
         need_mem_eviction_ = true;
         if (evicted_count > 0) {
             MasterMetricManager::instance().inc_eviction_success(
