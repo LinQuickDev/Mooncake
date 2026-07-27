@@ -8,6 +8,9 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MOONCAKE_SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # Get build directory from environment variable or argument
 BUILD_DIR="${BUILD_DIR:-${1:-build}}"
 if [[ "${BUILD_DIR}" = /* ]]; then
@@ -56,6 +59,22 @@ rm -rf ${OUTPUT_DIR}/
 fail_ubdiag_packaging() {
     echo "Error: UbDiag RPM provenance check failed: $*" >&2
     return 1
+}
+
+remove_staged_rpath() {
+    local staged_elf="$1"
+
+    if readelf -d "${staged_elf}" 2>/dev/null |
+       grep -Eq '\((RPATH|RUNPATH)\)'; then
+        cmake -DINPUT_FILE="${staged_elf}" \
+            -P "${MOONCAKE_SOURCE_DIR}/cmake/RemoveRpath.cmake"
+    fi
+    if readelf -d "${staged_elf}" 2>/dev/null |
+       grep -Eq '\((RPATH|RUNPATH)\)'; then
+        fail_ubdiag_packaging \
+            "staged ELF still contains RPATH/RUNPATH: ${staged_elf}"
+        return 1
+    fi
 }
 
 load_ubdiag_rpm_manifest() {
@@ -359,8 +378,13 @@ build_rpm_for_platform() {
                 fail_ubdiag_packaging "staged library differs from build output"
                 return 1
             }
-        ubdiag_cli_sha256="$(sha256sum "${ubdiag_cli}" | awk '{print $1}')"
-        ubdiag_library_sha256="$(sha256sum "${ubdiag_library_real}" | awk '{print $1}')"
+        remove_staged_rpath "${BUILDROOT}/usr/bin/ubdiag"
+        ubdiag_cli_sha256="$(
+            sha256sum "${BUILDROOT}/usr/bin/ubdiag" | awk '{print $1}'
+        )"
+        ubdiag_library_sha256="$(
+            sha256sum "${staged_library_real}" | awk '{print $1}'
+        )"
         cat > "${BUILDROOT}/usr/share/doc/mooncake/ubdiag-provenance.txt" << EOF
 layer=vendored
 repository=${MOONCAKE_UBDIAG_GIT_REPOSITORY}
@@ -499,6 +523,7 @@ EOF
         esac
         if readelf -d "${staged_elf}" 2>/dev/null |
            grep -q 'Shared library:.*libubdiag\.so'; then
+            remove_staged_rpath "${staged_elf}"
             staged_ubdiag_dependency_count=$((staged_ubdiag_dependency_count + 1))
         fi
     done < <(find "${BUILDROOT}" -type f -print0)
