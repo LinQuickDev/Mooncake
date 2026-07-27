@@ -31,10 +31,10 @@ set(MOONCAKE_UBDIAG_GIT_REPOSITORY
     "https://github.com/LinQuickDev/ubdiag.git"
     CACHE STRING "ubdiag Git repository")
 set(MOONCAKE_UBDIAG_GIT_TAG
-    "v0.5.1"
+    "8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f"
     CACHE STRING "ubdiag 版本(tag/branch/commit)")
 set(MOONCAKE_UBDIAG_EXPECTED_COMMIT
-    "705c6c37da45df2be4bc64c134dca0b7f30b2113"
+    "8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f"
     CACHE STRING "Mooncake 允许使用的 ubdiag 精确提交 SHA")
 set(MOONCAKE_UBDIAG_SOURCE_DIR "" CACHE PATH "本地 ubdiag 源码目录(离线用,为空则 FetchContent)")
 

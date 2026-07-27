@@ -32,10 +32,10 @@ cmake --build build -j
 CMake 配置阶段应输出（末尾同时打印已验证提交）：
 
 ```text
-UbDiag: UBDIAG_DISABLE(空函数,零依赖), verified 705c6c37da45df2be4bc64c134dca0b7f30b2113
+UbDiag: UBDIAG_DISABLE(空函数,零依赖), verified 8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f
 ```
 
-该模式使用 UbDiag `v0.5.1` 的同一份公共头文件，并通过
+该模式使用 UbDiag `0.6.0` 的同一份公共头文件，并通过
 `UBDIAG_DISABLE` 将 PerfPoint 编译为空函数。Mooncake 无需启动 UbDiag，
 也不需要安装 CLI 或动态库。可使用以下命令确认目标程序未链接 UbDiag：
 
@@ -57,7 +57,7 @@ cmake --build build-ubdiag -j
 CMake 配置阶段应输出（末尾同时打印已验证提交）：
 
 ```text
-UbDiag: FetchContent 编译 v0.5.1(库+CLI), verified 705c6c37da45df2be4bc64c134dca0b7f30b2113
+UbDiag: FetchContent 编译 8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f(库+CLI), verified 8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f
 ```
 
 默认构建目录下的关键产物为：
@@ -121,7 +121,8 @@ mkdir -p ./ubdiag-results
 UbDiag 洁净工作树，并通过 `MOONCAKE_UBDIAG_SOURCE_DIR` 指定绝对路径：
 
 ```bash
-git clone --branch v0.5.1 https://github.com/LinQuickDev/ubdiag.git /opt/src/ubdiag
+git clone https://github.com/LinQuickDev/ubdiag.git /opt/src/ubdiag
+git -C /opt/src/ubdiag checkout 8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f
 cmake -S . -B build-ubdiag \
   -DMOONCAKE_ENABLE_UBDIAG=ON \
   -DMOONCAKE_UBDIAG_SOURCE_DIR=/opt/src/ubdiag
@@ -139,7 +140,7 @@ git -C /opt/src/ubdiag rev-parse HEAD
 git -C /opt/src/ubdiag status --porcelain --untracked-files=all
 ```
 
-提交必须为 `705c6c37da45df2be4bc64c134dca0b7f30b2113`，工作树必须无修改和
+提交必须为 `8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f`，工作树必须无修改和
 未跟踪文件。升级 UbDiag 版本时，必须同时更新
 `MOONCAKE_UBDIAG_GIT_TAG` 和完整的
 `MOONCAKE_UBDIAG_EXPECTED_COMMIT`，不能只更换标签。
