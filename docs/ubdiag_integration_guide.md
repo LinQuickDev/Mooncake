@@ -1,8 +1,9 @@
-# Mooncake UbDiag 两层分发使用指南
+# Mooncake UbDiag 两层分发与单 RPM 使用指南
 
 Mooncake 通过统一的 CMake 接口提供 UbDiag 两层分发能力。默认模式将
 PerfPoint 编译为空实现；启用模式从同一份 UbDiag 源码同步构建 SDK 动态库
-与命令行工具，供 Mooncake 性能采集与分析使用。
+与命令行工具，并将 Mooncake、CLI、动态库和配置打入一个 RPM，供性能
+采集与分析使用。
 
 ## 1. 模式选择
 
@@ -12,6 +13,10 @@ PerfPoint 编译为空实现；启用模式从同一份 UbDiag 源码同步构�
 | Layer 1：启用模式 | `MOONCAKE_ENABLE_UBDIAG=ON` | 使用 PerfPoint、分位数、PerfLog 和 CSV 分析 Mooncake | 同步生成 `libubdiag.so` 与 `ubdiag` CLI |
 
 模式由编译期选项决定，不能在运行时切换。建议为两种模式使用独立构建目录。
+
+> [!NOTE]
+> L1 RPM 安装后可以不执行 `ubdiag start`，此时不会进行共享内存采集；
+> 但该二进制仍链接真实 `libubdiag`，不能称为 Layer 0 编译期禁用模式。
 
 ## 2. 默认禁用模式
 
@@ -78,23 +83,57 @@ export LD_LIBRARY_PATH="$UBDIAG_BUILD/src/sdk${LD_LIBRARY_PATH:+:$LD_LIBRARY_PAT
 不得混用系统中其他版本的 `ubdiag` CLI 或 `libubdiag.so`。CLI 与 SDK
 必须来自同一源码版本和同一次构建，以保证共享内存布局及功能开关一致。
 
-## 4. 采集与分析
+## 4. 安装 L1 单 RPM
+
+完成 L1 构建后，可直接生成一个包含 Mooncake 和 UbDiag 的 RPM：
+
+```bash
+bash scripts/build_rpm.sh build-ubdiag rpm-output "$(uname -m)"
+sudo rpm -Uvh rpm-output/mooncake-*.rpm
+```
+
+安装后的关键文件如下：
+
+```text
+/usr/bin/mooncake_master
+/usr/bin/mooncake_client
+/usr/bin/ubdiag
+/usr/lib64/libubdiag.so
+/usr/lib64/libubdiag.so.0
+/usr/lib64/libubdiag.so.0.6.0
+/etc/ubdiag/ubdiag.conf
+/usr/share/doc/mooncake/ubdiag-provenance.txt
+```
+
+不需要再安装独立 UbDiag CLI 包。可以直接确认版本和来源：
+
+```bash
+/usr/bin/ubdiag --version
+cat /usr/share/doc/mooncake/ubdiag-provenance.txt
+ldd /usr/bin/mooncake_master | grep libubdiag
+```
+
+版本输出应包含 `ubdiag version 0.6.0` 和构建身份 `8df2c284`；
+provenance 中的完整提交应为
+`8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f`。
+
+## 5. 采集与分析
 
 启动 UbDiag 共享内存，并启用 PerfLog：
 
 ```bash
-"$UBDIAG_CLI" start --perflog
-"$UBDIAG_CLI" status
+ubdiag start --perflog
+ubdiag status
 ```
 
 随后按 Mooncake 原有方式启动服务和业务负载。负载运行期间可执行：
 
 ```bash
-"$UBDIAG_CLI" show
-"$UBDIAG_CLI" show --detail
-"$UBDIAG_CLI" show --perflog
-"$UBDIAG_CLI" watch --interval 1000
-"$UBDIAG_CLI" history -n 5
+ubdiag show
+ubdiag show --detail
+ubdiag show --perflog
+ubdiag watch --interval 1000
+ubdiag history -n 5
 ```
 
 其中 `show` 输出聚合统计及 P99/P999/P9999，`show --detail` 输出按核数据，
@@ -104,18 +143,23 @@ export LD_LIBRARY_PATH="$UBDIAG_BUILD/src/sdk${LD_LIBRARY_PATH:+:$LD_LIBRARY_PAT
 
 ```bash
 mkdir -p ./ubdiag-results
-"$UBDIAG_CLI" show --csv ./ubdiag-results
-"$UBDIAG_CLI" show --detail --csv ./ubdiag-results
-"$UBDIAG_CLI" history --csv ./ubdiag-results
+ubdiag show --csv ./ubdiag-results
+ubdiag show --detail --csv ./ubdiag-results
+ubdiag show --perflog --csv ./ubdiag-results
+ubdiag history --csv ./ubdiag-results
 ```
 
 分析结束后销毁共享内存：
 
 ```bash
-"$UBDIAG_CLI" stop
+ubdiag stop
 ```
 
-## 5. 离线源码
+源码构建但尚未安装 RPM 时，将以上 `ubdiag` 替换为
+`build-ubdiag/_deps/ubdiag-build/src/cli/ubdiag`，并确保
+`LD_LIBRARY_PATH` 首项为同一构建目录的 `src/sdk`。
+
+## 6. 离线源码
 
 构建环境无法访问 GitHub 时，预先准备精确版本且保留 `.git` 元数据的
 UbDiag 洁净工作树，并通过 `MOONCAKE_UBDIAG_SOURCE_DIR` 指定绝对路径：
@@ -145,7 +189,7 @@ git -C /opt/src/ubdiag status --porcelain --untracked-files=all
 `MOONCAKE_UBDIAG_GIT_TAG` 和完整的
 `MOONCAKE_UBDIAG_EXPECTED_COMMIT`，不能只更换标签。
 
-## 6. RPM 打包与来源保证
+## 7. RPM 打包与来源保证
 
 CMake 每次配置都会在当前构建目录生成
 `mooncake_ubdiag_rpm.env`。该清单记录当前层、UbDiag 源码目录、期望提交
@@ -171,6 +215,10 @@ CMake 清单指定的 FetchContent 源码和构建产物，并在出包前再次
    `_deps/ubdiag-build` 内。
 5. CLI 确实依赖同一构建目录生成的 `libubdiag.so`。
 6. 复制到 RPM BUILDROOT 后逐文件比较，防止打包阶段替换产物。
+7. 删除 CLI 和 Mooncake 消费者中的构建目录 `RPATH/RUNPATH`，避免安装后
+   继续引用出包机器的 `_deps` 路径。
+8. 对完成 RPATH 清理后的最终 CLI 和真实动态库计算 SHA256，并写入
+   provenance。
 
 Layer 0 的 RPM 不包含 UbDiag CLI 或动态库，并检查待打包 ELF 不依赖
 `libubdiag.so`。Layer 1 的 RPM 包含同一次构建生成的 CLI、动态库和配置，
@@ -189,7 +237,7 @@ bash scripts/build_rpm.sh build rpm-output "$(uname -m)"
 重新配置会刷新来源清单；打包脚本只按最新清单处理。反向切回 Layer 0 时，
 即使构建目录残留旧的 `libubdiag.so`，也不会将其打入 RPM。
 
-## 7. 验收标准
+## 8. 验收标准
 
 | 检查项 | Layer 0 | Layer 1 |
 |--------|---------|---------|
@@ -202,3 +250,14 @@ bash scripts/build_rpm.sh build rpm-output "$(uname -m)"
 若启用模式下 CLI 无数据，应依次确认共享内存已启动、Mooncake 使用的是
 `build-ubdiag` 产物、运行时加载的是同目录 `libubdiag.so`，以及业务负载已
 实际经过 Mooncake PerfPoint 打点路径。
+
+## 9. 常见问题
+
+| 现象 | 原因与处理 |
+|------|------------|
+| L1 RPM 未执行 `ubdiag start` | Mooncake 可以运行，但不产生 UbDiag 采集数据；这不是 Layer 0 Mock |
+| `ubdiag show` 表格为空 | 先确认 `status` 为 running，再运行实际 Mooncake 负载 |
+| CLI 与 Mooncake 数据布局不一致 | 检查 CLI、动态库和 provenance 是否来自同一 RPM |
+| 配置时报提交不一致 | 删除陈旧 `_deps/ubdiag-src`，或提供匹配完整 SHA 的洁净本地源码 |
+| 打包时报 binary marker 不一致 | 重新执行 CMake 配置和构建，不要复用其他版本的 UbDiag 子构建目录 |
+| RPM 中出现构建目录 RPATH | 使用当前打包脚本重新出包；最终 ELF 不应包含 `_deps/ubdiag-build` |
