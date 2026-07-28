@@ -57,6 +57,11 @@ BatchID ProxyManager::submitCrossStage(const Request& request,
     inter_stage.length = chunk_length;
     inter_stage.target_id = request.target_id;
     inter_stage.target_offset = remote_stage_buffer;
+    inter_stage.receiver_credit_session_high =
+        request.receiver_credit_session_high;
+    inter_stage.receiver_credit_session_low =
+        request.receiver_credit_session_low;
+    inter_stage.receiver_credit_epoch = request.receiver_credit_epoch;
     auto batch = impl_->allocateBatch(1);
     auto status = impl_->submitStagingTransfer(batch, {inter_stage});
     if (!status.ok()) {
@@ -107,6 +112,11 @@ Status ProxyManager::waitRemoteStage(const std::string& server_addr,
     remote_stage.length = chunk_length;
     remote_stage.target_id = LOCAL_SEGMENT_ID;
     remote_stage.target_offset = request.target_offset + offset;
+    remote_stage.receiver_credit_session_high =
+        request.receiver_credit_session_high;
+    remote_stage.receiver_credit_session_low =
+        request.receiver_credit_session_low;
+    remote_stage.receiver_credit_epoch = request.receiver_credit_epoch;
     return ControlClient::delegate(server_addr, remote_stage);
 }
 
@@ -121,6 +131,11 @@ void ProxyManager::submitRemoteStage(const std::string& server_addr,
     remote_stage.length = chunk_length;
     remote_stage.target_id = LOCAL_SEGMENT_ID;
     remote_stage.target_offset = request.target_offset + offset;
+    remote_stage.receiver_credit_session_high =
+        request.receiver_credit_session_high;
+    remote_stage.receiver_credit_session_low =
+        request.receiver_credit_session_low;
+    remote_stage.receiver_credit_epoch = request.receiver_credit_epoch;
     handle = delegate_pool_.enqueue([server_addr, remote_stage]() {
         return ControlClient::delegate(server_addr, remote_stage);
     });
