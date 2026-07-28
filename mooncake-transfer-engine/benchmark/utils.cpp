@@ -79,15 +79,16 @@ DEFINE_string(metadata_url_list, "",
 DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
-DEFINE_string(xport_type, "",
-              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link");
+DEFINE_string(
+    xport_type, "",
+    "Transport type: rdma|tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
 DEFINE_string(
     tent_transport_hint, "unspec",
     "tent only: per-request transport_hint. "
-    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|ub|sunrise_link");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"

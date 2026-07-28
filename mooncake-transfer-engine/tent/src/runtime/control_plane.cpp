@@ -45,6 +45,24 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     return Status::OK();
 }
 
+Status ControlClient::bootstrapUb(const std::string& server_addr,
+                                  const UbBootstrapDesc& request,
+                                  UbBootstrapDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, BootstrapUb, request_raw, response_raw));
+    try {
+        response = json::parse(response_raw).get<UbBootstrapDesc>();
+    } catch (const std::exception& e) {
+        return Status::MalformedJson(
+            std::string("Malformed UB bootstrap response: ") + e.what() +
+            LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -176,6 +194,11 @@ ControlService::ControlService(const std::string& type,
             onBootstrapRdma(request, response);
         });
     rpc_server_->registerFunction(
+        BootstrapUb,
+        [this](const std::string_view& request, std::string& response) {
+            onBootstrapUb(request, response);
+        });
+    rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
@@ -218,7 +241,18 @@ ControlService::ControlService(const std::string& type,
         });
 }
 
-ControlService::~ControlService() {}
+ControlService::~ControlService() {
+    // Registered RPC closures capture this. Stop and join the server while
+    // every callback and its synchronization primitive are still alive;
+    // relying on reverse member destruction would destroy them first.
+    if (rpc_server_) (void)rpc_server_->stop();
+    {
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+        ub_bootstrap_callback_ = {};
+    }
+    bootstrap_callback_ = {};
+    notify_callback_ = {};
+}
 
 Status ControlService::start(uint16_t& port, bool ipv6_) {
     return rpc_server_->start(port, ipv6_);
@@ -226,7 +260,7 @@ Status ControlService::start(uint16_t& port, bool ipv6_) {
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    // Re-use the cached dump shared across concurrent peer fetches.
+    // Reuse the cached dump shared across concurrent peer fetches.
     auto cached = manager_->getLocalDumpedJson();
     response = *cached;
 }
@@ -238,6 +272,37 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
         json::parse(std::string(request)).get<BootstrapDesc>();
     BootstrapDesc response_desc;
     if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onBootstrapUb(const std::string_view& request,
+                                   std::string& response) {
+    UbBootstrapDesc response_desc;
+    try {
+        auto request_desc =
+            json::parse(std::string(request)).get<UbBootstrapDesc>();
+        int ret = -1;
+        {
+            // Callback replacement during uninstall is serialized with
+            // invocation, so an in-flight bootstrap cannot outlive the UB
+            // transport object it targets.
+            std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+            if (ub_bootstrap_callback_) {
+                ret = ub_bootstrap_callback_(request_desc, response_desc);
+            } else {
+                response_desc.reply_msg =
+                    "UB bootstrap callback is not registered";
+            }
+        }
+        if (ret != 0 && response_desc.reply_msg.empty()) {
+            response_desc.reply_msg =
+                "UB bootstrap callback failed, ret=" + std::to_string(ret);
+        }
+    } catch (const std::exception& e) {
+        response_desc.reply_msg =
+            std::string("Malformed UB bootstrap request: ") + e.what();
+    }
     json j = response_desc;
     response = j.dump();
 }
