@@ -112,8 +112,12 @@ function(_mooncake_write_ubdiag_rpm_manifest layer)
 endfunction()
 
 set(ubdiag_BINARY_DIR "${FETCHCONTENT_BASE_DIR}/ubdiag-build")
-if(MOONCAKE_UBDIAG_SOURCE_DIR AND
-   EXISTS "${MOONCAKE_UBDIAG_SOURCE_DIR}/CMakeLists.txt")
+if(MOONCAKE_UBDIAG_SOURCE_DIR)
+  if(NOT EXISTS "${MOONCAKE_UBDIAG_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "MOONCAKE_UBDIAG_SOURCE_DIR does not contain CMakeLists.txt: "
+      "${MOONCAKE_UBDIAG_SOURCE_DIR}")
+  endif()
   set(ubdiag_SOURCE_DIR "${MOONCAKE_UBDIAG_SOURCE_DIR}")
 else()
   FetchContent_Populate(ubdiag

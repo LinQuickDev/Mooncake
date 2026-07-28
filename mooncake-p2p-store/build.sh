@@ -48,7 +48,8 @@ case "$UBDIAG_LAYER" in
         echo "P2P Store: ubdiag DISABLE 模式,跳过 -lubdiag"
         ;;
     *)
-        echo "P2P Store: 未知 ubdiag layer: $UBDIAG_LAYER,跳过 -lubdiag"
+        echo "P2P Store: 未知 ubdiag layer: $UBDIAG_LAYER" >&2
+        exit 1
         ;;
 esac
 
