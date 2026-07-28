@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ "$#" -ne 7 ]; then
-    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR UBDIAG_LAYER"
+if [ "$#" -ne 8 ]; then
+    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR UBDIAG_LAYER UBDIAG_LIB_DIR"
     exit 1
 fi
 
@@ -25,6 +25,7 @@ USE_HTTP=$4
 USE_ETCD_LEGACY=$5
 BUILD_DIR=$6
 UBDIAG_LAYER=$7
+UBDIAG_LIB_DIR=$8
 
 cd "src/p2pstore"
 if [ $? -ne 0 ]; then
@@ -38,17 +39,21 @@ EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
 
-# ubdiag 链接: vendored 模式链接真实库, mock 模式跳过(空函数无库)
+# UbDiag link contract: mock has no runtime library; system uses the
+# separately installed library selected by FindUbDiag.cmake.
 case "$UBDIAG_LAYER" in
-    vendored)
-        UBDIAG_LIB_DIR="$BUILD_DIR/_deps/ubdiag-build/src/sdk"
+    system)
+        if [ -z "$UBDIAG_LIB_DIR" ] || [ ! -d "$UBDIAG_LIB_DIR" ]; then
+            echo "P2P Store: invalid system UbDiag library directory: $UBDIAG_LIB_DIR" >&2
+            exit 1
+        fi
         EXT_LDFLAGS+=" -L$UBDIAG_LIB_DIR -lubdiag"
         ;;
     mock)
-        echo "P2P Store: ubdiag DISABLE 模式,跳过 -lubdiag"
+        echo "P2P Store: UBDIAG_DISABLE mode, skipping -lubdiag"
         ;;
     *)
-        echo "P2P Store: 未知 ubdiag layer: $UBDIAG_LAYER" >&2
+        echo "P2P Store: unknown UbDiag layer: $UBDIAG_LAYER" >&2
         exit 1
         ;;
 esac
