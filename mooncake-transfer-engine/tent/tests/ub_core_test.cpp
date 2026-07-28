@@ -23,6 +23,7 @@
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
+#include "tent/transport/ub/workers.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -206,6 +207,97 @@ TEST(UbQuotaTest, EnforcesBothLevelsAndReleasesIdempotently) {
     EXPECT_TRUE(quota.tryAcquire(first_path, 60).has_value());
 }
 
+TEST(UbQuotaTest, EndpointGenerationsShareOnePhysicalRailLimit) {
+    QuotaManager quota(/*default_device_limits=*/{200, 4},
+                       /*default_path_limits=*/{60, 1});
+    const auto old_generation = makePath(0, 1, 10);
+    const auto replacement = makePath(0, 1, 11);
+
+    auto old_reservation = quota.tryAcquire(old_generation, 60);
+    ASSERT_TRUE(old_reservation.has_value());
+    EXPECT_FALSE(quota.tryAcquire(replacement, 1).has_value());
+    EXPECT_EQ(quota.pathStats(replacement).usage.inflight_bytes, 60u);
+    ASSERT_EQ(quota.allPathStats().size(), 1u);
+    // Diagnostics follow the newest observed endpoint incarnation even when
+    // its acquisition is rejected by pressure left by the old generation.
+    EXPECT_EQ(quota.allPathStats().front().path.endpoint_generation, 11u);
+
+    EXPECT_TRUE(quota.release(*old_reservation));
+    auto replacement_reservation = quota.tryAcquire(replacement, 60);
+    ASSERT_TRUE(replacement_reservation.has_value());
+    ASSERT_EQ(quota.allPathStats().size(), 1u);
+    EXPECT_EQ(quota.allPathStats().front().path.endpoint_generation, 11u);
+    EXPECT_TRUE(quota.release(*replacement_reservation));
+}
+
+TEST(UbQuotaTest, ScoresProjectedPressureAndFallsBackAtomically) {
+    QuotaManager quota(/*default_device_limits=*/{200, 4},
+                       /*default_path_limits=*/{100, 2});
+    const auto preferred = makePath(0, 1, 1);
+    const auto alternate = makePath(0, 2, 1);
+
+    auto first = quota.tryAcquire(preferred, 50);
+    ASSERT_TRUE(first.has_value());
+    const auto preferred_pressure = quota.availability(preferred, 50);
+    const auto alternate_pressure = quota.availability(alternate, 50);
+    ASSERT_TRUE(preferred_pressure.can_acquire);
+    ASSERT_TRUE(alternate_pressure.can_acquire);
+    EXPECT_DOUBLE_EQ(preferred_pressure.normalized_inflight, 1.0);
+    EXPECT_DOUBLE_EQ(alternate_pressure.normalized_inflight, 0.5);
+
+    auto fill_preferred = quota.tryAcquire(preferred, 50);
+    ASSERT_TRUE(fill_preferred.has_value());
+    EXPECT_FALSE(quota.availability(preferred, 1).can_acquire);
+
+    // Preflight selection can race with another worker. The ordered commit
+    // must skip the now-full first rail and reserve the alternate rail while
+    // holding one quota lock.
+    auto selected = quota.tryAcquireFirst({preferred, alternate}, 50);
+    ASSERT_TRUE(selected.has_value());
+    EXPECT_EQ(selected->path, alternate);
+    EXPECT_EQ(quota.pathStats(preferred).rejected_acquisitions, 1U);
+    EXPECT_EQ(quota.aggregateStats().rejected_acquisitions, 0U);
+
+    EXPECT_TRUE(quota.release(*first));
+    EXPECT_TRUE(quota.release(*fill_preferred));
+    EXPECT_TRUE(quota.release(*selected));
+}
+
+TEST(UbPathSelectionScoreTest, AppliesCapacityLocalityPressureAndBandwidth) {
+    UbPathSelectionScore base;
+    base.quota_available = true;
+    base.topology_rank = 0;
+    base.normalized_inflight = 0.5;
+    base.normalized_quota_wrs = 0.5;
+    base.endpoint_outstanding_wrs = 2;
+    base.endpoint_outstanding_bytes = 128;
+    base.has_bandwidth_sample = true;
+    base.ewma_bandwidth_bytes_per_second = 100.0;
+
+    auto saturated = base;
+    saturated.quota_available = false;
+    saturated.topology_rank = 0;
+    saturated.normalized_inflight = 0.0;
+    EXPECT_TRUE(betterUbPathScore(base, saturated));
+
+    auto farther = base;
+    farther.topology_rank = 1;
+    farther.normalized_inflight = 0.0;
+    EXPECT_TRUE(betterUbPathScore(base, farther));
+
+    auto busier = base;
+    busier.normalized_inflight = 0.75;
+    EXPECT_TRUE(betterUbPathScore(base, busier));
+
+    auto endpoint_busier = base;
+    endpoint_busier.endpoint_outstanding_wrs = 3;
+    EXPECT_TRUE(betterUbPathScore(base, endpoint_busier));
+
+    auto slower = base;
+    slower.ewma_bandwidth_bytes_per_second = 50.0;
+    EXPECT_TRUE(betterUbPathScore(base, slower));
+}
+
 TEST(UbRailMonitorTest, PausesOnErrorWindowAndRecoversAfterCooldown) {
     RailMonitor monitor(RailMonitorConfig{/*error_threshold=*/2,
                                           /*error_window_ns=*/100,
@@ -298,6 +390,22 @@ TEST(UbRailMonitorTest, OutOfOrderExpiredErrorDoesNotTriggerPause) {
     EXPECT_EQ(stats.last_error_ns, 200U);
     EXPECT_EQ(stats.pauses, 0U);
     EXPECT_EQ(stats.recoveries, 0U);
+}
+
+TEST(UbRailMonitorTest, EndpointRebuildTelemetryDeduplicatesGeneration) {
+    RailMonitor monitor;
+    const auto first = makePath(0, 1, 10);
+    const auto replacement = makePath(0, 1, 11);
+
+    EXPECT_TRUE(monitor.recordEndpointRebuild(first, 100));
+    EXPECT_FALSE(monitor.recordEndpointRebuild(first, 101));
+    EXPECT_TRUE(monitor.recordEndpointRebuild(replacement, 102));
+    // A late callback for an older incarnation cannot double count it.
+    EXPECT_FALSE(monitor.recordEndpointRebuild(first, 103));
+
+    const auto stats = monitor.stats(replacement, 103);
+    EXPECT_EQ(stats.endpoint_rebuilds, 2U);
+    EXPECT_EQ(stats.latest_endpoint_generation, 11U);
 }
 
 }  // namespace

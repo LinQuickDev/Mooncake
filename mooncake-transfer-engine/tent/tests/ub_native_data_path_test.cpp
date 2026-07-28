@@ -167,6 +167,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
     Status shutdown() override {
+        if (fail_next_shutdown_.exchange(false, std::memory_order_acq_rel)) {
+            return Status::InternalError("injected adapter shutdown failure");
+        }
         initialized_ = false;
         return Status::OK();
     }
@@ -273,6 +276,8 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (fail_next_quiesce_.exchange(false, std::memory_order_acq_rel)) {
             return Status::RdmaError("injected quiesce failure");
         }
+        const bool drop_completion = drop_next_quiesced_completion_.exchange(
+            false, std::memory_order_acq_rel);
         std::lock_guard<std::mutex> lock(pending_mutex_);
         auto it = pending_.begin();
         while (it != pending_.end()) {
@@ -280,9 +285,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                 ++it;
                 continue;
             }
-            completions.push_back(Completion{CompletionCategory::ENDPOINT_ERROR,
-                                             0, it->request.token, 0,
-                                             fake->id()});
+            if (!drop_completion) {
+                completions.push_back(
+                    Completion{CompletionCategory::ENDPOINT_ERROR, 0,
+                               it->request.token, 0, fake->id()});
+            }
             it = pending_.erase(it);
         }
         quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -347,8 +354,14 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
     }
+    void dropNextQuiescedCompletion() {
+        drop_next_quiesced_completion_.store(true, std::memory_order_release);
+    }
     void failNextQuiesce() {
         fail_next_quiesce_.store(true, std::memory_order_release);
+    }
+    void failNextShutdown() {
+        fail_next_shutdown_.store(true, std::memory_order_release);
     }
     size_t pendingCount() const {
         std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -373,7 +386,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<CompletionCategory> next_completion_{
         CompletionCategory::SUCCESS};
     std::atomic<bool> hold_next_completion_{false};
+    std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};
+    std::atomic<bool> fail_next_shutdown_{false};
     mutable std::mutex pending_mutex_;
     std::vector<Pending> pending_;
     std::atomic<uint64_t> quiesce_calls_{0};
@@ -519,6 +534,7 @@ TEST(UbNativeDataPathTest,
                       });
     ASSERT_TRUE(workers.start().ok());
     adapter->holdNextCompletion();
+    adapter->dropNextQuiescedCompletion();
 
     Request request{};
     request.opcode = Request::WRITE;
@@ -701,6 +717,13 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_EQ(transfer.transferred_bytes, source.size());
     EXPECT_EQ(source, expected);
 
+    std::vector<NicLoadStats> nic_stats;
+    ASSERT_TRUE(transport.getNicLoadStats(nic_stats).ok());
+    ASSERT_EQ(nic_stats.size(), 1U);
+    EXPECT_EQ(nic_stats.front().device_name, "ub:fake0:eid0");
+    EXPECT_EQ(nic_stats.front().inflight_bytes, 0U);
+    EXPECT_GT(nic_stats.front().ewma_bandwidth_bps, 0.0);
+
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_EQ(batch, nullptr);
 
@@ -720,7 +743,8 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     adapter->failNextQuiesce();
     EXPECT_FALSE(transport.uninstall().ok());
     EXPECT_EQ(adapter->pendingCount(), 1U);
-    EXPECT_TRUE(transport.uninstall().ok());
+    adapter->failNextShutdown();
+    EXPECT_FALSE(transport.uninstall().ok());
     EXPECT_EQ(adapter->pendingCount(), 0U);
     EXPECT_TRUE(transport.freeSubBatch(draining_batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());

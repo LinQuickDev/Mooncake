@@ -177,6 +177,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
         owner.kind = owner_input.kind;
+        owner.transport = owner_input.transport;
         owner.degradation_eligible = owner_input.degradation_eligible;
         owners_.emplace(owner_id, owner);
 
@@ -220,6 +221,16 @@ void LocalTransferAdmissionQueue::setDegradationPolicy(
     BandwidthProvider bandwidth_provider, DegradationHooks hooks,
     NowProvider now_provider) {
     bandwidth_provider_ = std::move(bandwidth_provider);
+    transport_bandwidth_provider_ = nullptr;
+    degradation_hooks_ = std::move(hooks);
+    now_provider_ = std::move(now_provider);
+}
+
+void LocalTransferAdmissionQueue::setTransportDegradationPolicy(
+    TransportBandwidthProvider bandwidth_provider, DegradationHooks hooks,
+    NowProvider now_provider) {
+    transport_bandwidth_provider_ = std::move(bandwidth_provider);
+    bandwidth_provider_ = nullptr;
     degradation_hooks_ = std::move(hooks);
     now_provider_ = std::move(now_provider);
 }
@@ -240,13 +251,13 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     //
     // RFC #2519 step 3 (opt-in): drop is active only when a positive threshold,
     // deadline awareness, and a bandwidth provider are all present.
-    const bool drop_enabled = limits_.deadline_aware &&
-                              limits_.mlu_local_threshold > 0.0 &&
-                              static_cast<bool>(bandwidth_provider_);
+    const bool drop_enabled =
+        limits_.deadline_aware && limits_.mlu_local_threshold > 0.0 &&
+        (static_cast<bool>(bandwidth_provider_) ||
+         static_cast<bool>(transport_bandwidth_provider_));
     const bool promotion_enabled =
         limits_.deadline_aware && limits_.promotion_slack_ns > 0;
     const bool need_now = drop_enabled || promotion_enabled;
-    const double bw_bps = drop_enabled ? bandwidth_provider_() : 0.0;
     const uint64_t now_ns =
         need_now
             ? (now_provider_
@@ -277,8 +288,12 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
     // if the owner is predicted to miss its deadline hard enough to drop.
     auto shouldDrop = [&](const QueueOwner& owner) -> bool {
-        if (!drop_enabled || !owner.degradation_eligible || bw_bps <= 0.0)
-            return false;
+        if (!drop_enabled || !owner.degradation_eligible) return false;
+        const double bw_bps =
+            transport_bandwidth_provider_
+                ? transport_bandwidth_provider_(owner.transport)
+                : bandwidth_provider_();
+        if (bw_bps <= 0.0) return false;
         const uint64_t deadline_ns = owner.request.deadline_ns;
         if (deadline_ns == 0) return false;      // no deadline
         if (deadline_ns <= now_ns) return true;  // already past

@@ -9,6 +9,18 @@
 #include <vector>
 
 namespace mooncake::tent::ub {
+namespace {
+
+bool retirementComplete(const std::shared_ptr<UbEndpoint>& endpoint) {
+    return endpoint && endpoint->state() == UbEndpoint::State::kDestroyed;
+}
+
+Status retirementPending() {
+    return Status::TooManyRequests(
+        "UB endpoint retirement is waiting for outstanding WRs" LOC_MARK);
+}
+
+}  // namespace
 
 EndpointStore::EndpointStore(std::shared_ptr<UrmaAdapter> adapter,
                              size_t max_size, uint32_t jetty_count,
@@ -35,24 +47,17 @@ EndpointStore::~EndpointStore() {
 }
 
 std::shared_ptr<UbEndpoint> EndpointStore::get(const UbEndpointKey& key) {
-    std::shared_ptr<UbEndpoint> retired;
     std::shared_ptr<UbEndpoint> result;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = endpoints_.find(key);
         if (it == endpoints_.end()) return nullptr;
         if (!it->second.endpoint || !it->second.endpoint->reusable()) {
-            retired = std::move(it->second.endpoint);
+            auto retired = std::move(it->second.endpoint);
             endpoints_.erase(it);
+            (void)retireLocked(retired);
         } else {
             result = it->second.endpoint;
-        }
-    }
-    if (retired) {
-        auto status = retired->retire();
-        if (!status.ok()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            quarantined_.push_back(std::move(retired));
         }
     }
     return result;
@@ -69,21 +74,26 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
             "Invalid UB endpoint store request" LOC_MARK);
     }
 
-    std::shared_ptr<UbEndpoint> evicted;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A transient provider busy/error must not permanently consume the
+        // cache. Retry unpublished ownership before deciding that no slot is
+        // available for a replacement generation.
+        (void)retryQuarantinedLocked();
         auto existing = endpoints_.find(key);
         if (existing != endpoints_.end()) {
             if (existing->second.endpoint &&
                 existing->second.endpoint->reusable()) {
                 endpoint = existing->second.endpoint;
             } else {
-                evicted = std::move(existing->second.endpoint);
+                auto evicted = std::move(existing->second.endpoint);
                 endpoints_.erase(existing);
+                (void)retireLocked(evicted);
             }
         }
 
-        if (!endpoint && endpoints_.size() + quarantined_.size() >= max_size_) {
+        while (!endpoint &&
+               endpoints_.size() + quarantined_.size() >= max_size_) {
             auto victim = endpoints_.end();
             uint64_t oldest = std::numeric_limits<uint64_t>::max();
             for (auto it = endpoints_.begin(); it != endpoints_.end(); ++it) {
@@ -98,21 +108,15 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
                 return Status::TooManyRequests(
                     "All UB endpoint cache entries are in flight" LOC_MARK);
             }
-            if (!evicted) evicted = std::move(victim->second.endpoint);
+            auto evicted = std::move(victim->second.endpoint);
             endpoints_.erase(victim);
+            (void)retireLocked(evicted);
         }
 
         if (!endpoint) {
             endpoint = std::make_shared<UbEndpoint>(
                 key, context, adapter_, jetty_count_, jetty_options_);
             endpoints_.emplace(key, Entry{endpoint, next_insertion_order_++});
-        }
-    }
-    if (evicted) {
-        auto evict_status = evicted->retire();
-        if (!evict_status.ok()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            quarantined_.push_back(std::move(evicted));
         }
     }
 
@@ -126,22 +130,15 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
 }
 
 bool EndpointStore::retire(const UbEndpointKey& key, uint64_t generation) {
-    std::shared_ptr<UbEndpoint> endpoint;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = endpoints_.find(key);
-        if (it == endpoints_.end() || !it->second.endpoint ||
-            it->second.endpoint->generation() != generation) {
-            return false;
-        }
-        endpoint = std::move(it->second.endpoint);
-        endpoints_.erase(it);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = endpoints_.find(key);
+    if (it == endpoints_.end() || !it->second.endpoint ||
+        it->second.endpoint->generation() != generation) {
+        return false;
     }
-    auto status = endpoint->retire();
-    if (!status.ok()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        quarantined_.push_back(std::move(endpoint));
-    }
+    auto endpoint = std::move(it->second.endpoint);
+    endpoints_.erase(it);
+    (void)retireLocked(endpoint);
     return true;
 }
 
@@ -149,34 +146,74 @@ bool EndpointStore::retire(const std::shared_ptr<UbEndpoint>& endpoint) {
     return endpoint && retire(endpoint->key(), endpoint->generation());
 }
 
+Status EndpointStore::retireLocalDevice(Topology::NicID local_topology_id) {
+    std::vector<std::shared_ptr<UbEndpoint>> endpoints;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = endpoints_.begin(); it != endpoints_.end();) {
+        if (it->first.local_topology_id != local_topology_id) {
+            ++it;
+            continue;
+        }
+        if (it->second.endpoint) {
+            endpoints.push_back(std::move(it->second.endpoint));
+        }
+        it = endpoints_.erase(it);
+    }
+    for (auto it = quarantined_.begin(); it != quarantined_.end();) {
+        if (!*it || (*it)->key().local_topology_id != local_topology_id) {
+            ++it;
+            continue;
+        }
+        endpoints.push_back(std::move(*it));
+        it = quarantined_.erase(it);
+    }
+
+    Status first_error = Status::OK();
+    for (auto& endpoint : endpoints) {
+        auto status = retireLocked(endpoint);
+        if (!status.ok() && first_error.ok()) first_error = status;
+    }
+    return first_error;
+}
+
 Status EndpointStore::clear() {
     std::vector<std::shared_ptr<UbEndpoint>> endpoints;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        endpoints.reserve(endpoints_.size());
-        for (auto& [_, entry] : endpoints_) {
-            if (entry.endpoint) endpoints.push_back(std::move(entry.endpoint));
-        }
-        endpoints_.clear();
-        for (auto& endpoint : quarantined_) {
-            if (endpoint) endpoints.push_back(std::move(endpoint));
-        }
-        quarantined_.clear();
+    std::lock_guard<std::mutex> lock(mutex_);
+    endpoints.reserve(endpoints_.size());
+    for (auto& [_, entry] : endpoints_) {
+        if (entry.endpoint) endpoints.push_back(std::move(entry.endpoint));
     }
+    endpoints_.clear();
+    for (auto& endpoint : quarantined_) {
+        if (endpoint) endpoints.push_back(std::move(endpoint));
+    }
+    quarantined_.clear();
+
     Status first_error = Status::OK();
-    std::vector<std::shared_ptr<UbEndpoint>> failed;
     for (auto& endpoint : endpoints) {
-        auto status = endpoint->retire();
-        if (!status.ok()) {
-            if (first_error.ok()) first_error = status;
-            failed.push_back(std::move(endpoint));
-        }
+        auto status = retireLocked(endpoint);
+        if (!status.ok() && first_error.ok()) first_error = status;
     }
-    if (!failed.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        quarantined_.insert(quarantined_.end(),
-                            std::make_move_iterator(failed.begin()),
-                            std::make_move_iterator(failed.end()));
+    return first_error;
+}
+
+Status EndpointStore::retireLocked(std::shared_ptr<UbEndpoint>& endpoint) {
+    if (!endpoint) return Status::OK();
+    auto status = endpoint->retire();
+    if (status.ok() && !retirementComplete(endpoint)) {
+        status = retirementPending();
+    }
+    if (!status.ok()) quarantined_.push_back(std::move(endpoint));
+    return status;
+}
+
+Status EndpointStore::retryQuarantinedLocked() {
+    std::vector<std::shared_ptr<UbEndpoint>> pending;
+    pending.swap(quarantined_);
+    Status first_error = Status::OK();
+    for (auto& endpoint : pending) {
+        auto status = retireLocked(endpoint);
+        if (!status.ok() && first_error.ok()) first_error = status;
     }
     return first_error;
 }
