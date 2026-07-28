@@ -180,9 +180,9 @@ build_rpm_for_platform() {
     local MOONCAKE_UBDIAG_EXPECTED_COMMIT=""
     local MOONCAKE_UBDIAG_RESOLVED_COMMIT=""
     local MOONCAKE_UBDIAG_SOURCE_DIR=""
-    
+
     echo "Building RPM for platform: ${PLATFORM}"
-    
+
     # Determine lib directory based on platform
     if [ "${PLATFORM}" = "aarch64" ]; then
         LIB_DIR="lib64"  # ARM64 also uses lib64 on most distros
@@ -192,19 +192,19 @@ build_rpm_for_platform() {
         echo "Error: Unsupported platform ${PLATFORM}"
         return 1
     fi
-    
+
     # Create RPM build directory structure for this platform
     mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
     mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}
-    
+
     # Create target directories in BUILDROOT
     mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/{usr/{bin,${LIB_DIR},include,share/doc/mooncake},etc/{mooncake,ubdiag}}
-    
+
     # -------------------------------------------------------------------------
     # Copy executables
     # -------------------------------------------------------------------------
     echo "Copying executables..."
-    
+
     # Determine build subdirectory based on platform
     local PLATFORM_BUILD_DIR="${BUILD_DIR_ABS}"
     if [ "${PLATFORM}" != "${HOST_ARCH}" ]; then
@@ -217,7 +217,7 @@ build_rpm_for_platform() {
     echo "Reading verified UbDiag RPM manifest: ${UBDIAG_RPM_MANIFEST}"
     load_ubdiag_rpm_manifest "${UBDIAG_RPM_MANIFEST}"
     verify_ubdiag_source_provenance
-    
+
     # mooncake_master
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-store/src/mooncake_master ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-store/src/mooncake_master rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/bin/
@@ -225,7 +225,7 @@ build_rpm_for_platform() {
     else
         echo "Warning: mooncake_master not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # mooncake_client
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-store/src/mooncake_client ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-store/src/mooncake_client rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/bin/
@@ -233,7 +233,7 @@ build_rpm_for_platform() {
     else
         echo "Warning: mooncake_client not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # stress_cluster_bench
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-store/benchmarks/stress_cluster_bench ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-store/benchmarks/stress_cluster_bench rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/bin/
@@ -241,7 +241,7 @@ build_rpm_for_platform() {
     else
         echo "Warning: stress_cluster_bench not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # transfer_engine_bench
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/bin/
@@ -249,40 +249,40 @@ build_rpm_for_platform() {
     else
         echo "Warning: transfer_engine_bench not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # -------------------------------------------------------------------------
     # Copy libraries
     # -------------------------------------------------------------------------
     echo "Copying shared libraries..."
-    
+
     # libmooncake_store.so
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-store/src/libmooncake_store.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
     else
         echo "Warning: libmooncake_store.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # libtransfer_engine.so
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
     else
         echo "Warning: libtransfer_engine.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # libasio.so
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-common/libasio.so ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-common/libasio.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
     else
         echo "Warning: libasio.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # libetcd_wrapper.so
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
     else
         echo "Warning: libetcd_wrapper.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # libmooncake_common.so
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-common/libmooncake_common.so ]; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-common/libmooncake_common.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/
@@ -291,14 +291,14 @@ build_rpm_for_platform() {
     else
         echo "Warning: libmooncake_common.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # engine.so (Python binding)
     if compgen -G "${PLATFORM_BUILD_DIR}/mooncake-integration/engine.*.so" >/dev/null; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-integration/engine.*.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/libmooncake_engine.so
     else
         echo "Warning: engine.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
-    
+
     # store.so (Python binding)
     if compgen -G "${PLATFORM_BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
         cp ${PLATFORM_BUILD_DIR}/mooncake-integration/store.*.so rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/${LIB_DIR}/libmooncake_store_python.so
@@ -408,15 +408,15 @@ EOF
             return 1
         fi
     fi
-    
+
     # -------------------------------------------------------------------------
     # Copy header files (only core headers for real_client and dummy_client)
     # -------------------------------------------------------------------------
     echo "Copying core header files for real_client and dummy_client..."
-    
+
     # Create include directories
     mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/usr/include/mooncake
-    
+
     # Core client headers (real_client and dummy_client dependencies)
     # These are the essential headers needed for client-side development
     CORE_HEADERS=(
@@ -424,21 +424,21 @@ EOF
         "real_client.h"
         "dummy_client.h"
         "pyclient.h"
-        
+
         # pyclient dependencies
         "client_service.h"
         "client_buffer.hpp"
         "mutex.h"
         "utils.h"
         "file_storage.h"
-        
+
         # real_client dependencies
         "rpc_types.h"
-        
+
         # dummy_client dependencies
         "shm_helper.h"
         "client_metric.h"
-        
+
         # Common types and utilities
         "types.h"
         "segment.h"
@@ -454,11 +454,11 @@ EOF
         "metadata_store.h"
         "mmap_arena.h"
         "pinned_buffer_pool.h"
-        
+
         # C API headers
         "store_c.h"
     )
-    
+
     # Copy core store headers
     for header in "${CORE_HEADERS[@]}"; do
         if [ -f mooncake-store/include/${header} ]; then
@@ -467,7 +467,7 @@ EOF
             echo "Warning: Core header ${header} not found"
         fi
     done
-    
+
     # Transfer engine core headers (needed by real_client)
     TRANSFER_ENGINE_HEADERS=(
         "transfer_engine_c.h"
@@ -479,7 +479,7 @@ EOF
         "multi_transport.h"
         "topology.h"
     )
-    
+
     # Copy transfer engine headers
     for header in "${TRANSFER_ENGINE_HEADERS[@]}"; do
         if [ -f mooncake-transfer-engine/include/${header} ]; then
@@ -488,7 +488,7 @@ EOF
             echo "Warning: Transfer engine header ${header} not found"
         fi
     done
-    
+
     # Note: Excluding the following directories as they are not needed for basic client usage:
     # - cachelib_memory_allocator/ (memory allocator internals)
     # - engram/ (engram store specific)
@@ -498,17 +498,17 @@ EOF
     # - serialize/ (serialization utilities)
     # - spdk/ (SPDK integration)
     # - utils/s3_helper.h, zstd_util.h (specific utilities)
-    
+
     # -------------------------------------------------------------------------
     # Copy configuration files
     # -------------------------------------------------------------------------
     echo "Copying configuration files..."
-    
+
     # Master configuration
     if [ -f mooncake-store/conf/master.yaml ]; then
         cp mooncake-store/conf/master.yaml rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/etc/mooncake/
     fi
-    
+
     if [ -f mooncake-store/conf/master.json ]; then
         cp mooncake-store/conf/master.json rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/etc/mooncake/
     fi
@@ -554,12 +554,12 @@ EOF
             OPTIONAL_RPM_FILES+="${optional_rpm_file}"$'\n'
         fi
     done
-    
+
     # -------------------------------------------------------------------------
     # Create RPM spec file
     # -------------------------------------------------------------------------
     echo "Creating RPM spec file for ${PLATFORM}..."
-    
+
     cat > rpmbuild/SPECS/${PACKAGE_NAME}-${PLATFORM}.spec << EOF
 Name:           ${PACKAGE_NAME}
 Version:        ${PACKAGE_VERSION}
@@ -614,30 +614,30 @@ ${UBDIAG_RPM_FILES}
 * $(date +"%a %b %d %Y") KVCache.AI <support@kvcache.ai> - ${PACKAGE_VERSION}-${PACKAGE_RELEASE}
 - Initial RPM package for ${PLATFORM}
 EOF
-    
+
     # -------------------------------------------------------------------------
     # Build RPM package
     # -------------------------------------------------------------------------
     echo "Building RPM package for ${PLATFORM}..."
-    
+
     # Ensure rpmbuild is available
     if ! command -v rpmbuild &>/dev/null; then
         echo "Error: rpmbuild not found. Please install rpm-build package."
         exit 1
     fi
-    
+
     # Create platform-specific output directory
     mkdir -p ${OUTPUT_DIR}/${PLATFORM}
-    
+
     # Build the RPM
     rpmbuild -bb \
         --define "_topdir $(pwd)/rpmbuild" \
         --define "_rpmdir ${OUTPUT_DIR}" \
         rpmbuild/SPECS/${PACKAGE_NAME}-${PLATFORM}.spec
-    
+
     # Move RPM to platform-specific directory
     mv ${OUTPUT_DIR}/${PLATFORM}/*.rpm ${OUTPUT_DIR}/ 2>/dev/null || true
-    
+
     # Cleanup BUILDROOT for next platform
     rm -rf rpmbuild/BUILDROOT/
 }
@@ -647,20 +647,20 @@ EOF
 # -----------------------------------------------------------------------------
 if [ "${TARGET_PLATFORM}" = "all" ]; then
     echo "Building RPM packages for all supported platforms..."
-    
+
     # Build for x86_64
     build_rpm_for_platform "x86_64"
-    
+
     # Build for aarch64 (if cross-compilation is available or running on ARM)
     if [ "${HOST_ARCH}" = "aarch64" ] || [ -d "${BUILD_DIR}-aarch64" ]; then
         build_rpm_for_platform "aarch64"
     else
         echo "Warning: Skipping aarch64 build - no cross-compilation build directory found"
     fi
-    
+
 elif [ "${TARGET_PLATFORM}" = "x86_64" ] || [ "${TARGET_PLATFORM}" = "aarch64" ]; then
     build_rpm_for_platform "${TARGET_PLATFORM}"
-    
+
 else
     echo "Error: Unsupported platform ${TARGET_PLATFORM}"
     echo "Supported platforms: x86_64, aarch64, all"
