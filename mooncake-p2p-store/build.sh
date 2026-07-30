@@ -39,24 +39,9 @@ EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
 
-# UbDiag link contract: mock has no runtime library; system uses the
-# separately installed library selected by FindUbDiag.cmake.
-case "$UBDIAG_LAYER" in
-    system)
-        if [ -z "$UBDIAG_LIB_DIR" ] || [ ! -d "$UBDIAG_LIB_DIR" ]; then
-            echo "P2P Store: invalid system UbDiag library directory: $UBDIAG_LIB_DIR" >&2
-            exit 1
-        fi
-        EXT_LDFLAGS+=" -L$UBDIAG_LIB_DIR -lubdiag"
-        ;;
-    mock)
-        echo "P2P Store: UBDIAG_DISABLE mode, skipping -lubdiag"
-        ;;
-    *)
-        echo "P2P Store: unknown UbDiag layer: $UBDIAG_LAYER" >&2
-        exit 1
-        ;;
-esac
+if [ "$UBDIAG_LAYER" = "system" ]; then
+    EXT_LDFLAGS+=" -L$UBDIAG_LIB_DIR -lubdiag"
+fi
 
 if [ -d "/usr/local/cuda/lib64/stubs" ]; then
     EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"
