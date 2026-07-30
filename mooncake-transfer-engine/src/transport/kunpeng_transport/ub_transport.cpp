@@ -308,13 +308,13 @@ Status UbTransport::submitTransferTask(
             slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
             if (context->numa_affinity()) {
                 const auto& local_buf = local_segment_desc->buffers[buffer_id];
-                uint64_t off = (uint64_t)slice->source_addr - local_buf.addr;
-                int data_numa =
-                    resolveBufferNumaNode(local_buf.name, local_buf.length, off);
+                int data_numa = parseCpuNumaNode(local_buf.name);
                 if (local_buf.chip_id >= 0) {
-                    // Use the chip_id published at registration (single-NUMA buf)
+                    // Prefer the chip id published at registration.
                     slice->ub.src_chip_id = (uint8_t)local_buf.chip_id;
                 } else {
+                    // Each UB buffer belongs to one NUMA node and is named
+                    // "cpu:N"; no offset-based segment lookup is required.
                     slice->ub.src_chip_id = numaNodeToChipId(data_numa);
                 }
                 static std::atomic<uint64_t> numa_log_counter{0};
@@ -456,11 +456,10 @@ int UbTransport::selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
             continue;
         }
 
-        std::string location = buffer.name;
-        SegmentsLocationInfo seg_info;
-        if (parseSegmentsLocation(buffer.name, seg_info)) {
-            location = resolveSegmentsLocation(seg_info, buffer.length, offset - buffer.addr);
-        }
+        // UB memory is allocated and mounted as one independent segment per
+        // NUMA node. Its BufferDesc name is already the resolved location
+        // ("cpu:N"), so no offset-based segments-location lookup is needed.
+        const std::string& location = buffer.name;
         device_id =
             hint.empty()
                 ? desc->topology.selectDevice(location, retry_cnt)

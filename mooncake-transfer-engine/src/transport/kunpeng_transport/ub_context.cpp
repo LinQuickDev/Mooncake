@@ -285,9 +285,7 @@ int UbWorkerPool::submitPostSend(
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
         if (context_.numa_affinity()) {
             const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
-            uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
-            int data_numa = resolveBufferNumaNode(peer_buf.name,
-                                                  peer_buf.length, in_buf_off);
+            int data_numa = parseCpuNumaNode(peer_buf.name);
             if (peer_buf.chip_id >= 0) {
                 slice->ub.dst_chip_id = (uint8_t)peer_buf.chip_id;
             } else {
@@ -538,10 +536,7 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
             slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
             if (context_.numa_affinity()) {
                 const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
-                uint64_t in_buf_off = slice->ub.dest_addr - peer_buf.addr;
-                int data_numa = resolveBufferNumaNode(peer_buf.name,
-                                                      peer_buf.length,
-                                                      in_buf_off);
+                int data_numa = parseCpuNumaNode(peer_buf.name);
                 if (peer_buf.chip_id >= 0) {
                     slice->ub.dst_chip_id = (uint8_t)peer_buf.chip_id;
                 } else {
