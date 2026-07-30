@@ -1204,6 +1204,7 @@ int UrmaEndpoint::submitPostSend(
     __sync_fetch_and_add(jfc_outstanding_, wr_count);
     urma_jfs_wr_t* bad_wr = nullptr;
     int rc;
+    int failed_post_count = 0;
 
     if (numa_affinity) {
         // —— 分支一：chip 亲和，用 bondp_jfs_wr_t 链 ——
@@ -1229,17 +1230,17 @@ int UrmaEndpoint::submitPostSend(
         for (int i = 0; i < wr_count; ++i) {
             fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
             wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
-            wr_list[i].src_chip_id = slice_list[i]->ub.dst_chip_id;   // 本地 chip，不随 opcode 换
-            // 强制 dst_chip == src_chip：本机两端 chip_id 不同无法跨 chip 传输，
-            // 这里把远端 chip 钉成本地 chip（slice->ub.dst_chip_id 仍保留真实远端
-            // chip 仅用于日志/观测）。
-            wr_list[i].dst_chip_id = slice_list[i]->ub.dst_chip_id;
+            // src/dst 均使用远端 segment 所在 chip，避免跨 chip 传输。
+            const uint8_t remote_chip_id = slice_list[i]->ub.dst_chip_id;
+            wr_list[i].src_chip_id = remote_chip_id;
+            wr_list[i].dst_chip_id = remote_chip_id;
         }
         rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
         if (rc) {
             PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
             while (bad_wr) {
                 // 用 user_ctx 直接还原失败 slice —— 不依赖 base 是不是首成员
+                ++failed_post_count;
                 failed_slice_list.push_back((Transport::Slice*)bad_wr->user_ctx);
                 __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
                 __sync_fetch_and_sub(jfc_outstanding_, 1);
@@ -1263,8 +1264,7 @@ int UrmaEndpoint::submitPostSend(
             wr_list[i].next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
         }
         rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0], &bad_wr);
-        int failed_post_count = 0;
-    if (rc) {
+        if (rc) {
             PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
             while (bad_wr) {
                 int i = bad_wr - wr_list;
