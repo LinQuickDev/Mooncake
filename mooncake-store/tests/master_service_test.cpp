@@ -3663,6 +3663,62 @@ TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsPartialAllocation) {
     ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
 }
 
+// Covers the exact scenario where strict mode changes behavior: a dual
+// memory replica request that can only allocate one replica (single
+// mounted segment). Best-effort silently degrades to one replica while
+// strict mode rejects the request outright.
+TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsDegradedDualReplica) {
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 64;  // 64MB
+    auto& metrics = MasterMetricManager::instance();
+
+    // Baseline (flag off, pre-change behavior): with a single mounted
+    // segment, replica_num=2 degrades to one replica and still succeeds.
+    {
+        std::unique_ptr<MasterService> service_(new MasterService());
+        auto segment = MakeSegment("segment1", kBufferAddress, kSegmentSize);
+        UUID client_id = generate_uuid();
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+        const int64_t partial_before =
+            metrics.get_put_start_partial_allocations();
+        ReplicateConfig config;
+        config.replica_num = 2;
+        auto result = service_->PutStart(client_id, "degraded_dual_key",
+                                         "default", 1024, config);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(1u, result->size());
+        ASSERT_EQ(metrics.get_put_start_partial_allocations(),
+                  partial_before + 1);
+    }
+
+    // Strict mode: the same request must fail instead of degrading.
+    {
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_strict_replica_allocation(true)
+                                  .build();
+        std::unique_ptr<MasterService> service_(
+            new MasterService(service_config));
+        auto segment = MakeSegment("segment1", kBufferAddress, kSegmentSize);
+        UUID client_id = generate_uuid();
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+        const int64_t partial_before =
+            metrics.get_put_start_partial_allocations();
+        const int64_t alloc_fail_before =
+            metrics.get_put_start_alloc_failures();
+        ReplicateConfig config;
+        config.replica_num = 2;
+        auto result = service_->PutStart(client_id, "strict_dual_key",
+                                         "default", 1024, config);
+        ASSERT_FALSE(result.has_value());
+        ASSERT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, result.error());
+        ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
+        ASSERT_EQ(metrics.get_put_start_alloc_failures(),
+                  alloc_fail_before + 1);
+    }
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t kBufferAddress = 0x300000000;
