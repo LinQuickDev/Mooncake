@@ -771,6 +771,7 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
         .err_timeout = 17,         // URMA_TYPICAL_ERR_TIMEOUT   17
         .user_ctx = 0,
     };
+    jfs_cfg.flag.bs.multi_path = context_->multipath() ? 1 : 0;
     urma_jetty_flag_t jetty_flag = {};
     urma_jetty_cfg_t attr;
     memset(&attr, 0, sizeof(attr));
@@ -1169,11 +1170,11 @@ int UrmaEndpoint::submitPostSend(
         for (int i = 0; i < wr_count; ++i) {
             fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
             wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
-            wr_list[i].src_chip_id = slice_list[i]->ub.src_chip_id;   // 本地 chip，不随 opcode 换
+            wr_list[i].src_chip_id = slice_list[i]->ub.dst_chip_id;   // 本地 chip，不随 opcode 换
             // 强制 dst_chip == src_chip：本机两端 chip_id 不同无法跨 chip 传输，
             // 这里把远端 chip 钉成本地 chip（slice->ub.dst_chip_id 仍保留真实远端
             // chip 仅用于日志/观测）。
-            wr_list[i].dst_chip_id = slice_list[i]->ub.src_chip_id;
+            wr_list[i].dst_chip_id = slice_list[i]->ub.dst_chip_id;
         }
         rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
         if (rc) {
