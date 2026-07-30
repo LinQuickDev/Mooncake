@@ -63,6 +63,7 @@ if(NOT UbDiag_FOUND OR NOT TARGET UbDiag::ubdiag_lib)
       "RPMs. Install the RPMs that provide libubdiag.so, the ubdiag CLI, and "
       "UbDiagConfig.cmake before configuring Mooncake.")
 endif()
+set_property(TARGET UbDiag::ubdiag_lib PROPERTY IMPORTED_GLOBAL TRUE)
 
 get_target_property(_MOONCAKE_UBDIAG_TARGET_TYPE UbDiag::ubdiag_lib TYPE)
 if(NOT _MOONCAKE_UBDIAG_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
@@ -114,7 +115,15 @@ foreach(_definition UBDIAG_ENABLE_PERCENTILE UBDIAG_ENABLE_PERFLOG)
   endif()
 endforeach()
 
-find_program(MOONCAKE_UBDIAG_SYSTEM_CLI NAMES ubdiag)
+get_filename_component(_MOONCAKE_UBDIAG_SYSTEM_PREFIX
+                       "${MOONCAKE_UBDIAG_LIBRARY_DIR}" DIRECTORY)
+unset(MOONCAKE_UBDIAG_SYSTEM_CLI)
+unset(MOONCAKE_UBDIAG_SYSTEM_CLI CACHE)
+find_program(
+  MOONCAKE_UBDIAG_SYSTEM_CLI
+  NAMES ubdiag
+  PATHS "${_MOONCAKE_UBDIAG_SYSTEM_PREFIX}/bin"
+  NO_DEFAULT_PATH)
 if(NOT MOONCAKE_UBDIAG_SYSTEM_CLI)
   message(
     FATAL_ERROR "The UbDiag SDK was found, but the ubdiag CLI is missing. "
