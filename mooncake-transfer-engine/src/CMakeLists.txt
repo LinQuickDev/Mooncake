@@ -1,5 +1,5 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
-find_package(UbDiag REQUIRED)
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
 add_subdirectory(common)
 add_subdirectory(transport)
 

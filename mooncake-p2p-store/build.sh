@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ "$#" -ne 6 ]; then
-    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR"
+if [ "$#" -ne 8 ]; then
+    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR UBDIAG_LAYER UBDIAG_LIB_DIR"
     exit 1
 fi
 
@@ -24,6 +24,8 @@ USE_REDIS=$3
 USE_HTTP=$4
 USE_ETCD_LEGACY=$5
 BUILD_DIR=$6
+UBDIAG_LAYER=$7
+UBDIAG_LIB_DIR=$8
 
 cd "src/p2pstore"
 if [ $? -ne 0 ]; then
@@ -35,7 +37,11 @@ EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
-EXT_LDFLAGS+=" -ltransfer_engine -lubdiag -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
+EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
+
+if [ "$UBDIAG_LAYER" = "system" ]; then
+    EXT_LDFLAGS+=" -L$UBDIAG_LIB_DIR -lubdiag"
+fi
 
 if [ -d "/usr/local/cuda/lib64/stubs" ]; then
     EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"

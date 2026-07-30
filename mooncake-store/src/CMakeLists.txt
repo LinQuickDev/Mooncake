@@ -251,7 +251,7 @@ target_link_libraries(
   PRIVATE transfer_engine)
 
 # UbDiag instrumentation
-find_package(UbDiag REQUIRED)
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
 target_link_libraries(mooncake_store PRIVATE UbDiag::ubdiag_lib)
 target_include_directories(mooncake_store PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
