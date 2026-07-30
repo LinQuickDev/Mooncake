@@ -1808,30 +1808,29 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(replica));
-        metadata.AddReplicas(std::move(replicas));
-        return {};
-    }
-
-    metadata.VisitReplicas(
+    // Record every LOCAL_DISK replica per owning client. First try to refresh
+    // an existing replica owned by THIS client (idempotent re-offload or
+    // restart re-registration only changes the endpoint/size). If this client
+    // has no LOCAL_DISK replica yet, append a new one so that a key offloaded
+    // by multiple nodes keeps one LOCAL_DISK replica per node.
+    size_t updated = metadata.VisitReplicas(
         [client_id](const Replica& rep) {
             return rep.type() == ReplicaType::LOCAL_DISK &&
                    rep.get_descriptor().get_local_disk_descriptor().client_id ==
                        client_id;
         },
         [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+            const auto& desc =
+                replica.get_descriptor().get_local_disk_descriptor();
+            rep.update_local_disk_location(desc.transport_endpoint,
+                                           desc.object_size);
         });
+
+    if (updated == 0) {
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        metadata.AddReplicas(std::move(replicas));
+    }
     return {};
 }
 

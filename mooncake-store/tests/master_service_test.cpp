@@ -541,7 +541,118 @@ TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
     EXPECT_TRUE(has_complete_memory);
     EXPECT_TRUE(has_complete_nof);
 }
+#endif  // USE_NOF
 
+// Injects a synthetic LOCAL_DISK replica for `key` owned by `client_id` via
+// NotifyOffloadSuccess, without running the full offload pipeline.
+static bool InjectLocalDiskReplicaForTest(MasterService& service,
+                                          const UUID& client_id,
+                                          const std::string& key, int64_t size,
+                                          const std::string& transport_endpoint) {
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
+    StorageObjectMetadata sm;
+    sm.bucket_id = 0;
+    sm.offset = 0;
+    sm.key_size = static_cast<int64_t>(key.size());
+    sm.data_size = size;
+    sm.transport_endpoint = transport_endpoint;
+    std::vector<StorageObjectMetadata> metas{sm};
+    return service.NotifyOffloadSuccess(client_id, tasks, metas).has_value();
+}
+
+// A key offloaded by multiple nodes must keep one LOCAL_DISK replica per node
+// (distinct client_id), instead of dropping later ones.
+TEST_F(MasterServiceTest, AddReplicaRecordsOneLocalDiskPerClient) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string key = "multi_local_disk_key";
+    const UUID node_a = generate_uuid();
+    const UUID node_b = generate_uuid();
+
+    // Node A offloads first.
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A"));
+    // Node B offloads the same key from a different node.
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_b, key, 1024,
+                                              "endpoint_B"));
+
+    auto resp = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(resp.has_value());
+
+    std::set<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.insert(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    // Both nodes' LOCAL_DISK replicas must be recorded.
+    EXPECT_EQ(2u, local_disk_endpoints.size());
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_A"));
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_B"));
+}
+
+// A re-offload from the SAME client (e.g. restart re-registration) must update
+// that client's LOCAL_DISK replica endpoint in place, not append a duplicate.
+TEST_F(MasterServiceTest, AddReplicaSameClientUpdatesInPlace) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string key = "idempotent_local_disk_key";
+    const UUID node_a = generate_uuid();
+
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_old"));
+    // Same client reports again with a new endpoint (restart re-register).
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_new"));
+
+    auto resp = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(resp.has_value());
+
+    std::vector<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.push_back(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    // Still exactly one LOCAL_DISK replica, with the refreshed endpoint.
+    ASSERT_EQ(1u, local_disk_endpoints.size());
+    EXPECT_EQ("endpoint_A_new", local_disk_endpoints[0]);
+}
+
+// Mixed: A and B each recorded; then A re-offloads -> still 2 replicas, only
+// A's endpoint refreshed.
+TEST_F(MasterServiceTest, AddReplicaMixedAppendAndUpdate) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string key = "mixed_local_disk_key";
+    const UUID node_a = generate_uuid();
+    const UUID node_b = generate_uuid();
+
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_old"));
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_b, key, 1024,
+                                              "endpoint_B"));
+    // A re-offloads with a new endpoint.
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_new"));
+
+    auto resp = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(resp.has_value());
+
+    std::set<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.insert(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    EXPECT_EQ(2u, local_disk_endpoints.size());
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_A_new"));
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_B"));
+    EXPECT_FALSE(local_disk_endpoints.count("endpoint_A_old"));
+}
+
+#ifdef USE_NOF
 TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
