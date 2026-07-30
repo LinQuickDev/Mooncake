@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <xxhash.h>
 #include <filesystem>
@@ -189,6 +190,8 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    auto* stats = CurrentStorageReadStats();
+    if (stats) stats->io_mode = "distributed";
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -197,11 +200,33 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     for (auto& [key, slice] : batched_slices) {
         auto path = GetObjectPath(key);
 
+        const auto read_start = std::chrono::steady_clock::now();
         auto result = fs_adapter_->ReadFile(path, slice.ptr, slice.size);
+        if (stats) {
+            const auto read_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - read_start)
+                    .count();
+            stats->disk_read_us += read_us;
+            if (read_us > stats->slowest_disk_read_us) {
+                stats->slowest_disk_read_us = read_us;
+                stats->slowest_key = key;
+            }
+        }
         if (!result) {
+            if (stats) {
+                stats->status = "read_fail";
+                stats->error_key = key;
+                stats->error_code = result.error();
+            }
             return tl::make_unexpected(result.error());
         }
         if (*result != slice.size) {
+            if (stats) {
+                stats->status = "short_read";
+                stats->error_key = key;
+                stats->error_code = ErrorCode::FILE_READ_FAIL;
+            }
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }

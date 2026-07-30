@@ -12,6 +12,7 @@
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
+#include "environ.h"
 #include "client_metric.h"
 #include "replica.h"
 #include "segment.h"
@@ -59,6 +60,14 @@ class MasterClient {
           metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
+        pool_conf.max_connection = Environ::Get().GetYltRpcPoolMaxConnection(
+            pool_conf.max_connection);
+        pool_conf.idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+                pool_conf.idle_timeout.count()));
+        pool_conf.short_connect_idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+                pool_conf.short_connect_idle_timeout.count()));
 
         // Disable alive_detect to prevent stale reconnection logs after HA
         // failover. Old client_pool objects remain in client_pools_ map and
@@ -372,6 +381,15 @@ class MasterClient {
     GetAllNoFSegments();
 
     /**
+     * @brief Fetch all registered segment names from master.
+     * Used for pre-establishing connections during client setup.
+     * @return Vector of segment names (format: {ip}:{port}) on success,
+     * ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments();
+
+    /**
      * @brief Gets all mounted NoF segments that match a segment name together
      * with their owner client ids.
      * @param segment_name Mounted NoF segment name
@@ -432,6 +450,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetOffloadEndpoints();
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
@@ -653,6 +674,8 @@ class MasterClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
+
+    void WarmupRpcPool();
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool

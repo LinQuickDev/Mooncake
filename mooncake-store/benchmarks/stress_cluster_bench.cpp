@@ -11,6 +11,7 @@
 #include <latch>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -199,6 +200,10 @@ DEFINE_uint64(num_threads, 1, "Number of concurrent reader threads");
 DEFINE_uint64(warmup_keys, 5, "Number of warmup keys (not counted in stats)");
 DEFINE_uint64(wait_seconds, 5,
               "Seconds to wait before reading (for remote scenarios)");
+DEFINE_uint64(client_init_wait_seconds, 0,
+              "Seconds to wait after RealClient setup succeeds and before "
+              "benchmark run starts. This can give asynchronous RPC/transfer "
+              "warmup and background initialization time to settle.");
 DEFINE_bool(verify, true, "Verify data integrity after read");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_bool(hard_pin, false,
@@ -218,6 +223,9 @@ DEFINE_uint64(duration, 0,
               "scenario (0 = read num_keys once)");
 DEFINE_uint64(statis_interval, 5,
               "Statistics print interval in seconds for segment_read scenario");
+DEFINE_uint64(shuffle_seed, 0,
+              "Seed for deterministic shuffle of segment_read keys "
+              "(0 = disabled)");
 
 using Clock = std::chrono::steady_clock;
 using Nanos = std::chrono::nanoseconds;
@@ -235,8 +243,9 @@ inline double NanosToSec(int64_t ns) { return static_cast<double>(ns) / 1e9; }
 struct ThreadResult {
     std::vector<int64_t> latencies_ns;  // per-query latency
     size_t total_bytes = 0;
-    size_t total_keys = 0;     // number of keys processed
-    size_t total_queries = 0;  // number of API calls (get_into / batch_get_into)
+    size_t total_keys = 0;  // number of keys processed
+    size_t total_queries =
+        0;  // number of API calls (get_into / batch_get_into)
     size_t failed_ops = 0;
 };
 
@@ -289,10 +298,11 @@ class BenchmarkStats {
 
     double MeanLatencyUs() const {
         if (merged_latencies_ns_.empty()) return 0.0;
-        double sum = static_cast<double>(std::accumulate(
-            merged_latencies_ns_.begin(), merged_latencies_ns_.end(),
-            int64_t(0)));
-        return NanosToUs(sum / static_cast<double>(merged_latencies_ns_.size()));
+        double sum = static_cast<double>(
+            std::accumulate(merged_latencies_ns_.begin(),
+                            merged_latencies_ns_.end(), int64_t(0)));
+        return NanosToUs(sum /
+                         static_cast<double>(merged_latencies_ns_.size()));
     }
 
     double ThroughputMBps() const {
@@ -817,6 +827,12 @@ class StressBenchmark {
                 all_keys.push_back(MakeSegmentKey(read_segments[s], i));
             }
         }
+        if (FLAGS_shuffle_seed != 0) {
+            std::mt19937_64 rng(FLAGS_shuffle_seed);
+            std::shuffle(all_keys.begin(), all_keys.end(), rng);
+            LOG(INFO) << "Shuffled segment_read keys with seed="
+                      << FLAGS_shuffle_seed;
+        }
         LOG(INFO) << "Total keys to read: " << all_keys.size();
 
         size_t warmup_end =
@@ -1135,14 +1151,15 @@ class StressBenchmark {
                           << " (failed=" << interval_failed << ")"
                           << "  lat[us]: avg="
                           << NanosToUs(interval_stats.avg_latency_ns)
-                          << ", P50=" << NanosToUs(interval_stats.p50_latency_ns)
-                          << ", P90=" << NanosToUs(interval_stats.p90_latency_ns)
+                          << ", P50="
+                          << NanosToUs(interval_stats.p50_latency_ns)
+                          << ", P90="
+                          << NanosToUs(interval_stats.p90_latency_ns)
                           << ", P99="
                           << NanosToUs(interval_stats.p99_latency_ns)
                           << "  total: " << cur_queries << " queries, "
-                          << cur_keys << " keys, "
-                          << total_throughput_mbps << " MB/s, "
-                          << total_keys_per_sec << " keys/s, "
+                          << cur_keys << " keys, " << total_throughput_mbps
+                          << " MB/s, " << total_keys_per_sec << " keys/s, "
                           << total_queries_per_sec << " qps"
                           << " (failed=" << cur_failed << ")\n";
 
@@ -1569,6 +1586,8 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Read seg nums:  " << FLAGS_read_segment_nums;
     LOG(INFO) << "  Duration:       " << FLAGS_duration << "s";
     LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
+    LOG(INFO) << "  Client init wait: " << FLAGS_client_init_wait_seconds
+              << "s";
 
     size_t total_data = FLAGS_num_keys * FLAGS_value_size;
     if (total_data > FLAGS_global_segment_size * 9.5 / 10) {
@@ -1584,6 +1603,14 @@ int main(int argc, char* argv[]) {
     if (ret != 0) {
         LOG(ERROR) << "Benchmark setup failed";
         return ret;
+    }
+
+    if (FLAGS_client_init_wait_seconds > 0) {
+        LOG(INFO) << "Waiting " << FLAGS_client_init_wait_seconds
+                  << " seconds after client setup before benchmark run...";
+        std::this_thread::sleep_for(
+            std::chrono::seconds(FLAGS_client_init_wait_seconds));
+        LOG(INFO) << "Client init wait complete";
     }
 
     ret = bench.Run();

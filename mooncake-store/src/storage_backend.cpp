@@ -23,7 +23,29 @@
 #include <ylt/util/tl/expected.hpp>
 #include "storage/distributed/distributed_storage_backend.h"
 
+// ubdiag perf points for the offload owner-side disk load breakdown.
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+
 namespace mooncake {
+
+namespace {
+thread_local StorageReadStats* current_storage_read_stats = nullptr;
+}
+
+StorageReadStats* CurrentStorageReadStats() {
+    return current_storage_read_stats;
+}
+
+ScopedStorageReadStats::ScopedStorageReadStats(StorageReadStats* stats)
+    : previous_(current_storage_read_stats) {
+    current_storage_read_stats = stats;
+}
+
+ScopedStorageReadStats::~ScopedStorageReadStats() {
+    current_storage_read_stats = previous_;
+}
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -1078,7 +1100,10 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    auto* stats = CurrentStorageReadStats();
+    if (stats) stats->io_mode = "preadv";
     for (const auto& [key, slice] : batched_slices) {
+        const auto io_start = std::chrono::steady_clock::now();
         KVEntry kv;
         kv.key = key;
         auto path =
@@ -1092,6 +1117,11 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 
         auto r = storage_backend_->LoadObject(path, kv_buf, kv_buf.size());
         if (!r) {
+            if (stats) {
+                stats->status = "read_fail";
+                stats->error_key = key;
+                stats->error_code = r.error();
+            }
             LOG(ERROR) << "Failed to load from file";
             return tl::make_unexpected(r.error());
         }
@@ -1100,6 +1130,17 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
+        }
+        if (stats) {
+            const auto io_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - io_start)
+                    .count();
+            stats->disk_read_us += io_us;
+            if (io_us > stats->slowest_disk_read_us) {
+                stats->slowest_disk_read_us = io_us;
+                stats->slowest_key = key;
+            }
         }
     }
     return {};
@@ -1376,6 +1417,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    auto* stats = CurrentStorageReadStats();
+    const auto plan_start = std::chrono::steady_clock::now();
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1393,12 +1436,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<int64_t, std::vector<ReadPlan>> bucket_read_plans;
     std::vector<BucketReadGuard> bucket_guards;  // RAII guards for all buckets
 
+    // Phase 1: build read plan under lock (OwnerLoadPlan). Pure in-memory
+    // metadata lookups; the error early-returns let the dtor Abandon the
+    // unfinished sample.
+    UbDiag::PerfPoint pt_plan(PerfKey::GET_SSD_OWNER_LOAD_PLAN,
+                              UbDiag::PerfLevel::MODULE);
+    pt_plan.Start();
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
         for (const auto& [key, dest_slice] : batch_object) {
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
             if (object_it == object_bucket_map_.end()) {
+                if (stats) {
+                    stats->plan_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - plan_start)
+                            .count();
+                    stats->status = "plan_fail";
+                    stats->error_key = key;
+                    stats->error_code = ErrorCode::INVALID_KEY;
+                }
                 LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
@@ -1407,6 +1465,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             // Lookup bucket -> BucketMetadata
             auto bucket_it = buckets_.find(metadata.bucket_id);
             if (bucket_it == buckets_.end()) {
+                if (stats) {
+                    stats->plan_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - plan_start)
+                            .count();
+                    stats->status = "plan_fail";
+                    stats->error_key = key;
+                    stats->error_code = ErrorCode::BUCKET_NOT_FOUND;
+                }
                 LOG(ERROR) << "Bucket not found for key: " << key
                            << ", bucket_id=" << metadata.bucket_id;
                 return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
@@ -1414,6 +1481,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
             // Validate size
             if (metadata.data_size != static_cast<int64_t>(dest_slice.size)) {
+                if (stats) {
+                    stats->plan_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - plan_start)
+                            .count();
+                    stats->status = "plan_fail";
+                    stats->error_key = key;
+                    stats->error_code = ErrorCode::INVALID_PARAMS;
+                }
                 LOG(ERROR) << "Size mismatch for key: " << key
                            << ", expected: " << metadata.data_size
                            << ", got: " << dest_slice.size;
@@ -1443,6 +1519,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                          metadata.key_size, metadata.data_size, dest_slice});
         }
     }
+    pt_plan.End(0);
+    if (stats) {
+        stats->plan_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - plan_start)
+                .count();
+    }
     // Lock released here - bucket files protected by BucketReadGuards
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
@@ -1450,15 +1533,34 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         // Open file for this bucket (cheap syscall, no lock needed)
+        const auto open_start = std::chrono::steady_clock::now();
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
+            if (stats) {
+                stats->file_open_us +=
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - open_start)
+                        .count();
+                stats->status = "open_fail";
+                stats->error_code = ErrorCode::INTERNAL_ERROR;
+            }
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
                        << bucket_id;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
         auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+        if (stats) {
+            stats->file_open_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - open_start)
+                    .count();
+        }
         if (!file_res) {
+            if (stats) {
+                stats->status = "open_fail";
+                stats->error_code = file_res.error();
+            }
             LOG(ERROR) << "Failed to open bucket file: "
                        << filepath_res.value();
             return tl::make_unexpected(file_res.error());
@@ -1469,11 +1571,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         for (const auto& plan : read_plans) {
             int64_t actual_offset = plan.offset + plan.key_size;
             tl::expected<size_t, ErrorCode> read_res;
+            const auto disk_start = std::chrono::steady_clock::now();
+            const char* io_mode = "preadv";
 
 #ifdef USE_URING
             // Try to use read_aligned for O_DIRECT I/O if file is UringFile
             UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
             if (uring_file != nullptr) {
+                io_mode = "io_uring_direct";
                 // Calculate aligned read range
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
@@ -1488,8 +1593,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Zero-copy path: read directly into the slice buffer.
                 // dest_slice.ptr is 4096-aligned and oversized (from
                 // AllocateBatch) to accommodate the full aligned read range.
+                UbDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
+                                           UbDiag::PerfLevel::MODULE);
+                pt_uring.Start();
                 read_res = uring_file->read_aligned(
                     plan.dest_slice.ptr, aligned_size, aligned_offset);
+                pt_uring.End(read_res ? 0 : -1);
 
                 if (read_res) {
                     // Adjust ptr to point to actual data start (no memcpy)
@@ -1501,12 +1610,37 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             } else
 #endif
             {
-                // Fallback to vector_read for non-UringFile
+                // Fallback to vector_read for non-UringFile (preadv).
                 iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                UbDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
+                                           UbDiag::PerfLevel::MODULE);
+                pt_posix.Start();
                 read_res = file->vector_read(&iov, 1, actual_offset);
+                pt_posix.End(read_res ? 0 : -1);
+            }
+            if (stats) {
+                const auto read_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - disk_start)
+                        .count();
+                stats->disk_read_us += read_us;
+                if (read_us > stats->slowest_disk_read_us) {
+                    stats->slowest_disk_read_us = read_us;
+                    stats->slowest_key = plan.key;
+                }
+                if (stats->io_mode == "unknown") {
+                    stats->io_mode = io_mode;
+                } else if (stats->io_mode != io_mode) {
+                    stats->io_mode = "mixed";
+                }
             }
 
             if (!read_res) {
+                if (stats) {
+                    stats->status = "read_fail";
+                    stats->error_key = plan.key;
+                    stats->error_code = read_res.error();
+                }
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
                            << ", error: " << read_res.error();
@@ -1514,6 +1648,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             }
 
             if (read_res.value() != plan.dest_slice.size) {
+                if (stats) {
+                    stats->status = "short_read";
+                    stats->error_key = plan.key;
+                    stats->error_code = ErrorCode::FILE_READ_FAIL;
+                }
                 LOG(ERROR) << "Read size mismatch for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
                            << ", got: " << read_res.value();
@@ -2927,6 +3066,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    auto* stats = CurrentStorageReadStats();
+    const auto plan_start = std::chrono::steady_clock::now();
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -2980,7 +3121,15 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
     // Step 2: Perform disk I/O without holding any locks
     // Allocations are kept alive by shared_ptr references in read_plans
+    if (stats) {
+        stats->plan_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - plan_start)
+                .count();
+        stats->io_mode = "preadv";
+    }
     for (const auto& plan : read_plans) {
+        const auto disk_start = std::chrono::steady_clock::now();
         // Read header first
         RecordHeader header;
         iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
@@ -3043,6 +3192,17 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
                        << ", expected: " << header.value_len
                        << ", got: " << read_value_result.value();
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (stats) {
+            const auto read_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - disk_start)
+                    .count();
+            stats->disk_read_us += read_us;
+            if (read_us > stats->slowest_disk_read_us) {
+                stats->slowest_disk_read_us = read_us;
+                stats->slowest_key = plan.key;
+            }
         }
     }
 

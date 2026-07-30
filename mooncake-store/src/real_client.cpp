@@ -18,9 +18,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <exception>
 #include <functional>
+#include <future>
 #include <limits>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 #include "mooncake_logging.h"
@@ -36,6 +39,7 @@
 #include "file_storage.h"
 #include "gpu_staging_utils.h"
 #include "default_config.h"
+#include "environ.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
@@ -60,6 +64,26 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+struct OffloadReadTiming {
+    uint64_t offload_rpc_us{0};
+    uint64_t transfer_data_us{0};
+    uint64_t release_buffer_us{0};
+};
+
+thread_local OffloadReadTiming *current_offload_read_timing = nullptr;
+
+class ScopedOffloadReadTiming {
+   public:
+    explicit ScopedOffloadReadTiming(OffloadReadTiming *timing)
+        : previous_(current_offload_read_timing) {
+        current_offload_read_timing = timing;
+    }
+    ~ScopedOffloadReadTiming() { current_offload_read_timing = previous_; }
+
+   private:
+    OffloadReadTiming *previous_;
+};
+
 // Format a wall-clock time_point as "YYYY-MM-DD HH:MM:SS.ffffff" for the
 // request-start (t0) field in the *_breakdown logs.  Only called at log
 // emission time (guarded by breakdown_log); the cheap system_clock::now() that
@@ -664,7 +688,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path, const std::string &tenant_id) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    size_t offload_rpc_thread_num) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -1002,12 +1027,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
+        if (offload_rpc_thread_num == 0) {
+            LOG(WARNING) << "Invalid offload_rpc_thread_num=0, using 1";
+            offload_rpc_thread_num = 1;
+        }
         offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+            std::make_unique<coro_rpc::coro_rpc_server>(
+                offload_rpc_thread_num, 0, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object_push>(this);
+        offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::service_ready_internal>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -1017,7 +1051,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
         offload_rpc_port_ = offload_rpc_server_->port();
-        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
+        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_
+                  << " with " << offload_rpc_thread_num << " thread(s)";
 
         // Build local_rpc_addr from hostname + auto-allocated port
         this->local_rpc_addr = buildHostNameWithPort(
@@ -1039,10 +1074,57 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        auto endpoints_result = client_->GetOffloadEndpoints();
+        if (!endpoints_result) {
+            LOG(WARNING) << "Failed to fetch offload RPC endpoints for pool "
+                         << "warmup: "
+                         << toString(endpoints_result.error());
+        } else {
+            const auto& endpoints = endpoints_result.value();
+            LOG(INFO) << "Warming up offload RPC pools for "
+                      << endpoints.size() << " endpoint(s) during client "
+                      << "initialization";
+            for (const auto& endpoint : endpoints) {
+                client_requester_->WarmupRpcPool(endpoint);
+            }
+        }
+    }
     if (FLAGS_enable_http_server) {
         if (start_http_server() != 0) {
             LOG(ERROR) << "Failed to start HTTP server on port "
                        << FLAGS_http_port;
+        }
+    }
+
+    // Optionally warmup transport connections to all segments
+    // currently registered with the master.  This is especially valuable
+    // for high-concurrency small-file workloads where on-demand RDMA QP
+    // handshakes can storm the listener and surface as TRANSFER_FAIL.
+    // Controlled by MC_STORE_WARMUP (default: disabled to
+    // preserve existing behaviour). Set to 1/true/yes to enable.
+    if (client_) {
+        const bool enable_warmup = Environ::Get().GetStoreWarmupEnabled(false);
+        if (enable_warmup) {
+            // warmup issues RDMA transfers using a buffer from
+            // client_buffer_allocator_, which must be registered with the
+            // transfer engine.  For cxl protocol or zero-sized buffers the
+            // allocator base is not registered, so skip warmup in that case.
+            if (!local_buffer_region_.has_value() ||
+                local_buffer_region_->size == 0) {
+                LOG(WARNING) << "Warmup enabled but local buffer is not "
+                             << "registered (protocol=" << this->protocol
+                             << "), skipping warmup";
+            } else {
+                LOG(INFO) << "Warming up connections to all registered segments";
+                auto warmup_result = client_->warmup(client_buffer_allocator_);
+                if (!warmup_result) {
+                    LOG(WARNING)
+                        << "Warmup failed: "
+                        << toString(warmup_result.error())
+                        << ", continuing setup (will connect on demand)";
+                }
+            }
         }
     }
 
@@ -1061,7 +1143,7 @@ int RealClient::setup_real(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id));
+        tenant_id, Environ::Get().GetOffloadRpcThreadNum(8)));
 }
 
 namespace {
@@ -1163,6 +1245,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
+    auto offload_rpc_thread_num_opt =
+        get_config_size(config, "offload_rpc_thread_num",
+                        Environ::Get().GetOffloadRpcThreadNum(8));
+    if (!offload_rpc_thread_num_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    size_t offload_rpc_thread_num = offload_rpc_thread_num_opt.value();
 
     std::string enable_ssd_offload_str =
         get_config(config, "enable_ssd_offload", "false");
@@ -1175,7 +1264,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     return setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        offload_rpc_thread_num);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1804,7 +1894,8 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     }
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -1839,15 +1930,15 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     auto log_put = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
-        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_alloc - t0)
-                            .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_alloc)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto alloc_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_alloc - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         MC_LOG(INFO) << "put_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] alloc_us[" << alloc_us
                      << "] write_us[" << write_us << "] total_us[" << total_us
@@ -1917,7 +2008,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     }
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -1989,18 +2081,18 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 
     if (breakdown_log) {
         auto now = std::chrono::steady_clock::now();
-        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t_prep - t0)
-                           .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_prep)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         const char *status = success_count == results.size() ? "ok"
-                             : success_count == 0             ? "err"
-                                                              : "partial";
+                             : success_count == 0            ? "err"
+                                                             : "partial";
         MC_LOG(INFO) << "batch_put_breakdown num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] prep_us[" << prep_us << "] write_us[" << write_us
@@ -2755,13 +2847,15 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
                                  : std::chrono::system_clock::time_point{};
-    auto t_query = t0, t_select = t0, t_alloc = t0;
+    auto t_query = t0, t_local_endpoints = t0, t_select = t0, t_alloc = t0;
     std::string replica_type;
+    std::string remote_endpoint = "-";
 
     // Query the object info
     UbDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY,
@@ -2795,6 +2889,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                                 UbDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
+    if (breakdown_log) {
+        t_local_endpoints = std::chrono::steady_clock::now();
+    }
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (breakdown_log) t_select = std::chrono::steady_clock::now();
     pt_select.End(best_replica ? 0 : -1);
@@ -2810,10 +2907,12 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (replica.is_memory_replica()) {
         const auto &endpoint = replica.get_memory_descriptor()
                                    .buffer_descriptor.transport_endpoint_;
+        remote_endpoint = endpoint;
         bool is_local = local_endpoints.count(endpoint) > 0;
         replica_type = is_local ? "memory_local" : "memory_remote";
     } else if (replica.is_local_disk_replica()) {
         const auto &ld_desc = replica.get_local_disk_descriptor();
+        remote_endpoint = ld_desc.transport_endpoint;
         bool is_local_holder = (ld_desc.client_id == client_->getClientId());
         replica_type =
             is_local_holder ? "local_disk_local" : "local_disk_remote";
@@ -2843,27 +2942,41 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto log_breakdown = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
-        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_query - t0)
-                            .count();
+        auto query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count();
         auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(
                              t_select - t_query)
                              .count();
+        auto local_endpoints_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_local_endpoints - t_query)
+                .count();
+        auto select_replica_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_select - t_local_endpoints)
+                .count();
         auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             t_alloc - t_select)
                             .count();
-        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           now - t_alloc)
-                           .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto read_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us[" << query_us
-                     << "] select_us[" << select_us << "] alloc_us[" << alloc_us
+                     << "] select_us[" << select_us
+                     << "] local_endpoints_us[" << local_endpoints_us
+                     << "] select_replica_us[" << select_replica_us
+                     << "] alloc_us[" << alloc_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
-                     << "] type[" << replica_type << "] status[" << status
-                     << "]";
+                     << "] type[" << replica_type << "] replica_count["
+                     << replica_list.size() << "] selected_type["
+                     << replica_type << "] local_endpoint["
+                     << client_->GetSegmentEndpoint() << "] remote_endpoint["
+                     << remote_endpoint << "] status[" << status << "]";
     };
 
     if (best_replica->is_local_disk_replica()) {
@@ -3133,7 +3246,8 @@ RealClient::batch_get_buffer_internal(
 
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -3380,18 +3494,18 @@ RealClient::batch_get_buffer_internal(
         for (const auto &result : final_results) {
             if (result) success_count++;
         }
-        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_query - t0)
-                            .count();
+        auto query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count();
         auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            t_prep - t_query)
                            .count();
         auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            t_read - t_prep)
                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_read - t0)
-                            .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_read - t0)
+                .count();
         MC_LOG(INFO) << "batch_get_breakdown num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
@@ -3541,6 +3655,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
                                 UbDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
+    auto t_local_endpoints = std::chrono::steady_clock::now();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     auto t_select = std::chrono::steady_clock::now();
     pt_select.End(best_replica ? 0 : -1);
@@ -3549,17 +3664,21 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    const size_t replica_count = replica_list.size();
     auto query_value = std::move(query_result.value());
     auto replica = *best_replica;
     auto total_size = calculate_total_size(replica);
     std::string replica_type;
+    std::string remote_endpoint = "-";
     if (replica.is_memory_replica()) {
         const auto &endpoint = replica.get_memory_descriptor()
                                    .buffer_descriptor.transport_endpoint_;
+        remote_endpoint = endpoint;
         bool is_local = local_endpoints.count(endpoint) > 0;
         replica_type = is_local ? "memory_local" : "memory_remote";
     } else if (replica.is_local_disk_replica()) {
         const auto &ld_desc = replica.get_local_disk_descriptor();
+        remote_endpoint = ld_desc.transport_endpoint;
         bool is_local_holder = (ld_desc.client_id == client_->getClientId());
         replica_type =
             is_local_holder ? "local_disk_local" : "local_disk_remote";
@@ -3571,13 +3690,24 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         .query_result = std::move(query_value),
         .replica = std::move(replica),
         .total_size = total_size,
-        .query_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        t_query - t0)
-                        .count(),
+        .query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count(),
         .select_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          t_select - t_query)
                          .count(),
-        .replica_type = std::move(replica_type)};
+        .local_endpoints_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_local_endpoints - t_query)
+                .count(),
+        .select_replica_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_select - t_local_endpoints)
+                .count(),
+        .replica_type = std::move(replica_type),
+        .replica_count = replica_count,
+        .local_endpoint = client_->GetSegmentEndpoint(),
+        .remote_endpoint = std::move(remote_endpoint)};
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -3725,8 +3855,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 objects.emplace(
                     key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
                                              src_offset + size}});
-                auto r = batch_get_into_offload_object_internal(endpoint,
-                                                                objects);
+                auto r =
+                    batch_get_into_offload_object_internal(endpoint, objects);
                 pt_ssd.End(r ? 0 : -1);
                 return r;
             },
@@ -3781,7 +3911,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     size_t size, bool size_is_buffer_capacity) {
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -3800,7 +3931,10 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
                     .count();
             MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                          << FormatWallClock(t0_wall)
-                         << "] query_us[0] select_us[0] read_us[0] total_us["
+                         << "] query_us[0] select_us[0] local_endpoints_us[0]"
+                            " select_replica_us[0] read_us[0]"
+                            " offload_rpc_us[0] transfer_data_us[0]"
+                            " release_buffer_us[0] read_overhead_us[0] total_us["
                          << total_us << "] type[unknown] mode[unknown] status["
                          << toString(metadata_result.error()) << "]";
         }
@@ -3808,8 +3942,11 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     }
 
     const auto &metadata = metadata_result.value();
+    OffloadReadTiming offload_timing;
+    ScopedOffloadReadTiming offload_timing_scope(
+        breakdown_log ? &offload_timing : nullptr);
     auto read_start = breakdown_log ? std::chrono::steady_clock::now()
-                                     : std::chrono::steady_clock::time_point{};
+                                    : std::chrono::steady_clock::time_point{};
     auto read_result =
         execute_ranged_read(key, buffer, dst_offset, src_offset, size, metadata,
                             size_is_buffer_capacity);
@@ -3837,14 +3974,34 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            read_end - read_start)
                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            read_end - t0)
-                            .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(read_end - t0)
+                .count();
+        const uint64_t known_read_us =
+            offload_timing.offload_rpc_us + offload_timing.transfer_data_us +
+            offload_timing.release_buffer_us;
+        const uint64_t read_overhead_us =
+            read_us > static_cast<int64_t>(known_read_us)
+                ? static_cast<uint64_t>(read_us) - known_read_us
+                : 0;
         MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us["
-                     << metadata.query_us << "] select_us[" << metadata.select_us
-                     << "] read_us[" << read_us << "] total_us[" << total_us
-                     << "] type[" << metadata.replica_type << "] mode[" << mode
+                     << metadata.query_us << "] select_us["
+                     << metadata.select_us << "] local_endpoints_us["
+                     << metadata.local_endpoints_us << "] select_replica_us["
+                     << metadata.select_replica_us << "] read_us[" << read_us
+                     << "] offload_rpc_us[" << offload_timing.offload_rpc_us
+                     << "] transfer_data_us["
+                     << offload_timing.transfer_data_us
+                     << "] release_buffer_us["
+                     << offload_timing.release_buffer_us
+                     << "] read_overhead_us[" << read_overhead_us
+                     << "] total_us[" << total_us << "] type["
+                     << metadata.replica_type << "] mode[" << mode
+                     << "] replica_count[" << metadata.replica_count
+                     << "] selected_type[" << metadata.replica_type
+                     << "] local_endpoint[" << metadata.local_endpoint
+                     << "] remote_endpoint[" << metadata.remote_endpoint
                      << "] status[" << status << "]";
     }
 
@@ -4174,7 +4331,8 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
 
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -4227,18 +4385,18 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         for (const auto &r : results) {
             if (r.has_value()) success_count++;
         }
-        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t_prep - t0)
-                           .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_prep)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         const char *status = success_count == results.size() ? "ok"
-                             : success_count == 0             ? "err"
-                                                              : "partial";
+                             : success_count == 0            ? "err"
+                                                             : "partial";
         MC_LOG(INFO) << "batch_put_into_breakdown num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] prep_us[" << prep_us << "] write_us[" << write_us
@@ -4271,7 +4429,8 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
 
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0 = breakdown_log ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
@@ -4295,15 +4454,15 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
     auto log_put = [&](const char *status) {
         if (!breakdown_log) return;
         auto now = std::chrono::steady_clock::now();
-        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t_prep - t0)
-                           .count();
-        auto write_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t_prep)
-                            .count();
-        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - t0)
-                            .count();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
         MC_LOG(INFO) << "put_into_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] prep_us[" << prep_us
                      << "] write_us[" << write_us << "] total_us[" << total_us
@@ -5011,7 +5170,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     auto start_time = std::chrono::steady_clock::now();
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
                                  : std::chrono::system_clock::time_point{};
     auto t_query = start_time, t_prep = start_time;
@@ -5192,8 +5352,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     t_query - start_time)
                     .count();
             auto prep_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    t_prep - t_query)
+                std::chrono::duration_cast<std::chrono::microseconds>(t_prep -
+                                                                      t_query)
                     .count();
             auto total_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -5361,9 +5521,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     size_t offload_object_count = 0;
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        UbDiag::PerfPoint pt_ssd_read(
-            PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
-            UbDiag::PerfLevel::MODULE);
+        UbDiag::PerfPoint pt_ssd_read(PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
+                                      UbDiag::PerfLevel::MODULE);
         pt_ssd_read.Start();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
             offload_objects_it.first, offload_objects_it.second);
@@ -6286,40 +6445,294 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 }
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
-                                     const std::vector<int64_t> &sizes) {
+                                     const std::vector<int64_t> &sizes,
+                                     uint64_t trace_id) {
+    const auto handler_start = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
     struct CallState {
+        CallState()
+            : pt_queue(PerfKey::GET_SSD_OWNER_RPC_QUEUE,
+                       UbDiag::PerfLevel::DEBUG),
+              pt_batch_get(PerfKey::GET_SSD_OWNER_RPC_BATCH_GET,
+                           UbDiag::PerfLevel::MODULE),
+              pt_resume(PerfKey::GET_SSD_OWNER_RPC_RESUME,
+                        UbDiag::PerfLevel::DEBUG) {}
         std::vector<std::string> keys;
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
+        uint64_t trace_id;
+        std::chrono::steady_clock::time_point worker_start;
+        std::chrono::steady_clock::time_point worker_end;
+        UbDiag::PerfPoint pt_queue;
+        UbDiag::PerfPoint pt_batch_get;
+        UbDiag::PerfPoint pt_resume;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
     state->file_storage = file_storage_;
+    state->trace_id = trace_id;
     auto *s = state.get();
+    s->pt_queue.Start();
     auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+        [s]() {
+            s->worker_start = std::chrono::steady_clock::now();
+            s->pt_queue.End(0);
+            mooncake::logging::ScopedTraceId trace(s->trace_id);
+            s->pt_batch_get.Start();
+            auto result = s->file_storage->BatchGet(s->keys, s->sizes);
+            s->pt_batch_get.End(result ? 0 : -1);
+            s->worker_end = std::chrono::steady_clock::now();
+            s->pt_resume.Start();
+            return result;
+        });
+    const auto resumed = std::chrono::steady_clock::now();
+    s->pt_resume.End(0);
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
                    << result.error();
+        if (breakdown_log) {
+            mooncake::logging::ScopedTraceId trace(trace_id);
+            MC_LOG(INFO)
+                << "offload_rpc_server_breakdown mode=pull"
+                << " num_keys=" << keys.size()
+                << " queue_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       s->worker_start - handler_start)
+                       .count()
+                << " batch_get_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       s->worker_end - s->worker_start)
+                       .count()
+                << " resume_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - s->worker_end)
+                       .count()
+                << " response_us=0 total_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - handler_start)
+                       .count()
+                << " status=read_fail error_code="
+                << static_cast<int>(result.error());
+        }
         co_return tl::make_unexpected(result.error());
     }
-    co_return BatchGetOffloadObjectResponse(
+    const auto response_start = std::chrono::steady_clock::now();
+    BatchGetOffloadObjectResponse response(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
+    const auto response_end = std::chrono::steady_clock::now();
+    const auto queue_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              s->worker_start - handler_start)
+                              .count();
+    const auto batch_get_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(s->worker_end -
+                                                              s->worker_start)
+            .count();
+    const auto resume_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(resumed -
+                                                              s->worker_end)
+            .count();
+    const auto response_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(response_end -
+                                                              response_start)
+            .count();
+    const auto total_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(response_end -
+                                                              handler_start)
+            .count();
+    if (breakdown_log) {
+        mooncake::logging::ScopedTraceId trace(trace_id);
+        MC_LOG(INFO) << "offload_rpc_server_breakdown mode=pull"
+                     << " num_keys=" << keys.size()
+                     << " queue_us=" << queue_us
+                     << " batch_get_us=" << batch_get_us
+                     << " resume_us=" << resume_us
+                     << " response_us=" << response_us
+                     << " total_us=" << total_us << " status=ok";
+    }
+    co_return response;
 }
 
-bool RealClient::release_offload_buffer(uint64_t batch_id) {
+async_simple::coro::Lazy<
+    tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+RealClient::batch_get_offload_object_push(
+    const BatchGetOffloadObjectPushRequest &req) {
+    const auto handler_start = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(req.trace_id);
+    if (!file_storage_) {
+        LOG(ERROR)
+            << "batch_get_offload_object_push called but file_storage_ is null";
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (req.keys.size() != req.sizes.size() ||
+        req.keys.size() != req.dst_slices.size()) {
+        LOG(ERROR) << "batch_get_offload_object_push size mismatch: keys="
+                   << req.keys.size() << ", sizes=" << req.sizes.size()
+                   << ", dst_slices=" << req.dst_slices.size();
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Do the SSD read, the one-sided WRITE and the buffer release on the
+    // dedicated thread pool so the coro_rpc IO thread stays free. Same
+    // heap-owned state pattern as batch_get_offload_object: the lambda captures
+    // only a raw pointer.
+    struct CallState {
+        CallState()
+            : pt_queue(PerfKey::GET_SSD_OWNER_RPC_QUEUE,
+                       UbDiag::PerfLevel::DEBUG),
+              pt_batch_get(PerfKey::GET_SSD_OWNER_RPC_BATCH_GET,
+                           UbDiag::PerfLevel::MODULE),
+              pt_resume(PerfKey::GET_SSD_OWNER_RPC_RESUME,
+                        UbDiag::PerfLevel::DEBUG) {}
+        BatchGetOffloadObjectPushRequest req;
+        std::shared_ptr<FileStorage> file_storage;
+        Client *client;
+        uint64_t trace_id;
+        std::chrono::steady_clock::time_point worker_start;
+        std::chrono::steady_clock::time_point worker_end;
+        uint64_t batch_get_us{0};
+        uint64_t transfer_us{0};
+        uint64_t release_us{0};
+        UbDiag::PerfPoint pt_queue;
+        UbDiag::PerfPoint pt_batch_get;
+        UbDiag::PerfPoint pt_resume;
+    };
+    auto state = std::make_unique<CallState>();
+    state->req = req;
+    state->file_storage = file_storage_;
+    state->client = client_.get();
+    state->trace_id = req.trace_id;
+    auto *s = state.get();
+    s->pt_queue.Start();
+    auto try_result =
+        co_await coro_io::post([s]() -> tl::expected<void, ErrorCode> {
+            s->worker_start = std::chrono::steady_clock::now();
+            s->pt_queue.End(0);
+            mooncake::logging::ScopedTraceId trace(s->trace_id);
+            // Stage the on-disk blobs into the local ClientBuffer
+            // (FileStorage::BatchGet carries the OwnerSsdRead breakdown).
+            const auto batch_get_start = std::chrono::steady_clock::now();
+            s->pt_batch_get.Start();
+            auto result = s->file_storage->BatchGet(s->req.keys, s->req.sizes);
+            s->pt_batch_get.End(result ? 0 : -1);
+            s->batch_get_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - batch_get_start)
+                    .count();
+            if (!result) {
+                LOG(ERROR) << "Push offload BatchGet failed, err_code = "
+                           << result.error();
+                s->worker_end = std::chrono::steady_clock::now();
+                s->pt_resume.Start();
+                return tl::make_unexpected(result.error());
+            }
+            const uint64_t batch_id = result.value().batch_id;
+            // WRITE the staged blobs straight into the requester's memory.
+            UbDiag::PerfPoint pt_write(PerfKey::GET_SSD_OWNER_PUSH_WRITE,
+                                       UbDiag::PerfLevel::MODULE);
+            pt_write.Start();
+            const auto transfer_start = std::chrono::steady_clock::now();
+            auto write_result = s->client->BatchPushOffloadObject(
+                s->req.requester_te_addr, s->req.keys, result.value().pointers,
+                s->req.dst_slices);
+            s->transfer_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - transfer_start)
+                    .count();
+            pt_write.End(write_result ? 0 : -1);
+            // The WRITE has completed (BatchPushOffloadObject blocks on the
+            // transfer future), so the ClientBuffer can be reclaimed
+            // immediately instead of waiting for the GC lease
+            // (FileStorage::ReleaseBuffer carries OwnerReleaseBuffer).
+            const auto release_start = std::chrono::steady_clock::now();
+            s->file_storage->ReleaseBuffer(batch_id);
+            s->release_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - release_start)
+                    .count();
+            s->worker_end = std::chrono::steady_clock::now();
+            s->pt_resume.Start();
+            return write_result;
+        });
+    const auto resumed = std::chrono::steady_clock::now();
+    s->pt_resume.End(0);
+    auto pushed = try_result.value();
+    if (!pushed) {
+        LOG(ERROR) << "Push offload transfer failed, err_code = "
+                   << pushed.error();
+        if (breakdown_log) {
+            mooncake::logging::ScopedTraceId trace(req.trace_id);
+            MC_LOG(INFO)
+                << "offload_rpc_server_breakdown mode=push"
+                << " num_keys=" << req.keys.size()
+                << " queue_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       s->worker_start - handler_start)
+                       .count()
+                << " batch_get_us=" << s->batch_get_us
+                << " transfer_data_us=" << s->transfer_us
+                << " release_buffer_us=" << s->release_us
+                << " resume_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - s->worker_end)
+                       .count()
+                << " response_us=0 total_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       resumed - handler_start)
+                       .count()
+                << " status=failed error_code="
+                << static_cast<int>(pushed.error());
+        }
+        co_return tl::make_unexpected(pushed.error());
+    }
+    const auto response_start = std::chrono::steady_clock::now();
+    BatchGetOffloadObjectPushResponse response(ErrorCode::OK);
+    const auto response_end = std::chrono::steady_clock::now();
+    if (breakdown_log) {
+        mooncake::logging::ScopedTraceId trace(req.trace_id);
+        MC_LOG(INFO)
+            << "offload_rpc_server_breakdown mode=push"
+            << " num_keys=" << req.keys.size()
+            << " queue_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   s->worker_start - handler_start)
+                   .count()
+            << " batch_get_us=" << s->batch_get_us
+            << " transfer_data_us=" << s->transfer_us
+            << " release_buffer_us=" << s->release_us
+            << " resume_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   resumed - s->worker_end)
+                   .count()
+            << " response_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   response_end - response_start)
+                   .count()
+            << " total_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   response_end - handler_start)
+                   .count()
+            << " status=ok";
+    }
+    co_return response;
+}
+
+bool RealClient::release_offload_buffer(uint64_t batch_id, uint64_t trace_id) {
     if (!file_storage_) {
         LOG(WARNING)
             << "release_offload_buffer called but file_storage_ is null";
         return false;
     }
+    mooncake::logging::ScopedTraceId trace(trace_id);
+    // Owner-side buffer release triggered by the requester's RPC (pull path).
+    // FileStorage::ReleaseBuffer carries the OwnerReleaseBuffer perf point.
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
@@ -6329,22 +6742,98 @@ RealClient::batch_get_into_offload_object_internal(
     std::unordered_map<std::string, std::vector<Slice>> &objects) {
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
+    // Per-key destination slices, kept in lockstep with storage_keys so the
+    // push path can hand the owner positionally-aligned (key, dst) pairs.
+    std::vector<std::vector<OffloadDstSlice>> dst_slices;
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
         storage_keys.emplace_back(
             MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
         int64_t total = 0;
-        for (const auto &s : object_it.second) total += s.size;
+        std::vector<OffloadDstSlice> key_dst;
+        key_dst.reserve(object_it.second.size());
+        for (const auto &s : object_it.second) {
+            total += s.size;
+            key_dst.emplace_back(reinterpret_cast<uint64_t>(s.ptr), s.size);
+        }
         sizes.emplace_back(total);
+        dst_slices.emplace_back(std::move(key_dst));
     }
+
+    // Push mode (MC_OFFLOAD_PUSH=true): the owner WRITEs the SSD data straight
+    // into our destination slices, so a single RPC replaces the pull path's
+    // get-pointers + READ + release_offload_buffer sequence. Falls back to the
+    // pull path otherwise (and for transports without one-sided WRITE).
+    static const bool kOffloadPush = []() {
+        const char *v = std::getenv("MC_OFFLOAD_PUSH");
+        return v && (std::string_view(v) == "true" ||
+                     std::string_view(v) == "1");
+    }();
+    if (kOffloadPush) {
+        BatchGetOffloadObjectPushRequest push_req;
+        push_req.keys = storage_keys;
+        push_req.sizes = sizes;
+        push_req.requester_te_addr = client_->GetSegmentEndpoint();
+        push_req.dst_slices = std::move(dst_slices);
+        push_req.trace_id = mooncake::logging::CurrentTraceId();
+
+        UbDiag::PerfPoint pt_push(PerfKey::GET_SSD_OFFLOAD_RPC,
+                                  UbDiag::PerfLevel::MODULE);
+        pt_push.Start();
+        const auto rpc_start = std::chrono::steady_clock::now();
+        ClientRequester::RpcTiming rpc_timing;
+        auto pushResp = client_requester_->batch_get_offload_object_push(
+            target_rpc_service_addr, push_req, &rpc_timing);
+        const auto rpc_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - rpc_start)
+                .count();
+        if (current_offload_read_timing) {
+            current_offload_read_timing->offload_rpc_us = rpc_us;
+        }
+        pt_push.End(pushResp ? 0 : -1);
+        if (!pushResp) {
+            LOG(ERROR) << "Push offload failed with error: "
+                       << pushResp.error();
+            return tl::make_unexpected(pushResp.error());
+        }
+        if (pushResp->error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Push offload owner-side error: "
+                       << pushResp->error_code;
+            return tl::make_unexpected(pushResp->error_code);
+        }
+        auto end_time = std::chrono::steady_clock::now();
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                                  start_time)
+                .count();
+        if (breakdown_log) {
+            MC_LOG(INFO) << "offload_read_breakdown mode=push"
+                         << " endpoint=" << target_rpc_service_addr
+                         << " num_keys=" << objects.size()
+                         << " total_us=" << total_us << " status=ok";
+        }
+        return {};
+    }
+
     UbDiag::PerfPoint pt_rpc(PerfKey::GET_SSD_OFFLOAD_RPC,
                              UbDiag::PerfLevel::MODULE);
     pt_rpc.Start();
+    const auto rpc_start = std::chrono::steady_clock::now();
+    ClientRequester::RpcTiming rpc_timing;
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, storage_keys, sizes);
+        target_rpc_service_addr, storage_keys, sizes, &rpc_timing);
+    const auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - rpc_start)
+                            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->offload_rpc_us = rpc_us;
+    }
     pt_rpc.End(batchGetResp ? 0 : -1);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
@@ -6359,29 +6848,53 @@ RealClient::batch_get_into_offload_object_internal(
     UbDiag::PerfPoint pt_transfer(PerfKey::GET_SSD_TRANSFER_DATA,
                                   UbDiag::PerfLevel::MODULE);
     pt_transfer.Start();
+    const auto transfer_start = std::chrono::steady_clock::now();
     auto result =
         client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
                                        batchGetResp->pointers, objects);
+    const auto transfer_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - transfer_start)
+            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->transfer_data_us = transfer_us;
+    }
     pt_transfer.End(result ? 0 : -1);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
                                                               start_time)
             .count());
-    LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
-              << elapsed_time
-              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
-              << ", key size: " << objects.size()
-              << ", batch_id: " << batchGetResp->batch_id
-              << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+    if (breakdown_log) {
+        MC_LOG(INFO) << "offload_read_breakdown mode=pull"
+                     << " endpoint=" << target_rpc_service_addr
+                     << " num_keys=" << objects.size()
+                     << " batch_id=" << batchGetResp->batch_id
+                     << " gc_ttl_ms=" << batchGetResp->gc_ttl_ms
+                     << " pre_release_total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - start_time)
+                            .count()
+                     << " status=" << (result ? "ok" : "transfer_fail");
+    }
 
-    // Release buffer immediately after transfer completion (fire-and-forget)
-    // This allows early buffer reclamation instead of waiting for GC lease
+    // Release the owner buffer immediately after transfer completion. This RPC
+    // is synchronous; measuring it separately exposes owner lock/reclaim stalls.
     UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_RELEASE_BUFFER,
                                  UbDiag::PerfLevel::MODULE);
     pt_release.Start();
+    const auto release_start = std::chrono::steady_clock::now();
+    ClientRequester::RpcTiming release_timing;
     client_requester_->release_offload_buffer(target_rpc_service_addr,
-                                              batchGetResp->batch_id);
+                                              batchGetResp->batch_id,
+                                              &release_timing);
+    const auto release_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - release_start)
+            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->release_buffer_us = release_us;
+    }
     pt_release.End(0);
 
     if (!result) {
@@ -6397,6 +6910,14 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+    pool_conf.max_connection =
+        Environ::Get().GetYltRpcPoolMaxConnection(pool_conf.max_connection);
+    pool_conf.idle_timeout = std::chrono::milliseconds(
+        Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+            pool_conf.idle_timeout.count()));
+    pool_conf.short_connect_idle_timeout = std::chrono::milliseconds(
+        Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+            pool_conf.short_connect_idle_timeout.count()));
     const char *value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
         pool_conf.client_config.socket_config =
@@ -6419,13 +6940,80 @@ ClientRequester::ClientRequester() {
             pool_conf);
 }
 
+void ClientRequester::WarmupRpcPool(const std::string &client_addr) {
+    if (!Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        return;
+    }
+
+    std::unique_lock lock(warmed_rpc_pool_mutex_);
+    const auto [_, inserted] = warmed_rpc_pools_.insert(client_addr);
+    if (!inserted) {
+        return;
+    }
+
+    auto client_pool = client_pools_->at(client_addr);
+    const size_t target_connections =
+        Environ::Get().GetYltRpcPoolWarmupConnections(
+            client_pool->get_pool_config().max_connection);
+    if (target_connections == 0) {
+        LOG(INFO) << "Offload RPC pool warmup disabled for " << client_addr
+                  << " by MC_YLT_RPC_POOL_WARMUP_CONNECTIONS=0";
+        return;
+    }
+
+    LOG(INFO) << "Warming up offload RPC pool for " << client_addr << " to "
+              << target_connections << " connection(s), max_connection="
+              << client_pool->get_pool_config().max_connection;
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(target_connections);
+    for (size_t i = 0; i < target_connections; ++i) {
+        futures.emplace_back(std::async(std::launch::async, [this, client_addr]() {
+            auto result =
+                invoke_rpc<&RealClient::service_ready_internal, void>(
+                    client_addr, nullptr);
+            return result.has_value();
+        }));
+    }
+
+    size_t ok_count = 0;
+    for (auto &future : futures) {
+        try {
+            if (future.get()) {
+                ++ok_count;
+            }
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Offload RPC pool warmup task failed for "
+                         << client_addr << ": " << e.what();
+        }
+    }
+
+    LOG(INFO) << "Offload RPC pool warmup completed for " << client_addr
+              << ": " << ok_count << "/" << target_connections
+              << " succeeded";
+}
+
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 ClientRequester::batch_get_offload_object(const std::string &client_addr,
                                           const std::vector<std::string> &keys,
-                                          const std::vector<int64_t> &sizes) {
+                                          const std::vector<int64_t> &sizes,
+                                          RpcTiming *timing) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result =
         invoke_rpc<&RealClient::batch_get_offload_object,
-                   BatchGetOffloadObjectResponse>(client_addr, keys, sizes);
+                   BatchGetOffloadObjectResponse>(
+            client_addr, timing, keys, sizes, trace_id);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=pull"
+                     << " endpoint=" << client_addr
+                     << " num_keys=" << keys.size()
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
@@ -6434,11 +7022,50 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
     return result;
 }
 
+tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
+ClientRequester::batch_get_offload_object_push(
+    const std::string &client_addr,
+    const BatchGetOffloadObjectPushRequest &req, RpcTiming *timing) {
+    auto result = invoke_rpc<&RealClient::batch_get_offload_object_push,
+                             BatchGetOffloadObjectPushResponse>(
+        client_addr, timing, req);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(req.trace_id)) {
+        mooncake::logging::ScopedTraceId trace(req.trace_id);
+        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=push"
+                     << " endpoint=" << client_addr
+                     << " num_keys=" << req.keys.size()
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
+    if (!result) {
+        LOG(ERROR)
+            << "Failed to invoke batch_get_offload_object_push, client_addr = "
+            << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
 void ClientRequester::release_offload_buffer(const std::string &client_addr,
-                                             uint64_t batch_id) {
-    // Fire-and-forget: attempt to release buffer, log errors but don't block
+                                             uint64_t batch_id,
+                                             RpcTiming *timing) {
+    // Synchronous RPC. Failure is non-fatal because GC eventually reclaims it.
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
-        client_addr, batch_id);
+        client_addr, timing, batch_id, trace_id);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "offload_release_client_breakdown endpoint="
+                     << client_addr << " batch_id=" << batch_id
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         // This is expected in some cases (e.g., network issues, buffer already
         // GC'd) Log at INFO level since GC will eventually clean up anyway
@@ -6453,26 +7080,86 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
-    const std::string &client_addr, Args &&...args) {
+    const std::string &client_addr, RpcTiming *timing, Args &&...args) {
+    const auto total_start = std::chrono::steady_clock::now();
+    UbDiag::PerfPoint pt_pool(PerfKey::GET_SSD_OFFLOAD_RPC_POOL,
+                              UbDiag::PerfLevel::DEBUG);
+    pt_pool.Start();
     auto client_pool = client_pools_->at(client_addr);
-    return async_simple::coro::syncAwait(
+    pt_pool.End(0);
+    if (timing) {
+        timing->pool_lookup_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+    }
+    auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            const auto rpc_call_start = std::chrono::steady_clock::now();
+            UbDiag::PerfPoint pt_rpc_call(
+                PerfKey::GET_SSD_OFFLOAD_RPC_CALL, UbDiag::PerfLevel::DEBUG);
+            pt_rpc_call.Start();
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client &client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            pt_rpc_call.End(ret.has_value() ? 0 : -1);
+            if (timing) {
+                timing->rpc_call_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - rpc_call_start)
+                        .count();
+            }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
+            const auto result_get_start = std::chrono::steady_clock::now();
+            UbDiag::PerfPoint pt_result_get(
+                PerfKey::GET_SSD_OFFLOAD_RPC_RESULT_GET,
+                UbDiag::PerfLevel::MODULE);
+            pt_result_get.Start();
             auto result = co_await std::move(ret.value());
+            pt_result_get.End(result ? 0 : -1);
+            if (timing) {
+                timing->result_get_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_get_start)
+                        .count();
+            }
             if (!result) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
-            co_return result->result();
+            const auto parse_start = std::chrono::steady_clock::now();
+            if constexpr (std::is_void_v<ReturnType>) {
+                result->result();
+                if (timing) {
+                    timing->result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - parse_start)
+                            .count();
+                }
+                co_return tl::expected<void, ErrorCode>{};
+            } else {
+                auto response = std::move(result->result());
+                if (timing) {
+                    timing->result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - parse_start)
+                            .count();
+                }
+                co_return std::move(response);
+            }
         }());
+    if (timing) {
+        timing->total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+    }
+    return rpc_result;
 }
 }  // namespace mooncake

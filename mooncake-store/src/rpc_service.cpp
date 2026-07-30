@@ -1012,7 +1012,8 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
     const auto t0 = sample ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
     auto result = execute_rpc(
@@ -1031,6 +1032,8 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         MC_LOG(INFO) << "GetReplicaList host="
                      << ResolveClientHost(master_service_, client_id)
                      << " key=" << key << " tenant=" << tenant_id
+                     << " replica_count="
+                     << (result ? result->replicas.size() : 0)
                      << " latency_us=" << latency_us << " status="
                      << (result.has_value() ? "ok" : toString(result.error()));
     }
@@ -1047,7 +1050,8 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
     const auto t0 = sample ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
     UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
@@ -1062,8 +1066,24 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
 
-    for (const auto& key : keys) {
-        results.emplace_back(master_service_.GetReplicaList(key, tenant_id));
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto item_start = sample ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+        results.emplace_back(
+            master_service_.GetReplicaList(keys[i], tenant_id));
+        if (sample) {
+            const auto item_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - item_start)
+                    .count();
+            const auto& item = results.back();
+            MC_LOG(INFO)
+                << "BatchGetReplicaListItem key=" << keys[i]
+                << " batch_index=" << i << " replica_count="
+                << (item ? item->replicas.size() : 0)
+                << " latency_us=" << item_us << " status="
+                << (item ? "ok" : toString(item.error()));
+        }
     }
 
     size_t failure_count = 0;
@@ -1120,7 +1140,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
     const auto t0 = sample ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
     auto result = execute_rpc(
@@ -1158,7 +1179,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
     const auto t0 = sample ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
     auto result = execute_rpc(
@@ -2079,6 +2101,16 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::GetOffloadEndpoints() {
+    ScopedVLogTimer timer(1, "GetOffloadEndpoints");
+    timer.LogRequest("action=get_offload_endpoints");
+
+    auto result = master_service_.GetOffloadEndpoints();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
@@ -2212,6 +2244,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
         &wrapped_master_service);
     server.register_handler<
+        &mooncake::WrappedMasterService::GetAllSegmentsForAdmin>(
+        &wrapped_master_service);
+    server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
@@ -2240,6 +2275,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetOffloadEndpoints>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(

@@ -202,6 +202,8 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    tl::expected<std::vector<std::string>, ErrorCode> GetOffloadEndpoints();
+
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);

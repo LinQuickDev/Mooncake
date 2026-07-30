@@ -593,6 +593,13 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Returns unique RPC endpoints that own completed LOCAL_DISK
+     * replicas. Used by clients to warm up offload RPC pools before traffic.
+     */
+    auto GetOffloadEndpoints()
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
      * its per-client promotion_objects queue. The per-shard promotion_tasks

@@ -1072,6 +1072,11 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+Client::GetOffloadEndpoints() {
+    return master_client_.GetOffloadEndpoints();
+}
+
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
     std::chrono::steady_clock::time_point start_time =
@@ -1380,6 +1385,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
+    const bool batch_item_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     if (!transfer_submitter_) {
         MC_LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1535,6 +1542,36 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 }
             }
         }
+        if (batch_item_log) {
+            std::string selected_type = "disk";
+            std::string remote_endpoint = "-";
+            if (stored_replica.is_memory_replica()) {
+                selected_type = "memory";
+                remote_endpoint =
+                    stored_replica.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
+            } else if (stored_replica.is_nof_replica()) {
+                selected_type = "nof";
+                remote_endpoint =
+                    stored_replica.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
+            }
+            const auto slices_it = slices.find(key);
+            const size_t bytes =
+                slices_it == slices.end()
+                    ? 0
+                    : CalculateSliceSize(slices_it->second);
+            MC_LOG(INFO)
+                << "batch_transfer_item op=batch_get key=" << key
+                << " batch_index=" << index
+                << " selected_type=" << selected_type
+                << " strategy=" << future.strategy()
+                << " local_endpoint=" << GetSegmentEndpoint()
+                << " remote_endpoint=" << remote_endpoint
+                << " bytes=" << bytes << " status="
+                << (result == ErrorCode::OK ? "ok" : "transfer_fail")
+                << " error_code=" << static_cast<int>(result);
+        }
     }
 
     // As lease expired is a rare case, we check all the results with the same
@@ -1679,6 +1716,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             pt_tw.End(transfer_err == ErrorCode::OK ? 0 : -1);
             if (transfer_err != ErrorCode::OK) {
+                MC_LOG(ERROR) << "transfer_write_failed key=" << key
+                              << " error_code="
+                              << static_cast<int>(transfer_err);
                 // Revoke put operation
                 UbDiag::PerfPoint pt_revoke(PerfKey::PUT_SINGLE_PUT_REVOKE,
                                             UbDiag::PerfLevel::MODULE);
@@ -1787,6 +1827,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (replica.is_memory_replica()) {
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
+                MC_LOG(ERROR) << "transfer_write_failed key=" << key
+                              << " error_code="
+                              << static_cast<int>(transfer_err);
                 auto revoke_result =
                     master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
                 if (!revoke_result) {
@@ -2108,6 +2151,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+    const bool batch_item_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     if (!transfer_submitter_) {
         MC_LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
@@ -2181,7 +2226,33 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                         replica, op.slices, TransferRequest::WRITE);
                 }
                 pt_submit.End(submit_result ? 0 : -1);
+                if (batch_item_log) {
+                    const auto& handle =
+                        replica.is_memory_replica()
+                            ? replica.get_memory_descriptor().buffer_descriptor
+                            : replica.get_nof_descriptor().buffer_descriptor;
+                    MC_LOG(INFO)
+                        << "batch_transfer_item op=batch_put key=" << op.key
+                        << " selected_type="
+                        << (replica.is_memory_replica() ? "memory" : "nof")
+                        << " strategy="
+                        << (submit_result ? submit_result->strategy()
+                                          : TransferStrategy::EMPTY)
+                        << " local_endpoint=" << GetSegmentEndpoint()
+                        << " remote_endpoint=" << handle.transport_endpoint_
+                        << " bytes=" << CalculateSliceSize(op.slices)
+                        << " status="
+                        << (submit_result ? "submitted" : "submit_fail")
+                        << " error_code="
+                        << static_cast<int>(
+                               submit_result ? ErrorCode::OK
+                                             : ErrorCode::TRANSFER_FAIL);
+                }
                 if (!submit_result) {
+                    MC_LOG(ERROR)
+                        << "transfer_failed op=batch_put key=" << op.key
+                        << " direction=write stage=submit error_code="
+                        << static_cast<int>(ErrorCode::TRANSFER_FAIL);
                     std::string failure_context =
                         "Failed to submit transfer for replica " +
                         std::to_string(replica_idx);
@@ -2212,6 +2283,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             auto& pending_transfer = op.pending_transfers[i];
             ErrorCode transfer_result = pending_transfer.future.get();
             if (transfer_result != ErrorCode::OK) {
+                MC_LOG(ERROR)
+                    << "transfer_failed op=batch_put key=" << op.key
+                    << " direction=write stage=wait error_code="
+                    << static_cast<int>(transfer_result);
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
                 std::string error_context =
@@ -2867,6 +2942,117 @@ std::vector<int> Client::GetNicNumaNodes() const {
     return {nodes.begin(), nodes.end()};
 }
 
+tl::expected<void, ErrorCode> Client::warmup(
+    const std::shared_ptr<ClientBufferAllocator>& allocator) {
+    if (!transfer_engine_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!allocator) {
+        LOG(WARNING) << "warmup: no buffer allocator provided, skipping";
+        return {};
+    }
+
+    // Allocate a buffer from the client's buffer allocator.  The allocator's
+    // underlying memory is already registered with the transfer engine during
+    // setup_internal, so it can be used directly as the source (WRITE) and
+    // destination (READ) for warmup transfers.  BufferHandle is RAII: it
+    // deallocates the buffer back to the allocator on destruction, so no
+    // explicit register/unregister is needed here.
+    constexpr size_t kWarmupBufSize = 4096;
+    auto buf_handle = allocator->allocate(kWarmupBufSize);
+    if (!buf_handle) {
+        LOG(WARNING) << "warmup: failed to allocate warmup buffer";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::memset(buf_handle->ptr(), 0, buf_handle->size());
+
+    // Fetch all segment names registered with the master.
+    auto segments_result = master_client_.GetAllSegments();
+    if (!segments_result) {
+        LOG(WARNING) << "warmup: GetAllSegments failed: "
+                     << toString(segments_result.error());
+        return tl::unexpected(segments_result.error());
+    }
+
+    const auto& segments = segments_result.value();
+    LOG(INFO) << "warmup: pre-establishing connections to "
+              << segments.size() << " segment(s) for protocol '"
+              << protocol_ << "'";
+
+    // Helper lambda: submit a single transfer request and poll to completion.
+    auto submit_and_wait = [&](Transport::TransferRequest::OpCode op,
+                              SegmentID target_id,
+                              const std::string& segment_name) -> bool {
+        auto batch_id = transfer_engine_->allocateBatchID(1);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(WARNING) << "warmup: allocateBatchID failed for '"
+                         << segment_name << "'";
+            return false;
+        }
+        auto target_meta_data = transfer_engine_->getMetadata();
+        auto target_segment = target_meta_data->getSegmentDescByID(target_id);
+        Transport::TransferRequest request;
+        request.opcode = op;
+        request.source = buf_handle->ptr();  // registered buffer carries r/w data
+        request.target_id = target_id;
+        request.target_offset = target_segment->buffers[0].addr;
+        request.length = kWarmupBufSize;
+
+        auto status = transfer_engine_->submitTransfer(batch_id, {request});
+        if (!status.ok()) {
+            LOG(WARNING) << "warmup: submitTransfer("
+                         << (op == Transport::TransferRequest::WRITE ? "W" : "R")
+                         << ") failed for '" << segment_name
+                         << "': " << status.message();
+            transfer_engine_->freeBatchID(batch_id);
+            return false;
+        }
+
+        // Poll for completion — the connection handshake occurs here.
+        Transport::TransferStatus ts;
+        for (int poll = 0; poll < 1000; ++poll) {
+            auto s = transfer_engine_->getTransferStatus(batch_id, 0, ts);
+            if (!s.ok()) break;
+            if (ts.s == Transport::COMPLETED ||
+                ts.s == Transport::FAILED ||
+                ts.s == Transport::INVALID)
+                break;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        transfer_engine_->freeBatchID(batch_id);
+        return ts.s == Transport::COMPLETED;
+    };
+
+    size_t success_count = 0;
+    for (const auto& segment_name : segments) {
+        // Open the segment to resolve its SegmentID (caches the descriptor).
+        auto target_id = transfer_engine_->openSegment(segment_name);
+        if (target_id == (SegmentHandle)-1) {
+            LOG(WARNING) << "warmup: cannot open segment '"
+                         << segment_name << "'";
+            continue;
+        }
+        // Skip the local segment — no point self-connecting, and a WRITE
+        // would corrupt our own buffer.
+        if (target_id == LOCAL_SEGMENT_ID) {
+            continue;
+        }
+
+        // Issue a 1-byte WRITE then a 1-byte READ using the registered
+        // buffer to exercise both directions of the connection.
+        bool ok = submit_and_wait(Transport::TransferRequest::WRITE,
+                                  target_id, segment_name);
+        ok = submit_and_wait(Transport::TransferRequest::READ,
+                             target_id, segment_name) && ok;
+        if (ok) ++success_count;
+    }
+
+    LOG(INFO) << "warmup: completed, " << success_count << "/"
+              << segments.size() << " segments processed";
+    return {};
+}
+
 int Client::GetNumaNodeCount() const {
     if (!transfer_engine_) return 0;
     auto topo = transfer_engine_->getLocalTopology();
@@ -3225,13 +3411,59 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit transfer operation";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_get_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=read remote_endpoint=" << transfer_engine_addr
+                << " stage=submit error_code="
+                << static_cast<int>(ErrorCode::TRANSFER_FAIL);
+        }
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
     auto result = future->get();
     if (result != ErrorCode::OK) {
-        MC_LOG(ERROR) << "Transfer failed, error code is " << result;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_get_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=read remote_endpoint=" << transfer_engine_addr
+                << " stage=wait error_code=" << static_cast<int>(result);
+        }
+        return tl::make_unexpected(result);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::BatchPushOffloadObject(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    auto future = transfer_submitter_->submit_batch_push_offload_object(
+        requester_te_addr, keys, src_pointers, dst_slices);
+    if (!future) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_push_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=write remote_endpoint=" << requester_te_addr
+                << " stage=submit error_code="
+                << static_cast<int>(ErrorCode::TRANSFER_FAIL);
+        }
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            MC_LOG(ERROR)
+                << "transfer_failed op=batch_push_offload key=" << keys[i]
+                << " batch_index=" << i
+                << " direction=write remote_endpoint=" << requester_te_addr
+                << " stage=wait error_code=" << static_cast<int>(result);
+        }
         return tl::make_unexpected(result);
     }
     return {};
@@ -3616,6 +3848,24 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code) {
     bool is_write = (op_code == TransferRequest::WRITE);
+    std::string remote_endpoint = "-";
+    if (replica_descriptor.is_memory_replica()) {
+        remote_endpoint =
+            replica_descriptor.get_memory_descriptor()
+                .buffer_descriptor.transport_endpoint_;
+    } else if (replica_descriptor.is_nof_replica()) {
+        remote_endpoint =
+            replica_descriptor.get_nof_descriptor()
+                .buffer_descriptor.transport_endpoint_;
+    } else if (replica_descriptor.is_local_disk_replica()) {
+        remote_endpoint =
+            replica_descriptor.get_local_disk_descriptor().transport_endpoint;
+    }
+    const bool diag_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    const auto submit_start =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
     UbDiag::PerfPoint pt_full(is_write ? PerfKey::PUT_SINGLE_TRANSFER_FULL
                                        : PerfKey::GET_SINGLE_TRANSFER_FULL,
                               UbDiag::PerfLevel::MODULE);
@@ -3645,10 +3895,30 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
     pt_submit.End(future ? 0 : -1);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit transfer operation";
+        if (diag_log) {
+            const auto submit_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - submit_start)
+                    .count();
+            MC_LOG(INFO) << "transfer_diag op="
+                         << (is_write ? "put" : "get")
+                         << " direction=" << (is_write ? "write" : "read")
+                         << " strategy=unknown request_count=" << slices.size()
+                         << " total_bytes=" << CalculateSliceSize(slices)
+                         << " submit_us=" << submit_us
+                         << (is_write ? " local_endpoint=" : "")
+                         << (is_write ? GetSegmentEndpoint() : "")
+                         << (is_write ? " remote_endpoint=" : "")
+                         << (is_write ? remote_endpoint : "")
+                         << " wait_us=0 status=submit_fail error_code="
+                         << static_cast<int>(ErrorCode::TRANSFER_FAIL);
+        }
         pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
+    const auto submit_end =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
 
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
 
@@ -3657,8 +3927,34 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                               UbDiag::PerfLevel::DEBUG);
     pt_wait.Start();
     auto result = future->get();
+    const auto wait_end =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
     pt_wait.End(result == ErrorCode::OK ? 0 : -1);
     pt_full.End(result == ErrorCode::OK ? 0 : -1);
+    if (diag_log) {
+        const auto submit_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                submit_end - submit_start)
+                .count();
+        const auto wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(wait_end -
+                                                                  submit_end)
+                .count();
+        MC_LOG(INFO) << "transfer_diag op=" << (is_write ? "put" : "get")
+                     << " direction=" << (is_write ? "write" : "read")
+                     << " strategy=" << future->strategy()
+                     << " request_count=" << slices.size()
+                     << " total_bytes=" << CalculateSliceSize(slices)
+                     << (is_write ? " local_endpoint=" : "")
+                     << (is_write ? GetSegmentEndpoint() : "")
+                     << (is_write ? " remote_endpoint=" : "")
+                     << (is_write ? remote_endpoint : "")
+                     << " submit_us=" << submit_us << " wait_us=" << wait_us
+                     << " status="
+                     << (result == ErrorCode::OK ? "ok" : "transfer_fail")
+                     << " error_code=" << static_cast<int>(result);
+    }
     return result;
 }
 
@@ -3670,16 +3966,42 @@ ErrorCode Client::TransferReadInternal(
         return ErrorCode::INVALID_PARAMS;
     }
 
+    const bool diag_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    const auto submit_start =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
                                                        slices, src_offset);
     if (!future) {
-        MC_LOG(ERROR) << "Failed to submit range read operation";
         return ErrorCode::TRANSFER_FAIL;
     }
+    const auto submit_end =
+        diag_log ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
 
     MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
-
-    return future->get();
+    const auto result = future->get();
+    if (diag_log) {
+        const auto wait_end = std::chrono::steady_clock::now();
+        MC_LOG(INFO)
+            << "transfer_diag op=get_into_range"
+            << " direction=read strategy=" << future->strategy()
+            << " request_count=" << slices.size()
+            << " total_bytes=" << CalculateSliceSize(slices)
+            << " submit_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   submit_end - submit_start)
+                   .count()
+            << " wait_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(wait_end -
+                                                                     submit_end)
+                   .count()
+            << " status="
+            << (result == ErrorCode::OK ? "ok" : "transfer_fail")
+            << " error_code=" << static_cast<int>(result);
+    }
+    return result;
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,

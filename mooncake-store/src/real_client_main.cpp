@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <algorithm>
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -25,6 +26,10 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
+DEFINE_int32(offload_rpc_thread_num, 8,
+             "Number of threads for the offload RPC server. "
+             "Effective only when --enable_offload and "
+             "--start_offload_rpc_server are true.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -86,6 +91,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
         &real_client);
+    server.register_handler<&RealClient::batch_get_offload_object_push>(
+        &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
 }
 }  // namespace mooncake
@@ -113,11 +120,18 @@ int main(int argc, char *argv[]) {
 #endif
 
     auto client_inst = RealClient::create();
+    const size_t offload_rpc_thread_num =
+        static_cast<size_t>(std::max(1, FLAGS_offload_rpc_thread_num));
+    if (FLAGS_offload_rpc_thread_num <= 0) {
+        LOG(WARNING) << "Invalid --offload_rpc_thread_num="
+                     << FLAGS_offload_rpc_thread_num << ", using 1";
+    }
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
         nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-        FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server);
+        FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
+        "default", offload_rpc_thread_num);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

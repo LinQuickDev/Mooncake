@@ -37,7 +37,7 @@ UbTransport::~UbTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
-    context_list_.clear();
+    uninit(this);
 }
 
 int UbTransport::install(std::string& local_server_name,
@@ -519,6 +519,8 @@ int UbTransport::initializeUbResources(UbTransport* t) {
 }
 
 int UbTransport::init(UbTransport* transport) {
+    if (transport->runtime_initialized_) return 0;
+
     if (transport->endpoint_type_ == URMA_ENDPOINT) {
         if (!UrmaContext::init()) {
             LOG(ERROR) << "UrmaContext init failed";
@@ -531,10 +533,14 @@ int UbTransport::init(UbTransport* transport) {
         LOG(ERROR) << "invalid endpoint type : " << transport->endpoint_type_;
         return -1;
     }
+    transport->runtime_initialized_ = true;
     return 0;
 }
 
 void UbTransport::uninit(UbTransport* transport) {
+    transport->context_list_.clear();
+    if (!transport->runtime_initialized_) return;
+
     if (transport->endpoint_type_ == URMA_ENDPOINT) {
         if (!UrmaContext::uninit()) {
             LOG(ERROR) << "UrmaContext uninit failed";
@@ -544,6 +550,7 @@ void UbTransport::uninit(UbTransport* transport) {
     } else {
         LOG(ERROR) << "invalid endpoint type : " << transport->endpoint_type_;
     }
+    transport->runtime_initialized_ = false;
 }
 
 std::shared_ptr<UbContext> UbTransport::buildContext(

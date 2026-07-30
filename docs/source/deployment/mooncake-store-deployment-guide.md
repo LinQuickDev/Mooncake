@@ -598,10 +598,15 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Set `1` to disable arena, fall back to per-call `mmap()` |
 
-### yalantinglibs Log Level
+### yalantinglibs Logging
 
 ```bash
 export MC_YLT_LOG_LEVEL=info
+export MC_YLT_LOG_PATH=logs/rpc.log
+export MC_YLT_LOG_MAX_FILE_SIZE=1048576000
+export MC_YLT_LOG_MAX_FILES=3
 ```
 
 Available: `trace`, `debug`, `info`, `warn` (or `warning`), `error`, `critical`.
+`MC_YLT_LOG_MAX_FILE_SIZE` is specified in bytes. Invalid or unset values fall
+back to the defaults shown above.

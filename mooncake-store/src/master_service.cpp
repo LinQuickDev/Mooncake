@@ -1311,6 +1311,42 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     return results;
 }
 
+auto MasterService::GetOffloadEndpoints()
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::unordered_set<std::string> unique_endpoints;
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& tenant_it : shard->tenants) {
+            for (const auto& metadata_it : tenant_it.second.metadata) {
+                const auto& metadata = metadata_it.second;
+                metadata.VisitReplicas(
+                    [](const Replica& replica) {
+                        return replica.is_completed() &&
+                               replica.is_local_disk_replica();
+                    },
+                    [&unique_endpoints](const Replica& replica) {
+                        const auto& endpoint =
+                            replica.get_descriptor()
+                                .get_local_disk_descriptor()
+                                .transport_endpoint;
+                        if (!endpoint.empty()) {
+                            unique_endpoints.emplace(endpoint);
+                        }
+                    });
+            }
+        }
+    }
+
+    std::vector<std::string> endpoints;
+    endpoints.reserve(unique_endpoints.size());
+    for (const auto& endpoint : unique_endpoints) {
+        endpoints.emplace_back(endpoint);
+    }
+    return endpoints;
+}
+
 auto MasterService::GetReplicaList(const std::string& key,
                                    const std::string& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
