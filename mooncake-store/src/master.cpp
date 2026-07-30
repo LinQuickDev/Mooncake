@@ -136,6 +136,10 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_bool(strict_replica_allocation, false,
+            "Require memory-only multi-replica PutStart/UpsertStart to "
+            "allocate exactly replica_num replicas instead of best-effort "
+            "degradation to fewer replicas");
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
@@ -373,6 +377,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("strict_replica_allocation",
+                           &master_config.strict_replica_allocation,
+                           FLAGS_strict_replica_allocation);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",
@@ -649,6 +656,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("strict_replica_allocation", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.strict_replica_allocation =
+            FLAGS_strict_replica_allocation;
     }
     if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
          !info.is_default) ||

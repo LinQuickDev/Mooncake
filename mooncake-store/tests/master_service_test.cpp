@@ -3604,7 +3604,7 @@ TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
     ReplicateConfig config;
     config.replica_num = 3;
     auto put_start_result = service_->PutStart(
-        client_id, "partial_alloc_key", TenantId::Default(), 1024, config);
+        client_id, "partial_alloc_key", "default", 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(2u, put_start_result->size());
     ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
@@ -3613,10 +3613,54 @@ TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
     ReplicateConfig full_config;
     full_config.replica_num = 2;
     auto full_result = service_->PutStart(
-        client_id, "full_alloc_key", TenantId::Default(), 1024, full_config);
+        client_id, "full_alloc_key", "default", 1024, full_config);
     ASSERT_TRUE(full_result.has_value());
     ASSERT_EQ(2u, full_result->size());
     ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
+}
+
+TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsPartialAllocation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_strict_replica_allocation(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Mount two segments only
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t segment_size = 1024 * 1024 * 64;  // 64MB
+
+    auto segment1 = MakeSegment("segment1", buffer1, segment_size);
+    auto segment2 = MakeSegment("segment2", buffer2, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t partial_before = metrics.get_put_start_partial_allocations();
+    const int64_t alloc_fail_before = metrics.get_put_start_alloc_failures();
+
+    // Requesting more replicas than available segments must fail outright
+    // instead of degrading to a partial allocation.
+    ReplicateConfig config;
+    config.replica_num = 3;
+    auto put_start_result = service_->PutStart(
+        client_id, "strict_partial_key", "default", 1024, config);
+    ASSERT_FALSE(put_start_result.has_value());
+    ASSERT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_start_result.error());
+    // Strict failures are surfaced as allocation failures, not as partial
+    // allocations.
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(), alloc_fail_before + 1);
+
+    // A fully satisfiable request still succeeds in strict mode.
+    ReplicateConfig full_config;
+    full_config.replica_num = 2;
+    auto full_result = service_->PutStart(
+        client_id, "strict_full_key", "default", 1024, full_config);
+    ASSERT_TRUE(full_result.has_value());
+    ASSERT_EQ(2u, full_result->size());
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {

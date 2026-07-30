@@ -1747,6 +1747,11 @@ class MasterService {
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
 
+    // Strict replica allocation: memory-only multi-replica requests must
+    // allocate exactly replica_num replicas instead of best-effort
+    // degradation (config: strict_replica_allocation)
+    bool strict_replica_allocation_{false};
+
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.
     bool promotion_on_hit_{false};

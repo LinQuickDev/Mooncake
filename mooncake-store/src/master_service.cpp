@@ -96,12 +96,16 @@ size_t RandomIndex(size_t upper_bound) {
 // Decides whether PutStart may proceed with the replicas that were
 // actually allocated. Three deliberately different policies apply:
 //
-//  - Memory-only (nof_replica_num == 0): best-effort. Fewer than
-//    config.replica_num replicas (but at least one) still succeed, even
-//    though DetermineReplicaWriteMode() classifies such configs as
+//  - Memory-only (nof_replica_num == 0): best-effort by default. Fewer
+//    than config.replica_num replicas (but at least one) still succeed,
+//    even though DetermineReplicaWriteMode() classifies such configs as
 //    RELIABLE_MULTI_REPLICA. The shortfall is surfaced via a WARNING log
 //    (action=put_start_partial_allocation) and the
 //    master_put_start_partial_allocations_total metric.
+//    When strict_memory_only is true (master flag
+//    --strict_replica_allocation), the allocation must match
+//    config.replica_num exactly, otherwise PutStart fails with
+//    NO_AVAILABLE_HANDLE instead of degrading.
 //  - FLEXIBLE_DUAL_REPLICA (1 memory + 1 NoF): allocating either side
 //    alone is sufficient.
 //  - Any other config with nof_replica_num > 0: strict. Both replica
@@ -110,11 +114,16 @@ size_t RandomIndex(size_t upper_bound) {
 //
 // The "reliable" guarantee of RELIABLE_MULTI_REPLICA is enforced at the
 // transfer stage (all allocated replicas must complete or the put is
-// revoked), not at the allocation stage for memory-only configs.
+// revoked), not at the allocation stage for memory-only configs unless
+// strict_memory_only is enabled.
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
-                                  size_t allocated_nof_replicas) {
+                                  size_t allocated_nof_replicas,
+                                  bool strict_memory_only) {
     if (config.nof_replica_num == 0) {
+        if (strict_memory_only) {
+            return allocated_memory_replicas == config.replica_num;
+        }
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -261,6 +270,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
             te_endpoint, timeout_ms, error_reason);
     };
 #endif
+
+    // Strict replica allocation: memory-only multi-replica requests must
+    // allocate exactly replica_num replicas instead of degrading.
+    strict_replica_allocation_ = config.strict_replica_allocation;
+    if (strict_replica_allocation_) {
+        MC_LOG(INFO) << "Strict replica allocation enabled: memory-only "
+                        "multi-replica requests must be fully satisfied";
+    }
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     offload_on_evict_ = enable_offload_ && config.offload_on_evict;
@@ -1537,7 +1554,8 @@ auto MasterService::AllocateAndInsertMetadata(
 #endif
 
     if (!HasExpectedReplicaAllocation(config, allocated_memory_replicas,
-                                      allocated_nof_replicas)) {
+                                      allocated_nof_replicas,
+                                      strict_replica_allocation_)) {
         if ((config.replica_num > 0 &&
              allocated_memory_replicas != config.replica_num) ||
             (config.nof_replica_num > 0 &&
