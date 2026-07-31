@@ -701,7 +701,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port, size_t offload_rpc_thread_num) {
+    size_t offload_rpc_thread_num, bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -1127,7 +1127,7 @@ int RealClient::setup_real(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, enable_client_http_server, client_http_port, Environ::Get().GetOffloadRpcThreadNum(8)));
+        tenant_id, Environ::Get().GetOffloadRpcThreadNum(8), enable_client_http_server, client_http_port));
 }
 
 namespace {
@@ -1219,59 +1219,6 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
     return parsed_value;
 }
 
-inline std::string trim(const std::string &value) {
-    auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return "";
-    }
-    auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
-inline bool get_config_bool(const ConfigDict &config, const std::string &key,
-                            bool default_value) {
-    auto it = config.find(key);
-    if (it == config.end()) {
-        return default_value;
-    }
-
-    std::string value = trim(it->second);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (value == "true" || value == "1" || value == "yes" || value == "on" ||
-        value == "enable") {
-        return true;
-    }
-    if (value == "false" || value == "0" || value == "no" || value == "off" ||
-        value == "disable") {
-        return false;
-    }
-
-    LOG(WARNING) << "Invalid boolean value for config key '" << key
-                 << "': " << it->second << ", using default: " << default_value;
-    return default_value;
-}
-
-inline std::optional<int> get_config_int(const ConfigDict &config,
-                                         const std::string &key,
-                                         int default_value) {
-    auto it = config.find(key);
-    if (it == config.end()) {
-        return default_value;
-    }
-
-    std::string value = trim(it->second);
-    int parsed_value = 0;
-    const char *begin = value.data();
-    const char *end = begin + value.size();
-    auto [ptr, ec] = std::from_chars(begin, end, parsed_value);
-    if (ec != std::errc{} || ptr != end) {
-        LOG(ERROR) << "Invalid integer value for config key '" << key
-                   << "': " << it->second;
-        return std::nullopt;
-    }
-    return parsed_value;
-}
 }  // namespace
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1364,7 +1311,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                           local_buffer_size, protocol, rdma_devices,
                           master_server_addr, nullptr, ipc_socket_path, 50052,
                           enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port, offload_rpc_thread_num);
+                          offload_rpc_thread_num, enable_client_http_server, client_http_port);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -4207,6 +4154,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         return tl::unexpected(metadata_result.error());
     }
 
+    const auto& metadata = metadata_result.value();
     OffloadReadTiming offload_timing;
     ScopedOffloadReadTiming offload_timing_scope(
         breakdown_log ? &offload_timing : nullptr);
