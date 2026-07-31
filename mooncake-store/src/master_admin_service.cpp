@@ -722,16 +722,6 @@ void MasterAdminServer::HandleQuerySegment(
     });
 }
 
-struct HttpCreateDrainJobResponse {
-    bool success{false};
-    std::string job_id;
-    std::string status;
-    int32_t error_code{0};
-    std::string error_message;
-};
-YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
-         error_message);
-
 void MasterAdminServer::HandleCreateDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     CreateDrainJobRequest request;
@@ -760,32 +750,6 @@ void MasterAdminServer::HandleCreateDrainJob(
     });
 }
 
-struct HttpQueryDrainJobResponse {
-    bool success{false};
-    std::string job_id;
-    int32_t type{0};
-    std::string type_name;
-    int32_t status{0};
-    std::string status_name;
-    int64_t created_at_ms_epoch{0};
-    int64_t last_updated_at_ms_epoch{0};
-    std::vector<std::string> segments;
-    uint64_t succeeded_units{0};
-    uint64_t failed_units{0};
-    uint64_t blocked_units{0};
-    uint64_t active_units{0};
-    uint64_t migrated_bytes{0};
-    std::string message;
-    int32_t error_code{0};
-    std::string error_message;
-};
-YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
-         status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
-         succeeded_units, failed_units, blocked_units, active_units,
-         migrated_bytes, message, error_code, error_message);
-
-namespace {
-
 HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     const QueryJobResponse& job) {
     HttpQueryDrainJobResponse payload;
@@ -805,9 +769,6 @@ HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     payload.migrated_bytes = job.migrated_bytes;
     payload.message = job.message;
     return payload;
-}
-
-}  // namespace
 
 void MasterAdminServer::HandleQueryDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
@@ -830,16 +791,6 @@ void MasterAdminServer::HandleQueryDrainJob(
                           ToHttpQueryDrainJobResponse(result.value()));
     });
 }
-
-struct HttpCancelDrainJobResponse {
-    bool success{false};
-    std::string job_id;
-    std::string status;
-    int32_t error_code{0};
-    std::string error_message;
-};
-YLT_REFL(HttpCancelDrainJobResponse, success, job_id, status, error_code,
-         error_message);
 
 void MasterAdminServer::HandleCancelDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
