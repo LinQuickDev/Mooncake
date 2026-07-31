@@ -193,8 +193,6 @@ YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
          error_message);
 
 struct QueryJobResponse;
-HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
-    const QueryJobResponse& job);
 
 struct HttpQueryDrainJobResponse {
     bool success{false};
@@ -219,6 +217,9 @@ YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
          status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
          succeeded_units, failed_units, blocked_units, active_units,
          migrated_bytes, message, error_code, error_message);
+
+HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
+    const QueryJobResponse& job);
 
 struct HttpCancelDrainJobResponse {
     bool success{false};

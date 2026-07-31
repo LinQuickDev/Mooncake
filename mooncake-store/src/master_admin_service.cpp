@@ -34,7 +34,6 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     return primary;
 }
 
-namespace {
 
 struct HttpErrorResponse {
     bool success{false};
@@ -232,8 +231,6 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
     }
     return request;
 }
-
-}  // namespace
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
                                      bool enable_metric_reporting)
@@ -769,6 +766,7 @@ HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     payload.migrated_bytes = job.migrated_bytes;
     payload.message = job.message;
     return payload;
+}
 
 void MasterAdminServer::HandleQueryDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
