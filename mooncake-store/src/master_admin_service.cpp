@@ -449,6 +449,36 @@ std::string MasterAdminServer::BuildMetricsSummaryText() const {
     return oss.str();
 }
 
+std::string MasterAdminServer::BuildHealthJson() const {
+    const auto snapshot = SnapshotState();
+    std::ostringstream oss;
+    oss << "{\"status\":\"ok\",\"role\":\""
+        << ha::MasterRuntimeRoleToString(snapshot.state) << "\",\"ha_state\":\""
+        << ha::MasterRuntimeStateToString(snapshot.state)
+        << "\",\"service_ready\":"
+        << (snapshot.service_available ? "true" : "false");
+    if (snapshot.leader_view.has_value()) {
+        oss << ",\"leader_address\":\""
+            << EscapeJson(snapshot.leader_view->leader_address)
+            << "\",\"view_version\":" << snapshot.leader_view->view_version;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string MasterAdminServer::BuildLeaderJson() const {
+    const auto snapshot = SnapshotState();
+    if (!snapshot.leader_view.has_value()) {
+        return "{\"present\":false}";
+    }
+
+    std::ostringstream oss;
+    oss << "{\"present\":true,\"leader_address\":\""
+        << EscapeJson(snapshot.leader_view->leader_address)
+        << "\",\"view_version\":" << snapshot.leader_view->view_version << "}";
+    return oss.str();
+}
+
 struct HttpHealthResponse {
     std::string status;
     std::string role;

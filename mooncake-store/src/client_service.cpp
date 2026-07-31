@@ -4436,4 +4436,26 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     return local_hostname_ == replica_transfer_endpoint;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode> Client::GetOffloadEndpoints() {
+    return master_client_.GetOffloadEndpoints();
+}
+
+tl::expected<void, ErrorCode> Client::BatchPushOffloadObject(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    (void)requester_te_addr;
+    (void)keys;
+    (void)src_pointers;
+    (void)dst_slices;
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<void, ErrorCode> Client::warmup(
+    const std::shared_ptr<ClientBufferAllocator>& allocator) {
+    (void)allocator;
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
 }  // namespace mooncake
