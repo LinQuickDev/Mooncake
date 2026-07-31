@@ -118,6 +118,7 @@ class Transport {
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
+        uint64_t trace_id = 0;
         std::string peer_nic_path;
         std::string source_location;
         SliceStatus status;
@@ -291,6 +292,8 @@ class Transport {
                 slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
                 tail_++;
                 slice->from_cache = true;
+                slice->peer_nic_path.clear();
+                slice->dest_rkeys.clear();
             }
 
             return slice;

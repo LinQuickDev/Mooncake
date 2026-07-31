@@ -47,6 +47,82 @@ int ReadInt(const EnvironSource& source, const char* name, int default_value) {
     return default_value;
 }
 
+size_t Environ::GetOffloadRpcThreadNum(size_t default_value) const {
+    const size_t value = GetSizeT("MC_OFFLOAD_RPC_THREAD_NUM", default_value);
+    return value == 0 ? default_value : value;
+}
+
+uint32_t Environ::GetYltRpcPoolMaxConnection(uint32_t default_value) const {
+    const size_t value =
+        GetSizeT("MC_YLT_RPC_POOL_MAX_CONNECTION", default_value);
+    if (value == 0 || value > UINT32_MAX) {
+        std::cerr << "[Mooncake] Warning: invalid value for env "
+                  << "MC_YLT_RPC_POOL_MAX_CONNECTION, using default "
+                  << default_value << std::endl;
+        return default_value;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+size_t Environ::GetYltRpcPoolIdleTimeoutMs(size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_IDLE_TIMEOUT_MS", default_value);
+}
+
+size_t Environ::GetYltRpcPoolShortIdleTimeoutMs(
+    size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_SHORT_IDLE_TIMEOUT_MS", default_value);
+}
+
+bool Environ::GetYltRpcPoolWarmupEnabled(bool default_value) const {
+    return GetBool("MC_YLT_RPC_POOL_WARMUP", default_value);
+}
+
+size_t Environ::GetYltRpcPoolWarmupConnections(size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_WARMUP_CONNECTIONS", default_value);
+}
+
+bool Environ::GetStoreWarmupEnabled(bool default_value) const {
+    return GetBool("MC_STORE_WARMUP", default_value);
+}
+
+size_t Environ::GetOffloadRpcThreadNum(size_t default_value) const {
+    const size_t value = GetSizeT("MC_OFFLOAD_RPC_THREAD_NUM", default_value);
+    return value == 0 ? default_value : value;
+}
+
+uint32_t Environ::GetYltRpcPoolMaxConnection(uint32_t default_value) const {
+    const size_t value =
+        GetSizeT("MC_YLT_RPC_POOL_MAX_CONNECTION", default_value);
+    if (value == 0 || value > UINT32_MAX) {
+        std::cerr << "[Mooncake] Warning: invalid value for env "
+                  << "MC_YLT_RPC_POOL_MAX_CONNECTION, using default "
+                  << default_value << std::endl;
+        return default_value;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+size_t Environ::GetYltRpcPoolIdleTimeoutMs(size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_IDLE_TIMEOUT_MS", default_value);
+}
+
+size_t Environ::GetYltRpcPoolShortIdleTimeoutMs(
+    size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_SHORT_IDLE_TIMEOUT_MS", default_value);
+}
+
+bool Environ::GetYltRpcPoolWarmupEnabled(bool default_value) const {
+    return GetBool("MC_YLT_RPC_POOL_WARMUP", default_value);
+}
+
+size_t Environ::GetYltRpcPoolWarmupConnections(size_t default_value) const {
+    return GetSizeT("MC_YLT_RPC_POOL_WARMUP_CONNECTIONS", default_value);
+}
+
+bool Environ::GetStoreWarmupEnabled(bool default_value) const {
+    return GetBool("MC_STORE_WARMUP", default_value);
+}
+
 int64_t ReadInt64(const EnvironSource& source, const char* name,
                   int64_t default_value) {
     const char* val = source.Get(name);

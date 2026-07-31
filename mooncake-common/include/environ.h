@@ -61,6 +61,13 @@ class Environ {
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
+    size_t GetOffloadRpcThreadNum(size_t default_value = 8) const;
+    uint32_t GetYltRpcPoolMaxConnection(uint32_t default_value = 100) const;
+    size_t GetYltRpcPoolIdleTimeoutMs(size_t default_value) const;
+    size_t GetYltRpcPoolShortIdleTimeoutMs(size_t default_value) const;
+    bool GetYltRpcPoolWarmupEnabled(bool default_value = true) const;
+    size_t GetYltRpcPoolWarmupConnections(size_t default_value) const;
+    bool GetStoreWarmupEnabled(bool default_value = false) const;
     bool GetStoreChecksumEnabled() const { return store_checksum_enabled_; }
 
     // AWS / S3 client configuration

@@ -42,6 +42,14 @@ class UbWorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
+    uint64_t pendingSliceCount() const {
+        const uint64_t submitted =
+            submitted_slice_count_.load(std::memory_order_relaxed);
+        const uint64_t processed =
+            processed_slice_count_.load(std::memory_order_relaxed);
+        return submitted >= processed ? submitted - processed : 0;
+    }
+
    private:
     void performPostSend(int thread_id);
 
@@ -180,7 +188,7 @@ class UbContext {
 
     virtual void* retrieveRemoteSeg(const std::string& value) = 0;
 
-    virtual int openDevice(const std::string& device_name, uint8_t port,
+    virtual int openDevice(const std::string& device_name, int8_t port,
                            int& eid_index) = 0;
 
     // Polls one JFC and processes the slices internally:

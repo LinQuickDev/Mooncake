@@ -519,6 +519,7 @@ class RealClient : public PyClient {
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
+        size_t offload_rpc_thread_num = 8,
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
@@ -544,6 +545,14 @@ class RealClient : public PyClient {
         QueryResult query_result;
         Replica::Descriptor replica;
         uint64_t total_size;
+        int64_t query_us;
+        int64_t select_us;
+        int64_t local_endpoints_us;
+        int64_t select_replica_us;
+        std::string replica_type;
+        size_t replica_count{0};
+        std::string local_endpoint{"-"};
+        std::string remote_endpoint{"-"};
     };
 
     tl::expected<RangedReadMetadata, ErrorCode>
@@ -692,7 +701,22 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             uint64_t trace_id = 0);
+
+    /**
+     * @brief Push-mode offload handler, run on the data owner. Reads the
+     * requested keys from SSD into the local ClientBuffer, WRITEs them
+     * directly into the requester's destination slices over the transfer
+     * engine, then releases the ClientBuffer locally. The requester therefore
+     * needs no follow-up READ nor a separate release_offload_buffer RPC.
+     * @param req keys/sizes plus the requester's TE endpoint and dst slices.
+     * @return per-batch result; data already landed in requester memory.
+     */
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+    batch_get_offload_object_push(
+        const BatchGetOffloadObjectPushRequest &req);
 
     /**
      * @brief Releases buffer associated with a specific batch_id.
@@ -700,7 +724,7 @@ class RealClient : public PyClient {
      * @param batch_id The unique identifier of the batch to release
      * @return true if batch was found and released, false otherwise
      */
-    bool release_offload_buffer(uint64_t batch_id);
+    bool release_offload_buffer(uint64_t batch_id, uint64_t trace_id = 0);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.

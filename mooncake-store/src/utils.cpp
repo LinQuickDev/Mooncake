@@ -138,6 +138,11 @@ void *allocate_buffer_allocator_memory(size_t total_size,
                                                           -1);
     }
 #endif
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        return mooncake::ub_allocate_memory(alignment, total_size);
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }

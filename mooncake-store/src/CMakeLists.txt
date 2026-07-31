@@ -309,6 +309,13 @@ target_link_libraries(
          yaml-cpp
          asio_shared
   PRIVATE transfer_engine)
+
+# UbDiag instrumentation
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
+target_link_libraries(mooncake_store PRIVATE UbDiag::ubdiag_lib)
+target_include_directories(mooncake_store PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
+
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
@@ -352,7 +359,8 @@ target_link_libraries(
           JsonCpp::JsonCpp
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
-          asio_shared)
+          asio_shared
+          UbDiag::ubdiag_lib)
 # mooncake_store is static and propagates optional runtime dependencies to its
 # consumers. The metadata-only master does not use accelerator staging, so drop
 # those dependencies when they do not satisfy any symbols in the final binary.
@@ -369,7 +377,7 @@ endif()
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
-                                              asio_shared)
+                                              asio_shared UbDiag::ubdiag_lib)
 set_target_properties(mooncake_master mooncake_client
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -396,8 +404,9 @@ endif()
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
 # Go's build.sh already does this; CI workflows must do the same.
-
-find_package(CUDAToolkit QUIET)
+if(USE_CUDA)
+    find_package(CUDAToolkit QUIET)
+endif()
 if(CUDAToolkit_FOUND)
   message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
   target_compile_definitions(mooncake_store PRIVATE USE_CUDA)

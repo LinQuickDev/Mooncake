@@ -1,6 +1,9 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <dirent.h>  // For opendir (MC_LOG_DIR validation)
+#include <unistd.h>  // For access/W_OK (MC_LOG_DIR validation)
+
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
@@ -19,6 +22,7 @@
 
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
+#include "mooncake_logging.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -134,6 +138,10 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(ddr_admission_watermark_ratio,
+              mooncake::DEFAULT_DDR_ADMISSION_WATERMARK_RATIO,
+              "Ratio above which DDR allocation is rejected (0.0 = use "
+              "eviction_high_watermark_ratio)");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -300,7 +308,11 @@ DEFINE_string(memory_allocator, "offset",
 DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
-    "ssd_free_ratio_first | local_first");
+    "ssd_free_ratio_first | local_first | "
+    "ssd_balance");
+DEFINE_double(ssd_high_watermark_ratio, 0.90,
+              "SSD usage ratio above which a segment is excluded from "
+              "allocation (0.0-1.0)");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -468,6 +480,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("ddr_admission_watermark_ratio",
+                             &master_config.ddr_admission_watermark_ratio,
+                             FLAGS_ddr_admission_watermark_ratio);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -584,6 +599,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+    default_config.GetDouble("ssd_high_watermark_ratio",
+                             &master_config.ssd_high_watermark_ratio,
+                             FLAGS_ssd_high_watermark_ratio);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -1036,6 +1054,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
     }
+    if ((google::GetCommandLineFlagInfo("ssd_high_watermark_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ssd_high_watermark_ratio = FLAGS_ssd_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("ddr_admission_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ddr_admission_watermark_ratio =
+            FLAGS_ddr_admission_watermark_ratio;
+    }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1290,9 +1320,38 @@ int main(int argc, char* argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (!FLAGS_log_dir.empty()) {
+    // The master does not go through the transfer engine's globalConfig(),
+    // which is where MC_LOG_DIR is normally applied. Without this, master logs
+    // ignore MC_LOG_DIR and only go to stderr. Honor it here, mirroring
+    // config.cpp: validate the directory and fall back to stderr if it is
+    // missing or unwritable. --log_dir (if passed) takes precedence.
+    const char* mc_log_dir =
+        FLAGS_log_dir.empty() ? std::getenv("MC_LOG_DIR") : nullptr;
+    // Resolve the log directory BEFORE initializing glog: SetLogDestination
+    // below builds the journal path from FLAGS_log_dir, so FLAGS_log_dir must
+    // already hold the MC_LOG_DIR value at that point. Validate the directory
+    // and fall back to stderr if it is missing or unwritable. These early
+    // LOG(WARNING)s run before InitGoogleLogging and therefore go to stderr,
+    // which is the intended fallback sink anyway.
+    if (mc_log_dir) {
+        if (opendir(mc_log_dir) == nullptr) {
+            LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
+                         << "] is not a valid directory. Logging to stderr.";
+        } else if (access(mc_log_dir, W_OK) != 0) {
+            LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
+                         << "] is not writable. Logging to stderr.";
+        } else {
+            FLAGS_log_dir = mc_log_dir;
+            FLAGS_logtostderr = 0;
+            FLAGS_stop_logging_if_full_disk = true;
+        }
+    }
+    // Init glog if either --log_dir was passed or MC_LOG_DIR resolved to a
+    // valid directory above. The guard against IsGoogleLoggingInitialized
+    // avoids a double init.
+    if (!FLAGS_log_dir.empty() && !google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(argv[0]);
-        // Merge all master logs into a single journal file in --log_dir,
+        // Merge all master logs into a single journal file in FLAGS_log_dir,
         // reusing glog: every record is already written to its own severity
         // file and all lower ones, so the INFO sink is a complete journal.
         // Disable the higher-severity files so everything lands in one file.
@@ -1303,6 +1362,7 @@ int main(int argc, char* argv[]) {
         google::SetLogDestination(google::GLOG_FATAL, "");
         google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
+    mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     // Initialize the master configuration
     mooncake::MasterConfig master_config;

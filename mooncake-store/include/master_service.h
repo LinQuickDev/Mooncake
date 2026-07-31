@@ -711,6 +711,13 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Returns unique RPC endpoints that own completed LOCAL_DISK
+     * replicas. Used by clients to warm up offload RPC pools before traffic.
+     */
+    auto GetOffloadEndpoints()
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
      * its per-client promotion_objects queue. The per-shard promotion_tasks
@@ -1663,6 +1670,7 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double ssd_high_watermark_ratio_;           // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 

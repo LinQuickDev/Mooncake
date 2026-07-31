@@ -862,16 +862,14 @@ ErrorCode Client::InitTransferEngine(
                            << e.what() << "\"";
             }
         } else if (protocol == "ub") {
-            auto deviceName = device_names.value_or("bonding_dev_0");
-            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
-            auto devices = splitString(deviceName, ',', true);
-            auto topology = transfer_engine_->getLocalTopology();
-            if (topology) {
-                topology->discover(devices);
-                LOG(INFO) << "Topology discovery complete with specified "
-                             "devices. Found "
-                          << topology->getHcaList().size() << " HCAs";
+            if (!device_names.has_value() || device_names->empty()) {
+                LOG(ERROR) << "ub protocol requires device names when auto "
+                              "discovery is disabled";
+                return ErrorCode::INVALID_PARAMS;
             }
+            auto deviceName = device_names.value_or("bonding_dev_0");
+            auto devices = splitString(deviceName, ',', true);
+            transfer_engine_->getLocalTopology()->discover(devices);
             transport = transfer_engine_->installTransport("ub", nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install ub transport with specified "
@@ -1436,7 +1434,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
                 auto index = op.key_indexes[idx];
                 VLOG(1) << "Transfer completed successfully for key: "
-                        << object_keys[index];
+                           << object_keys[index];
+                results[index] = {};
 
                 // Release the cache block after transfer completes (memcpy is
                 // done)
@@ -1680,6 +1679,9 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    UbDiag::PerfPoint pt_full(PerfKey::PUT_SINGLE_FULL,
+                              UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -1772,8 +1774,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         DetermineFinalizeDecision(config, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
+        UbDiag::PerfPoint pt_end(PerfKey::PUT_SINGLE_PUT_END,
+                                 UbDiag::PerfLevel::MODULE);
+        pt_end.Start();
         auto end_result = master_client_.PutEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+        pt_end.End(end_result ? 0 : -1);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -2110,6 +2116,9 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
+    UbDiag::PerfPoint pt_batch_start(PerfKey::PUT_BATCH_PUT_START,
+                                     UbDiag::PerfLevel::MODULE);
+    pt_batch_start.Start();
     auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
 
@@ -2220,6 +2229,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+    const bool batch_item_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     if (std::all_of(ops.begin(), ops.end(),
                     [](const PutOperation& op) { return op.IsResolved(); })) {
         return;
@@ -2800,6 +2811,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_FULL,
+                              UbDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3657,8 +3671,10 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     // Async StoreObject + PutEnd (unchanged from original)
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
-                                value = std::move(value), path] {
+                                value = std::move(value), path, trace_id] {
+        mooncake::logging::ScopedTraceId trace(trace_id);
         ReplicaType replica_type = ReplicaType::DISK;
         // Store the object
         auto store_result = backend->StoreObject(

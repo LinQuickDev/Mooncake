@@ -199,6 +199,11 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
+    bool disable_ssd_eviction =
+        false;  // Force disable eviction regardless of
+                // eviction_policy. Set via
+                // MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION.
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
@@ -340,6 +345,29 @@ struct FileStorageConfig {
      * @return FileStorageConfig with values from env or defaults
      */
     static FileStorageConfig FromEnvironment();
+};
+
+struct StorageReadStats {
+    uint64_t plan_us{0};
+    uint64_t file_open_us{0};
+    uint64_t disk_read_us{0};
+    uint64_t slowest_disk_read_us{0};
+    std::string slowest_key{"-"};
+    std::string io_mode{"unknown"};
+    std::string status{"ok"};
+    std::string error_key{"-"};
+    ErrorCode error_code{ErrorCode::OK};
+};
+
+StorageReadStats* CurrentStorageReadStats();
+
+class ScopedStorageReadStats {
+   public:
+    explicit ScopedStorageReadStats(StorageReadStats* stats);
+    ~ScopedStorageReadStats();
+
+   private:
+    StorageReadStats* previous_;
 };
 
 class StorageBackendInterface {

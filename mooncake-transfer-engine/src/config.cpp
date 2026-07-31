@@ -18,6 +18,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <sstream>
 #include <strings.h>
@@ -357,6 +359,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* handshake_worker_threads =
+        std::getenv("MC_HANDSHAKE_WORKER_THREADS");
+    if (handshake_worker_threads) {
+        try {
+            int val = std::stoi(handshake_worker_threads);
+            if (val > 0) {
+                config.handshake_worker_threads = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_WORKER_THREADS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_WORKER_THREADS environment "
+                            "value: "
+                         << handshake_worker_threads << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_connect_timeout =
         std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
     if (handshake_connect_timeout) {
@@ -401,6 +421,9 @@ void loadGlobalConfig(GlobalConfig& config) {
             config.log_level = google::ERROR;
     }
     FLAGS_minloglevel = config.log_level;
+    // MC_LOG_ENABLE only controls MC_LOG macros via ShouldLog().
+    // Do not suppress FLAGS_minloglevel here to avoid affecting other LOG()
+    // calls.
 
     const char* slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
     if (slice_timeout_env) {
@@ -439,7 +462,9 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        if (!google::IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging("mooncake-transfer-engine");
+        }
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
@@ -633,6 +658,52 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (std::getenv("MC_URMA_BONDING_BALANCE")) {
+        config.urma_bonding_balance = true;
+    }
+
+    const char* urma_trans_mode_env = std::getenv("MC_URMA_TRANS_MODE");
+    if (urma_trans_mode_env && *urma_trans_mode_env) {
+        std::string val(urma_trans_mode_env);
+        if (val == "RM" || val == "RC" || val == "UM")
+            config.urma_trans_mode = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_URMA_TRANS_MODE, it should be RM|RC|UM";
+    }
+
+    const char* urma_active_port_env = std::getenv("MC_URMA_ACTIVE_PORT");
+    if (urma_active_port_env && *urma_active_port_env) {
+        try {
+            int val = std::stoi(urma_active_port_env);
+            if (val >= 0) {
+                config.urma_active_port = val;
+                LOG(INFO) << "MC_URMA_ACTIVE_PORT is " << val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_URMA_ACTIVE_PORT, it should be >= 0; "
+                                "using auto-selection (scan active ports)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to parse MC_URMA_ACTIVE_PORT='"
+                         << urma_active_port_env << "': " << e.what()
+                         << "; using auto-selection (scan active ports)";
+        }
+    }
+
+    const char* urma_bonding_multipath_enable =
+        std::getenv("MC_URMA_BONDING_MULTIPATH_ENABLE");
+    if (urma_bonding_multipath_enable && *urma_bonding_multipath_enable) {
+        std::string val(urma_bonding_multipath_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.urma_bonding_multipath = true;
+            LOG(WARNING) << "MC_URMA_BONDING_MULTIPATH_ENABLE is " << val;
+        } else
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                   "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
+    }
+
     const char* mlx5_qp_lag_port_balance_env =
         std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
     if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
@@ -707,6 +778,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "handshake_listen_backlog = "
+              << config.handshake_listen_backlog;
+    LOG(INFO) << "handshake_worker_threads = "
+              << config.handshake_worker_threads;
+    LOG(INFO) << "handshake_connect_timeout = "
+              << config.handshake_connect_timeout;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -723,6 +800,9 @@ void dumpGlobalConfig() {
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "
               << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
+    LOG(INFO) << "urma_bonding_balance = "
+              << (config.urma_bonding_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

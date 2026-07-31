@@ -1062,6 +1062,9 @@ the deferred direct-mmap path is desired while the arena is otherwise enabled.
 
 ```bash
 export MC_YLT_LOG_LEVEL=info
+export MC_YLT_LOG_PATH=logs/rpc.log
+export MC_YLT_LOG_MAX_FILE_SIZE=1048576000
+export MC_YLT_LOG_MAX_FILES=3
 ```
 
 Available: `trace`, `debug`, `info`, `warn` (or `warning`), `error`, `critical`. When unset (or set to an unrecognized value), the level defaults to `warn`.

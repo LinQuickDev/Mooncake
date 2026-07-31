@@ -9,6 +9,8 @@ jobs:
     # Skip fork and cross-repo PRs (head repo must match this repository)
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    env:
+      QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
     permissions:
       contents: read
       pull-requests: write
@@ -21,9 +23,10 @@ jobs:
           fetch-depth: 0
       
       - name: Run Qoder Code Review
+        if: env.QODER_PERSONAL_ACCESS_TOKEN != ''
         uses: QoderAI/qoder-action@v0
         with:
-          qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+          qoder_personal_access_token: ${{ env.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review-pr
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}

@@ -12,6 +12,7 @@
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
+#include "environ.h"
 #include "client_metric.h"
 #include "replica.h"
 #include "segment.h"
@@ -75,11 +76,36 @@ class MasterClient {
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
-        : client_accessor_(GetStoreRpcClientIoContextPool(),
+        : client_accessor_(GetStoreRpcClientIoContextPool(), 
                            detail::MakeMasterRpcClientPoolConfig()),
           client_id_(client_id),
-          tenant_id_(std::move(tenant_id)),
-          metrics_(metrics) {}
+          tenant_id_(NormalizeTenantId(std::move(tenant_id))),
+          metrics_(metrics) {
+        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
+            pool_conf{};
+        pool_conf.max_connection = Environ::Get().GetYltRpcPoolMaxConnection(
+            pool_conf.max_connection);
+        pool_conf.idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+                pool_conf.idle_timeout.count()));
+        pool_conf.short_connect_idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+                pool_conf.short_connect_idle_timeout.count()));
+
+        // Disable alive_detect to prevent stale reconnection logs after HA
+        // failover. Old client_pool objects remain in client_pools_ map and
+        // would otherwise continue probing failed addresses indefinitely. See
+        // PR #1642.
+        pool_conf.host_alive_detect_duration = std::chrono::seconds(0);
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            detail::MaybeEnableRdmaSocketConfig(
+                pool_conf.client_config.socket_config);
+        }
+        client_pools_ =
+            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+                pool_conf);
+    }
     ~MasterClient();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
@@ -378,6 +404,15 @@ class MasterClient {
     GetAllNoFSegments();
 
     /**
+     * @brief Fetch all registered segment names from master.
+     * Used for pre-establishing connections during client setup.
+     * @return Vector of segment names (format: {ip}:{port}) on success,
+     * ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments();
+
+    /**
      * @brief Gets all mounted NoF segments that match a segment name together
      * with their owner client ids.
      * @param segment_name Mounted NoF segment name
@@ -444,6 +479,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetOffloadEndpoints();
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
@@ -666,6 +704,34 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
+    void WarmupRpcPool();
+
+    /**
+     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
+     * cannot reconnect to a different address, a new coro_rpc_client pool is
+     * created if the address is different from the current one.
+     */
+    class RpcClientAccessor {
+       public:
+        void SetClientPool(
+            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+                client_pool) {
+            std::lock_guard<std::shared_mutex> lock(client_mutex_);
+            client_pool_ = client_pool;
+        }
+
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+        GetClientPool() {
+            std::shared_lock<std::shared_mutex> lock(client_mutex_);
+            return client_pool_;
+        }
+
+       private:
+        mutable std::shared_mutex client_mutex_;
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+            client_pool_;
+    };
+
     RpcClientPool client_accessor_;
 
     // The client identification.
@@ -676,6 +742,8 @@ class MasterClient {
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client

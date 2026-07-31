@@ -146,7 +146,7 @@ impl MooncakeStore {
 
     /// Initialise the store client.
     ///
-    /// # Parameters
+    /// For real client, the relevant parameters are:
     /// - `local_hostname` – IP or hostname of *this* node.
     /// - `metadata_server` – URL of the metadata server
     ///   (e.g. `"http://127.0.0.1:8080/metadata"` or `"etcd://127.0.0.1:2379"`).
@@ -156,6 +156,12 @@ impl MooncakeStore {
     /// - `device_name` – network device name (empty string = auto-select).
     /// - `master_server_addr` – address of the Mooncake master service
     ///   (e.g. `"127.0.0.1:50051"`).
+    ///
+    /// For dummy client, the relevant parameters are:
+    /// - `local_buffer_size` – size of the local transfer buffer in bytes.
+    /// - `mem_pool_size` – size of the memory pool in bytes.
+    /// - `server_address` – server address for dummy client.
+    /// - `ipc_socket_path` – IPC socket path for dummy client.
     pub fn setup(
         &self,
         local_hostname: &str,
@@ -165,12 +171,17 @@ impl MooncakeStore {
         protocol: &str,
         device_name: &str,
         master_server_addr: &str,
+        mem_pool_size: u64,
+        server_address: &str,
+        ipc_socket_path: &str,
     ) -> Result<(), StoreError> {
         let local_hostname_c = CString::new(local_hostname)?;
         let metadata_server_c = CString::new(metadata_server)?;
         let protocol_c = CString::new(protocol)?;
         let device_name_c = CString::new(device_name)?;
         let master_server_addr_c = CString::new(master_server_addr)?;
+        let server_address_c = CString::new(server_address)?;
+        let ipc_socket_path_c = CString::new(ipc_socket_path)?;
 
         let rc = unsafe {
             ffi::mooncake_store_setup(
@@ -182,6 +193,9 @@ impl MooncakeStore {
                 protocol_c.as_ptr(),
                 device_name_c.as_ptr(),
                 master_server_addr_c.as_ptr(),
+                mem_pool_size,
+                server_address_c.as_ptr(),
+                ipc_socket_path_c.as_ptr(),
             )
         };
         if rc != 0 {

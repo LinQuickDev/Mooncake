@@ -60,11 +60,14 @@ class WrappedMasterService {
                           const std::string& tenant_id = "default");
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+        const std::string& key, const std::string& tenant_id = "default",
+        uint64_t client_trace_id = 0, const UUID& client_id = {});
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const std::string& tenant_id = "default");
+                        const std::string& tenant_id = "default",
+                        uint64_t client_trace_id = 0,
+                        const UUID& client_id = {});
 
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
@@ -78,12 +81,12 @@ class WrappedMasterService {
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
@@ -94,12 +97,13 @@ class WrappedMasterService {
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config,
-                  const std::string& tenant_id = "default");
+                  const std::string& tenant_id = "default",
+                  uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
@@ -221,6 +225,8 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    tl::expected<std::vector<std::string>, ErrorCode> GetOffloadEndpoints();
 
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>

@@ -113,6 +113,11 @@ if(WITH_STORE)
     store/engram_store_py.cpp
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+
+  include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
+  target_include_directories(store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/store)
+  target_link_libraries(store PRIVATE UbDiag::ubdiag_lib)
+
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags

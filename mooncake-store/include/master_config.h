@@ -42,6 +42,8 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    double ddr_admission_watermark_ratio;
+    double ssd_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
@@ -166,6 +168,9 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_ratio{"eviction_ratio"};
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
+    RequiredParam<double> ddr_admission_watermark_ratio{
+        "ddr_admission_watermark_ratio"};
+    RequiredParam<double> ssd_high_watermark_ratio{"ssd_high_watermark_ratio"};
     RequiredParam<double> nof_eviction_ratio{"nof_eviction_ratio"};
     RequiredParam<double> nof_eviction_high_watermark_ratio{
         "nof_eviction_high_watermark_ratio"};
@@ -275,6 +280,8 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ddr_admission_watermark_ratio = config.ddr_admission_watermark_ratio;
+        ssd_high_watermark_ratio = config.ssd_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -460,6 +467,9 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double ddr_admission_watermark_ratio =
+        DEFAULT_DDR_ADMISSION_WATERMARK_RATIO;
+    double ssd_high_watermark_ratio = 0.90;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -550,6 +560,8 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ddr_admission_watermark_ratio = config.ddr_admission_watermark_ratio;
+        ssd_high_watermark_ratio = config.ssd_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -609,6 +621,8 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "ssd_balance") {
+            allocation_strategy_type = AllocationStrategyType::SSD_BALANCE;
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         } else if (config.allocation_strategy == "ssd_free_ratio_first") {
@@ -621,8 +635,8 @@ class WrappedMasterServiceConfig {
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
                          << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, local_first "
-                            "(case-sensitive)";
+                            "ssd_free_ratio_first, local_first, "
+                            "ssd_balance (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
@@ -665,6 +679,8 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ddr_admission_watermark_ratio = config.ddr_admission_watermark_ratio;
+        ssd_high_watermark_ratio = config.ssd_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -753,6 +769,9 @@ class MasterServiceConfigBuilder {
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double ddr_admission_watermark_ratio_ =
+        DEFAULT_DDR_ADMISSION_WATERMARK_RATIO;
+    double ssd_high_watermark_ratio_ = 0.90;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio_ =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -832,6 +851,17 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
         double ratio) {
         eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ddr_admission_watermark_ratio(
+        double ratio) {
+        ddr_admission_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ssd_high_watermark_ratio(double ratio) {
+        ssd_high_watermark_ratio_ = ratio;
         return *this;
     }
 
@@ -1110,6 +1140,9 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double ddr_admission_watermark_ratio =
+        DEFAULT_DDR_ADMISSION_WATERMARK_RATIO;
+    double ssd_high_watermark_ratio = 0.90;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -1196,6 +1229,8 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ddr_admission_watermark_ratio = config.ddr_admission_watermark_ratio;
+        ssd_high_watermark_ratio = config.ssd_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -1285,6 +1320,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.ddr_admission_watermark_ratio = ddr_admission_watermark_ratio_;
+    config.ssd_high_watermark_ratio = ssd_high_watermark_ratio_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
     config.nof_eviction_high_watermark_ratio =
         nof_eviction_high_watermark_ratio_;
@@ -1355,6 +1392,8 @@ struct InProcMasterConfig {
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
     std::optional<double> eviction_high_watermark_ratio;
+    std::optional<double> ddr_admission_watermark_ratio;
+    std::optional<double> ssd_high_watermark_ratio;
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
@@ -1372,6 +1411,8 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
     std::optional<double> eviction_high_watermark_ratio_ = std::nullopt;
+    std::optional<double> ddr_admission_watermark_ratio_ = std::nullopt;
+    std::optional<double> ssd_high_watermark_ratio_ = std::nullopt;
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
@@ -1428,6 +1469,24 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_ddr_admission_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "ddr_admission_watermark_ratio must be between 0.0 and 1.0");
+        }
+        ddr_admission_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_ssd_high_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "ssd_high_watermark_ratio must be between 0.0 and 1.0");
+        }
+        ssd_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     InProcMasterConfigBuilder& set_root_fs_dir(const std::string& dir) {
         root_fs_dir_ = dir;
         return *this;
@@ -1458,6 +1517,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.ddr_admission_watermark_ratio = ddr_admission_watermark_ratio_;
+    config.ssd_high_watermark_ratio = ssd_high_watermark_ratio_;
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;

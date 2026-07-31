@@ -53,6 +53,13 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Number of worker threads that concurrently handle inbound handshake
+    // requests on the listener. The legacy implementation processed requests
+    // strictly serially in a single thread, so under high concurrency (e.g.
+    // many small-file transfers firing simultaneous QP handshakes) the
+    // listener backlog was exhausted and clients hit the 60s read timeout,
+    // surfacing as TRANSFER_FAIL. Override via MC_HANDSHAKE_WORKER_THREADS.
+    int handshake_worker_threads = 16;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a
@@ -125,6 +132,19 @@ struct GlobalConfig {
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
+    // urma transport mode: "RM" (default), "RC", "UM"; override via
+    // MC_URMA_TRANS_MODE
+    std::string urma_trans_mode = "RM";
+    // urma active port: -1 (default) for auto-selection by scanning port
+    // attributes, >=0 for user-specified port index; override via
+    // MC_URMA_ACTIVE_PORT
+    int urma_active_port = -1;
+    // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_BALANCE
+    bool urma_bonding_balance = false;
+    // enable bonding multipath mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_MULTIPATH_ENABLE
+    bool urma_bonding_multipath = false;
 };
 
 struct RpcCommunicatorConfig {

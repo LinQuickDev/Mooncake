@@ -18,6 +18,42 @@
 namespace mooncake {
 namespace {
 
+std::string ResolveClientHost(MasterService& svc, const UUID& client_id) {
+    if (client_id == UUID{}) {
+        return "unknown";
+    }
+    auto ips = svc.QueryIp(client_id);
+    if (ips.has_value() && !ips->empty()) {
+        std::string out;
+        for (const auto& ip : *ips) {
+            if (!out.empty()) {
+                out += ",";
+            }
+            out += ip;
+        }
+        return out;
+    }
+    return "unknown";
+}
+
+std::string ResolveClientHost(MasterService& svc, const UUID& client_id) {
+    if (client_id == UUID{}) {
+        return "unknown";
+    }
+    auto ips = svc.QueryIp(client_id);
+    if (ips.has_value() && !ips->empty()) {
+        std::string out;
+        for (const auto& ip : *ips) {
+            if (!out.empty()) {
+                out += ",";
+            }
+            out += ip;
+        }
+        return out;
+    }
+    return "unknown";
+}
+
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
     TenantId tenant_id{std::string(raw)};
     if (!tenant_id.IsValid()) {
@@ -93,6 +129,598 @@ WrappedMasterService::WrappedMasterService(
 
 WrappedMasterService::~WrappedMasterService() = default;
 
+MasterAdminServer::MasterAdminServer(uint16_t http_port,
+                                     bool enable_metric_reporting)
+    : http_port_(http_port),
+      enable_metric_reporting_(enable_metric_reporting),
+      http_server_(4, http_port) {}
+
+MasterAdminServer::~MasterAdminServer() { Stop(); }
+
+bool MasterAdminServer::Start() {
+    InitHttpServer();
+
+    auto ec = http_server_.async_start();
+    if (ec.hasResult()) {
+        MC_LOG(ERROR) << "Failed to start master admin server on port "
+                      << http_port_;
+        return false;
+    }
+
+    started_.store(true);
+    if (enable_metric_reporting_) {
+        metric_report_running_.store(true);
+        metric_report_thread_ = std::thread([this]() {
+            while (metric_report_running_.load()) {
+                const auto snapshot = SnapshotState();
+                std::ostringstream log_stream;
+                log_stream << "Master Admin Metrics: role="
+                           << ha::MasterRuntimeRoleToString(snapshot.state)
+                           << ", state="
+                           << ha::MasterRuntimeStateToString(snapshot.state)
+                           << ", service_ready="
+                           << (snapshot.service_available ? "true" : "false")
+                           << ", master={"
+                           << MasterMetricManager::instance()
+                                  .get_summary_string_and_update_snapshot()
+                           << "}"
+                           << ", ha={"
+                           << HAMetricManager::instance().get_summary_string()
+                           << "}";
+                if (snapshot.leader_view.has_value()) {
+                    log_stream
+                        << ", leader=" << snapshot.leader_view->leader_address
+                        << ", view_version="
+                        << snapshot.leader_view->view_version;
+                }
+                MC_LOG(INFO) << log_stream.str();
+                if (metric_report_stop_sem_.try_acquire_for(
+                        std::chrono::seconds(kMetricReportIntervalSeconds))) {
+                    break;
+                }
+            }
+        });
+    }
+
+    LOG(INFO) << "Master admin server started on port " << http_server_.port();
+    return true;
+}
+
+void MasterAdminServer::Stop() {
+    metric_report_running_.store(false, std::memory_order_relaxed);
+    if (started_.exchange(false)) {
+        http_server_.stop();
+    }
+    if (metric_report_thread_.joinable()) {
+        metric_report_stop_sem_.release();
+        metric_report_thread_.join();
+    }
+}
+
+void MasterAdminServer::SetRuntimeState(ha::MasterRuntimeState state) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_ = state;
+}
+
+void MasterAdminServer::SetObservedLeader(
+    const std::optional<ha::MasterView>& leader_view) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    leader_view_ = leader_view;
+}
+
+void MasterAdminServer::SetServiceDelegate(
+    std::shared_ptr<WrappedMasterService> service) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    service_ = std::move(service);
+    if (!service_) {
+        service_available_ = false;
+    }
+}
+
+void MasterAdminServer::SetServiceAvailable(bool available) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    service_available_ = available && service_ != nullptr;
+}
+
+MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return RuntimeSnapshot{
+        .state = state_,
+        .leader_view = leader_view_,
+        .service = service_,
+        .service_available = service_available_,
+    };
+}
+
+std::string MasterAdminServer::BuildMetricsText() const {
+    return AppendMetricSections(
+        MasterMetricManager::instance().serialize_metrics(),
+        HAMetricManager::instance().serialize_metrics());
+}
+
+std::string MasterAdminServer::BuildMetricsSummaryText() const {
+    const auto snapshot = SnapshotState();
+    std::ostringstream oss;
+    oss << "role=" << ha::MasterRuntimeRoleToString(snapshot.state)
+        << ", state=" << ha::MasterRuntimeStateToString(snapshot.state)
+        << ", service_ready=" << (snapshot.service_available ? "true" : "false")
+        << ", master={" << MasterMetricManager::instance().get_summary_string()
+        << "}, ha={" << HAMetricManager::instance().get_summary_string() << "}";
+    if (snapshot.leader_view.has_value()) {
+        oss << ", leader=" << snapshot.leader_view->leader_address
+            << ", view_version=" << snapshot.leader_view->view_version;
+    }
+    return oss.str();
+}
+
+std::string MasterAdminServer::BuildHealthJson() const {
+    const auto snapshot = SnapshotState();
+    std::ostringstream oss;
+    oss << "{\"status\":\"ok\",\"role\":\""
+        << ha::MasterRuntimeRoleToString(snapshot.state) << "\",\"ha_state\":\""
+        << ha::MasterRuntimeStateToString(snapshot.state)
+        << "\",\"service_ready\":"
+        << (snapshot.service_available ? "true" : "false");
+    if (snapshot.leader_view.has_value()) {
+        oss << ",\"leader_address\":\""
+            << EscapeJson(snapshot.leader_view->leader_address)
+            << "\",\"view_version\":" << snapshot.leader_view->view_version;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string MasterAdminServer::BuildLeaderJson() const {
+    const auto snapshot = SnapshotState();
+    if (!snapshot.leader_view.has_value()) {
+        return "{\"present\":false}";
+    }
+
+    std::ostringstream oss;
+    oss << "{\"present\":true,\"leader_address\":\""
+        << EscapeJson(snapshot.leader_view->leader_address)
+        << "\",\"view_version\":" << snapshot.leader_view->view_version << "}";
+    return oss.str();
+}
+
+std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
+    const {
+    const auto snapshot = SnapshotState();
+    if (!snapshot.service_available) {
+        return nullptr;
+    }
+    return snapshot.service;
+}
+
+void MasterAdminServer::InitHttpServer() {
+    using namespace coro_http;
+
+    http_server_.set_http_handler<GET>(
+        "/metrics", [this](coro_http_request&, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, BuildMetricsText());
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/metrics/summary",
+        [this](coro_http_request&, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok,
+                                        BuildMetricsSummaryText());
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/health", [this](coro_http_request&, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(status_type::ok, BuildHealthJson());
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/role", [this](coro_http_request&, coro_http_response& resp) {
+            const auto snapshot = SnapshotState();
+            resp.add_header("Content-Type", "text/plain; charset=utf-8");
+            resp.set_status_and_content(
+                status_type::ok, ha::MasterRuntimeRoleToString(snapshot.state));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/ha_status", [this](coro_http_request&, coro_http_response& resp) {
+            const auto snapshot = SnapshotState();
+            resp.add_header("Content-Type", "text/plain; charset=utf-8");
+            resp.set_status_and_content(
+                status_type::ok,
+                ha::MasterRuntimeStateToString(snapshot.state));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/leader", [this](coro_http_request&, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(status_type::ok, BuildLeaderJson());
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/query_key", [this](coro_http_request& req, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto key = req.get_query_value("key");
+            auto get_result =
+                service->GetReplicaList(std::string(key), "default");
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            if (get_result) {
+                std::string ss = "{\"success\":true,\"data\":[";
+                const auto& replicas = get_result.value().replicas;
+                bool first = true;
+                for (const auto& replica : replicas) {
+                    if (!replica.is_memory_replica()) {
+                        continue;
+                    }
+                    std::string tmp;
+                    struct_json::to_json(
+                        replica.get_memory_descriptor().buffer_descriptor, tmp);
+                    if (!first) {
+                        ss += ",";
+                    }
+                    ss += tmp;
+                    first = false;
+                }
+                ss += "]}";
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+                return;
+            }
+
+            resp.set_status_and_content(
+                status_type::not_found,
+                std::string("{\"success\":false,\"error_code\":") +
+                    std::to_string(toInt(get_result.error())) +
+                    ",\"error_message\":\"" +
+                    EscapeJson(toString(get_result.error())) + "\"}");
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/get_all_keys", [this](coro_http_request&, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = service->GetAllKeysForAdmin();
+            if (!result) {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to get all keys");
+                return;
+            }
+
+            std::string body;
+            for (const auto& key : result.value()) {
+                body += key;
+                body += "\n";
+            }
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/get_all_segments",
+        [this](coro_http_request&, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = service->GetAllSegmentsForAdmin();
+            if (!result) {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to get all segments");
+                return;
+            }
+
+            std::string body;
+            for (const auto& segment_name : result.value()) {
+                body += segment_name;
+                body += "\n";
+            }
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/get_segments_detail",
+        [this](coro_http_request&, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->GetSegmentsDetailForAdmin();
+            if (!result) {
+                WriteErrorResponse(resp, status_type::internal_server_error,
+                                   result.error(),
+                                   "Failed to get segments detail");
+                return;
+            }
+
+            HttpSegmentsDetailResponse payload;
+            payload.total_segments = result.value().size();
+            for (const auto& info : result.value()) {
+                HttpSegmentDetailItem item;
+                item.segment_name = info.segment_name;
+                item.segment_id = UuidToString(info.segment_id);
+                item.client_id = UuidToString(info.client_id);
+
+                std::ostringstream addr_oss;
+                addr_oss << "0x" << std::hex << info.base_address;
+                item.base_address = addr_oss.str();
+
+                item.size_bytes = info.size_bytes;
+                std::ostringstream size_oss;
+                size_oss << (info.size_bytes / 1024.0 / 1024.0 / 1024.0)
+                         << " GiB";
+                item.size_human = size_oss.str();
+
+                item.te_endpoint = info.te_endpoint;
+                item.protocol = info.protocol;
+                item.status = EnumToString(info.status);
+                item.allocator_used_bytes = info.allocator_used_bytes;
+                item.allocator_capacity_bytes = info.allocator_capacity_bytes;
+                item.allocator_usage_percent =
+                    info.allocator_capacity_bytes > 0
+                        ? (static_cast<double>(info.allocator_used_bytes) /
+                           info.allocator_capacity_bytes * 100.0)
+                        : 0.0;
+                payload.segments.push_back(std::move(item));
+            }
+            WriteJsonResponse(resp, status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/query_segment",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto segment = req.get_query_value("segment");
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = service->QuerySegmentForAdmin(std::string(segment));
+
+            if (!result) {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to query segment");
+                return;
+            }
+
+            const auto [used, capacity] = result.value();
+            std::string body(segment);
+            body += "\nUsed(bytes): ";
+            body += std::to_string(used);
+            body += "\nCapacity(bytes) : ";
+            body += std::to_string(capacity);
+            body += "\n";
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<POST>(
+        "/api/v1/drain_jobs",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            CreateDrainJobRequest request;
+            try {
+                struct_json::from_json(request, req.get_body());
+            } catch (const std::exception& e) {
+                WriteErrorResponse(
+                    resp, status_type::bad_request, ErrorCode::INVALID_PARAMS,
+                    std::string("Invalid JSON body: ") + e.what());
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->CreateDrainJob(request);
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            HttpCreateDrainJobResponse payload;
+            payload.success = true;
+            payload.job_id = UuidToString(result.value());
+            payload.status = "CREATED";
+            WriteJsonResponse(resp, status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/api/v1/drain_jobs/query",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto job_id_result =
+                ParseJobId(req.get_decode_query_value("job_id"));
+            if (!job_id_result.has_value()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   job_id_result.error(),
+                                   "Missing or invalid job_id");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->QueryDrainJob(job_id_result.value());
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            WriteJsonResponse(resp, status_type::ok,
+                              ToHttpQueryDrainJobResponse(result.value()));
+        });
+
+    http_server_.set_http_handler<POST>(
+        "/api/v1/drain_jobs/cancel",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto job_id_result =
+                ParseJobId(req.get_decode_query_value("job_id"));
+            if (!job_id_result.has_value()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   job_id_result.error(),
+                                   "Missing or invalid job_id");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->CancelDrainJob(job_id_result.value());
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            HttpCancelDrainJobResponse payload;
+            payload.success = true;
+            payload.job_id = UuidToString(job_id_result.value());
+            payload.status = "CANCELED";
+            WriteJsonResponse(resp, status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/api/v1/segments/status",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto segment_name = req.get_decode_query_value("segment");
+            if (segment_name.empty()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   ErrorCode::INVALID_PARAMS,
+                                   "Missing segment query parameter");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result =
+                service->QuerySegmentStatus(std::string(segment_name));
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            HttpSegmentStatusResponse payload;
+            payload.success = true;
+            payload.segment = std::string(segment_name);
+            payload.status = static_cast<int32_t>(result.value());
+            payload.status_name = EnumToString(result.value());
+            WriteJsonResponse(resp, status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/batch_query_keys",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                resp.add_header("Content-Type",
+                                "application/json; charset=utf-8");
+                resp.set_status_and_content(
+                    status_type::service_unavailable,
+                    "{\"success\":false,\"error\":\"service plane is not "
+                    "active\"}");
+                return;
+            }
+
+            auto keys_view = req.get_query_value("keys");
+            std::vector<std::string> keys;
+            if (!keys_view.empty()) {
+                std::string keys_str(keys_view);
+                std::string key;
+                std::istringstream iss(keys_str);
+                while (std::getline(iss, key, ',')) {
+                    keys.push_back(std::move(key));
+                }
+            }
+
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            if (keys.empty()) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "{\"success\":false,\"error\":\"No keys provided. Use "
+                    "?keys=key1,key2,...\"}");
+                return;
+            }
+
+            auto results = service->BatchGetReplicaList(keys, "default");
+            const size_t n = std::min(keys.size(), results.size());
+            std::string body;
+            body.reserve(n * 512);
+            body += "{\"success\":true,\"data\":{";
+
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) {
+                    body += ",";
+                }
+
+                body += "\"";
+                body += EscapeJson(keys[i]);
+                body += "\":";
+
+                const auto& result = results[i];
+                if (!result.has_value()) {
+                    body += "{\"ok\":false,\"error\":\"";
+                    body += EscapeJson(toString(result.error()));
+                    body += "\"}";
+                    continue;
+                }
+
+                body += "{\"ok\":true,\"values\":[";
+                bool first = true;
+                for (const auto& replica : result.value().replicas) {
+                    if (!replica.is_memory_replica()) {
+                        continue;
+                    }
+
+                    std::string tmp;
+                    struct_json::to_json(
+                        replica.get_memory_descriptor().buffer_descriptor, tmp);
+                    if (!first) {
+                        body += ",";
+                    }
+                    body += tmp;
+                    first = false;
+                }
+                body += "]}";
+            }
+
+            body += "}}";
+            if (results.size() != keys.size()) {
+                MC_LOG(WARNING)
+                    << "BatchGetReplicaList size mismatch: keys=" << keys.size()
+                    << " results=" << results.size();
+            }
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
@@ -102,6 +730,7 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
         "ExistKey",
+        PerfKey::MASTER_RPC_EXIST_KEY,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -135,8 +764,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
         if (!result[i].has_value()) {
             failure_count++;
             auto error = result[i].error();
-            LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+            MC_LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
+                          << keys[i] << "': " << toString(error);
         }
     }
 
@@ -174,8 +803,8 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
             const auto& client_id = client_ids[i];
             if (result.value().find(client_id) == result.value().end()) {
                 failure_count++;
-                VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
-                        << client_id << "': not found in results";
+                MC_VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
+                           << client_id << "': not found in results";
             }
         }
     }
@@ -212,8 +841,8 @@ WrappedMasterService::BatchReplicaClear(
     size_t failure_count = 0;
     if (!result.has_value()) {
         failure_count = total_keys;
-        LOG(WARNING) << "BatchReplicaClear failed: "
-                     << toString(result.error());
+        MC_LOG(WARNING) << "BatchReplicaClear failed: "
+                        << toString(result.error());
     } else {
         const size_t cleared_count = result.value().size();
         failure_count = total_keys - cleared_count;
@@ -262,9 +891,20 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
-                                     const std::string& tenant_id) {
-    return execute_rpc(
-        "GetReplicaList",
+                                     const std::string& tenant_id,
+                                     uint64_t client_trace_id,
+                                     const UUID& client_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
+        "GetReplicaList", PerfKey::MASTER_RPC_GET_REPLICA_LIST,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -279,11 +919,39 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
         });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "GetReplicaList host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " replica_count="
+                     << (result ? result->replicas.size() : 0)
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                          const std::string& tenant_id) {
+                                          const std::string& tenant_id,
+                                          uint64_t client_trace_id,
+                                          const UUID& client_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -292,6 +960,26 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto item_start = sample ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+        results.emplace_back(
+            master_service_.GetReplicaList(keys[i], tenant_id));
+        if (sample) {
+            const auto item_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - item_start)
+                    .count();
+            const auto& item = results.back();
+            MC_LOG(INFO)
+                << "BatchGetReplicaListItem key=" << keys[i]
+                << " batch_index=" << i << " replica_count="
+                << (item ? item->replicas.size() : 0)
+                << " latency_us=" << item_us << " status="
+                << (item ? "ok" : toString(item.error()));
+        }
+    }
 
     results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
@@ -308,11 +996,11 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_NOT_FOUND ||
                 error == ErrorCode::REPLICA_IS_NOT_READY) {
-                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
-            } else {
-                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                MC_VLOG(1) << "BatchGetReplicaList failed for key[" << i
                            << "] '" << keys[i] << "': " << toString(error);
+            } else {
+                MC_LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                              << "] '" << keys[i] << "': " << toString(error);
             }
         }
     }
@@ -328,6 +1016,19 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "BatchGetReplicaList host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " tenant=" << tenant_id << " keys_count=" << total_keys
+                     << " success=" << (results.size() - failure_count)
+                     << " failures=" << failure_count
+                     << " latency_us=" << latency_us;
+    }
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
@@ -365,9 +1066,19 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
-                               const std::string& tenant_id) {
-    return execute_rpc(
-        "PutStart",
+                               const std::string& tenant_id,
+                               uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
+        "PutStart", PerfKey::MASTER_RPC_PUT_START,
         [&] {
             return WithWriteTenant(tenant_id,
                                    master_service_.IsTenantQuotaEnabled(),
@@ -383,13 +1094,35 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "PutStart host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " size=" << slice_length << " latency_us=" << latency_us
+                     << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id) {
-    return execute_rpc(
-        "PutEnd",
+    ReplicaType replica_type, const std::string& tenant_id, uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
+        "PutEnd", PerfKey::MASTER_RPC_PUT_END,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -406,13 +1139,26 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "PutEnd host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " replica_type=" << replica_type
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
-        "PutRevoke",
+        "PutRevoke", PerfKey::MASTER_RPC_PUT_REVOKE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -436,7 +1182,16 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<std::string>& keys,
                                     const std::vector<uint64_t>& slice_lengths,
                                     const ReplicateConfig& config,
-                                    const std::string& tenant_id) {
+                                    const std::string& tenant_id,
+                                    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_START,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -449,15 +1204,15 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         tenant_id, master_service_.IsTenantQuotaEnabled());
 
     if (keys.size() != slice_lengths.size()) {
-        LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
-                   << " != slice_lengths.size()=" << slice_lengths.size();
+        MC_LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
+                      << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
                config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchPutStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+        MC_LOG(ERROR) << "BatchPutStart: group_ids.size()="
+                      << config.group_ids->size()
+                      << " != keys.size()=" << keys.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (!resolved_tenant_id) {
@@ -503,20 +1258,21 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             failure_count++;
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
+                MC_VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(error);
             } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
-                LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
-                           << keys[i] << "': " << toString(error);
+                MC_LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
+                              << keys[i] << "': " << toString(error);
             }
         }
     }
 
     if (no_available_handle_count > 0) {
-        LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
-                     << " keys" << PUT_NO_SPACE_HELPER_STR;
+        MC_LOG(WARNING) << "BatchPutStart failed for "
+                        << no_available_handle_count << " keys"
+                        << PUT_NO_SPACE_HELPER_STR;
     }
 
     if (failure_count == total_keys) {
@@ -530,12 +1286,22 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_END,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -570,12 +1336,16 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
+    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_REVOKE,
+                         UbDiag::PerfLevel::SUB_SYSTEM);
+    pt.Start();
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -599,8 +1369,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+            MC_LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
+                          << keys[i] << "': " << toString(error);
         }
     }
 
@@ -615,6 +1385,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    pt.End(failure_count == total_keys ? -1 : 0);
     return results;
 }
 
@@ -624,7 +1395,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const ReplicateConfig& config,
                                   const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertStart",
+        "UpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
             return WithWriteTenant(tenant_id,
                                    master_service_.IsTenantQuotaEnabled(),
@@ -646,7 +1417,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertEnd",
+        "UpsertEnd", PerfKey::MASTER_RPC_UPSERT_END,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -669,7 +1440,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertRevoke",
+        "UpsertRevoke", PerfKey::MASTER_RPC_UPSERT_REVOKE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -727,8 +1498,8 @@ WrappedMasterService::BatchUpsertStart(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+            MC_LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
+                          << keys[i] << "': " << toString(error);
         }
     }
 
@@ -808,8 +1579,8 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchUpsertRevoke failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+            MC_LOG(ERROR) << "BatchUpsertRevoke failed for key[" << i << "] '"
+                          << keys[i] << "': " << toString(error);
         }
     }
 
@@ -831,6 +1602,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key, bool force, const std::string& tenant_id) {
     return execute_rpc(
         "Remove",
+        PerfKey::MASTER_RPC_REMOVE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -848,7 +1620,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
     const std::string& str, bool force, const std::string& tenant_id) {
     return execute_rpc(
-        "RemoveByRegex",
+        "RemoveByRegex", PerfKey::MASTER_RPC_REMOVE_BY_REGEX,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -925,7 +1697,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
     return execute_rpc(
-        "MountSegment",
+        "MountSegment", PerfKey::MASTER_RPC_MOUNT_SEGMENT,
         [&] { return master_service_.MountSegment(segment, client_id); },
         [&](auto& timer) {
             timer.LogRequest("base=", segment.base, ", size=", segment.size,
@@ -988,7 +1760,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
     const UUID& segment_id, const UUID& client_id) {
     return execute_rpc(
-        "UnmountSegment",
+        "UnmountSegment", PerfKey::MASTER_RPC_UNMOUNT_SEGMENT,
         [&] { return master_service_.UnmountSegment(segment_id, client_id); },
         [&](auto& timer) {
             timer.LogRequest("segment_id=", segment_id,
@@ -1063,7 +1835,7 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
     return execute_rpc(
-        "CopyStart",
+        "CopyStart", PerfKey::MASTER_RPC_COPY_START,
         [&] {
             return WithWriteTenant(tenant_id,
                                    master_service_.IsTenantQuotaEnabled(),
@@ -1087,7 +1859,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
     return execute_rpc(
-        "CopyEnd",
+        "CopyEnd", PerfKey::MASTER_RPC_COPY_END,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1110,7 +1882,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
     return execute_rpc(
-        "CopyRevoke",
+        "CopyRevoke", PerfKey::MASTER_RPC_COPY_REVOKE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1250,9 +2022,9 @@ WrappedMasterService::BatchEvictDiskReplica(
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
-                         << "] '" << keys[i]
-                         << "': " << toString(results[i].error());
+            MC_LOG(WARNING)
+                << "BatchEvictDiskReplica failed for key[" << i << "] '"
+                << keys[i] << "': " << toString(results[i].error());
         }
     }
     if (failure_count > 0) {
@@ -1538,6 +2310,16 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::GetOffloadEndpoints() {
+    ScopedVLogTimer timer(1, "GetOffloadEndpoints");
+    timer.LogRequest("action=get_offload_endpoints");
+
+    auto result = master_service_.GetOffloadEndpoints();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
@@ -1701,6 +2483,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
         &wrapped_master_service);
     server.register_handler<
+        &mooncake::WrappedMasterService::GetAllSegmentsForAdmin>(
+        &wrapped_master_service);
+    server.register_handler<
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
@@ -1729,6 +2514,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetOffloadEndpoints>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
