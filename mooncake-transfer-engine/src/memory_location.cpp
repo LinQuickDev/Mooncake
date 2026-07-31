@@ -38,13 +38,6 @@ int parseCpuNumaNode(const std::string& location) {
     catch (const std::exception&) { return -1; }
 }
 
-int resolveBufferNumaNode(const std::string& name, uint64_t length, uint64_t offset) {
-    SegmentsLocationInfo info;
-    if (parseSegmentsLocation(name, info))                 // 分段 buffer
-        return parseCpuNumaNode(resolveSegmentsLocation(info, length, offset));
-    return parseCpuNumaNode(name);                         // 非分段 "cpu:N"
-}
-
 // 数 /sys/devices/system/node 下的 NUMA 节点数
 static size_t getNumaNodeCount() {
     int count = 0;
