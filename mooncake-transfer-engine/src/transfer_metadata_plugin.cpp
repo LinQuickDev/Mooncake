@@ -814,23 +814,18 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     void handleConnection(int conn_fd) {
         Json::Value local, peer;
 
-                auto [type, json_str] = readString(conn_fd);
-                if (type == HandShakeRequestType::Invalid) {
-                    close(conn_fd);
-                    continue;
-                }
-
-                std::string errs;
-                if (!parseJsonString(json_str, peer, &errs)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to receive "
-                           "handshake message, "
-                           "malformed json format: "
-                        << errs << ", json string length: " << json_str.size()
-                        << ", json string content: " << json_str;
-                    close(conn_fd);
-                    continue;
-                }
+        auto [type, json_str] = readString(conn_fd);
+        std::string errs;
+        if (!parseJsonString(json_str, peer, &errs)) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to receive "
+                   "handshake message, "
+                   "malformed json format: "
+                << errs << ", json string length: " << json_str.size()
+                << ", json string content: " << json_str;
+            close(conn_fd);
+            return;
+        }
 
         // old protocol equals Connection type
         if (type == HandShakeRequestType::Connection ||
