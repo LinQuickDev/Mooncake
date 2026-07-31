@@ -9,9 +9,12 @@
 #include <optional>
 #include <semaphore>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/reflection/user_reflect_macro.hpp>
+#include <ylt/struct_json/json_writer.h>
 
 #include "ha/ha_types.h"
 
@@ -125,6 +128,58 @@ class MasterAdminServer {
     std::shared_ptr<WrappedMasterService> service_;
     bool service_available_ = false;
 };
+
+// --- HTTP response types used by InitHttpServer (legacy path in rpc_service.cpp) ---
+struct HttpSegmentDetailItem {
+    std::string segment_name;
+    std::string segment_id;
+    std::string client_id;
+    std::string base_address;
+    uint64_t size_bytes{0};
+    std::string size_human;
+    std::string te_endpoint;
+    std::string protocol;
+    std::string status;
+    uint64_t allocator_used_bytes{0};
+    uint64_t allocator_capacity_bytes{0};
+    double allocator_usage_percent{0.0};
+};
+YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
+         base_address, size_bytes, size_human, te_endpoint, protocol, status,
+         allocator_used_bytes, allocator_capacity_bytes,
+         allocator_usage_percent);
+
+struct HttpSegmentsDetailResponse {
+    uint64_t total_segments{0};
+    std::vector<HttpSegmentDetailItem> segments;
+};
+YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
+
+// --- Shared helper functions / templates ---
+template <typename T>
+void WriteJsonResponse(coro_http::coro_http_response& resp,
+                       coro_http::status_type status, const T& payload) {
+    std::string json;
+    struct_json::to_json(payload, json);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(status, std::move(json));
+}
+
+template <typename T>
+std::string EnumToString(const T& value) {
+    std::ostringstream oss;
+    oss << value;
+    return oss.str();
+}
+
+void SetServiceUnavailable(coro_http::coro_http_response& resp,
+                           std::string message);
+
+void WriteErrorResponse(coro_http::coro_http_response& resp,
+                        coro_http::status_type status, ErrorCode error,
+                        std::string message = {});
+
+std::string EscapeJson(std::string_view input);
 
 std::string AppendMetricSections(std::string primary, std::string secondary);
 
