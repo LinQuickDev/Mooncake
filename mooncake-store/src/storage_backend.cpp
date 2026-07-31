@@ -5377,17 +5377,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     }
     for (const auto& plan : read_plans) {
         const auto disk_start = std::chrono::steady_clock::now();
-        // Read header first.  The CRC is NOT verified here: records are
-        // CRC-validated once during recovery, and during normal operation
-        // a key only becomes visible after its write completed, so the
-        // hot read path stays checksum-free.
-        char hdr_buf[RecordHeader::SIZE];
-        iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
-
-    // Allocations are kept alive by shared_ptr references in read_plans
-    
-    for (const auto& plan : read_plans) {
-        const auto disk_start = std::chrono::steady_clock::now();
         // Read header first
         RecordHeader header;
         iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
@@ -5405,7 +5394,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
         // Validate header matches metadata
         if (!header.ValidateAgainstMetadata(plan.value_size)) {
