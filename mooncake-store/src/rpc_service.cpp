@@ -36,24 +36,6 @@ std::string ResolveClientHost(MasterService& svc, const UUID& client_id) {
     return "unknown";
 }
 
-std::string ResolveClientHost(MasterService& svc, const UUID& client_id) {
-    if (client_id == UUID{}) {
-        return "unknown";
-    }
-    auto ips = svc.QueryIp(client_id);
-    if (ips.has_value() && !ips->empty()) {
-        std::string out;
-        for (const auto& ip : *ips) {
-            if (!out.empty()) {
-                out += ",";
-            }
-            out += ip;
-        }
-        return out;
-    }
-    return "unknown";
-}
-
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
     TenantId tenant_id{std::string(raw)};
     if (!tenant_id.IsValid()) {

@@ -200,11 +200,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_type_(config.enable_cxl                          ? AllocationStrategyType::CXL
-                                    : 
-          config.allocation_strategy_type, config.ssd_high_watermark_ratio,
-          config.ddr_admission_watermark_ratio),
-      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
+      allocation_strategy_type_(config.enable_cxl
+                                    ? AllocationStrategyType::CXL
+                                    : config.allocation_strategy_type),
+      allocation_strategy_(CreateAllocationStrategy(
+          allocation_strategy_type_, config.ssd_high_watermark_ratio,
+          config.ddr_admission_watermark_ratio)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
