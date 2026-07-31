@@ -3440,12 +3440,6 @@ auto MasterService::AllocateAndInsertMetadata(
         }
 
         const SsdMetricsProvider* ssd_provider = nullptr;
-        std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
-        if (allocation_strategy_type_ ==
-            AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
-            ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
-            ssd_provider = &*ssd_access;
-        }
 
         UbDiag::PerfPoint pt_alloc_mem(PerfKey::MASTER_PUT_ALLOCATE_MEM,
                                        UbDiag::PerfLevel::KEY_MODULE);

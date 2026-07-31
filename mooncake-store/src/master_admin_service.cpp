@@ -26,8 +26,6 @@ namespace mooncake {
 
 const uint64_t kMetricReportIntervalSeconds = 10;
 
-namespace {
-
 std::string AppendMetricSections(std::string primary, std::string secondary) {
     if (!primary.empty() && primary.back() != '\n') {
         primary.push_back('\n');
@@ -35,6 +33,8 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     primary += secondary;
     return primary;
 }
+
+namespace {
 
 struct HttpErrorResponse {
     bool success{false};

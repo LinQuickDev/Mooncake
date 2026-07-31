@@ -949,7 +949,7 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         const auto item_start = sample ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
         results.emplace_back(
-            master_service_.GetReplicaList(keys[i], tenant_id));
+            master_service_.GetReplicaList(keys[i], TenantId(tenant_id)));
         if (sample) {
             const auto item_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1130,7 +1130,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                 .count();
         MC_LOG(INFO) << "PutEnd host="
                      << ResolveClientHost(master_service_, client_id)
-                     << " key=" << key << " tenant=" << tenant_id
+                     << " key=" << object_meta.key << " tenant=" << tenant_id
                      << " replica_type=" << replica_type
                      << " latency_us=" << latency_us << " status="
                      << (result.has_value() ? "ok" : toString(result.error()));

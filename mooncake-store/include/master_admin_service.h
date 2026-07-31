@@ -106,6 +106,12 @@ class MasterAdminServer {
 
     void RegisterHandler();
 
+    void InitHttpServer();
+
+    std::string BuildHealthJson() const;
+
+    std::string BuildLeaderJson() const;
+
     uint16_t http_port_;
     bool enable_metric_reporting_ = false;
     coro_http::coro_http_server http_server_;
@@ -119,5 +125,7 @@ class MasterAdminServer {
     std::shared_ptr<WrappedMasterService> service_;
     bool service_available_ = false;
 };
+
+std::string AppendMetricSections(std::string primary, std::string secondary);
 
 }  // namespace mooncake
