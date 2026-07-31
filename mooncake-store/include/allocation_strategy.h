@@ -623,7 +623,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
             }
 
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length, generator);
+                                         slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -681,8 +681,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
             }
 
             const auto& name = names[candidate.name_idx];
-            auto buffer = allocateSingle(allocator_manager, name, slice_length,
-                                         generator);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -719,8 +718,7 @@ class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto buffer = allocateSingle(allocator_manager, name, slice_length,
-                                         generator);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -853,10 +851,6 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
         case AllocationStrategyType::SSD_BALANCE:
             return std::make_shared<SsdBalanceAllocationStrategy>(
                 ssd_high_watermark, ddr_admission_watermark);
-        case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
-            return std::make_shared<SsdFreeRatioFirstAllocationStrategy>();
-        case AllocationStrategyType::LOCAL_FIRST:
-            return std::make_shared<RandomAllocationStrategy>();
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }
