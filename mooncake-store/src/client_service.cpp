@@ -43,6 +43,10 @@
 #include "crc_checksum.h"
 #include "environ.h"
 
+#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define UBDIAG_PROGRAM_NAME "mooncake_store"
+#include "ubdiag/auto_perf.h"
+
 namespace mooncake {
 
 namespace {

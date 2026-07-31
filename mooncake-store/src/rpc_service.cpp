@@ -8,6 +8,8 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha_metric_manager.h"
+#include "master_admin_service.h"
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "rpc_helper.h"
