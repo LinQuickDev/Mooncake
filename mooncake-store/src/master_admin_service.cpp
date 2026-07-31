@@ -68,7 +68,7 @@ coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
 
 void WriteErrorResponse(coro_http::coro_http_response& resp,
                         coro_http::status_type status, ErrorCode error,
-                        std::string message = {}) {
+                        std::string message) {
     HttpErrorResponse payload;
     payload.error_code = toInt(error);
     payload.error_message =
@@ -814,17 +814,6 @@ void MasterAdminServer::HandleCancelDrainJob(
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
 }
-
-struct HttpSegmentStatusResponse {
-    bool success{false};
-    std::string segment;
-    int32_t status{0};
-    std::string status_name;
-    int32_t error_code{0};
-    std::string error_message;
-};
-YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
-         error_code, error_message);
 
 void MasterAdminServer::HandleSegmentStatus(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {

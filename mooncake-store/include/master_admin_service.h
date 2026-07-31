@@ -155,6 +155,17 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
 
+struct HttpSegmentStatusResponse {
+    bool success{false};
+    std::string segment;
+    int32_t status{0};
+    std::string status_name;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
+         error_code, error_message);
+
 // --- Shared helper functions / templates ---
 template <typename T>
 void WriteJsonResponse(coro_http::coro_http_response& resp,
