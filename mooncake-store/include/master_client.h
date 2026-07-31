@@ -21,6 +21,7 @@
 #include "master_metric_manager.h"
 #include "store_rpc_client_io_context.h"
 #include "task_manager.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 

@@ -5383,7 +5383,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
                                 {&header.value_len, sizeof(header.value_len)}};
 
         auto read_header_result =
-            plan.data_file->vector_read(&header_iov, 1, plan.offset);
+            plan.data_file->vector_read(header_iovs, 2, plan.offset);
         if (!read_header_result) {
             LOG(ERROR) << "Failed to read header for key: " << plan.key
                        << ", error: " << read_header_result.error();
