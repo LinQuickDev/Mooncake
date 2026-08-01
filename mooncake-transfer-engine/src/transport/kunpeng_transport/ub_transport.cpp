@@ -32,7 +32,7 @@ UbTransport::~UbTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
-    uninit(this);
+    context_list_.clear();
 }
 
 int UbTransport::install(std::string& local_server_name,
