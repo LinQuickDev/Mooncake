@@ -90,8 +90,23 @@ Status ShareMapStore::getOrCreateShareMap(const std::string& bucketKey,
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = shareMaps_.find(bucketKey);
     if (it != shareMaps_.end()) {
-        out = it->second;
-        return Status::OK();
+        if (valueSize != 0 && it->second->ValueSize() != valueSize) {
+            // Import uses a one-byte placeholder because the real value size
+            // is stored in ShareMapMeta. If that import failed, discard the
+            // empty placeholder so a later Publish can create the map with
+            // the table's actual value size. A non-empty map is authoritative
+            // and must not be silently replaced.
+            if (!it->second->IsPublished() && it->second->Size() == 0) {
+                shareMaps_.erase(it);
+            } else {
+                return Status::Error(
+                    ErrorCode::kInvalidArgument,
+                    "ShareMap value size mismatch for bucket: " + bucketKey);
+            }
+        } else {
+            out = it->second;
+            return Status::OK();
+        }
     }
     if (valueSize == 0) {
         return Status::Error(
@@ -107,6 +122,15 @@ Status ShareMapStore::getOrCreateShareMap(const std::string& bucketKey,
     return Status::OK();
 }
 
+std::shared_ptr<std::mutex> ShareMapStore::getBucketMutex(
+    const std::string& bucketKey) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto [it, inserted] = bucketMutexes_.try_emplace(
+        bucketKey, std::make_shared<std::mutex>());
+    (void)inserted;
+    return it->second;
+}
+
 Status ShareMapStore::Publish(const std::string& bucketKey, uint64_t valueSize,
                               const std::vector<uint64_t>& keys,
                               const std::vector<StringView>& values) {
@@ -114,6 +138,8 @@ Status ShareMapStore::Publish(const std::string& bucketKey, uint64_t valueSize,
         return Status::Error(ErrorCode::kInternal,
                              "ShareMapStore not initialized");
     }
+    auto bucketMutex = getBucketMutex(bucketKey);
+    std::lock_guard<std::mutex> bucketLock(*bucketMutex);
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, valueSize, sm);
     if (!s.IsOk()) return s;
@@ -132,6 +158,8 @@ Status ShareMapStore::QueryData(const std::string& bucketKey,
         totalPoint.End(status.code());
         return status;
     }
+    auto bucketMutex = getBucketMutex(bucketKey);
+    std::lock_guard<std::mutex> bucketLock(*bucketMutex);
     std::shared_ptr<ShareMap> sm;
     UbDiag::PerfPoint getMapPoint(PerfKey::EMB_RD_STORE_GET_SHARE_MAP,
                                   UbDiag::PerfLevel::MODULE);
@@ -152,6 +180,8 @@ Status ShareMapStore::BuildIndex(const std::string& bucketKey) {
         return Status::Error(ErrorCode::kInternal,
                              "ShareMapStore not initialized");
     }
+    auto bucketMutex = getBucketMutex(bucketKey);
+    std::lock_guard<std::mutex> bucketLock(*bucketMutex);
     std::shared_ptr<ShareMap> sm;
     auto s = getOrCreateShareMap(bucketKey, 0, sm);
     if (!s.IsOk()) return s;
@@ -163,18 +193,31 @@ Status ShareMapStore::Import(const std::string& bucketKey) {
         return Status::Error(ErrorCode::kInternal,
                              "ShareMapStore not initialized");
     }
+    auto bucketMutex = getBucketMutex(bucketKey);
+    std::lock_guard<std::mutex> bucketLock(*bucketMutex);
     std::shared_ptr<ShareMap> sm;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = shareMaps_.find(bucketKey);
+        if (it != shareMaps_.end() &&
+            (it->second->IsPublished() || it->second->Size() != 0)) {
+            return Status::OK();
+        }
+    }
     auto s = getOrCreateShareMap(bucketKey, 1, sm);
     if (!s.IsOk()) return s;
     s = sm->Import();
-    // Concurrent queries may miss the same bucket and race to import it. The
-    // first importer publishes the local ShareMap; later importers must not
-    // mutate that published instance, but can treat the completed import as
-    // success and continue with their lookup retry.
-    if (!s.IsOk() &&
-        s.code() == static_cast<int>(ErrorCode::kIndexBuilt) &&
-        sm->IsPublished()) {
-        return Status::OK();
+    if (s.IsOk()) return s;
+
+    // Import may have created a placeholder or partially reconstructed an
+    // object before failing. Do not leave that unusable object in the cache:
+    // the next Query/Publish must be able to retry from a clean lifecycle.
+    if (!sm->IsPublished() && sm->Size() == 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = shareMaps_.find(bucketKey);
+        if (it != shareMaps_.end() && it->second == sm) {
+            shareMaps_.erase(it);
+        }
     }
     return s;
 }
@@ -221,18 +264,18 @@ Status ShareMapStore::QueryDataToBuffer(
     // If local ShareMap is missing, try to Import it from Mooncake Store.
     if (!s.IsOk()) {
         if (s.code() == static_cast<int>(ErrorCode::kNotFound)) {
-            UbDiag::PerfPoint importPoint(PerfKey::EMB_RD_SERVER_IMPORT,
-                                          UbDiag::PerfLevel::KEY_MODULE);
-            importPoint.Start();
-            s = Import(bucketKey);
-            importPoint.End(s.IsOk() ? 0 : s.code());
-            if (s.IsOk()) {
-                UbDiag::PerfPoint retryPoint(
-                    PerfKey::EMB_RD_SERVER_LOCAL_LOOKUP,
-                    UbDiag::PerfLevel::KEY_MODULE);
-                retryPoint.Start();
+            auto importStatus = Import(bucketKey);
+            if (importStatus.IsOk()) {
                 s = QueryData(bucketKey, keys, buffers);
-                retryPoint.End(s.IsOk() ? 0 : s.code());
+            } else if (importStatus.code() ==
+                       static_cast<int>(ErrorCode::kNotFound)) {
+                // A bucket can legitimately be empty before its first
+                // Publish. Treat an absent ShareMap and an absent key alike;
+                // Import() has already removed any failed placeholder.
+                buffers.assign(keys.size(), {});
+                s = Status::OK();
+            } else {
+                s = importStatus;
             }
         }
         if (!s.IsOk()) return finish(s);
@@ -376,12 +419,16 @@ Status ShareMapStore::BatchQueryDataToBuffer(
         auto s = QueryData(bucketKey, keys, buffers);
         if (!s.IsOk()) {
             if (s.code() == static_cast<int>(ErrorCode::kNotFound)) {
-                UbDiag::PerfPoint importPoint(PerfKey::EMB_RD_SERVER_IMPORT,
-                                              UbDiag::PerfLevel::KEY_MODULE);
-                importPoint.Start();
-                s = Import(bucketKey);
-                importPoint.End(s.IsOk() ? 0 : s.code());
-                if (s.IsOk()) s = QueryData(bucketKey, keys, buffers);
+                auto importStatus = Import(bucketKey);
+                if (importStatus.IsOk()) {
+                    s = QueryData(bucketKey, keys, buffers);
+                } else if (importStatus.code() ==
+                           static_cast<int>(ErrorCode::kNotFound)) {
+                    buffers.assign(keys.size(), {});
+                    s = Status::OK();
+                } else {
+                    s = importStatus;
+                }
             }
             if (!s.IsOk()) {
                 lookupPoint.End(s.code());

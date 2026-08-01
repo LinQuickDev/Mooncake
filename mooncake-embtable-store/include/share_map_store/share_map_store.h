@@ -142,11 +142,17 @@ class ShareMapStore {
     Status getOrCreateShareMap(const std::string& bucketKey, uint64_t valueSize,
                                std::shared_ptr<ShareMap>& out);
 
+    // Serialize lifecycle transitions for one bucket. In particular, a
+    // failed Import must not race with a Publish that observes its temporary
+    // placeholder ShareMap.
+    std::shared_ptr<std::mutex> getBucketMutex(const std::string& bucketKey);
+
     DeploymentConfig config_;
     std::string localHostname_;
     std::shared_ptr<mooncake::RealClient> realClient_;
     std::shared_ptr<PhfLookupThreadPool> phfLookupThreadPool_;
     std::unordered_map<std::string, std::shared_ptr<ShareMap>> shareMaps_;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> bucketMutexes_;
     mutable std::mutex mutex_;
     std::vector<TransferBufferSlot> transferBuffers_;
     std::mutex transferBufferMutex_;

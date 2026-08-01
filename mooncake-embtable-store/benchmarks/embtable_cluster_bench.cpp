@@ -246,7 +246,41 @@ bool PrepareData(uint64_t value_size) {
             keys.push_back(key);
             values.emplace_back(value.data(), value.size());
         }
-        status = client.Insert(keys, values);
+
+        // Preparation can be resumed after an earlier run failed while
+        // flushing another bucket. Discover keys already present in this
+        // batch and submit only the missing keys; ShareMap intentionally
+        // rejects duplicate keys rather than silently overwriting them.
+        std::vector<embtable::StringView> existing;
+        status = client.Find(keys, existing);
+        if (!status.IsOk() || existing.size() != keys.size()) {
+            LOG(ERROR) << "Preparation existing-data probe failed: "
+                       << (status.IsOk()
+                               ? "unexpected result count"
+                               : status.msg());
+            return false;
+        }
+        std::vector<uint64_t> missing_keys;
+        std::vector<embtable::StringView> missing_values;
+        missing_keys.reserve(keys.size());
+        missing_values.reserve(values.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            // valueSize is validated as non-zero, so an empty StringView is
+            // an unambiguous miss and does not depend on data()'s empty-view
+            // representation.
+            if (existing[i].empty()) {
+                missing_keys.push_back(keys[i]);
+                missing_values.push_back(values[i]);
+            }
+        }
+        if (missing_keys.empty()) {
+            LOG(INFO) << "Insert batch already present; skipping: table="
+                      << FLAGS_embtable_table_name << ", batch_keys="
+                      << count;
+            continue;
+        }
+
+        status = client.Insert(missing_keys, missing_values);
         if (!status.IsOk()) {
             if (status.code() ==
                 static_cast<int>(embtable::ErrorCode::kIndexBuilt)) {
@@ -258,7 +292,8 @@ bool PrepareData(uint64_t value_size) {
             return false;
         }
         LOG(INFO) << "Insert batch completed: table="
-                  << FLAGS_embtable_table_name << ", batch_keys=" << count
+                  << FLAGS_embtable_table_name << ", batch_keys="
+                  << missing_keys.size()
                   << ", inserted=" << (offset + count) << "/"
                   << FLAGS_embtable_num_keys;
     }

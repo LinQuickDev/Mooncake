@@ -297,8 +297,21 @@ Status Bucket::Find(
     if (local) {
         // Local query: ShareMap returns StringViews into ShareObject memory.
         s = shareMapStore_->QueryData(bucketKey_, keys, buffers);
-        point.End(s.IsOk() ? 0 : s.code());
-        return s;
+        if (s.IsOk()) return s;
+        if (s.code() != static_cast<int>(ErrorCode::kNotFound)) return s;
+
+        // The owner may not have received its first Publish yet. Try to
+        // import a previously published map; if none exists, this bucket is
+        // simply empty and every requested key is a miss.
+        auto importStatus = shareMapStore_->Import(bucketKey_);
+        if (importStatus.IsOk()) {
+            return shareMapStore_->QueryData(bucketKey_, keys, buffers);
+        }
+        if (importStatus.code() == static_cast<int>(ErrorCode::kNotFound)) {
+            buffers.assign(keys.size(), {});
+            return Status::OK();
+        }
+        return importStatus;
     }
     if (!shareMapStoreClient_) {
         auto status = Status::Error(
