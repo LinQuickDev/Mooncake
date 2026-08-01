@@ -389,10 +389,8 @@ class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
         return client_local_disk_segment_;
     }
 
-    // SsdMetricsProvider implementation
     int64_t getSsdTotalCapacity(const std::string& segment_name) const override;
     int64_t getSsdUsedBytes(const std::string& segment_name) const override;
-    double getDdrUsedRatio(const std::string& segment_name) const override;
 
    private:
     const std::unordered_map<std::string, UUID>&

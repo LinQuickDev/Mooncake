@@ -2096,7 +2096,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             } else
 #endif
             {
-                // Fallback to vector_read for non-UringFile (preadv).
+                // Fallback to vector_read for non-UringFile
                 iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
                 UbDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
                                            UbDiag::PerfLevel::MODULE);
@@ -2409,11 +2409,9 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
-    // When eviction is enabled (and not force-disabled), always allow
-    // offloading since PrepareEviction will manage capacity by evicting old
-    // buckets.
-    if (!bucket_backend_config_.disable_ssd_eviction &&
-        bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
+    // When eviction is enabled, always allow offloading since PrepareEviction
+    // will manage capacity by evicting old buckets as needed.
+    if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
         bucket_backend_config_.max_total_size > 0) {
         return true;
     }
@@ -2975,8 +2973,7 @@ BucketStorageBackend::PrepareEviction(
         pending_write_keys_.insert(write_keys.begin(), write_keys.end());
     }
 
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE ||
-        bucket_backend_config_.disable_ssd_eviction) {
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
         return result;
     }
 
@@ -5377,13 +5374,14 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     }
     for (const auto& plan : read_plans) {
         const auto disk_start = std::chrono::steady_clock::now();
-        // Read header first
-        RecordHeader header;
-        iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
-                                {&header.value_len, sizeof(header.value_len)}};
-
+        // Read header first.  The CRC is NOT verified here: records are
+        // CRC-validated once during recovery, and during normal operation
+        // a key only becomes visible after its write completed, so the
+        // hot read path stays checksum-free.
+        char hdr_buf[RecordHeader::SIZE];
+        iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
         auto read_header_result =
-            plan.data_file->vector_read(header_iovs, 2, plan.offset);
+            plan.data_file->vector_read(&header_iov, 1, plan.offset);
         if (!read_header_result) {
             LOG(ERROR) << "Failed to read header for key: " << plan.key
                        << ", error: " << read_header_result.error();
@@ -5394,6 +5392,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
+        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
         // Validate header matches metadata
         if (!header.ValidateAgainstMetadata(plan.value_size)) {

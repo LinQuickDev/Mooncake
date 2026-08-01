@@ -1145,12 +1145,12 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
     if (it == config.end()) {
         return default_value;
     }
-    const std::string &value = it->second;
-    // Check for negative numbers (stoull incorrectly parses "-1" as large val)
-    if (!value.empty() && value[0] == '-') {
-        LOG(WARNING) << "Invalid negative value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
+
+    auto parsed_size_opt = try_string_to_byte_size(it->second);
+    if (!parsed_size_opt.has_value()) {
+        LOG(ERROR) << "Invalid size value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
     }
     try {
         return std::stoull(value);

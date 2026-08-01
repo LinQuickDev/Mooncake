@@ -377,7 +377,8 @@ endif()
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
-                                              asio_shared UbDiag::ubdiag_lib)
+                                              asio_shared
+                                              UbDiag::ubdiag_lib)
 set_target_properties(mooncake_master mooncake_client
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

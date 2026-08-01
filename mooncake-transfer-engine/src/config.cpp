@@ -421,9 +421,6 @@ void loadGlobalConfig(GlobalConfig& config) {
             config.log_level = google::ERROR;
     }
     FLAGS_minloglevel = config.log_level;
-    // MC_LOG_ENABLE only controls MC_LOG macros via ShouldLog().
-    // Do not suppress FLAGS_minloglevel here to avoid affecting other LOG()
-    // calls.
 
     const char* slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
     if (slice_timeout_env) {

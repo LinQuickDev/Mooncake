@@ -867,14 +867,16 @@ ErrorCode Client::InitTransferEngine(
                            << e.what() << "\"";
             }
         } else if (protocol == "ub") {
-            if (!device_names.has_value() || device_names->empty()) {
-                LOG(ERROR) << "ub protocol requires device names when auto "
-                              "discovery is disabled";
-                return ErrorCode::INVALID_PARAMS;
-            }
             auto deviceName = device_names.value_or("bonding_dev_0");
+            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
             auto devices = splitString(deviceName, ',', true);
-            transfer_engine_->getLocalTopology()->discover(devices);
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete with specified "
+                             "devices. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
             transport = transfer_engine_->installTransport("ub", nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install ub transport with specified "
@@ -1439,8 +1441,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
                 auto index = op.key_indexes[idx];
                 VLOG(1) << "Transfer completed successfully for key: "
-                           << object_keys[index];
-                results[index] = {};
+                        << object_keys[index];
 
                 // Release the cache block after transfer completes (memcpy is
                 // done)
@@ -2234,8 +2235,6 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
-    const bool batch_item_log = mooncake::logging::ShouldSampleHiFreqLog(
-        mooncake::logging::CurrentTraceId());
     if (std::all_of(ops.begin(), ops.end(),
                     [](const PutOperation& op) { return op.IsResolved(); })) {
         return;

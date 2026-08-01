@@ -91,8 +91,6 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
-static constexpr double DEFAULT_DDR_ADMISSION_WATERMARK_RATIO =
-    0.0;  // 0.0 = use eviction_high_watermark_ratio
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
@@ -300,8 +298,6 @@ enum class ErrorCode : int32_t {
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
         -200,  ///< Memory allocation failed due to insufficient space.
-    DDR_ADMISSION_REJECTED =
-        -201,  ///< Allocation rejected by DDR admission watermark.
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.
@@ -460,8 +456,7 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
-    LOCAL_FIRST,           // Prefer local host before ordered remote fallback
-    SSD_BALANCE,       // SSD-ratio-based load balancing
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
 };
 
 /**

@@ -138,10 +138,6 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
-DEFINE_double(ddr_admission_watermark_ratio,
-              mooncake::DEFAULT_DDR_ADMISSION_WATERMARK_RATIO,
-              "Ratio above which DDR allocation is rejected (0.0 = use "
-              "eviction_high_watermark_ratio)");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -308,11 +304,7 @@ DEFINE_string(memory_allocator, "offset",
 DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
-    "ssd_free_ratio_first | local_first | "
-    "ssd_balance");
-DEFINE_double(ssd_high_watermark_ratio, 0.90,
-              "SSD usage ratio above which a segment is excluded from "
-              "allocation (0.0-1.0)");
+    "ssd_free_ratio_first | local_first");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -480,9 +472,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
-    default_config.GetDouble("ddr_admission_watermark_ratio",
-                             &master_config.ddr_admission_watermark_ratio,
-                             FLAGS_ddr_admission_watermark_ratio);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -599,9 +588,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
-    default_config.GetDouble("ssd_high_watermark_ratio",
-                             &master_config.ssd_high_watermark_ratio,
-                             FLAGS_ssd_high_watermark_ratio);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -1054,18 +1040,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
     }
-    if ((google::GetCommandLineFlagInfo("ssd_high_watermark_ratio", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.ssd_high_watermark_ratio = FLAGS_ssd_high_watermark_ratio;
-    }
-    if ((google::GetCommandLineFlagInfo("ddr_admission_watermark_ratio",
-                                        &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.ddr_admission_watermark_ratio =
-            FLAGS_ddr_admission_watermark_ratio;
-    }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1351,7 +1325,7 @@ int main(int argc, char* argv[]) {
     // avoids a double init.
     if (!FLAGS_log_dir.empty() && !google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(argv[0]);
-        // Merge all master logs into a single journal file in FLAGS_log_dir,
+        // Merge all master logs into a single journal file in --log_dir,
         // reusing glog: every record is already written to its own severity
         // file and all lower ones, so the INFO sink is a complete journal.
         // Disable the higher-severity files so everything lands in one file.

@@ -15,7 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"

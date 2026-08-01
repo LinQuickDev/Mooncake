@@ -1,27 +1,5 @@
 find_package(yaml-cpp REQUIRED)
 
-find_package(asio QUIET)
-
-if(asio_FOUND)
-    message(STATUS "Found ASIO via find_package")
-    set(ASIO_INCLUDE_DIR ${asio_INCLUDE_DIR})
-else()
-    find_path(ASIO_INCLUDE_DIR
-        NAMES asio.hpp
-        PATHS
-            /usr/local/include
-            /usr/include
-            ${CMAKE_INSTALL_PREFIX}/include
-        DOC "Path to ASIO headers"
-    )
-
-    if(NOT ASIO_INCLUDE_DIR)
-        message(FATAL_ERROR "ASIO not found. Please install ASIO or set ASIO_INCLUDE_DIR manually.")
-    endif()
-
-    message(STATUS "Found ASIO at: ${ASIO_INCLUDE_DIR}")
-endif()
-
 set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
                             rpc_client_io_context.cpp    mooncake_logging.cpp
 )

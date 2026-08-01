@@ -113,435 +113,6 @@ WrappedMasterService::WrappedMasterService(
 
 WrappedMasterService::~WrappedMasterService() = default;
 
-void MasterAdminServer::InitHttpServer() {
-    using namespace coro_http;
-
-    http_server_.set_http_handler<GET>(
-        "/metrics", [this](coro_http_request&, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, BuildMetricsText());
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/metrics/summary",
-        [this](coro_http_request&, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok,
-                                        BuildMetricsSummaryText());
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/health", [this](coro_http_request&, coro_http_response& resp) {
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
-            resp.set_status_and_content(status_type::ok, BuildHealthJson());
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/role", [this](coro_http_request&, coro_http_response& resp) {
-            const auto snapshot = SnapshotState();
-            resp.add_header("Content-Type", "text/plain; charset=utf-8");
-            resp.set_status_and_content(
-                status_type::ok, ha::MasterRuntimeRoleToString(snapshot.state));
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/ha_status", [this](coro_http_request&, coro_http_response& resp) {
-            const auto snapshot = SnapshotState();
-            resp.add_header("Content-Type", "text/plain; charset=utf-8");
-            resp.set_status_and_content(
-                status_type::ok,
-                ha::MasterRuntimeStateToString(snapshot.state));
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/leader", [this](coro_http_request&, coro_http_response& resp) {
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
-            resp.set_status_and_content(status_type::ok, BuildLeaderJson());
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/query_key", [this](coro_http_request& req, coro_http_response& resp) {
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto key = req.get_query_value("key");
-            auto get_result =
-                service->GetReplicaList(std::string(key), "default");
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
-            if (get_result) {
-                std::string ss = "{\"success\":true,\"data\":[";
-                const auto& replicas = get_result.value().replicas;
-                bool first = true;
-                for (const auto& replica : replicas) {
-                    if (!replica.is_memory_replica()) {
-                        continue;
-                    }
-                    std::string tmp;
-                    struct_json::to_json(
-                        replica.get_memory_descriptor().buffer_descriptor, tmp);
-                    if (!first) {
-                        ss += ",";
-                    }
-                    ss += tmp;
-                    first = false;
-                }
-                ss += "]}";
-                resp.set_status_and_content(status_type::ok, std::move(ss));
-                return;
-            }
-
-            resp.set_status_and_content(
-                status_type::not_found,
-                std::string("{\"success\":false,\"error_code\":") +
-                    std::to_string(toInt(get_result.error())) +
-                    ",\"error_message\":\"" +
-                    EscapeJson(toString(get_result.error())) + "\"}");
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/get_all_keys", [this](coro_http_request&, coro_http_response& resp) {
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result = service->GetAllKeysForAdmin();
-            if (!result) {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to get all keys");
-                return;
-            }
-
-            std::string body;
-            for (const auto& key : result.value()) {
-                body += key;
-                body += "\n";
-            }
-            resp.set_status_and_content(status_type::ok, std::move(body));
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/get_all_segments",
-        [this](coro_http_request&, coro_http_response& resp) {
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result = service->GetAllSegmentsForAdmin();
-            if (!result) {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to get all segments");
-                return;
-            }
-
-            std::string body;
-            for (const auto& segment_name : result.value()) {
-                body += segment_name;
-                body += "\n";
-            }
-            resp.set_status_and_content(status_type::ok, std::move(body));
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/get_segments_detail",
-        [this](coro_http_request&, coro_http_response& resp) {
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto result = service->GetSegmentsDetailForAdmin();
-            if (!result) {
-                WriteErrorResponse(resp, status_type::internal_server_error,
-                                   result.error(),
-                                   "Failed to get segments detail");
-                return;
-            }
-
-            HttpSegmentsDetailResponse payload;
-            payload.total_segments = result.value().size();
-            for (const auto& info : result.value()) {
-                HttpSegmentDetailItem item;
-                item.segment_name = info.segment_name;
-                item.segment_id = UuidToString(info.segment_id);
-                item.client_id = UuidToString(info.client_id);
-
-                std::ostringstream addr_oss;
-                addr_oss << "0x" << std::hex << info.base_address;
-                item.base_address = addr_oss.str();
-
-                item.size_bytes = info.size_bytes;
-                std::ostringstream size_oss;
-                size_oss << (info.size_bytes / 1024.0 / 1024.0 / 1024.0)
-                         << " GiB";
-                item.size_human = size_oss.str();
-
-                item.te_endpoint = info.te_endpoint;
-                item.protocol = info.protocol;
-                item.status = EnumToString(info.status);
-                item.allocator_used_bytes = info.allocator_used_bytes;
-                item.allocator_capacity_bytes = info.allocator_capacity_bytes;
-                item.allocator_usage_percent =
-                    info.allocator_capacity_bytes > 0
-                        ? (static_cast<double>(info.allocator_used_bytes) /
-                           info.allocator_capacity_bytes * 100.0)
-                        : 0.0;
-                payload.segments.push_back(std::move(item));
-            }
-            WriteJsonResponse(resp, status_type::ok, payload);
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/query_segment",
-        [this](coro_http_request& req, coro_http_response& resp) {
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto segment = req.get_query_value("segment");
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result = service->QuerySegmentForAdmin(std::string(segment));
-
-            if (!result) {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to query segment");
-                return;
-            }
-
-            const auto [used, capacity] = result.value();
-            std::string body(segment);
-            body += "\nUsed(bytes): ";
-            body += std::to_string(used);
-            body += "\nCapacity(bytes) : ";
-            body += std::to_string(capacity);
-            body += "\n";
-            resp.set_status_and_content(status_type::ok, std::move(body));
-        });
-
-    http_server_.set_http_handler<POST>(
-        "/api/v1/drain_jobs",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            CreateDrainJobRequest request;
-            try {
-                struct_json::from_json(request, req.get_body());
-            } catch (const std::exception& e) {
-                WriteErrorResponse(
-                    resp, status_type::bad_request, ErrorCode::INVALID_PARAMS,
-                    std::string("Invalid JSON body: ") + e.what());
-                return;
-            }
-
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto result = service->CreateDrainJob(request);
-            if (!result.has_value()) {
-                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                                   result.error());
-                return;
-            }
-
-            HttpCreateDrainJobResponse payload;
-            payload.success = true;
-            payload.job_id = UuidToString(result.value());
-            payload.status = "CREATED";
-            WriteJsonResponse(resp, status_type::ok, payload);
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/api/v1/drain_jobs/query",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            auto job_id_result =
-                ParseJobId(req.get_decode_query_value("job_id"));
-            if (!job_id_result.has_value()) {
-                WriteErrorResponse(resp, status_type::bad_request,
-                                   job_id_result.error(),
-                                   "Missing or invalid job_id");
-                return;
-            }
-
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto result = service->QueryDrainJob(job_id_result.value());
-            if (!result.has_value()) {
-                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                                   result.error());
-                return;
-            }
-
-            WriteJsonResponse(resp, status_type::ok,
-                              ToHttpQueryDrainJobResponse(result.value()));
-        });
-
-    http_server_.set_http_handler<POST>(
-        "/api/v1/drain_jobs/cancel",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            auto job_id_result =
-                ParseJobId(req.get_decode_query_value("job_id"));
-            if (!job_id_result.has_value()) {
-                WriteErrorResponse(resp, status_type::bad_request,
-                                   job_id_result.error(),
-                                   "Missing or invalid job_id");
-                return;
-            }
-
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto result = service->CancelDrainJob(job_id_result.value());
-            if (!result.has_value()) {
-                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                                   result.error());
-                return;
-            }
-
-            HttpCancelDrainJobResponse payload;
-            payload.success = true;
-            payload.job_id = UuidToString(job_id_result.value());
-            payload.status = "CANCELED";
-            WriteJsonResponse(resp, status_type::ok, payload);
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/api/v1/segments/status",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            auto segment_name = req.get_decode_query_value("segment");
-            if (segment_name.empty()) {
-                WriteErrorResponse(resp, status_type::bad_request,
-                                   ErrorCode::INVALID_PARAMS,
-                                   "Missing segment query parameter");
-                return;
-            }
-
-            auto service = GetActiveService();
-            if (!service) {
-                SetServiceUnavailable(resp, "service plane is not active");
-                return;
-            }
-
-            auto result =
-                service->QuerySegmentStatus(std::string(segment_name));
-            if (!result.has_value()) {
-                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                                   result.error());
-                return;
-            }
-
-            HttpSegmentStatusResponse payload;
-            payload.success = true;
-            payload.segment = std::string(segment_name);
-            payload.status = static_cast<int32_t>(result.value());
-            payload.status_name = EnumToString(result.value());
-            WriteJsonResponse(resp, status_type::ok, payload);
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/batch_query_keys",
-        [this](coro_http_request& req, coro_http_response& resp) {
-            auto service = GetActiveService();
-            if (!service) {
-                resp.add_header("Content-Type",
-                                "application/json; charset=utf-8");
-                resp.set_status_and_content(
-                    status_type::service_unavailable,
-                    "{\"success\":false,\"error\":\"service plane is not "
-                    "active\"}");
-                return;
-            }
-
-            auto keys_view = req.get_query_value("keys");
-            std::vector<std::string> keys;
-            if (!keys_view.empty()) {
-                std::string keys_str(keys_view);
-                std::string key;
-                std::istringstream iss(keys_str);
-                while (std::getline(iss, key, ',')) {
-                    keys.push_back(std::move(key));
-                }
-            }
-
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
-            if (keys.empty()) {
-                resp.set_status_and_content(
-                    status_type::bad_request,
-                    "{\"success\":false,\"error\":\"No keys provided. Use "
-                    "?keys=key1,key2,...\"}");
-                return;
-            }
-
-            auto results = service->BatchGetReplicaList(keys, "default");
-            const size_t n = std::min(keys.size(), results.size());
-            std::string body;
-            body.reserve(n * 512);
-            body += "{\"success\":true,\"data\":{";
-
-            for (size_t i = 0; i < n; ++i) {
-                if (i > 0) {
-                    body += ",";
-                }
-
-                body += "\"";
-                body += EscapeJson(keys[i]);
-                body += "\":";
-
-                const auto& result = results[i];
-                if (!result.has_value()) {
-                    body += "{\"ok\":false,\"error\":\"";
-                    body += EscapeJson(toString(result.error()));
-                    body += "\"}";
-                    continue;
-                }
-
-                body += "{\"ok\":true,\"values\":[";
-                bool first = true;
-                for (const auto& replica : result.value().replicas) {
-                    if (!replica.is_memory_replica()) {
-                        continue;
-                    }
-
-                    std::string tmp;
-                    struct_json::to_json(
-                        replica.get_memory_descriptor().buffer_descriptor, tmp);
-                    if (!first) {
-                        body += ",";
-                    }
-                    body += tmp;
-                    first = false;
-                }
-                body += "]}";
-            }
-
-            body += "}}";
-            if (results.size() != keys.size()) {
-                MC_LOG(WARNING)
-                    << "BatchGetReplicaList size mismatch: keys=" << keys.size()
-                    << " results=" << results.size();
-            }
-            resp.set_status_and_content(status_type::ok, std::move(body));
-        });
-}
-
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
@@ -585,8 +156,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
         if (!result[i].has_value()) {
             failure_count++;
             auto error = result[i].error();
-            MC_LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
-                          << keys[i] << "': " << toString(error);
+            LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
         }
     }
 
@@ -662,8 +233,8 @@ WrappedMasterService::BatchReplicaClear(
     size_t failure_count = 0;
     if (!result.has_value()) {
         failure_count = total_keys;
-        MC_LOG(WARNING) << "BatchReplicaClear failed: "
-                        << toString(result.error());
+        LOG(WARNING) << "BatchReplicaClear failed: "
+                     << toString(result.error());
     } else {
         const size_t cleared_count = result.value().size();
         failure_count = total_keys - cleared_count;
@@ -817,11 +388,11 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_NOT_FOUND ||
                 error == ErrorCode::REPLICA_IS_NOT_READY) {
-                MC_VLOG(1) << "BatchGetReplicaList failed for key[" << i
-                           << "] '" << keys[i] << "': " << toString(error);
+                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
             } else {
-                MC_LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
-                              << "] '" << keys[i] << "': " << toString(error);
+                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                           << "] '" << keys[i] << "': " << toString(error);
             }
         }
     }
@@ -979,7 +550,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
-        "PutRevoke", PerfKey::MASTER_RPC_PUT_REVOKE,
+        "PutRevoke",
+        PerfKey::MASTER_RPC_PUT_REVOKE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1025,15 +597,15 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         tenant_id, master_service_.IsTenantQuotaEnabled());
 
     if (keys.size() != slice_lengths.size()) {
-        MC_LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
-                      << " != slice_lengths.size()=" << slice_lengths.size();
+        LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
+                   << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
                config.group_ids->size() != keys.size()) {
-        MC_LOG(ERROR) << "BatchPutStart: group_ids.size()="
-                      << config.group_ids->size()
-                      << " != keys.size()=" << keys.size();
+        LOG(ERROR) << "BatchPutStart: group_ids.size()="
+                   << config.group_ids->size()
+                   << " != keys.size()=" << keys.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (!resolved_tenant_id) {
@@ -1079,21 +651,20 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             failure_count++;
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                MC_VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
-                           << keys[i] << "': " << toString(error);
+                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
             } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
-                MC_LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
-                              << keys[i] << "': " << toString(error);
+                LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(error);
             }
         }
     }
 
     if (no_available_handle_count > 0) {
-        MC_LOG(WARNING) << "BatchPutStart failed for "
-                        << no_available_handle_count << " keys"
-                        << PUT_NO_SPACE_HELPER_STR;
+        LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
+                     << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
     if (failure_count == total_keys) {
@@ -1190,8 +761,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            MC_LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
-                          << keys[i] << "': " << toString(error);
+            LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
         }
     }
 
@@ -1216,7 +787,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const ReplicateConfig& config,
                                   const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
+        "UpsertStart",
+        PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
             return WithWriteTenant(tenant_id,
                                    master_service_.IsTenantQuotaEnabled(),
@@ -1238,7 +810,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertEnd", PerfKey::MASTER_RPC_UPSERT_END,
+        "UpsertEnd",
+        PerfKey::MASTER_RPC_UPSERT_END,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1261,7 +834,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertRevoke", PerfKey::MASTER_RPC_UPSERT_REVOKE,
+        "UpsertRevoke",
+        PerfKey::MASTER_RPC_UPSERT_REVOKE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1319,8 +893,8 @@ WrappedMasterService::BatchUpsertStart(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            MC_LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
-                          << keys[i] << "': " << toString(error);
+            LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
         }
     }
 
@@ -1400,8 +974,8 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            MC_LOG(ERROR) << "BatchUpsertRevoke failed for key[" << i << "] '"
-                          << keys[i] << "': " << toString(error);
+            LOG(ERROR) << "BatchUpsertRevoke failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
         }
     }
 
@@ -1441,7 +1015,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
     const std::string& str, bool force, const std::string& tenant_id) {
     return execute_rpc(
-        "RemoveByRegex", PerfKey::MASTER_RPC_REMOVE_BY_REGEX,
+        "RemoveByRegex",
+        PerfKey::MASTER_RPC_REMOVE_BY_REGEX,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1518,7 +1093,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
     return execute_rpc(
-        "MountSegment", PerfKey::MASTER_RPC_MOUNT_SEGMENT,
+        "MountSegment",
+        PerfKey::MASTER_RPC_MOUNT_SEGMENT,
         [&] { return master_service_.MountSegment(segment, client_id); },
         [&](auto& timer) {
             timer.LogRequest("base=", segment.base, ", size=", segment.size,
@@ -1581,7 +1157,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
     const UUID& segment_id, const UUID& client_id) {
     return execute_rpc(
-        "UnmountSegment", PerfKey::MASTER_RPC_UNMOUNT_SEGMENT,
+        "UnmountSegment",
+        PerfKey::MASTER_RPC_UNMOUNT_SEGMENT,
         [&] { return master_service_.UnmountSegment(segment_id, client_id); },
         [&](auto& timer) {
             timer.LogRequest("segment_id=", segment_id,
@@ -1656,7 +1233,8 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
     return execute_rpc(
-        "CopyStart", PerfKey::MASTER_RPC_COPY_START,
+        "CopyStart",
+        PerfKey::MASTER_RPC_COPY_START,
         [&] {
             return WithWriteTenant(tenant_id,
                                    master_service_.IsTenantQuotaEnabled(),
@@ -1680,7 +1258,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
     return execute_rpc(
-        "CopyEnd", PerfKey::MASTER_RPC_COPY_END,
+        "CopyEnd",
+        PerfKey::MASTER_RPC_COPY_END,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1703,7 +1282,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
     return execute_rpc(
-        "CopyRevoke", PerfKey::MASTER_RPC_COPY_REVOKE,
+        "CopyRevoke",
+        PerfKey::MASTER_RPC_COPY_REVOKE,
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
@@ -1843,9 +1423,9 @@ WrappedMasterService::BatchEvictDiskReplica(
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            MC_LOG(WARNING)
-                << "BatchEvictDiskReplica failed for key[" << i << "] '"
-                << keys[i] << "': " << toString(results[i].error());
+            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
+                         << "] '" << keys[i]
+                         << "': " << toString(results[i].error());
         }
     }
     if (failure_count > 0) {

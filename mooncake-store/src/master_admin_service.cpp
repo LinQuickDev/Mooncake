@@ -26,6 +26,8 @@ namespace mooncake {
 
 const uint64_t kMetricReportIntervalSeconds = 10;
 
+namespace {
+
 std::string AppendMetricSections(std::string primary, std::string secondary) {
     if (!primary.empty() && primary.back() != '\n') {
         primary.push_back('\n');
@@ -33,7 +35,6 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     primary += secondary;
     return primary;
 }
-
 
 struct HttpErrorResponse {
     bool success{false};
@@ -47,6 +48,22 @@ struct HttpSimpleErrorResponse {
     std::string error;
 };
 YLT_REFL(HttpSimpleErrorResponse, success, error);
+
+template <typename T>
+void WriteJsonResponse(coro_http::coro_http_response& resp,
+                       coro_http::status_type status, const T& payload) {
+    std::string json;
+    struct_json::to_json(payload, json);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(status, std::move(json));
+}
+
+template <typename T>
+std::string EnumToString(const T& value) {
+    std::ostringstream oss;
+    oss << value;
+    return oss.str();
+}
 
 coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
     switch (error) {
@@ -68,7 +85,7 @@ coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
 
 void WriteErrorResponse(coro_http::coro_http_response& resp,
                         coro_http::status_type status, ErrorCode error,
-                        std::string message) {
+                        std::string message = {}) {
     HttpErrorResponse payload;
     payload.error_code = toInt(error);
     payload.error_message =
@@ -231,6 +248,8 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
     }
     return request;
 }
+
+}  // namespace
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
                                      bool enable_metric_reporting)
@@ -449,36 +468,6 @@ std::string MasterAdminServer::BuildMetricsSummaryText() const {
     return oss.str();
 }
 
-std::string MasterAdminServer::BuildHealthJson() const {
-    const auto snapshot = SnapshotState();
-    std::ostringstream oss;
-    oss << "{\"status\":\"ok\",\"role\":\""
-        << ha::MasterRuntimeRoleToString(snapshot.state) << "\",\"ha_state\":\""
-        << ha::MasterRuntimeStateToString(snapshot.state)
-        << "\",\"service_ready\":"
-        << (snapshot.service_available ? "true" : "false");
-    if (snapshot.leader_view.has_value()) {
-        oss << ",\"leader_address\":\""
-            << EscapeJson(snapshot.leader_view->leader_address)
-            << "\",\"view_version\":" << snapshot.leader_view->view_version;
-    }
-    oss << "}";
-    return oss.str();
-}
-
-std::string MasterAdminServer::BuildLeaderJson() const {
-    const auto snapshot = SnapshotState();
-    if (!snapshot.leader_view.has_value()) {
-        return "{\"present\":false}";
-    }
-
-    std::ostringstream oss;
-    oss << "{\"present\":true,\"leader_address\":\""
-        << EscapeJson(snapshot.leader_view->leader_address)
-        << "\",\"view_version\":" << snapshot.leader_view->view_version << "}";
-    return oss.str();
-}
-
 struct HttpHealthResponse {
     std::string status;
     std::string role;
@@ -680,6 +669,31 @@ void MasterAdminServer::HandleGetAllSegments(
     });
 }
 
+struct HttpSegmentDetailItem {
+    std::string segment_name;
+    std::string segment_id;
+    std::string client_id;
+    std::string base_address;
+    uint64_t size_bytes{0};
+    std::string size_human;
+    std::string te_endpoint;
+    std::string protocol;
+    std::string status;
+    uint64_t allocator_used_bytes{0};
+    uint64_t allocator_capacity_bytes{0};
+    double allocator_usage_percent{0.0};
+};
+YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
+         base_address, size_bytes, size_human, te_endpoint, protocol, status,
+         allocator_used_bytes, allocator_capacity_bytes,
+         allocator_usage_percent);
+
+struct HttpSegmentsDetailResponse {
+    uint64_t total_segments{0};
+    std::vector<HttpSegmentDetailItem> segments;
+};
+YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
+
 void MasterAdminServer::HandleGetSegmentsDetail(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -749,6 +763,16 @@ void MasterAdminServer::HandleQuerySegment(
     });
 }
 
+struct HttpCreateDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    std::string status;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
+         error_message);
+
 void MasterAdminServer::HandleCreateDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     CreateDrainJobRequest request;
@@ -777,6 +801,32 @@ void MasterAdminServer::HandleCreateDrainJob(
     });
 }
 
+struct HttpQueryDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    int32_t type{0};
+    std::string type_name;
+    int32_t status{0};
+    std::string status_name;
+    int64_t created_at_ms_epoch{0};
+    int64_t last_updated_at_ms_epoch{0};
+    std::vector<std::string> segments;
+    uint64_t succeeded_units{0};
+    uint64_t failed_units{0};
+    uint64_t blocked_units{0};
+    uint64_t active_units{0};
+    uint64_t migrated_bytes{0};
+    std::string message;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
+         status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
+         succeeded_units, failed_units, blocked_units, active_units,
+         migrated_bytes, message, error_code, error_message);
+
+namespace {
+
 HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     const QueryJobResponse& job) {
     HttpQueryDrainJobResponse payload;
@@ -797,6 +847,8 @@ HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     payload.message = job.message;
     return payload;
 }
+
+}  // namespace
 
 void MasterAdminServer::HandleQueryDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
@@ -819,6 +871,16 @@ void MasterAdminServer::HandleQueryDrainJob(
                           ToHttpQueryDrainJobResponse(result.value()));
     });
 }
+
+struct HttpCancelDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    std::string status;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpCancelDrainJobResponse, success, job_id, status, error_code,
+         error_message);
 
 void MasterAdminServer::HandleCancelDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
@@ -844,6 +906,17 @@ void MasterAdminServer::HandleCancelDrainJob(
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
 }
+
+struct HttpSegmentStatusResponse {
+    bool success{false};
+    std::string segment;
+    int32_t status{0};
+    std::string status_name;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
+         error_code, error_message);
 
 void MasterAdminServer::HandleSegmentStatus(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
