@@ -1,8 +1,8 @@
 #include <iostream>
 #include <vector>
 
-#include "serialize/serializer.hpp"
-#include "offset_allocator/offset_allocator.hpp"
+#include "serialize/serializer.h"
+#include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "master_service.h"
 #include "utils/zstd_util.h"
@@ -830,9 +830,10 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     const MountedSegment &mounted_segment, MsgpackPacker &packer) {
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
-    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data...]
+    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
+    // host_id]
 
-    packer.pack_array(8);
+    packer.pack_array(9);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -855,12 +856,14 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
             if (!result) {
                 return tl::unexpected(result.error());
             }
+            packer.pack(mounted_segment.segment.host_id);
             return {};
         }
     }
 
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
+    packer.pack(mounted_segment.segment.host_id);
     return {};
 }
 
@@ -916,6 +919,9 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
             } else {
                 return tl::unexpected(allocatorResult.error());
             }
+        }
+        if (obj.via.array.size >= 9) {
+            mounted_segment.segment.host_id = array[8].as<std::string>();
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
@@ -993,6 +999,17 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
         // Set internal member variable values
         allocator->offset_allocator_ = offset_allocator_result.value();
         allocator->cur_size_ = cur_size;
+
+        // The snapshot restores cur_size_ directly from persisted data
+        // without going through the live allocate()/adoptImportedBuffer()
+        // paths, so no inc_allocated_mem_size() was paired with it. The
+        // allocator destructor still calls dec_allocated_mem_size(cur_size_)
+        // to undo its contribution to the global metric; without a matching
+        // inc the gauge would go negative and wrap to ~16M TB when formatted
+        // as uint64. Pair it here so the accounting stays symmetric and the
+        // gauge ends at 0 after this (often throwaway) allocator is destroyed.
+        MasterMetricManager::instance().inc_allocated_mem_size(
+            segment_name, static_cast<int64_t>(cur_size));
 
         return allocator;
     } catch (const std::exception &e) {

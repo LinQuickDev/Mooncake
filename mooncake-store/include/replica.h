@@ -91,6 +91,7 @@ struct ReplicateConfig {
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
     // Optional per-key routing group IDs. Empty string keeps that key
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
@@ -130,6 +131,9 @@ struct ReplicateConfig {
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
            << ", data_type: " << config.data_type;
+        if (!config.host_id.empty()) {
+            os << ", host_id: " << config.host_id;
+        }
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";
             for (size_t i = 0; i < config.group_ids->size(); ++i) {
@@ -372,6 +376,14 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
+    bool replace_memory_buffer(std::unique_ptr<AllocatedBuffer> buffer) {
+        if (!buffer || !is_memory_replica()) {
+            return false;
+        }
+        std::get<MemoryReplicaData>(data_).buffer = std::move(buffer);
+        return true;
+    }
+
     [[nodiscard]] bool has_invalid_nof_handle() const {
         if (is_nof_replica()) {
             const auto& nof_data = std::get<NoFReplicaData>(data_);
@@ -410,6 +422,21 @@ class Replica {
         return std::nullopt;
     }
 
+    /**
+     * @brief Update a LOCAL_DISK replica's transport endpoint and object size
+     * in place. No-op for non-local_disk replicas. Used when the same owning
+     * client re-offloads / re-registers a key (e.g. after restart the endpoint
+     * changes). Mutates the internal replica data directly; note that
+     * get_descriptor() returns a by-value copy and cannot be used to mutate.
+     */
+    void update_local_disk_location(std::string transport_endpoint,
+                                    uint64_t object_size) {
+        if (auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            disk_data->transport_endpoint = std::move(transport_endpoint);
+            disk_data->object_size = object_size;
+        }
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -438,6 +465,17 @@ class Replica {
             status_ = ReplicaStatus::PROCESSING;
         } else {
             LOG(ERROR) << "Cannot mark_processing from status: " << status_;
+        }
+    }
+
+    void mark_removed() {
+        if (status_ == ReplicaStatus::COMPLETE ||
+            status_ == ReplicaStatus::PROCESSING) {
+            status_ = ReplicaStatus::REMOVED;
+        } else if (status_ == ReplicaStatus::REMOVED) {
+            LOG(WARNING) << "Replica already marked as removed";
+        } else {
+            LOG(ERROR) << "Cannot mark_removed from status: " << status_;
         }
     }
 
