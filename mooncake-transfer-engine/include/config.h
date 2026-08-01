@@ -145,6 +145,11 @@ struct GlobalConfig {
     // enable bonding multipath mode; default off (STANDALONE); override via
     // MC_URMA_BONDING_MULTIPATH_ENABLE
     bool urma_bonding_multipath = false;
+    // enable UB NUMA affinity: store splits the global segment into one
+    // segment per NIC-NUMA node, and transfers pin src/dst chip by NUMA.
+    // Independent from urma_bonding_multipath; default off; override via
+    // MC_UB_NUMA_AFFINITY_ENABLE
+    bool ub_numa_affinity = false;
 };
 
 struct RpcCommunicatorConfig {

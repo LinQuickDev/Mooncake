@@ -75,6 +75,11 @@ class TransferMetadata {
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
+        // for ub: NUMA->chip id of this buffer, computed once by the owner at
+        // registration and published. -1 = not provided (consumer falls back
+        // to resolving from `name`). Only meaningful for single-NUMA ("cpu:N")
+        // buffers; multi-NUMA "segments:..." buffers leave it -1.
+        int chip_id = -1;
 
         bool operator==(const BufferDesc &other) const = default;
     };

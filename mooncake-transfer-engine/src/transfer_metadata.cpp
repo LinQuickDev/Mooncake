@@ -465,6 +465,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value tsegJSON(Json::arrayValue);
             for (auto &entry : buffer.tseg) tsegJSON.append(entry);
             bufferJSON["tseg"] = tsegJSON;
+            bufferJSON["chip_id"] = buffer.chip_id;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -875,6 +876,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &tsegJSON : bufferJSON["tseg"]) {
                 buffer.tseg.push_back(tsegJSON.asString());
             }
+            // Backward compatible: old peers don't publish chip_id -> keep -1.
+            buffer.chip_id = bufferJSON.isMember("chip_id")
+                                 ? bufferJSON["chip_id"].asInt()
+                                 : -1;
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.tseg.empty()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "

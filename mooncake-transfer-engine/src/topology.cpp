@@ -402,7 +402,19 @@ static std::vector<UBDevice> listUBDevices(
         snprintf(path, sizeof(path), "%s/numa",
                  dirname(dirname(resolved_path)));
         LOG(INFO) << "listUBDevices: numanodepath " << path;
-        std::ifstream(path) >> numa_node;
+        // The ubcore "numa" attribute is written in hex (e.g. "0x01"), unlike
+        // the infiniband "numa_node" which is decimal. A plain `>> int` parses
+        // "0x01" as 0 (stops at 'x'), so read as string and pick the base by
+        // the 0x prefix.
+        std::string numa_str;
+        std::ifstream(path) >> numa_str;
+        if (!numa_str.empty()) {
+            int base = (numa_str.rfind("0x", 0) == 0 ||
+                        numa_str.rfind("0X", 0) == 0)
+                           ? 16
+                           : 10;
+            numa_node = static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
+        }
         LOG(INFO) << "UBDevices : performation node ----"
                   << device_list[i]->name << " : " << numa_node;
 
