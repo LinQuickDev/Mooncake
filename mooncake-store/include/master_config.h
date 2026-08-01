@@ -166,9 +166,6 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_ratio{"eviction_ratio"};
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
-    RequiredParam<double> ddr_admission_watermark_ratio{
-        "ddr_admission_watermark_ratio"};
-    RequiredParam<double> ssd_high_watermark_ratio{"ssd_high_watermark_ratio"};
     RequiredParam<double> nof_eviction_ratio{"nof_eviction_ratio"};
     RequiredParam<double> nof_eviction_high_watermark_ratio{
         "nof_eviction_high_watermark_ratio"};
@@ -278,8 +275,6 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        ddr_admission_watermark_ratio = config.ddr_admission_watermark_ratio;
-        ssd_high_watermark_ratio = config.ssd_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
