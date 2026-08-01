@@ -857,8 +857,8 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     if ((google::GetCommandLineFlagInfo("strict_replica_allocation", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.strict_replica_allocation =
-            FLAGS_strict_replica_allocation;
+        master_config.strict_replica_allocation = FLAGS_strict_replica_allocation;
+    }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
         !conf_set) {
