@@ -6,9 +6,9 @@ on:
 
 jobs:
   qoder-review:
+    # Skip fork and cross-repo PRs (head repo must match this repository)
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    env:
-      QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
     permissions:
       contents: read
       pull-requests: write
@@ -21,14 +21,38 @@ jobs:
           fetch-depth: 0
       
       - name: Run Qoder Code Review
-        if: env.QODER_PERSONAL_ACCESS_TOKEN != ''
         uses: QoderAI/qoder-action@v0
         with:
-          qoder_personal_access_token: ${{ env.QODER_PERSONAL_ACCESS_TOKEN }}
+          qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review-pr
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
+            NO_AUTO_APPROVE: true
+            When submitting the review via mcp__qoder_github__submit_pending_pull_request_review, you MUST use event type "COMMENT" only. The available event types are "APPROVE", "REQUEST_CHANGES", and "COMMENT". DO NOT use "APPROVE" or "REQUEST_CHANGES". Human maintainers must approve pull requests.
 
-      - name: Skip Qoder Code Review
-        if: env.QODER_PERSONAL_ACCESS_TOKEN == ''
-        run: echo "QODER_PERSONAL_ACCESS_TOKEN is unavailable; skipping Qoder review."
+      - name: Dismiss accidental Qoder approval
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          mapfile -t REVIEW_IDS < <(
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+              --jq '.[] | select(.user.login == "qoderai[bot]" and .state == "APPROVED") | .id'
+          )
+
+          if [ "${#REVIEW_IDS[@]}" -eq 0 ]; then
+            echo "No Qoder APPROVED reviews to dismiss."
+            exit 0
+          fi
+
+          for review_id in "${REVIEW_IDS[@]}"; do
+            echo "Dismissing Qoder approval review ${review_id}..."
+            gh api \
+              --method PUT \
+              "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
+              -f message="Automated Qoder approvals are disabled; a human maintainer must approve this pull request."
+          done

@@ -511,18 +511,6 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                     break;
                 }
             }
-            if (dev_attr_.port_cnt != 0 &&
-                dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE &&
-                dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER) {
-                LOG(WARNING)
-                    << "Device " << device_name << " not found active port";
-                if (urma_delete_context(context)) {
-                    PLOG(ERROR)
-                        << "urma_delete_context(" << device_name << ") failed";
-                }
-                urma_free_device_list(devices);
-                return ERR_CONTEXT;
-            }
         } else {
             LOG(WARNING) << "Device " << device_name
                          << " manually specified port: "
