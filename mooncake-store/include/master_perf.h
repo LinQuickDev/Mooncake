@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Ubdiag perf-point integration for the mooncake_master process.
 // Include this header (at most once per translation unit) in any .cpp that
 // needs to construct UbDiag::PerfPoint with a MASTER_* key.

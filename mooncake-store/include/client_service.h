@@ -15,7 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -43,11 +43,15 @@ class QueryResult {
     const std::vector<Replica::Descriptor> replicas;
     /** @brief Time point when the lease for this key expires */
     const std::chrono::steady_clock::time_point lease_timeout;
+    /** @brief Optional full-object checksum */
+    const std::optional<uint64_t> object_checksum;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param)
+                std::chrono::steady_clock::time_point lease_timeout_param,
+                std::optional<uint64_t> object_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
-          lease_timeout(lease_timeout_param) {}
+          lease_timeout(lease_timeout_param),
+          object_checksum(object_checksum_param) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -155,6 +159,10 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> VerifyObjectChecksum(
+        const std::string& object_key, const std::vector<Slice>& slices,
+        size_t object_size, std::optional<uint64_t> expected_checksum);
 
     /**
      * @brief Batch clear KV cache for specified object keys on a specific
@@ -431,6 +439,8 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    tl::expected<bool, ErrorCode> PollRemoveAll();
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 
@@ -699,6 +709,17 @@ class Client {
            const std::map<std::string, std::string>& labels = {},
            const std::string& tenant_id = "default");
 
+    /**
+     * @brief Prepare and use the storage backend for persisting data.
+     * Exposed to subclasses for testing only.
+     * @return ErrorCode::OK on success. On failure no storage backend is
+     * retained, so persistence stays disabled.
+     */
+    ErrorCode PrepareStorageBackend(const std::string& storage_root_dir,
+                                    const std::string& fsdir,
+                                    bool enable_eviction = true,
+                                    uint64_t quota_bytes = 0);
+
    private:
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -722,14 +743,9 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
-
-    /**
-     * @brief Prepare and use the storage backend for persisting data
-     */
-    void PrepareStorageBackend(const std::string& storage_root_dir,
-                               const std::string& fsdir,
-                               bool enable_eviction = true,
-                               uint64_t quota_bytes = 0);
+    tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
+        const std::string& object_key, const std::vector<Slice>& slices,
+        size_t object_size);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
@@ -801,6 +817,7 @@ class Client {
         const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
+    void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -816,6 +833,7 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
+    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
     // Client identification
     const UUID client_id_;
@@ -857,8 +875,10 @@ class Client {
 
     // Configuration
     const std::string local_hostname_;
+    const std::string host_id_;
     const std::string metadata_connstring_;
     const std::string protocol_;
+    const bool object_checksum_enabled_;
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive
