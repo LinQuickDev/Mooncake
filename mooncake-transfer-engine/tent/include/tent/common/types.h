@@ -54,6 +54,7 @@ enum TransportType : int {
     TCP,
     AscendDirect,
     SUNRISE_LINK,
+    TPU,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
@@ -64,6 +65,61 @@ inline TransportType c_to_transport_hint(int v) {
     if (v < 0 || v >= kSupportedTransportTypes) return UNSPEC;
     return static_cast<TransportType>(v);
 }
+
+inline const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case UNSPEC:
+            return "unspec";
+        case RDMA:
+            return "rdma";
+        case MNNVL:
+            return "mnnvl";
+        case SHM:
+            return "shm";
+        case NVLINK:
+            return "nvlink";
+        case GDS:
+            return "gds";
+        case IOURING:
+            return "io_uring";
+        case TCP:
+            return "tcp";
+        case AscendDirect:
+            return "ascend";
+        case SUNRISE_LINK:
+            return "sunrise_link";
+        case TPU:
+            return "tpu";
+        case kNumTransportTypes:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+inline TransportType parseTransportType(const std::string& str) {
+    if (str == "unspec") return UNSPEC;
+    if (str == "rdma") return RDMA;
+    if (str == "mnnvl") return MNNVL;
+    if (str == "shm") return SHM;
+    if (str == "nvlink") return NVLINK;
+    if (str == "gds") return GDS;
+    if (str == "io_uring") return IOURING;
+    if (str == "tcp") return TCP;
+    if (str == "ascend") return AscendDirect;
+    if (str == "sunrise_link") return SUNRISE_LINK;
+    if (str == "tpu") return TPU;
+    return UNSPEC;
+}
+
+enum class IntentType : int {
+    INTENT_UNSPEC = 0,
+    FOREGROUND_GET,
+    BACKGROUND_PREFETCH,
+    MIGRATION,
+    CHECKPOINT,
+    WEIGHT_LOADING,
+    STAGING_INTERNAL,
+};
 
 struct Request {
     enum OpCode { READ, WRITE };
@@ -79,6 +135,13 @@ struct Request {
     TransportType transport_hint =
         UNSPEC;  // UNSPEC = follow policy; otherwise pin this request to the
                  // name transport.
+    // Optional SLO deadline as an absolute steady_clock timestamp in
+    // nanoseconds. 0 = no deadline (default), behaves exactly as today.
+    // When set, the engine emits an observability-only feasibility metric
+    // (MLU = actual transfer time / available window) on completion; it does
+    // not yet drive any admission or scheduling decision. See RFC #2519.
+    uint64_t deadline_ns = 0;
+    IntentType intent_type = IntentType::INTENT_UNSPEC;
 };
 
 enum TransferStatusEnum {
@@ -94,6 +157,12 @@ enum TransferStatusEnum {
 struct TransferStatus {
     TransferStatusEnum s;
     size_t transferred_bytes;
+};
+
+struct NicLoadStats {
+    std::string device_name;
+    uint64_t inflight_bytes{0};
+    double ewma_bandwidth_bps{0.0};
 };
 
 enum Permission {

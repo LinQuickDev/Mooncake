@@ -28,16 +28,75 @@ module_name = "mooncake.pg" + version_suffix
 
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
+repo_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
+sysroot_dir = os.path.join(repo_dir, ".deps", "sysroot", "usr")
+
+
+def existing_dirs(*paths):
+    return [path for path in paths if os.path.isdir(path)]
+
+
+sysroot_include_dirs = existing_dirs(
+    os.path.join(sysroot_dir, "include"),
+    os.path.join(sysroot_dir, "include", "jsoncpp"),
+    os.path.join(sysroot_dir, "include", "libnl3"),
+)
+sysroot_library_dirs = existing_dirs(
+    os.path.join(sysroot_dir, "lib", "x86_64-linux-gnu"),
+    os.path.join(sysroot_dir, "lib"),
+)
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
-cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
+
+ylt_include_dirs = existing_dirs(
+    *os.getenv("MOONCAKE_YLT_INCLUDE_DIRS", "").split("|")
+)
+if not ylt_include_dirs:
+    raise RuntimeError(
+        "MOONCAKE_YLT_INCLUDE_DIRS is unset or contains no existing directory"
+    )
+
+asio_so_path = os.getenv("MOONCAKE_ASIO_SO_PATH", "")
+if not os.path.isfile(asio_so_path):
+    raise RuntimeError(
+        "MOONCAKE_ASIO_SO_PATH is unset or does not name the libasio.so used "
+        "by engine.so"
+    )
+
+# Match the yalantinglibs configuration used by engine.so / store.so so that
+# header-only types like coro_io::socket_wrapper_t have the same layout across
+# all shared objects loaded in the same process.
+#
+# FIXME: This is fragile. PG is built via setup.py, independently of the main
+# CMake build, so it does not inherit yalantinglibs' compile definitions from
+# engine.so / store.so.  If any yalantinglibs feature macro (e.g. YLT_ENABLE_IBV,
+# etc.) diverges between the C++ targets and this file, template types
+# instantiated into both pg_*.so and store.so will have different layouts,
+#  leading to silent crashes. :(
+cxx_args = [
+    abi_define,
+    "-DYLT_ENABLE_IBV",
+    "-DASIO_SEPARATE_COMPILATION",
+    "-DASIO_DYN_LINK",
+    "-std=c++20",
+    "-O3",
+    "-g0",
+]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
-use_maca = hasattr(torch.version, "maca") and torch.version.maca is not None
+include_dirs = [
+    os.path.join(current_dir, "include"),
+    os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+    *ylt_include_dirs,
+]
+use_maca = (
+    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
+    or (hasattr(torch.version, "maca") and torch.version.maca is not None)
+)
 
 if use_musa:
-    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1", "-DYLT_ENABLE_IBV"]
     cxx_args += musa_defines
     # torchada maps the "nvcc" key to "mcc".
     device_args = [
@@ -50,9 +109,13 @@ if use_musa:
     ]
 else:
     if use_maca:
-        cxx_args.append("-DUSE_MACA")
+        cuda_libraries = []
+        cuda_library_dirs = sysroot_library_dirs.copy()
+        include_dirs += sysroot_include_dirs
+        cxx_args += ["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"]
     device_args = [
         abi_define,
+        "-DYLT_ENABLE_IBV",
         "-std=c++20",
         "-Xcompiler",
         "-O3",
@@ -60,10 +123,10 @@ else:
         "-g0",
     ]
     if use_maca:
-        device_args.append("-DUSE_MACA")
+        device_args += ["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"]
     # Link against the CUDA driver stub library if available.
     # Same approach as mooncake-ep/setup.py.
-    if CUDA_HOME is not None:
+    if not use_maca and CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
         cuda_stub_lib = os.path.join(cuda_stub_dir, "libcuda.so")
         if os.path.exists(cuda_stub_lib):
@@ -75,10 +138,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name=module_name,
-            include_dirs=[
-                os.path.join(current_dir, "include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
+            include_dirs=include_dirs,
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",
@@ -86,7 +146,13 @@ setup(
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_host.cpp",
                 "src/mooncake_worker_thread.cpp",
-                "src/connection_poller.cpp",
+                "src/work_handles.cpp",
+                "src/control_plane/agent.cpp",
+                "src/control_plane/agent_host.cpp",
+                "src/control_plane/coordinator.cpp",
+                "src/control_plane/coordinator_host.cpp",
+                "src/control_plane/rpc_runtime.cpp",
+                "src/control_plane/link_manager.cpp",
             ],
             extra_compile_args={"cxx": cxx_args, "nvcc": device_args},
             libraries=cuda_libraries,
@@ -96,6 +162,7 @@ setup(
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
                 "-Wl,--push-state,--no-as-needed",
                 "-l:engine.so",
+                asio_so_path,
                 "-Wl,--pop-state",
             ],
         )
