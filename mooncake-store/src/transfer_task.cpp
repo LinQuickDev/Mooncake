@@ -13,7 +13,6 @@
 #include <string>
 #include <vector>
 #include "device/accelerator_registry.h"
-#include "gpu_staging_utils.h"
 #include "mooncake_logging.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"

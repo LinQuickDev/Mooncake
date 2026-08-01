@@ -1152,17 +1152,7 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
                    << "': " << it->second;
         return std::nullopt;
     }
-    try {
-        return std::stoull(value);
-    } catch (const std::invalid_argument &e) {
-        LOG(WARNING) << "Invalid non-numeric value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    } catch (const std::out_of_range &e) {
-        LOG(WARNING) << "Value out of range for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    }
+    return static_cast<size_t>(parsed_size_opt.value());
 }
 
 inline std::string trim(const std::string &value) {
