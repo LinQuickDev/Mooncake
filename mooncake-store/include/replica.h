@@ -422,6 +422,21 @@ class Replica {
         return std::nullopt;
     }
 
+    /**
+     * @brief Update a LOCAL_DISK replica's transport endpoint and object size
+     * in place. No-op for non-local_disk replicas. Used when the same owning
+     * client re-offloads / re-registers a key (e.g. after restart the endpoint
+     * changes). Mutates the internal replica data directly; note that
+     * get_descriptor() returns a by-value copy and cannot be used to mutate.
+     */
+    void update_local_disk_location(std::string transport_endpoint,
+                                    uint64_t object_size) {
+        if (auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            disk_data->transport_endpoint = std::move(transport_endpoint);
+            disk_data->object_size = object_size;
+        }
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
