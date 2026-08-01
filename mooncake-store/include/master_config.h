@@ -127,6 +127,11 @@ struct MasterConfig {
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
+    // Strict replica allocation: require memory-only multi-replica requests
+    // to allocate exactly replica_num replicas in PutStart/UpsertStart,
+    // instead of best-effort degradation to fewer replicas.
+    bool strict_replica_allocation = false;
+
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
     bool promotion_on_hit = false;
@@ -232,6 +237,7 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool strict_replica_allocation = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -286,6 +292,7 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -474,6 +481,7 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool strict_replica_allocation = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -563,6 +571,7 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -679,6 +688,7 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -765,6 +775,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    bool strict_replica_allocation_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     // OpLog store configuration
@@ -880,6 +891,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_strict_replica_allocation(bool strict) {
+        strict_replica_allocation_ = strict;
         return *this;
     }
 
@@ -1124,6 +1140,7 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool strict_replica_allocation = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -1209,6 +1226,7 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -1295,6 +1313,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.strict_replica_allocation = strict_replica_allocation_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.enable_oplog = enable_oplog_;

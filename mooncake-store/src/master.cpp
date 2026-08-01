@@ -181,6 +181,10 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_bool(strict_replica_allocation, false,
+            "Require memory-only multi-replica PutStart/UpsertStart to "
+            "allocate exactly replica_num replicas instead of best-effort "
+            "degradation to fewer replicas");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -500,6 +504,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("strict_replica_allocation",
+                           &master_config.strict_replica_allocation,
+                           FLAGS_strict_replica_allocation);
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -847,6 +854,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
     }
+    if ((google::GetCommandLineFlagInfo("strict_replica_allocation", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.strict_replica_allocation =
+            FLAGS_strict_replica_allocation;
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
         !conf_set) {
