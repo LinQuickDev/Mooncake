@@ -357,20 +357,25 @@ static std::vector<UBDevice> listUBDevices(
     std::vector<UBDevice> devices;
 
     urma_init_attr_t init_attr = {};
-    if (urma_init(&init_attr) != URMA_SUCCESS) {
-        LOG(WARNING) << "Failed to urma init";
+    auto ret = urma_init(&init_attr);
+    if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
+        LOG(WARNING) << "Failed to urma init, ret=" << ret;
         return {};
     }
-    LOG(INFO) << "URMA module init success";
+    const bool need_uninit = (ret == URMA_SUCCESS);
+    LOG(INFO) << "URMA module init success, ret=" << ret
+              << ", need_uninit=" << need_uninit;
+
     urma_device_t **device_list = urma_get_device_list(&num_devices);
     if (!device_list) {
         LOG(WARNING) << "No UB devices found, check your device installation";
-        urma_uninit();
+        if (need_uninit) urma_uninit();
         return {};
     }
-    if (device_list && num_devices <= 0) {
+    if (num_devices <= 0) {
         LOG(WARNING) << "No UB devices found, check your device installation";
         urma_free_device_list(device_list);
+        if (need_uninit) urma_uninit();
         return {};
     }
 
@@ -397,7 +402,19 @@ static std::vector<UBDevice> listUBDevices(
         snprintf(path, sizeof(path), "%s/numa",
                  dirname(dirname(resolved_path)));
         LOG(INFO) << "listUBDevices: numanodepath " << path;
-        std::ifstream(path) >> numa_node;
+        // The ubcore "numa" attribute is written in hex (e.g. "0x01"), unlike
+        // the infiniband "numa_node" which is decimal. A plain `>> int` parses
+        // "0x01" as 0 (stops at 'x'), so read as string and pick the base by
+        // the 0x prefix.
+        std::string numa_str;
+        std::ifstream(path) >> numa_str;
+        if (!numa_str.empty()) {
+            int base = (numa_str.rfind("0x", 0) == 0 ||
+                        numa_str.rfind("0X", 0) == 0)
+                           ? 16
+                           : 10;
+            numa_node = static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
+        }
         LOG(INFO) << "UBDevices : performation node ----"
                   << device_list[i]->name << " : " << numa_node;
 
@@ -406,7 +423,7 @@ static std::vector<UBDevice> listUBDevices(
                                    .numa_node = numa_node});
     }
     urma_free_device_list(device_list);
-    urma_uninit();
+    if (need_uninit) urma_uninit();
     return devices;
 }
 
@@ -695,6 +712,10 @@ std::string Topology::toString() const {
     return value.toStyledString();
 }
 
+bool Topology::operator==(const Topology &other) const {
+    return matrix_ == other.matrix_ && hca_list_ == other.hca_list_;
+}
+
 Json::Value Topology::toJson() const {
     Json::Value root;
     for (const auto &pair : matrix_) {
@@ -756,6 +777,10 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
     auto &entry = resolved_matrix_[storage_type];
+    if (entry.preferred_hca.empty() && entry.avail_hca.empty()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
     if (retry_count == 0) {
         int rand_value;
         if (use_round_robin_) {
@@ -778,7 +803,7 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
             return entry.avail_hca[index];
         }
     }
-    return 0;
+    return ERR_DEVICE_NOT_FOUND;
 }
 
 int Topology::resolve() {
@@ -824,6 +849,13 @@ int Topology::resolve() {
 }
 
 int Topology::disableDevice(const std::string &device_name) {
+    int disabled_hca_index = -1;
+    auto hca_iter = std::find(hca_list_.begin(), hca_list_.end(), device_name);
+    if (hca_iter != hca_list_.end()) {
+        disabled_hca_index =
+            static_cast<int>(std::distance(hca_list_.begin(), hca_iter));
+    }
+
     for (auto &record : matrix_) {
         auto &preferred_hca = record.second.preferred_hca;
         auto preferred_hca_iter =
@@ -835,6 +867,35 @@ int Topology::disableDevice(const std::string &device_name) {
             std::find(avail_hca.begin(), avail_hca.end(), device_name);
         if (avail_hca_iter != avail_hca.end()) avail_hca.erase(avail_hca_iter);
     }
-    return resolve();
+
+    if (disabled_hca_index < 0) return 0;
+
+    // Keep existing HCA indexes stable. RDMA transport stores lkey/rkey and
+    // context arrays by the resolved HCA index, so re-running resolve() here
+    // could compact indexes after a disabled device and make those arrays point
+    // at the wrong RNIC.
+    for (auto &record : resolved_matrix_) {
+        auto &preferred_hca = record.second.preferred_hca;
+        preferred_hca.erase(
+            std::remove(preferred_hca.begin(), preferred_hca.end(),
+                        disabled_hca_index),
+            preferred_hca.end());
+        record.second.preferred_hca_name_to_index_map_.erase(device_name);
+
+        auto &avail_hca = record.second.avail_hca;
+        avail_hca.erase(
+            std::remove(avail_hca.begin(), avail_hca.end(), disabled_hca_index),
+            avail_hca.end());
+        record.second.avail_hca_name_to_index_map_.erase(device_name);
+    }
+    for (auto &local_entry : resolved_hca_peer_affinity_by_local_) {
+        for (auto &storage_entry : local_entry.second) {
+            auto &candidates = storage_entry.second;
+            candidates.erase(std::remove(candidates.begin(), candidates.end(),
+                                         disabled_hca_index),
+                             candidates.end());
+        }
+    }
+    return 0;
 }
 }  // namespace mooncake

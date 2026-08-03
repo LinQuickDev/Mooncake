@@ -14,9 +14,12 @@
 
 #include "config.h"
 
+#include <charconv>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <sstream>
 #include <strings.h>
@@ -317,6 +320,27 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.metacache = false;
     }
 
+    const char* te_metadata_refresh_interval_seconds =
+        std::getenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
+    if (te_metadata_refresh_interval_seconds) {
+        try {
+            int val = std::stoi(te_metadata_refresh_interval_seconds);
+            if (val >= 0) {
+                config.te_metadata_refresh_interval_seconds =
+                    static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_TE_METADATA_REFRESH_INTERVAL_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_TE_METADATA_REFRESH_INTERVAL_SECONDS "
+                            "environment "
+                            "value: "
+                         << te_metadata_refresh_interval_seconds
+                         << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
@@ -335,6 +359,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* handshake_worker_threads =
+        std::getenv("MC_HANDSHAKE_WORKER_THREADS");
+    if (handshake_worker_threads) {
+        try {
+            int val = std::stoi(handshake_worker_threads);
+            if (val > 0) {
+                config.handshake_worker_threads = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_WORKER_THREADS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_WORKER_THREADS environment "
+                            "value: "
+                         << handshake_worker_threads << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_connect_timeout =
         std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
     if (handshake_connect_timeout) {
@@ -344,6 +386,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_HANDSHAKE_CONNECT_TIMEOUT";
+    }
+
+    const char* rdma_rail_pause_seconds =
+        std::getenv("MC_RDMA_RAIL_PAUSE_SECONDS");
+    if (rdma_rail_pause_seconds) {
+        try {
+            int val = std::stoi(rdma_rail_pause_seconds);
+            if (val > 0 && val < 3600) {
+                config.rdma_rail_pause_seconds = static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_RDMA_RAIL_PAUSE_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_RDMA_RAIL_PAUSE_SECONDS environment "
+                            "value: "
+                         << rdma_rail_pause_seconds << ". Error: " << e.what();
+        }
     }
 
     const char* log_level = std::getenv("MC_LOG_LEVEL");
@@ -372,9 +432,36 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
     }
 
+    const char* conn_pause_ttl_env = std::getenv("MC_CONN_PAUSE_TTL_MS");
+    if (conn_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0. 0 is a valid explicit "disable";
+        // negative / out-of-range / garbage are rejected, preserving the
+        // default.
+        int val = 0;
+        const char* end = conn_pause_ttl_env + strlen(conn_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(conn_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 0 && val <= 600000) {
+                config.conn_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONN_PAUSE_TTL_MS, value "
+                             << conn_pause_ttl_env
+                             << " out of range (should be 0-600000)";
+            }
+        } else {
+            LOG(WARNING) << "Invalid MC_CONN_PAUSE_TTL_MS environment value: "
+                         << conn_pause_ttl_env
+                         << ". Expected an integer in range 0-600000";
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        if (!google::IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging("mooncake-transfer-engine");
+        }
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
@@ -451,6 +538,14 @@ void loadGlobalConfig(GlobalConfig& config) {
         parseBoolConfigEnv(log_rdma_slice_affinity_env,
                            "MC_LOG_RDMA_SLICE_AFFINITY",
                            config.log_rdma_slice_affinity);
+    }
+
+    const char* track_rdma_posted_slices_env =
+        std::getenv("MC_TRACK_RDMA_POSTED_SLICES");
+    if (track_rdma_posted_slices_env) {
+        parseBoolConfigEnv(track_rdma_posted_slices_env,
+                           "MC_TRACK_RDMA_POSTED_SLICES",
+                           config.track_rdma_posted_slices);
     }
 
     const char* enable_parallel_reg_mr =
@@ -560,6 +655,64 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (std::getenv("MC_URMA_BONDING_BALANCE")) {
+        config.urma_bonding_balance = true;
+    }
+
+    const char* urma_trans_mode_env = std::getenv("MC_URMA_TRANS_MODE");
+    if (urma_trans_mode_env && *urma_trans_mode_env) {
+        std::string val(urma_trans_mode_env);
+        if (val == "RM" || val == "RC" || val == "UM")
+            config.urma_trans_mode = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_URMA_TRANS_MODE, it should be RM|RC|UM";
+    }
+
+    const char* urma_active_port_env = std::getenv("MC_URMA_ACTIVE_PORT");
+    if (urma_active_port_env && *urma_active_port_env) {
+        try {
+            int val = std::stoi(urma_active_port_env);
+            if (val >= 0) {
+                config.urma_active_port = val;
+                LOG(INFO) << "MC_URMA_ACTIVE_PORT is " << val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_URMA_ACTIVE_PORT, it should be >= 0; "
+                                "using auto-selection (scan active ports)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to parse MC_URMA_ACTIVE_PORT='"
+                         << urma_active_port_env << "': " << e.what()
+                         << "; using auto-selection (scan active ports)";
+        }
+    }
+
+    const char* urma_bonding_multipath_enable =
+        std::getenv("MC_URMA_BONDING_MULTIPATH_ENABLE");
+    if (urma_bonding_multipath_enable && *urma_bonding_multipath_enable) {
+        std::string val(urma_bonding_multipath_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.urma_bonding_multipath = true;
+            LOG(WARNING) << "MC_URMA_BONDING_MULTIPATH_ENABLE is " << val;
+        } else
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                   "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
+    }
+
+    const char* ub_numa_affinity_enable =
+        std::getenv("MC_UB_NUMA_AFFINITY_ENABLE");
+    if (ub_numa_affinity_enable && *ub_numa_affinity_enable) {
+        std::string val(ub_numa_affinity_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.ub_numa_affinity = true;
+            LOG(WARNING) << "MC_UB_NUMA_AFFINITY_ENABLE is " << val;
+        } else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_UB_NUMA_AFFINITY_ENABLE, it should be true|1|on";
+    }
+
     const char* mlx5_qp_lag_port_balance_env =
         std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
     if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
@@ -631,6 +784,15 @@ void dumpGlobalConfig() {
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "te_metadata_refresh_interval_seconds = "
+              << config.te_metadata_refresh_interval_seconds;
+    LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "handshake_listen_backlog = "
+              << config.handshake_listen_backlog;
+    LOG(INFO) << "handshake_worker_threads = "
+              << config.handshake_worker_threads;
+    LOG(INFO) << "handshake_connect_timeout = "
+              << config.handshake_connect_timeout;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -645,6 +807,11 @@ void dumpGlobalConfig() {
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
+    LOG(INFO) << "track_rdma_posted_slices = "
+              << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
+    LOG(INFO) << "urma_bonding_balance = "
+              << (config.urma_bonding_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

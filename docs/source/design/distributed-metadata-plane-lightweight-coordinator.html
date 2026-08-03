@@ -1,0 +1,2066 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Mooncake 分布式元数据管理面轻量 Coordinator 架构设计</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+      color: #1f2937;
+      max-width: 1180px;
+      margin: 32px auto;
+      padding: 0 24px;
+      background: #ffffff;
+    }
+    h1, h2, h3, h4 {
+      color: #111827;
+      line-height: 1.3;
+    }
+    h1 {
+      border-bottom: 2px solid #e5e7eb;
+      padding-bottom: 12px;
+    }
+    h2 {
+      margin-top: 34px;
+      border-left: 4px solid #2563eb;
+      padding-left: 10px;
+    }
+    h3 {
+      margin-top: 24px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 12px 0 20px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid #d1d5db;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th {
+      background: #f3f4f6;
+      text-align: left;
+    }
+    code {
+      background: #f3f4f6;
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    pre {
+      background: #111827;
+      color: #f9fafb;
+      padding: 14px;
+      border-radius: 6px;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    pre.mermaid {
+      background: #ffffff;
+      color: #111827;
+      border: 1px solid #d1d5db;
+      text-align: center;
+      padding: 18px 10px;
+    }
+    .diagram-note {
+      color: #4b5563;
+      font-size: 13px;
+      margin-top: -10px;
+    }
+    .ok {
+      background: #ecfdf5;
+      border-left: 4px solid #10b981;
+      padding: 12px 14px;
+      margin: 16px 0;
+    }
+    .note {
+      background: #eff6ff;
+      border-left: 4px solid #2563eb;
+      padding: 12px 14px;
+      margin: 16px 0;
+    }
+    .warn {
+      background: #fff7ed;
+      border-left: 4px solid #f97316;
+      padding: 12px 14px;
+      margin: 16px 0;
+    }
+    .danger {
+      background: #fef2f2;
+      border-left: 4px solid #ef4444;
+      padding: 12px 14px;
+      margin: 16px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>Mooncake 分布式元数据管理面轻量 Coordinator 架构设计</h1>
+
+  <h2>1. 设计摘要</h2>
+  <div class="ok">
+    <strong>推荐方案：</strong>
+    采用 Redis Cluster 风格的固定 slot 分片和客户端直连路由，同时引入一个不在前台请求路径上的轻量 Coordinator。
+    Coordinator 只负责集群视图、slot 迁移计划、ownership version 与 fencing 发布、资源摘要聚合和后台任务预算调节；<code>GetReplicaList</code>、<code>PutStart</code>、<code>PutEnd</code> 等热路径请求仍由客户端直接访问 slot 所属 MasterGroup 的 current primary。
+  </div>
+
+  <h3>1.1 术语与层次</h3>
+  <table>
+    <thead><tr><th>术语</th><th>本文中的唯一含义</th></tr></thead>
+    <tbody>
+      <tr><td>MasterNode</td><td>一个可寻址的 Master 进程实例；是部署、租约和故障域单位。</td></tr>
+      <tr><td>MasterGroup</td><td>一个复制组；是日志提交、主备切换和一致性单位，包含一个 current primary 和若干 replica。</td></tr>
+      <tr><td>Slot</td><td>由 key hash 得到的固定路由编号。</td></tr>
+      <tr><td>SlotGroup</td><td>一组连续或离散 slot；是负载统计和组间迁移单位。</td></tr>
+      <tr><td>Slot owner</td><td>拥有 SlotGroup 的 MasterGroup，而不是某个永久固定的 MasterNode。</td></tr>
+      <tr><td>Group primary</td><td>MasterGroup 当前接收强一致前台请求的 MasterNode，随 term 变化。</td></tr>
+    </tbody>
+  </table>
+  <p>
+    下文若使用“Master 服务”，仅泛指 MasterNode 上运行的服务。路由、所有权或 failover 描述必须明确使用
+    MasterGroup、Group primary 或 MasterNode，避免“Master Shard”同时指进程、复制组和 slot 分片。
+  </p>
+
+  <h3>1.2 Generation、Term、Revision 与 Fencing</h3>
+  <p>
+    本设计不再把所有版本都称为 epoch，而是只区分三种语义：<strong>generation/term</strong> 是 fencing token，
+    用于隔离旧 owner；<strong>revision</strong> 只用于快照发布、CAS 和增量 watch；<strong>sequence</strong> 只用于同一数据流内的样本排序。
+    只有 generation/term 会决定请求是否有权改变状态，revision 和 sequence 都不能授予写权限。
+  </p>
+
+  <pre>
+初始状态：SlotGroup S belongs to MasterGroup G1, assignment_generation = 7
+
+Client C1 cached: S -> G1, generation 7
+Coordinator migrates S: G1 -> G2, generation becomes 8
+
+C1 sends Put(key, owner=G1, assignment_generation=7)
+G1/G2 compares request generation with durable assignment:
+  7 &lt; 8  -> reject STALE_ASSIGNMENT or MOVED(S, G2, 8)
+
+Without assignment_generation:
+  delayed C1 or old G1 might continue modifying S after cutover,
+  creating two owners and divergent object metadata.
+  </pre>
+
+  <div class="warn">
+    <strong>Generation/term 的作用不是发现故障，而是隔离旧状态。</strong>
+    lease/heartbeat 用于判断参与者可能失活；generation/term 用于在发生切换后证明请求仍属于当前一代。
+    仅检测到旧 primary 断连是不够的，因为它可能仍在运行，只是发生了网络分区。
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>字段</th>
+        <th>类别</th>
+        <th>作用域</th>
+        <th>何时递增</th>
+        <th>防止的问题</th>
+        <th>旧值处理</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>view_revision</code></td>
+        <td>Revision</td>
+        <td>整个 ClusterView</td>
+        <td>任意已发布集群视图发生变化</td>
+        <td>增量更新乱序、旧 view 覆盖新 view</td>
+        <td>客户端忽略旧 view；watch 缺口时重新读取全量 view</td>
+      </tr>
+      <tr>
+        <td><code>node_incarnation_id</code></td>
+        <td>Incarnation UUID</td>
+        <td>一个 <code>node_id</code> 的进程 incarnation</td>
+        <td>MasterNode 每次启动生成新的 UUID</td>
+        <td>重启前残留 lease/heartbeat 覆盖新进程状态</td>
+        <td>拒绝旧 incarnation 的续租和上报</td>
+      </tr>
+      <tr>
+        <td><code>term</code></td>
+        <td>Fencing term</td>
+        <td>一个 MasterGroup</td>
+        <td>组内选出或授权新的 primary</td>
+        <td>旧 primary 在网络分区后继续提交写</td>
+        <td>返回 <code>STALE_TERM</code> 或 <code>NOT_PRIMARY</code></td>
+      </tr>
+      <tr>
+        <td><code>assignment_generation</code></td>
+        <td>Fencing generation</td>
+        <td>一个 SlotGroup</td>
+        <td>SlotGroup 从一个 MasterGroup 迁到另一个 MasterGroup</td>
+        <td>迁移后 source group 或旧客户端继续修改对象元数据</td>
+        <td>返回 <code>STALE_ASSIGNMENT</code> 或 <code>MOVED</code></td>
+      </tr>
+      <tr>
+        <td><code>control_generation</code></td>
+        <td>Fencing generation</td>
+        <td>一个 Storage Client 的控制归属</td>
+        <td>client control owner 从一个 MasterGroup 迁到另一个 group</td>
+        <td>两个 group 同时接收 segment heartbeat、mount/unmount 或下发任务</td>
+        <td>拒绝旧 heartbeat/控制写并返回新 control owner</td>
+      </tr>
+      <tr>
+        <td><code>segment_incarnation</code></td>
+        <td>Fencing incarnation</td>
+        <td>一个物理 segment/allocator incarnation</td>
+        <td>segment 重新注册、重建 allocator 或不可兼容地 remount</td>
+        <td>旧 reservation/descriptor 写入已经重建的物理空间</td>
+        <td>reservation 失败，重新查询 segment 并分配</td>
+      </tr>
+      <tr>
+        <td><code>resource_revision</code></td>
+        <td>Revision</td>
+        <td>一版聚合 ResourceView</td>
+        <td>Coordinator 发布新的资源摘要</td>
+        <td>资源视图乱序覆盖</td>
+        <td>忽略旧摘要；它不单独提供空间分配正确性</td>
+      </tr>
+      <tr>
+        <td><code>sample_seq</code></td>
+        <td>Sequence</td>
+        <td>一个 segment 的遥测流</td>
+        <td>同一 <code>segment_incarnation</code> 每发布一个样本递增</td>
+        <td>延迟到达的容量/带宽样本覆盖新样本</td>
+        <td>丢弃旧样本并结合 timestamp 判断 freshness</td>
+      </tr>
+      <tr>
+        <td><code>budget_revision</code></td>
+        <td>Revision</td>
+        <td>一版 BackgroundBudget</td>
+        <td>Coordinator 调整后台任务预算</td>
+        <td>旧预算重新放大迁移或 offload 流量</td>
+        <td>忽略旧预算；当前预算过期则使用保守默认值</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    四个 fencing scope 是 <code>group term</code>、<code>slot assignment generation</code>、<code>client control generation</code>
+    和 <code>segment incarnation</code>。前三者可共享 <code>FencingToken{scope_id, generation}</code> 的实现；segment 使用 UUID incarnation token。
+    它们属于不同状态机，不能跨 scope 比较。
+    revision/sequence 使用无符号 64 位单调计数器；incarnation 使用启动或重建时生成的 UUID，避免依赖旧进程持久化计数器。
+  </p>
+  <pre>
+// 通用比较规则，不表示存在一个全局 generation。
+struct FencingToken {
+  string scope_id;
+  uint64_t generation;
+}
+
+SnapshotRevision = uint64_t;   // view/resource/budget，只用于排序、watch 和 CAS
+IncarnationId = UUID;          // node/segment，每次重启或重建生成新值
+StreamSequence = uint64_t;     // telemetry，在同一 incarnation 内单调递增
+  </pre>
+
+  <h4>1.2.1 Term 为什么单独命名</h4>
+  <p>
+    <code>term</code> 本质上是 MasterGroup 的领导权 generation，但保留 term 这个名称是为了和 Raft 等复制协议一致。
+    QUORUM 模式由组选举产生更高 term；ASYNC_STANDBY 模式由 Coordinator 在取得独占 fencing token 后授权更高 term。
+    无论采用哪种模式，数据写入权威方都必须检查 term。只把新 primary 地址写入服务发现，而不在提交点检查 term，不能防止双主。
+  </p>
+
+  <h4>1.2.2 Fencing 是什么</h4>
+  <p>
+    Fencing（隔离旧持有者）是“在最终写入点拒绝旧 token”的机制，generation/term/incarnation 是本文的 fencing token。
+    检查必须发生在真正改变状态的地方，例如 MasterGroup 日志提交、segment allocator reserve/free、HA Backend CAS，
+    而不能只在客户端或入口 RPC 检查一次。否则请求通过检查后发生切主，延迟请求仍可能写入。
+  </p>
+
+  <h3>1.3 一致性与故障恢复基础概念</h3>
+  <table>
+    <thead><tr><th>概念</th><th>解释及本文中的用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>Lease</code></td><td>有到期时间的临时所有权/存活声明，持有者必须续租。用于故障检测和资源自动回收，但不能代替 fencing。</td></tr>
+      <tr><td><code>CAS</code></td><td>Compare-And-Swap：仅当持久化值仍等于预期版本时才更新。用于保证两个 Coordinator 或迁移流程不能同时提交冲突 owner。</td></tr>
+      <tr><td><code>Quorum</code></td><td>复制组的多数派。3 voter 中至少 2 个确认后提交，可容忍 1 个故障；失去多数派时宁可拒绝写，也不能产生两个合法 primary。</td></tr>
+      <tr><td><code>OpLog</code></td><td>按顺序记录元数据状态变化的操作日志。replica 和迁移 target 先加载 snapshot，再 replay 后续 OpLog。</td></tr>
+      <tr><td><code>Snapshot</code></td><td>某个一致性位置上的完整状态快照，用于避免从第一条 OpLog 开始恢复。snapshot 必须携带其对应的 log/commit position。</td></tr>
+      <tr><td><code>Replay lag</code></td><td>target/replica 已应用位置与 source committed position 的差距。只有追到 cutover position 才能安全接管。</td></tr>
+      <tr><td><code>RPO</code></td><td>Recovery Point Objective，可接受的数据丢失范围。QUORUM 已提交写目标是 RPO=0；异步主备的 RPO 由尚未 replay 的日志决定。</td></tr>
+      <tr><td><code>RTO</code></td><td>Recovery Time Objective，从故障发生到恢复服务允许的时间；受故障检测、选主和 replay lag 影响。</td></tr>
+      <tr><td><code>Idempotency key</code></td><td>同一逻辑操作重试时保持不变的 ID，使重复请求只产生一次状态变化，用于 reservation 和后台 Task。</td></tr>
+      <tr><td><code>ResourceView</code></td><td>容量、带宽、IOPS 和健康状态的近实时只读快照，用于选候选；它可能过期，因此最终 reserve 仍需 allocator 原子确认。</td></tr>
+      <tr><td><code>Reservation</code></td><td>带 TTL 的临时资源承诺。PutStart 预留、PutEnd 提交、PutRevoke/超时释放，以避免并发请求超卖。</td></tr>
+      <tr><td><code>Replica descriptor</code></td><td>描述一个对象副本所在 segment、offset/length、介质类型和访问参数的元数据；它不是对象数据本身。</td></tr>
+      <tr><td><code>Failure domain</code></td><td>共享故障风险的边界，例如进程、机器、机架或 AZ。副本跨域放置是为了避免一次故障同时损坏全部副本。</td></tr>
+      <tr><td><code>Locality</code></td><td>调用方与 segment 之间的 NUMA、主机、机架、AZ 或网络 fabric 距离，用于估算访问时延和网络成本。</td></tr>
+      <tr><td><code>Rendezvous hash</code></td><td>对“实体、候选节点”组合计算稳定分数并选最高者；候选集合变化时只移动较少实体。本文用于生成初始 control-owner 建议，最终映射仍由 Coordinator 显式提交。</td></tr>
+      <tr><td><code>Hard constraint</code></td><td>不满足就绝不能选择的条件，例如容量不足、介质能力不符或副本处于同一故障域；与可权衡的软评分分开处理。</td></tr>
+      <tr><td><code>Dominant resource</code></td><td>某候选节点上占用比例最高的资源维度。例如容量只占 20% 但带宽占 90%，其主导资源是带宽，不能因容量充足继续放置。</td></tr>
+      <tr><td><code>Hysteresis</code></td><td>进入和退出某状态使用不同阈值或连续观测窗口，避免热点副本、预算和读路由在临界值附近频繁来回切换。</td></tr>
+      <tr><td><code>P99.9</code></td><td>99.9% 请求时延不超过的值，即每 1,000 个请求约有 1 个更慢；用于约束极端尾延迟，而不仅是平均性能。</td></tr>
+      <tr><td><code>MOVED</code></td><td>SlotGroup 已稳定归属于另一个 MasterGroup；客户端应更新本地长期路由并重试。</td></tr>
+      <tr><td><code>ASK</code></td><td>SlotGroup 正在迁移，客户端仅对本次请求访问 importing group，不永久覆盖本地 owner。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>1.4 一次 Put 请求如何使用这些版本号</h3>
+  <pre>
+1. Client 从 ClusterView(view_revision=100) 得到：
+     slot 42 -> SlotGroup S7(assignment_generation=8)
+             -> MasterGroup G2(term=12)
+             -> primary endpoint B
+
+2. Client 向 B 发送 PutStart：
+     {group=G2, term=12, slot=42, assignment_generation=8, request_id=R}
+
+3. B 在写入 PROCESSING 元数据前检查：
+     a. 自己仍是 G2 term 12 的 primary；否则 NOT_PRIMARY/STALE_TERM
+     b. slot 42 仍属于 G2 且 generation=8；否则 MOVED/STALE_ASSIGNMENT
+     c. request_id R 是否已处理；若是则返回相同结果
+
+4. B 使用本地 ResourceView 选择目标存储节点，并从本组的 DelegatedExtentPool
+   分配已由后台租入的空间和资源预算。常态 Put 不同步访问 Coordinator 或远端 allocator。
+
+5. B 写入 PROCESSING 元数据，将变更异步复制给 standby，然后返回 replica descriptors。
+
+6. Client 写数据并发送 PutEnd(R)。B 再次检查 term、assignment_generation 和 request_id，
+   然后把对象从 PROCESSING 转为 COMPLETE，并异步复制该变更。
+  </pre>
+  <p>
+    <code>view_revision</code> 只说明客户端使用哪一版路由快照，不授予写权限；真正保护写正确性的是对应作用域的
+    <code>term</code>、<code>assignment_generation</code>、<code>segment_incarnation</code> 以及幂等 request_id。即使客户端 view 不是最新，
+    服务端也能拒绝危险写，并通过错误码引导客户端刷新。
+  </p>
+
+  <div class="note">
+    <strong>和 Redis 的关系：</strong>
+    Redis Cluster 没有独立 Coordinator，slot ownership 和 failover 信息由节点 gossip 传播，reshard 通常由外部工具驱动。
+    Mooncake 的不同点在于 Master 还承担物理空间管理、冷热分级、租约、client liveness 和后台迁移任务。
+    因此引入轻量 Coordinator 是为了管理 Mooncake 特有的全局控制问题，而不是替代 Redis Cluster 的去中心化热路径。
+  </div>
+
+  <div class="warn">
+    <strong>P99.9 原则：</strong>
+    Coordinator 不能成为 P99.9 热路径依赖。客户端在正常读写时不访问 Coordinator；Coordinator 故障只影响扩缩容、rebalance、跨组迁移、视图发布和预算调节，不影响已有稳定 group 的前台读写或 quorum 组内选主。
+  </div>
+
+  <h2>2. 设计目标与非目标</h2>
+  <h3>2.1 设计目标</h3>
+  <ul>
+    <li>将对象元数据按固定 slot 拆分到多个 MasterGroup，解除单 MasterNode 的 CPU、锁和 RPC 瓶颈。</li>
+    <li>保持前台请求路径短：客户端计算 slot，直接访问对应 MasterGroup 的 current primary。</li>
+    <li>在扩缩容、slot 迁移、failover、冷热分级、资源压力下保持 P99.9 时延稳定。</li>
+    <li>用轻量 Coordinator 管理 slot view、资源摘要和后台预算，但不代理元数据请求。</li>
+    <li>支持兼容式演进：单 Master 先暴露全量 slot view，再逐步引入多 Master 和迁移能力。</li>
+  </ul>
+
+  <h3>2.2 非目标</h3>
+  <ul>
+    <li>不把 Coordinator 做成所有元数据 RPC 的代理。</li>
+    <li>不要求跨 slot Batch 操作具备全局原子性；默认提供逐 key 成功/失败结果。</li>
+    <li>不要求第一阶段实现完整自动 rebalance；可以先由管理命令触发迁移计划。</li>
+    <li>不把物理数据迁移放入 Master 进程内同步执行；Master 只负责元数据状态机和任务编排。</li>
+  </ul>
+
+  <h2>3. 顶层架构</h2>
+  <pre>
++---------------------------+
+| Mooncake Client / SDK     |
+| - slot(key)               |
+| - slot map cache          |
+| - MOVED/ASK retry         |
+| - batch regroup           |
++-------------+-------------+
+              |
+              | foreground metadata RPC
+              v
++-------------------+   +-------------------+   +-------------------+
+| Group G1 primary  |   | Group G2 primary  |   | Group G3 primary  |
+| serves slot groups|   | serves slot groups|   | serves slot groups|
+| object metadata   |   | object metadata   |   | object metadata   |
+| lease / tasks     |   | lease / tasks     |   | lease / tasks     |
++---------+---------+   +---------+---------+   +---------+---------+
+          |                       |                       |
+          | resource summary, latency stats, migration state
+          v                       v                       v
++---------------------------------------------------------+
+| Lightweight Coordinator                                 |
+| - cluster view publisher                                |
+| - slot ownership / generation                           |
+| - migration planner                                     |
+| - group placement / fencing publisher                   |
+| - resource summary aggregator                           |
+| - background budget controller                          |
++---------------------------+-----------------------------+
+                            |
+                            | durable cluster metadata
+                            v
++---------------------------------------------------------+
+| HA Backend                                               |
+| etcd / Redis / K8s Lease / persistent catalog / OpLog    |
++---------------------------------------------------------+
+
++---------------------------------------------------------+
+| Storage Clients / Segments                               |
+| - memory / local disk / NoF SSD / CXL                    |
+| - heartbeat / capacity / health                          |
+| - execute copy/offload/promotion tasks                   |
++---------------------------------------------------------+
+  </pre>
+
+  <h3>3.1 核心原则</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>原则</th>
+        <th>含义</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>热路径去中心化</td>
+        <td>客户端通过本地 slot map 直连 owner MasterGroup 的 current primary，不经过 Coordinator。</td>
+      </tr>
+      <tr>
+        <td>控制路径集中但轻量</td>
+        <td>Coordinator 管理 view、跨组迁移、group placement、fencing 发布和预算，不保存每个对象的热路径状态。</td>
+      </tr>
+      <tr>
+        <td>对象状态单 owner</td>
+        <td>同一个 key 的 Put/Get/Evict/Offload/Promotion 只由当前 slot owner MasterGroup 提交。</td>
+      </tr>
+      <tr>
+        <td>所有权带 fencing token</td>
+        <td>组内 primary 用 term，slot 改属用 assignment_generation，segment 控制权改属用 control_generation；三者不能混用。</td>
+      </tr>
+      <tr>
+        <td>后台任务可退让</td>
+        <td>迁移、snapshot、eviction、offload、promotion 必须受预算控制，P99.9 超阈值时自动降速。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>4. 组件职责</h2>
+  <h3>4.1 Mooncake Client / SDK</h3>
+  <ul>
+    <li>维护本地 <code>ClusterView</code> 和 slot map 缓存。</li>
+    <li>计算 <code>slot = hash(tenant_id, key) % 16384</code>。</li>
+    <li>按 slot owner MasterGroup 解析 current primary endpoint 并直连。</li>
+    <li>处理 <code>MOVED</code>、<code>ASK</code>、<code>NOT_PRIMARY</code>、<code>STALE_TERM</code>、<code>TRYAGAIN</code>、<code>STALE_ASSIGNMENT</code>。</li>
+    <li>对 Batch 请求按 owner regroup，并按原始 key 顺序合并响应。</li>
+    <li>设置 per-RPC deadline，避免单个 Master 慢请求拖垮 P99.9。</li>
+  </ul>
+
+  <h3>4.2 MasterGroup 与其 current primary</h3>
+  <ul>
+    <li>MasterGroup 负责一组 SlotGroup 的对象元数据；current primary 对外服务，replica 按复制模式同步状态。</li>
+    <li>执行对象生命周期状态机：<code>PutStart</code>、<code>PutEnd</code>、<code>PutRevoke</code>、<code>Remove</code>、<code>Evict</code>。</li>
+    <li>维护对象租约、hard pin、soft pin 和访问热度统计。</li>
+    <li>生成和消费对象级后台任务，例如 copy、move、offload、promotion。</li>
+    <li>由 current primary 向 Coordinator 上报前台时延、队列深度、slot 负载、资源使用摘要和迁移状态。</li>
+    <li>订阅 Coordinator 发布的 cluster view、resource view 和 background budget。</li>
+  </ul>
+
+  <h3>4.3 Lightweight Coordinator</h3>
+  <ul>
+    <li>维护 MasterNode incarnation、MasterGroup membership、slot ownership、assignment generation 和 view revision。</li>
+    <li>生成扩缩容和 rebalance 计划。</li>
+    <li>协调 slot group 迁移状态机，但不搬运前台请求。</li>
+    <li>汇总 segment resource summary，发布近实时 ResourceView。</li>
+    <li>根据 P99.9、队列深度、CPU、网络、replay lag 动态调节后台任务预算。</li>
+    <li>观察组内选主结果并发布带 term 的新 primary endpoint；通过 HA Backend fencing 防止旧 primary 继续写。</li>
+  </ul>
+
+  <h3>4.4 HA Backend</h3>
+  <ul>
+    <li>持久化 cluster view、slot ownership、membership lease 和 coordinator lease。</li>
+    <li>保存 MasterGroup 的 OpLog、snapshot catalog、commit position 或恢复指针。</li>
+    <li>在 Coordinator 故障时支持新 Coordinator 接管。</li>
+  </ul>
+
+  <h3>4.5 Storage Client / Segment</h3>
+  <ul>
+    <li>向 Master 或 Resource Registry 上报 segment 容量、水位、健康状态。</li>
+    <li>执行数据路径操作，例如 RDMA 写、SSD offload、本地 promotion、replica clear。</li>
+    <li>通过 task heartbeat 获取 offload/promotion/copy/move 任务。</li>
+  </ul>
+
+  <h3>4.6 Segment 与 MasterGroup 的归属关系</h3>
+  <div class="ok">
+    <strong>结论：</strong>
+    key 的 <code>slot owner</code> 和 segment 的 <code>control owner</code> 是两套独立映射。
+    slot owner 管对象及其 replica 状态；segment control owner 管 segment 注册、心跳、健康状态和客户端级任务通道。
+    一个对象可以被放到任意健康 segment 上，因此对象的 slot owner 不要求等于该 segment 的 control owner。
+  </div>
+
+  <p>
+    推荐按 <code>client_id</code> 而不是按 <code>segment_id</code> 分配 segment control owner：同一个 Storage Client
+    注册的 MEMORY、LOCAL_DISK、NOF_SSD 等全部 segment 由同一个 control-owner MasterGroup 管理，heartbeat 发往该组 current primary。
+    这样 client liveness、一次 heartbeat 中携带的多个 segment 状态以及下发给该 client 的任务队列都落在同一处，
+    不需要拆分一次 heartbeat。Coordinator 在 <code>ClusterView</code> 中持久化该映射；初次加入时可用
+    rendezvous hash 选择 control-owner MasterGroup，并在负载不均衡时显式迁移，而不能由各 MasterNode 独立计算后直接生效。
+  </p>
+
+  <pre>
+对象控制面：hash(tenant_id, key) -> slot -> slot owner MasterGroup -> current primary
+Segment 控制面：client_id -> client control-owner MasterGroup -> current primary -> 全部 segments
+
+例：
+  Group G1 owns slots [0, 4095]       and controls Client X -> [Segment X.mem, X.ssd]
+  Group G2 owns slots [4096, 8191]    and controls Client Y -> [Segment Y.mem]
+  Group G3 owns slots [8192, 16383]   and controls Client Z -> [Segment Z.mem, Z.nof]
+
+  key K belongs to a slot owned by G2
+  K replicas may be placed on X.mem and Z.nof
+  G2 owns K metadata and decides create/remove/offload/promotion
+  G1 controls X.mem health; G3 controls Z.nof health
+  Storage Client X/Z remains the authority that atomically reserves/frees physical extents
+  </pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>状态或动作</th>
+        <th>唯一写入者/权威方</th>
+        <th>其他 Master 如何使用</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>key、replica descriptor、对象状态机</td>
+        <td>key 的 slot owner MasterGroup</td>
+        <td>非 owner 返回 <code>MOVED</code>，不得修改</td>
+      </tr>
+      <tr>
+        <td>client lease、segment mount/unmount、health、watermark</td>
+        <td>client control-owner MasterGroup</td>
+        <td>通过只读 ResourceView 获取摘要</td>
+      </tr>
+      <tr>
+        <td>物理 extent 的 reserve/free</td>
+        <td>Storage Client 的 allocator，使用 lease/CAS 和幂等 request_id</td>
+        <td>slot owner 直接请求 allocator；control owner 不在每次 Put 的同步链路中</td>
+      </tr>
+      <tr>
+        <td>offload/promotion/copy/move 的对象决策</td>
+        <td>对象 slot owner MasterGroup</td>
+        <td>任务经 client control owner 的 heartbeat 通道投递，完成后回报 slot owner</td>
+      </tr>
+      <tr>
+        <td>segment control owner 映射</td>
+        <td>Coordinator + HA Backend CAS</td>
+        <td>所有 Master 订阅同一版本化映射</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    因而“G1 管理 Segment X”只表示 G1 是 X 所属 client 的控制面 owner，并不表示只有 G1 的 slot
+    才能在 X 上放 replica。所有 slot-owner group 都可依据 ResourceView 选择 X，但最终空间分配必须由 X 所在
+    Storage Client 的 allocator 原子确认，避免多个 Master 根据过期容量摘要重复分配。
+  </p>
+
+  <h4>4.6.1 Owner 选择、故障与迁移规则</h4>
+  <ul>
+    <li><strong>初始分配：</strong>Coordinator 对 <code>client_id</code> 和 ACTIVE MasterGroup 集合做 rendezvous hash，选择一个 control-owner group；组内 primary/replica 由该组成员关系决定。hash 可叠加连接数、segment 数和 heartbeat QPS 权重。</li>
+    <li><strong>稳定性：</strong>MasterNode 加入或退出时不自动重算全部 client；只有 Coordinator 生成并提交的新 group 映射才改变 owner，避免大规模心跳抖动。</li>
+    <li><strong>故障切换：</strong>current primary 失效后由组内复制协议选出新 primary 并递增 term；Coordinator 发布 endpoint。只有 client 从一个 control-owner group 迁到另一个 group 时才递增 <code>control_generation</code>。Storage Client 同时校验 term 和 control_generation，旧 primary 必须被 fencing。</li>
+    <li><strong>主动迁移：</strong>先让 target group 导入 client/segment 快照并接收增量状态，再递增 <code>control_generation</code> 切换 heartbeat，最后清理 source group；迁移期间对象 slot ownership 不变。</li>
+    <li><strong>故障域：</strong>同一 MasterGroup 的 replicas 尽量跨节点、机架或 AZ；同一 client 的 segment 不拆给多个 control-owner group，除非未来 heartbeat 协议支持按 segment 独立分流。</li>
+  </ul>
+
+  <div class="warn">
+    <strong>不要混淆三种变化：</strong>
+    MasterGroup 组内切主只提升 <code>term</code>；SlotGroup 跨组迁移改变对象元数据归属并提升 <code>assignment_generation</code>；
+    client control owner 跨组迁移改变 segment 控制归属并提升 <code>control_generation</code>。任何一种变化都不应隐式触发另外两种。
+  </div>
+
+  <h4>4.6.2 跨组任务投递</h4>
+  <p>
+    当对象 slot owner 与目标 segment control owner 不同，不能依赖两个 group 的内存队列或分布式事务。
+    对象 owner 先在本组 OpLog 中提交 <code>TaskIntent</code>，再以至少一次语义投递到 control-owner group；后者通过
+    Storage Client heartbeat 下发。完成通知可重复发送，由对象 owner 根据 <code>task_id</code> 幂等提交最终 replica 状态。
+  </p>
+  <pre>
+TaskEnvelope {
+  UUID task_id;
+  string object_owner_group_id;
+  uint64_t object_group_term;
+  uint32_t slot_id;
+  uint64_t assignment_generation;
+  string client_control_group_id;
+  uint64_t control_generation;
+  UUID target_segment_id;
+  TaskType type;
+}
+  </pre>
+  <p>
+    任一 fencing generation/term 不匹配时不得盲目执行：投递方刷新 ClusterView 后重新路由，执行方使用
+    <code>task_id</code> 去重。这样组内切主、SlotGroup 迁移或 client control owner 迁移都不会造成任务丢失或重复修改对象状态。
+  </p>
+
+  <h3>4.7 多 Master 的分组：MasterGroup 与 MasterNode</h3>
+  <div class="ok">
+    <strong>推荐模型：</strong>
+    用 <code>MasterGroup</code>（也可称 ReplicaSet）表达主备复制关系，用不同 MasterGroup 之间的 slot
+    分配表达 shard 分担关系。<code>MasterNode</code> 只是进程/机器实例，不应被永久标记成全局 primary、standby 或 shard。
+  </div>
+
+  <pre>
+                         Cluster
+                            |
+          +-----------------+-----------------+
+          |                                   |
+    MasterGroup G1                       MasterGroup G2
+    owns slot groups 0..3                owns slot groups 4..7
+    (shard relation with G2)             (shard relation with G1)
+          |                                   |
+    primary: Master A                    primary: Master C
+    standby: Master B                    standby: Master D
+    (A/B are replication peers)          (C/D are replication peers)
+
+Client route:
+  key -> slot -> slot_group -> master_group -> current primary endpoint
+  </pre>
+
+  <p>
+    因此，“A 和 B 是主备”表示它们是同一个 MasterGroup 的复制成员；“A 和 C 分担 shard”更准确地说是
+    A 所在的 G1 与 C 所在的 G2 分别拥有不同 slot group。主备关系发生在组内，分片关系发生在组间，
+    两者不应使用同一个 <code>role</code> 字段表达。
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>抽象</th>
+        <th>职责</th>
+        <th>所有权/版本</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>MasterNode</code></td>
+        <td>描述进程地址、故障域、容量、存活租约；可承载一个或多个 group replica</td>
+        <td><code>node_id + node_incarnation_id</code></td>
+      </tr>
+      <tr>
+        <td><code>MasterGroup</code></td>
+        <td>对象元数据的一致性与故障切换单元，包含一个 primary 和若干 standby</td>
+        <td><code>group_id + term</code></td>
+      </tr>
+      <tr>
+        <td><code>GroupMember</code></td>
+        <td>描述某个 node 在某个 group 内的 PRIMARY、VOTER、LEARNER 等角色</td>
+        <td>角色只在 group 内有效</td>
+      </tr>
+      <tr>
+        <td><code>SlotGroupAssignment</code></td>
+        <td>把一段 slot 映射到一个 MasterGroup；扩缩容时迁移该映射及其状态</td>
+        <td><code>assignment_generation</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>4.7.1 两种部署方式</h4>
+  <p><strong>方式一：节点独占 group，建议作为第一阶段。</strong></p>
+  <pre>
+G1 = {A primary, B standby}
+G2 = {C primary, D standby}
+  </pre>
+  <ul>
+    <li>关系直观，故障和容量边界容易分析，运维简单。</li>
+    <li>standby 正常情况下资源利用率较低，可提供只读诊断，但不应承接强一致前台写。</li>
+    <li>两副本只能实现异步或同步主备，无法在网络分区下形成安全多数派；需要 quorum 强一致时，每组至少放置 3 个跨故障域 voter。</li>
+  </ul>
+
+  <p><strong>方式二：一个节点承载多个 group replica，用于提高利用率。</strong></p>
+  <pre>
+G1 = {A primary, B standby, C standby}
+G2 = {B primary, C standby, A standby}
+G3 = {C primary, A standby, B standby}
+  </pre>
+  <ul>
+    <li>A、B、C 都承担一部分 primary shard，同时又互为其他 group 的 replica；“standby”是非 primary replica 的统称，QUORUM 模式对应 VOTER，ASYNC_STANDBY 模式对应 FOLLOWER。</li>
+    <li>调度必须限制同一 node 的 primary 数、总 QPS、metadata bytes、replay 带宽和故障恢复负载。</li>
+    <li>同一 group 的两个 replica 不能落在同一进程或同一故障域；否则节点或机架故障会同时丢失主备。</li>
+    <li>一个 node 故障后，不能让其所有 standby 同时提升到同一个剩余 node，需要预先校验 failover capacity。</li>
+  </ul>
+
+  <h4>4.7.2 分组与迁移规则</h4>
+  <ul>
+    <li><strong>组内切主：</strong>只改变 <code>MasterGroup.term</code> 和 primary member，不改变该组拥有的 slot；客户端刷新 endpoint 即可。</li>
+    <li><strong>组间迁移：</strong>把 SlotGroup 从 source MasterGroup 复制到 target MasterGroup，完成 snapshot/replay 后递增 <code>assignment_generation</code> 并切换归属。</li>
+    <li><strong>成员变更：</strong>采用 learner 加入、追平、转 voter、移除旧 member 的联合配置流程，不能直接覆盖成员列表。</li>
+    <li><strong>分组粒度：</strong>MasterGroup 数量应多于物理节点数，才能细粒度均衡；但每组都有 OpLog、snapshot 和 heartbeat 成本，应使用固定数量的虚拟 group，而不是每个 slot 一个复制组。</li>
+    <li><strong>Coordinator 边界：</strong>Coordinator 决定 group membership 和 slot-to-group assignment；组内复制协议决定日志提交和 primary，不让 Coordinator 进入每次元数据写的提交路径。</li>
+    <li><strong>Segment 控制归属：</strong><code>ClientControlOwner</code> 也指向 MasterGroup，而不是裸 node；heartbeat 访问该组当前 primary，组内切主不改变 client 的逻辑归属。</li>
+  </ul>
+
+  <div class="warn">
+    <strong>关键约束：</strong>
+    如果没有真正的组内复制协议和提交法定人数，只能称为 primary/standby snapshot failover，不能宣称强一致 HA。
+    此时 primary 故障可能丢失尚未同步的 OpLog，ClusterView 必须暴露相应的 RPO 状态。
+  </div>
+
+  <h2>5. 数据模型</h2>
+  <h3>5.1 ClusterView</h3>
+  <pre>
+struct ClusterView {
+  string cluster_id;
+  uint64_t view_revision;
+  uint32_t slot_count;          // default: 16384
+  vector&lt;MasterNode&gt; nodes;
+  vector&lt;MasterGroup&gt; master_groups;
+  vector&lt;SlotGroupOwner&gt; slot_groups;
+  vector&lt;ClientControlOwner&gt; client_control_owners;
+}
+
+struct MasterNode {
+  string node_id;
+  string rpc_address;
+  NodeStatus status;
+  FailureDomain failure_domain;
+  UUID node_incarnation_id;
+}
+
+struct MasterGroup {
+  string group_id;
+  uint64_t term;
+  vector&lt;GroupMember&gt; members;
+  string primary_node_id;       // cached routing endpoint for current term
+  ReplicationMode mode;         // QUORUM / ASYNC_STANDBY
+  CommitPosition committed;
+}
+
+struct GroupMember {
+  string node_id;
+  GroupRole role;               // PRIMARY / VOTER / FOLLOWER / LEARNER
+  CommitPosition replayed;
+}
+
+struct SlotGroupOwner {
+  uint32_t slot_group_id;
+  uint32_t slot_begin;
+  uint32_t slot_end;
+  string owner_master_group_id;
+  uint64_t assignment_generation;
+  SlotGroupState state;
+}
+
+struct ClientControlOwner {
+  UUID client_id;               // applies to all segments of this client
+  string owner_master_group_id;
+  uint64_t control_generation;  // independent from slot assignment
+  ControlOwnerState state;
+}
+  </pre>
+
+  <h3>5.2 ResourceView</h3>
+  <pre>
+struct ResourceView {
+  uint64_t resource_revision;
+  vector&lt;SegmentResource&gt; segments;
+  ClusterPressure pressure;
+}
+
+struct SegmentResource {
+  UUID segment_id;
+  UUID client_id;
+  uint64_t control_generation;
+  UUID segment_incarnation;
+  string segment_name;
+  ReplicaType type;             // MEMORY / LOCAL_DISK / NOF_SSD / CXL
+  ResourceCapability capability;
+  ResourceTelemetry telemetry;
+  FailureDomain failure_domain;
+  NetworkLocality locality;
+  SegmentHealth health;
+}
+  </pre>
+
+  <h3>5.3 多维资源、工作负载与放置抽象</h3>
+  <div class="ok">
+    <strong>设计原则：</strong>
+    不再用单一 <code>used_bytes / capacity_bytes</code> 判断节点优劣，而把“节点能提供什么”、
+    “对象需要什么”和“当前还承诺了多少资源”分开建模。容量大但带宽小的 segment 可承载冷数据，
+    容量小但带宽大的 segment 可承载热点副本；同一对象的持久放置与实时读流量也可以由不同策略处理。
+  </div>
+
+  <p>建议增加以下六类稳定抽象：</p>
+  <table>
+    <thead>
+      <tr>
+        <th>抽象</th>
+        <th>回答的问题</th>
+        <th>更新频率与归属</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ResourceCapability</code></td>
+        <td>segment 的容量、顺序/随机读写带宽、IOPS、基础时延、并发度和介质能力上限</td>
+        <td>慢变化；注册或基准测试时由 Storage Client 上报</td>
+      </tr>
+      <tr>
+        <td><code>ResourceTelemetry</code></td>
+        <td>当前空闲容量、可用带宽、队列深度、P99 时延、错误率和热度</td>
+        <td>快变化；control owner 聚合后发布带时间戳的摘要</td>
+      </tr>
+      <tr>
+        <td><code>FailureDomain / NetworkLocality</code></td>
+        <td>节点、机架、AZ、NUMA、RDMA fabric 与访问方之间的故障隔离和网络代价</td>
+        <td>低频变化；Coordinator 维护</td>
+      </tr>
+      <tr>
+        <td><code>WorkloadIntent</code></td>
+        <td>对象预期大小、读写比、目标吞吐/P99、热度、生命周期、持久性和副本约束</td>
+        <td>写入时显式提供，缺省值由历史观测推断</td>
+      </tr>
+      <tr>
+        <td><code>ResourceReservation</code></td>
+        <td>已被并发 Put 或流量调度承诺、但尚未反映到 telemetry 的 bytes、bandwidth 和 IOPS</td>
+        <td>实时；allocator/traffic admission 以 lease + segment incarnation 管理</td>
+      </tr>
+      <tr>
+        <td><code>PlacementPolicy + ScoreBreakdown</code></td>
+        <td>如何执行硬约束过滤、软目标打分，以及为什么选择某个 segment</td>
+        <td>版本化策略；Master 本地执行并记录可解释结果</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <pre>
+struct ResourceVector {
+  uint64_t capacity_bytes;
+  double read_bandwidth_Bps;
+  double write_bandwidth_Bps;
+  double read_iops;
+  double write_iops;
+  double concurrency;
+}
+
+struct ResourceCapability {
+  ResourceVector limit;         // calibrated sustainable limit, not link peak
+  LatencyProfile baseline;      // p50 / p99 by operation and object-size bucket
+  set&lt;Feature&gt; features;       // RDMA_READ / PERSISTENT / RANDOM_WRITE / ...
+}
+
+struct ResourceTelemetry {
+  ResourceVector used;
+  ResourceVector reserved;
+  LatencyProfile observed;
+  double queue_depth;
+  double error_rate;
+  uint64_t sample_timestamp_ms;
+  uint64_t sample_seq;          // monotonic within one segment_incarnation
+}
+
+struct WorkloadIntent {
+  uint64_t object_size_bytes;
+  AccessClass access_class;     // HOT / WARM / COLD, only a hint
+  double expected_read_Bps;
+  double expected_write_Bps;
+  double expected_iops;
+  uint64_t target_p99_us;
+  DurabilityClass durability;
+  uint32_t replica_num;
+  FailureDomainPolicy isolation;
+  optional&lt;string&gt; consumer_locality;
+}
+
+struct ResourceReservation {
+  UUID reservation_id;
+  UUID segment_id;
+  ResourceVector amount;
+  uint64_t expire_at_ms;
+  UUID segment_incarnation;
+  string idempotency_key;
+}
+
+struct ScoreBreakdown {
+  double capacity_headroom;
+  double bandwidth_headroom;
+  double latency_cost;
+  double locality_cost;
+  double failure_correlation_cost;
+  double migration_cost;
+  double total_score;
+  string policy_version;
+}
+  </pre>
+
+  <h4>5.3.1 放置和读路由必须解耦</h4>
+  <ul>
+    <li><strong>Replica Placement：</strong>决定数据存在哪些 segment，主要优化容量、持久性、写入代价和故障域。</li>
+    <li><strong>Replica Read Selection：</strong>在已有 replica 中按实时带宽、队列、时延和调用方 locality 选择读源；不因为一次流量变化立即搬数据。</li>
+    <li><strong>Tiering / Rebalance：</strong>根据较长时间窗口的热度和资源价格决定复制、迁移、offload 或 promotion，带 hysteresis 和冷却时间。</li>
+  </ul>
+  <p>
+    例如，大容量低带宽节点可保存完整冷副本，小容量高带宽节点只保存工作集热点副本；读请求优先访问高带宽副本，
+    高带宽层容量不足时淘汰热点副本不会删除低带宽层的持久副本。这样“容量归属”和“流量归属”不再被一个 placement 决策绑死。
+  </p>
+
+  <h4>5.3.2 可演进的算法接口</h4>
+  <pre>
+PlacementResult Place(PlacementContext ctx) {
+  candidates = FilterByHardConstraints(
+      ctx.resource_view, ctx.intent, ctx.excluded_failure_domains);
+
+  candidates = CheckMultiResourceFeasibility(
+      candidates, capability - telemetry.used - telemetry.reserved);
+
+  ranked = policy.Score(candidates, ctx.intent, ctx.policy_version);
+  reservation = TryReserve(ranked, bytes + bandwidth + iops, bounded_attempts);
+
+  return {reservation, ranked.winner.score_breakdown};
+}
+  </pre>
+  <ul>
+    <li>硬约束和软评分分离；容量不足、目标 P99 不满足、故障域冲突必须先过滤，不能靠低分表达。</li>
+    <li>采用归一化 headroom 或 Dominant Resource Fairness 思路检查多维可行性，避免容量充足却把带宽耗尽。</li>
+    <li><code>PlacementPolicy</code> 是版本化、无状态接口；后续可从加权打分演进为 bin-packing、min-cost flow 或学习型策略，而不改变 Put 状态机。</li>
+    <li>策略输入只使用版本化快照，输出保存 <code>policy_version</code> 和 <code>ScoreBreakdown</code>，便于回放、灰度和比较新旧算法。</li>
+    <li>在线请求只对 Top-K 候选做有界 reserve 尝试；复杂的全局优化在 Coordinator 后台生成 policy 参数或迁移计划，不能进入 Put 热路径。</li>
+  </ul>
+
+  <h4>5.3.3 指标语义要求</h4>
+  <div class="warn">
+    <strong>避免错误建模：</strong>
+    带宽不能只保存一个静态数值。至少区分读/写、可持续能力/当前使用量/已预留量，并按对象大小桶记录有效吞吐和时延；
+    否则 100 Gbit/s 网卡、SSD 顺序吞吐和 4 KiB 随机访问会被错误地视为同一种资源。
+  </div>
+
+  <h3>5.4 BackgroundBudget</h3>
+  <pre>
+struct BackgroundBudget {
+  uint64_t budget_revision;
+  uint32_t migration_max_inflight_groups;
+  uint32_t migration_qps_budget;
+  uint64_t snapshot_bytes_per_sec;
+  uint32_t eviction_keys_per_round;
+  uint32_t offload_tasks_per_heartbeat;
+  uint32_t promotion_tasks_per_heartbeat;
+}
+  </pre>
+
+  <h2>6. 热路径流程分析</h2>
+  <h3>6.1 GetReplicaList</h3>
+  <pre>
+Client
+  -> calculate slot(key)
+  -> find owner from local ClusterView
+  -> RPC GetReplicaList(key, tenant_id, master_group_id, group_term,
+                        slot_id, assignment_generation)
+
+Owner MasterGroup current primary
+  -> validate master_group_id, term, slot ownership and assignment_generation
+  -> lookup object metadata in local slot group
+  -> refresh lease / hotness counter
+  -> rank readable replicas by current latency / bandwidth / caller locality
+  -> if promotion-on-hit eligible: enqueue promotion task only
+  -> return replica list
+
+Client
+  -> if OK: use replica descriptors for data path
+  -> if MOVED/STALE_ASSIGNMENT: refresh slot map and retry
+  -> if TRYAGAIN: short backoff within request deadline
+  </pre>
+
+  <p>
+    P99.9 控制点：读路径只访问一个 MasterGroup primary；promotion 不在前台执行；slot view 或 group term 过期通过重定向快速修正；RPC 有 deadline。
+  </p>
+
+  <h3>6.2 PutStart / PutEnd</h3>
+  <pre>
+PutStart:
+Client -> owner MasterGroup current primary
+  -> validate group term and assignment generation
+  -> build WorkloadIntent from request policy and observed history
+  -> filter hard constraints and score candidates from local ResourceView
+  -> allocate from the local DelegatedExtentPool
+  -> write object PROCESSING metadata
+  -> enqueue asynchronous standby replication
+  -> return replica descriptors
+
+Data Path:
+Client writes object data to selected replicas
+
+PutEnd:
+Client -> owner MasterGroup current primary
+  -> validate group term and assignment generation
+  -> transition PROCESSING -> COMPLETE
+  -> enqueue asynchronous standby replication
+  -> optionally enqueue offload task
+  -> return OK
+  </pre>
+
+  <p>
+    P99.9 控制点：PutStart 不向 Coordinator 或远端空间分配服务同步请求资源；ResourceView 和 DelegatedExtentPool 都在本地。
+    本地 extent 不足时快速失败并触发后台补充，禁止把远端 refill 或长时间候选扫描退化到当前请求中。
+  </p>
+
+  <h3>6.3 Batch 请求</h3>
+  <pre>
+Client input keys: [k1, k2, k3, k4, k5]
+
+Regroup by owner:
+  Master A: [k1, k4]
+  Master B: [k2, k5]
+  Master C: [k3]
+
+Parallel RPC:
+  send sub-batches concurrently with per-shard deadline
+
+Merge:
+  output results in original key order
+  </pre>
+
+  <p>
+    P99.9 控制点：子批次并行，单个慢 shard 不阻塞其他 shard 的结果；业务可选择 fail-fast、partial success 或 bounded retry。
+  </p>
+
+  <h3>6.4 时序图与当前 Mooncake 对比</h3>
+  <p>
+    本节只统计正常稳定状态，不把首次建连、ClusterView watch、MOVED/STALE_TERM 重试和故障恢复计入常态热路径。
+    当前实现以代码中的单个全局 <code>MasterService</code> 为基线：客户端 Get 调用一次
+    <code>GetReplicaList</code>；Put 调用 <code>PutStart</code>、执行数据传输、再调用 <code>PutEnd</code>；
+    segment allocator 由 Master 进程内的 <code>segment_manager_</code> 访问。当前 1024 个 metadata shard 是进程内锁分片，
+    不是分布式 MasterGroup。对应代码入口为 <code>client_service.cpp::Get/Put</code>、
+    <code>master_client.cpp::GetReplicaList/PutStart/PutEnd</code> 和 <code>master_service.cpp::GetReplicaList/PutStart/PutEnd</code>。
+    图中的当前基线是默认非 HA 模式；当前 HA 仍是单个 active Master，客户端 RPC 形状不变，leader watch 在后台执行。
+    若某种 HA 配置把 OpLog 外部持久化同步放入请求路径，应把该耗时作为单独基线实测，不能与默认模式混合比较。
+  </p>
+  <p class="diagram-note">
+    本节时序图使用 Mermaid 11 <code>sequenceDiagram</code> 绘制；HTML 通过官方推荐的 ESM 方式从 jsDelivr 加载。
+    无网络环境仍会保留 Mermaid 源码，可在文档构建阶段改为 vendored Mermaid 或预渲染 SVG。
+  </p>
+
+  <h4>6.4.1 计数口径</h4>
+  <table>
+    <thead><tr><th>符号</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>G</code></td><td>一个 Batch 中涉及的 owner MasterGroup 数量。</td></tr>
+      <tr><td>RPC 次数</td><td>一次 request/response 算一个 RPC；若统计单向网络消息，会在表中单独说明。</td></tr>
+      <tr><td>串行网络轮次</td><td>关键路径上必须前后等待的网络 round trip 数。多个并行 RPC 虽然增加消息数，但只增加一个串行轮次。</td></tr>
+      <tr><td>数据传输</td><td>Transfer Engine/RDMA/NoF 写读，不等同于 metadata RPC；单独计数。</td></tr>
+    </tbody>
+  </table>
+
+  <h4>6.4.2 Get：当前实现</h4>
+  <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    actor App as Application
+    participant Client as Mooncake Client
+    participant Master as Global Master
+    participant Segment as Storage Segment
+    App->>Client: Get(key)
+    Client->>Master: GetReplicaList(key)
+    activate Master
+    Master->>Master: local metadata lookup<br/>grant read lease
+    Master-->>Client: replica descriptor
+    deactivate Master
+    Client->>Segment: TransferRead / RDMA read
+    Segment-->>Client: value bytes
+    Client-->>App: value
+    Note over Client,Master: Metadata RPC = 1, synchronous inter-Master RPC = 0
+  </pre>
+
+  <h4>6.4.3 Get：新设计</h4>
+  <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    actor App as Application
+    participant Client as Routed Client
+    participant Primary as Owner Group Primary
+    participant Segment as Selected Segment
+    participant Async as Async Aggregator
+    App->>Client: Get(key)
+    Client->>Client: slot hash + cached ClusterView lookup
+    Client->>Primary: GetReplicaList(term, assignment_generation)
+    activate Primary
+    Primary->>Primary: validate routing + local lookup
+    Primary-->>Client: ranked replica descriptors
+    Primary-)Async: aggregate lease and hotness update
+    deactivate Primary
+    Client->>Segment: TransferRead / RDMA read
+    Segment-->>Client: value bytes
+    Client-->>App: value
+    Note over Client,Primary: Metadata RPC = 1, Coordinator RPC = 0, quorum RTT = 0
+  </pre>
+
+  <p>
+    正常 Get 的通信次数与当前实现相同，新增 slot hash、view lookup、term/generation 比较均为本地 CPU 操作。
+    但当前 Get 会刷新对象 read lease；如果新设计把每次 lease/hotness 更新同步复制到 quorum，Get 将额外增加一个 group commit RTT，
+    形成明显劣化。推荐把访问热度和 lease heartbeat 做本地聚合、异步批量复制，并规定新 primary 在提升后至少一个
+    <code>max_read_lease_ttl</code> 窗口内禁止回收旧 replica。这样 failover 期间保守占用空间，但正常 Get 不增加网络轮次。
+  </p>
+
+  <h4>6.4.4 Put：当前实现</h4>
+  <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    actor App as Application
+    participant Client as Mooncake Client
+    participant Master as Global Master
+    participant Storage as Target Storage Nodes
+    App->>Client: Put(key, value)
+    Client->>Master: PutStart
+    activate Master
+    Master->>Master: local placement + local allocation
+    Master-->>Client: replica descriptors
+    deactivate Master
+    Client->>Storage: TransferWrite to configured replicas
+    Storage-->>Client: transfer completion
+    Client->>Master: PutEnd
+    activate Master
+    Master->>Master: mark COMPLETE
+    Master-->>Client: OK
+    deactivate Master
+    Client-->>App: OK
+    Note over Client,Master: Metadata RPC = 2, allocator RPC = 0, group commit RTT = 0
+  </pre>
+
+  <h4>6.4.5 Put：新设计快路径</h4>
+  <p>
+    Put 只采用这一条前台路径。为避免每次 PutStart 同步访问空间分配服务，增加 <code>DelegatedExtentLease</code>：Storage Client allocator
+    预先把互不重叠的 extent range、bytes/bandwidth/IOPS budget 租给 MasterGroup。Group primary 在租约范围内本地切分，
+    后台低水位时批量续租。lease 必须携带 <code>segment_incarnation + control_generation + owner_group_id + group_term + expire_at</code>，
+    Storage Client 不得把同一 extent 同时租给两个 group。
+  </p>
+  <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    actor App as Application
+    participant Client as Mooncake Client
+    participant Primary as Owner Group Primary
+    participant LocalPool as Local Delegated Extent Pool
+    participant Standby as Standby Replicas
+    participant Storage as Target Storage Nodes
+    participant Allocator as Background Allocation Service
+    rect rgb(239, 246, 255)
+        Note over Primary,Allocator: Background refill, outside per-object critical path
+        Primary-)Allocator: LeaseExtentBatch at low watermark
+        Allocator-)Primary: delegated ranges + budgets
+    end
+    rect rgb(236, 253, 245)
+        Note over App,Storage: Per-object low-latency path
+        App->>Client: Put(key, value)
+        Client->>Primary: PutStart(term, assignment_generation)
+        Primary->>LocalPool: local allocate
+        LocalPool-->>Primary: descriptors
+        Primary-)Standby: async replicate PROCESSING
+        Primary-->>Client: replica descriptors
+        Client->>Storage: TransferWrite to configured replicas
+        Storage-->>Client: transfer completion
+        Client->>Primary: PutEnd
+        Primary-)Standby: async replicate COMPLETE
+        Primary-->>Client: OK
+        Client-->>App: OK
+    end
+    Note over Client,Primary: Same synchronous metadata RPC count as current = 2
+    Note over Primary,Allocator: Normal PutStart allocator RPC = 0, synchronous replication RTT = 0
+  </pre>
+  <p>
+    该快路径在同步通信形状上与当前实现一致：2 次 metadata RPC、按配置副本数执行数据写、0 次逐对象 allocator RPC、0 次同步复制 RTT。
+    代价是 PROCESSING/COMPLETE 在 follower 确认前已经向客户端返回，因此 <code>ASYNC_STANDBY</code> 存在非零 RPO。
+    因而本设计的 Put 语义必须明确公布这一 RPO，不能把异步复制描述为 RPO=0 的强一致提交。
+  </p>
+  <p>
+    primary 切换后，新 term 不得继续本地切分旧 term 的 delegated range；旧 range 进入 quarantine，等待 lease TTL
+    到期或 allocator 明确回收，新 primary 获取新 range。这样即使旧 primary 暂时仍可访问数据网络，也只可能在隔离范围内产生孤儿写，
+    不会与新 primary 重复分配同一 extent。该策略用临时容量占用换取正常 PutStart 的零 allocator RTT。
+  </p>
+
+  <h4>6.4.6 Batch：当前实现与新设计</h4>
+  <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Current as Current Global Master
+    participant G1 as Group G1 Primary
+    participant G2 as Group G2 Primary
+    participant G3 as Group G3 Primary
+    rect rgb(249, 250, 251)
+        Note over Client,Current: Current implementation
+        Client->>Current: BatchGet / BatchPutStart(all keys)
+        Current->>Current: process keys in one Master process
+        Current-->>Client: per-key results
+    end
+    rect rgb(239, 246, 255)
+        Note over Client,G3: New design
+        Client->>Client: local regroup by owner group
+        par one parallel network round
+            Client->>G1: sub-batch 1
+            G1-->>Client: results 1
+        and
+            Client->>G2: sub-batch 2
+            G2-->>Client: results 2
+        and
+            Client->>G3: sub-batch 3
+            G3-->>Client: results 3
+        end
+        Client->>Client: merge in original key order
+    end
+  </pre>
+  <p>
+    当前跨任意 key 的 Batch 只发 1 个 Master RPC；新设计涉及 <code>G</code> 个 owner 时发送 <code>G</code> 个并行 RPC。
+    消息数从 2 个单向消息增加为 <code>2G</code>，但理想情况下仍是 1 个串行网络轮次。它提高总吞吐和故障隔离，
+    但整批完成时延变为所有 sub-batch 的最大值；因此必须支持 per-group deadline、partial result，以及限制最大并发 group 数。
+  </p>
+
+  <h4>6.4.7 Storage heartbeat 与后台任务</h4>
+  <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Storage as Storage Client
+    participant Current as Current Global Master
+    participant Object as Object-owner Group
+    participant Control as Control-owner Group
+    rect rgb(249, 250, 251)
+        Note over Storage,Current: Current implementation
+        Storage->>Current: Ping / Offload / Promotion heartbeat
+        Current-->>Storage: status / tasks
+    end
+    rect rgb(239, 246, 255)
+        Note over Storage,Control: New design
+        Object-)Control: batched TaskEnvelope
+        Storage->>Control: heartbeat(term, control_generation)
+        Control-->>Storage: task batch
+        Storage-)Control: batched completion
+        Control-)Object: idempotent completion batch
+    end
+    Note over Storage,Control: Per heartbeat RPC count unchanged, cross-group messages are asynchronous
+  </pre>
+  <p>
+    每类 heartbeat 的前台 RPC 次数不变，Coordinator 不参与。新增的跨组 TaskEnvelope/Completion 是后台批量通信，
+    不进入应用 Get/Put 的同步关键路径；如果实现成每对象同步转发，则会放大 RPC，违反本设计。
+  </p>
+
+  <h4>6.4.8 通信次数与性能结论</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>操作</th>
+        <th>当前实现</th>
+        <th>新设计常态路径</th>
+        <th>串行网络轮次变化</th>
+        <th>性能判断</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Get metadata</td>
+        <td>1 client-Master RPC</td>
+        <td>1 client-group-primary RPC；本地路由；无 Coordinator</td>
+        <td>0</td>
+        <td>基本不劣化；多 group 可降低锁和 CPU 排队。禁止每 Get 同步复制 lease/hotness。</td>
+      </tr>
+      <tr>
+        <td>Get data</td>
+        <td>1 replica data read</td>
+        <td>1 replica data read</td>
+        <td>0</td>
+        <td>不劣化；动态 read selection 可能改善 locality 和尾延迟。</td>
+      </tr>
+      <tr>
+        <td>Put metadata（新设计快路径）</td>
+        <td>PutStart + PutEnd = 2 RPC</td>
+        <td>2 client RPC；delegated extent 本地分配；replication 异步</td>
+        <td>0</td>
+        <td>通信形状与当前一致，目标为基本不劣化；代价是明确的非零 RPO。</td>
+      </tr>
+      <tr>
+        <td>Put data</td>
+        <td>按配置副本数写入目标存储节点</td>
+        <td>按相同副本数写入目标存储节点</td>
+        <td>0</td>
+        <td>不因元数据分片增加；placement/locality 可能改善或恶化，需基准验证。</td>
+      </tr>
+      <tr>
+        <td>跨组 Batch metadata</td>
+        <td>1 Batch RPC，2 个单向消息</td>
+        <td>G 个并行 sub-RPC，2G 个单向消息</td>
+        <td>理想值 0；仍为 1 round</td>
+        <td>消息数增加；吞吐可扩展，但整批 P99.9 受最慢 group 影响。</td>
+      </tr>
+      <tr>
+        <td>Storage heartbeat</td>
+        <td>每类 heartbeat 1 RPC</td>
+        <td>每类 heartbeat 1 RPC 到 control-owner primary</td>
+        <td>0</td>
+        <td>不劣化；跨组任务必须批量异步。</td>
+      </tr>
+      <tr>
+        <td>稳定状态 Coordinator</td>
+        <td>HA client watch backend</td>
+        <td>周期/watch 更新 ClusterView 和 budget</td>
+        <td>0（不在请求路径）</td>
+        <td>不影响单请求时延，但增加低频控制面流量。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="warn">
+    <strong>结论：</strong>
+    Put 采用 delegated extent 和 ASYNC replication 的唯一快路径，并配合并行 sub-batch、异步 lease/hotness 和后台任务批量化后，
+    Get、单 key Put 和 heartbeat 的同步 RPC/网络轮次可以与当前实现保持一致，因此设计目标可以设为“基本不劣化”。
+    该 Put 路径采用 <code>ASYNC_STANDBY</code>，允许非零 RPO；接口、监控和验收结果必须明确披露这一语义。
+  </div>
+
+  <h4>6.4.9 必须通过的性能验收</h4>
+  <ul>
+    <li>相同硬件、对象大小、replica 数和并发度下，对比当前单 Master 与采用 ASYNC_STANDBY 的新设计快路径。</li>
+    <li>分别测试 4 KiB、64 KiB、1 MiB、16 MiB；报告 metadata-only 与 end-to-end 的吞吐、P50、P99、P99.9。</li>
+    <li>Get：单副本 MasterGroup 相比当前实现在无 CPU 饱和时 P99.9 增幅目标不超过 5%；超出则必须给出 route/serialization/queue breakdown。</li>
+    <li>Put：ASYNC + delegated extent 快路径相比当前实现在无 CPU 饱和时 metadata P99.9 增幅目标不超过 5%；分别报告 local allocation、async enqueue 和 data transfer。</li>
+    <li>Batch：固定总 key 数，扫描 <code>G=1/2/4/8/16</code>；报告消息数、最慢 group latency 和 partial-result 时间。</li>
+    <li>验证 Coordinator 停止 60 秒时稳定 Get/Put 的 RPC 数和时延分布不发生变化。</li>
+    <li>验证 lease/hotness 更新、TaskEnvelope 和 ResourceView 上报不出现在应用请求 trace 的同步 critical path。</li>
+  </ul>
+
+  <h2>7. 控制路径流程分析</h2>
+  <h3>7.1 MasterNode 加入集群</h3>
+  <pre>
+1. New MasterNode starts with node_id and rpc_address.
+2. It registers membership lease in HA Backend.
+3. Coordinator observes the new node and marks it JOINING.
+4. Coordinator publishes a new ClusterView including the node but assigns no MasterGroup replica yet.
+5. After health check and warmup pass, node becomes ACTIVE.
+6. Coordinator adds it to selected MasterGroups as LEARNER.
+7. After snapshot/replay catches up, each group promotes the learner to VOTER or PRIMARY candidate.
+8. Coordinator may then generate a plan to move SlotGroups between MasterGroups.
+  </pre>
+
+  <p>
+    加入过程不影响已有 slot 的前台读写。只有当 slot group 迁移进入 cutover 时，相关 slot 的客户端会看到短暂 MOVED/ASK。
+  </p>
+
+  <h3>7.2 MasterNode 优雅下线</h3>
+  <pre>
+1. Operator marks MasterNode DRAINING.
+2. Coordinator stops placing new group replicas or primaries on this node.
+3. For every affected MasterGroup, add and catch up a replacement learner.
+4. Transfer primary leadership away, then remove this node from group membership.
+5. Only if group-level load remains imbalanced, move SlotGroups between groups in small batches.
+6. When the node carries no group replica, mark it INACTIVE and stop the process.
+  </pre>
+
+  <p>
+    P99.9 控制点：drain 以小批量迁移执行；当前台 P99.9 超阈值时迁移自动暂停；不做全节点一次性冻结。
+  </p>
+
+  <h3>7.3 扩容 Rebalance</h3>
+  <pre>
+1. Coordinator collects load:
+   - per slot group QPS
+   - key count / metadata bytes
+   - foreground P99.9
+   - migration backlog
+   - resource pressure
+
+2. Coordinator selects candidate slot groups:
+   - avoid hottest slot groups first
+   - prefer large imbalance but low active QPS groups
+   - limit concurrent groups
+
+3. Coordinator starts migration:
+   source -> snapshot copy -> incremental replay -> short cutover -> cleanup
+
+4. Coordinator observes P99.9 guard:
+   if P99.9 or queue depth exceeds threshold: reduce budget or pause migration
+
+5. Repeat until target balance reached.
+  </pre>
+
+  <h3>7.4 缩容 Rebalance</h3>
+  <pre>
+1. Operator marks nodes to remove as DRAINING.
+2. Coordinator computes target placement excluding DRAINING nodes.
+3. Slot groups migrate away in priority order:
+   - cold / low QPS slot groups first
+   - hot slot groups during low-traffic windows
+4. If remaining capacity is insufficient, Coordinator rejects shrink plan.
+5. After migration completes, DRAINING node is removed.
+  </pre>
+
+  <p>
+    缩容比扩容更容易造成尾延迟，因为目标节点承接更多负载。必须先做容量校验和 P99.9 预算校验，不能只看 slot 数是否均衡。
+  </p>
+
+  <h3>7.5 Slot Group 迁移</h3>
+  <pre>
+Plan:
+  Coordinator chooses source MasterGroup, target MasterGroup, slot_group_id, migration_budget.
+
+Prepare:
+  Target group primary creates empty slot group in IMPORTING state.
+  Source group primary marks slot group MIGRATING_SOURCE and records start_oplog_offset.
+
+Snapshot Copy:
+  Source scans metadata in bounded batches.
+  Target group replicates and commits imported batches but does not serve normal requests yet.
+
+Incremental Replay:
+  Source streams OpLog after start_oplog_offset.
+  Target group commits replay and reports committed replay_lag.
+
+Cutover:
+  Source briefly blocks writes for the slot group.
+  Source commits the final OpLog tail and emits a cutover position.
+  Target proves that the cutover position is committed by its replication mode.
+  Coordinator CAS-updates owner_master_group_id and increments assignment_generation with a fencing token.
+  Source group returns MOVED for new requests.
+  Target group serves requests with the new assignment generation.
+
+Cleanup:
+  Source keeps tombstone for late requests, then releases old metadata.
+  </pre>
+
+  <h3>7.6 MasterNode 故障与 MasterGroup Failover</h3>
+  <pre>
+1. HA Backend lease expires or health checks fail.
+2. Coordinator marks node SUSPECT, then UNAVAILABLE after quorum/lease confirmation.
+3. QUORUM group elects a replica holding the committed prefix; ASYNC_STANDBY group requires Coordinator-authorized promotion and reports possible RPO loss.
+4. New primary proves its commit/replay position and obtains a higher group term/fencing token.
+5. Coordinator publishes the new primary endpoint and term; slot owner and assignment_generation remain unchanged.
+6. Clients receive NOT_PRIMARY/STALE_TERM or refresh view after RPC deadline.
+7. New primary serves foreground traffic; groups without quorum remain unavailable instead of accepting split-brain writes.
+  </pre>
+
+  <p>
+    P99.9 控制点：故障检测不等待长 RPC；客户端使用短 deadline；failover 以 MasterGroup 为粒度并可并行；replica 持续 replay，避免切换后大规模恢复。组内切主不递增 <code>assignment_generation</code>，只有 SlotGroup 改属另一个 MasterGroup 时才递增。
+  </p>
+
+  <h3>7.7 Coordinator 故障</h3>
+  <pre>
+1. Active Coordinator lease expires in HA Backend.
+2. Standby Coordinator competes for coordinator lease.
+3. New Coordinator reads persisted ClusterView and migration states.
+4. It reconciles Master reports.
+5. Incomplete migration is either resumed or rolled back.
+6. Foreground metadata requests continue using last stable ClusterView.
+  </pre>
+
+  <p>
+    Coordinator 故障不应影响稳定 slot 的读写，也不阻止具备 quorum 的 MasterGroup 完成组内选主。受影响的是新的扩缩容计划、跨组迁移、primary endpoint 发布和后台预算更新。
+  </p>
+
+  <h3>7.8 资源压力与 Admission Control</h3>
+  <pre>
+1. Storage clients report segment usage and health.
+2. MasterGroup primaries report allocation failures and queue depth.
+3. Coordinator computes cluster pressure level.
+4. Coordinator publishes ResourceView and BackgroundBudget.
+5. MasterGroup primaries adjust placement, eviction/offload speed, and admission policy.
+6. If resources remain insufficient, PutStart fails fast with a precise error.
+  </pre>
+
+  <p>
+    P99.9 控制点：资源不足时不能让 PutStart 在 Master 内反复扫描和等待；应快速失败、降级 replica 数，或交给上层重试。
+  </p>
+
+  <h3>7.9 冷热分级任务</h3>
+  <pre>
+Get path:
+  GetReplicaList observes LOCAL_DISK-only hot key
+  -> enqueue promotion task
+  -> return current readable replica immediately
+
+Background path:
+  Storage client heartbeat pulls promotion/offload tasks
+  -> executes data movement
+  -> NotifyPromotionSuccess / NotifyOffloadSuccess
+  -> slot owner commits metadata transition
+  </pre>
+
+  <p>
+    P99.9 控制点：冷热任务必须异步化；前台读不等待 promotion 完成；Coordinator 只调节任务预算，不参与单对象决策。
+  </p>
+
+  <h2>8. P99.9 稳定性设计</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>设计点</th>
+        <th>要求</th>
+        <th>原因</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Coordinator 非热路径</td>
+        <td>正常 Get/Put 不访问 Coordinator</td>
+        <td>避免把 Coordinator 变成新的尾延迟来源</td>
+      </tr>
+      <tr>
+        <td>前台 RPC 优先级</td>
+        <td>MasterNode 按 group 区分 foreground queue 和 background queue</td>
+        <td>迁移和扫描不能挤占客户请求</td>
+      </tr>
+      <tr>
+        <td>短锁和分片锁</td>
+        <td>对象状态锁限定在 slot group 或 key 粒度</td>
+        <td>避免全 shard 锁导致 P99.9 抖动</td>
+      </tr>
+      <tr>
+        <td>迁移预算</td>
+        <td>限制同时迁移 slot group、snapshot 带宽和 replay QPS</td>
+        <td>扩缩容期间稳定前台时延</td>
+      </tr>
+      <tr>
+        <td>快速失败</td>
+        <td>资源不足、fencing token 过期、owner 错误时快速返回明确错误</td>
+        <td>避免请求排队等待不可满足条件</td>
+      </tr>
+      <tr>
+        <td>客户端 deadline</td>
+        <td>每个 Master RPC 设置 deadline 和 bounded retry</td>
+        <td>控制跨 shard Batch 的尾部等待</td>
+      </tr>
+      <tr>
+        <td>自动保护闭环</td>
+        <td>当 P99.9 超阈值时自动降低后台预算</td>
+        <td>把客户时延优先级置于扩缩容速度之上</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>9. 4+1 视图</h2>
+
+  <h3>9.1 逻辑视图</h3>
+  <p>
+    逻辑视图描述系统的核心抽象和职责边界。
+  </p>
+  <pre>
+Object Key Space
+  -> Slot
+  -> Slot Group
+  -> Owner MasterGroup
+  -> Current Primary MasterNode
+
+MasterGroup owns:
+  - ObjectMetadata
+  - LeaseState
+  - ReplicaState
+  - ObjectTaskState
+  - HotnessState
+  - SlotGroupOpLog
+
+Coordinator owns:
+  - ClusterView
+  - SlotOwnership
+  - MigrationPlan
+  - ResourceSummary
+  - BackgroundBudget
+  - GroupPlacement / SlotAssignment
+  - FencingPublication
+
+HA Backend persists:
+  - ClusterView records
+  - Membership leases
+  - Slot assignment generation records
+  - Snapshot catalog
+  - OpLog pointers
+  </pre>
+
+  <h3>9.2 开发视图</h3>
+  <p>
+    开发视图描述代码模块拆分建议。
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>模块</th>
+        <th>职责</th>
+        <th>可能落点</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>ClusterViewClient</td>
+        <td>客户端获取、缓存、刷新 slot map</td>
+        <td><code>mooncake-store/include/master_client.h</code> 附近新增路由层</td>
+      </tr>
+      <tr>
+        <td>ShardRouter</td>
+        <td>计算 slot，处理 MOVED/ASK，Batch regroup</td>
+        <td>MasterClient 内部组件</td>
+      </tr>
+      <tr>
+        <td>MasterNodeService</td>
+        <td>承载一个或多个 MasterGroup replica 的服务进程</td>
+        <td>从现有 <code>MasterService</code> 演进</td>
+      </tr>
+      <tr>
+        <td>SlotOwnershipManager</td>
+        <td>校验 master_group_id、term、slot ownership 和 assignment_generation</td>
+        <td>MasterNode 内部</td>
+      </tr>
+      <tr>
+        <td>CoordinatorService</td>
+        <td>集群视图、跨组迁移、fencing 发布、预算控制</td>
+        <td>新增 <code>coordinator</code> 模块</td>
+      </tr>
+      <tr>
+        <td>ResourceRegistry</td>
+        <td>汇总 segment 容量、水位、健康状态</td>
+        <td>Coordinator 子模块或独立库</td>
+      </tr>
+      <tr>
+        <td>MigrationManager</td>
+        <td>slot group snapshot、replay、cutover</td>
+        <td>Coordinator + source/target MasterGroup 协作</td>
+      </tr>
+      <tr>
+        <td>LatencyGuard</td>
+        <td>根据 P99.9 和队列深度调节后台预算</td>
+        <td>Coordinator 子模块</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>9.3 进程视图</h3>
+  <p>
+    进程视图描述运行时并发关系和通信路径。
+  </p>
+  <pre>
+Client Process
+  - foreground application threads
+  - MasterClient routing cache
+  - RPC pools per MasterGroup primary
+
+MasterNode Process
+  - foreground RPC workers
+  - background task workers
+  - one or more MasterGroup replicas
+  - per-group slot state store
+  - per-group OpLog append/replay worker
+  - metrics reporter
+  - migration sender/receiver
+
+Coordinator Process
+  - membership watcher
+  - cluster view publisher
+  - migration planner
+  - group placement / fencing publisher
+  - resource aggregator
+  - latency guard loop
+
+HA Backend
+  - lease/session service
+  - durable key-value records
+  - watch/notify stream
+  </pre>
+
+  <p>
+    前台通信路径：Client -> owner MasterGroup current primary。控制通信路径：MasterNode -> Coordinator -> HA Backend，或 Coordinator -> MasterNode。
+    两者必须使用独立 RPC 队列或至少独立优先级，防止控制面流量影响客户请求。
+  </p>
+
+  <h3>9.4 物理视图</h3>
+  <p>
+    物理视图描述部署拓扑。
+  </p>
+  <pre>
+Rack / AZ A:
+  MasterNode A: G1 primary, G2 voter, G3 voter
+  Storage Clients
+
+Rack / AZ B:
+  MasterNode B: G2 primary, G1 voter, G3 voter
+  Storage Clients
+
+Rack / AZ C:
+  MasterNode C: G3 primary, G1 voter, G2 voter
+  Storage Clients
+
+Coordinator:
+  active + standby deployment
+  backed by HA Backend lease
+
+HA Backend:
+  odd-number quorum deployment if using etcd-like backend
+  </pre>
+
+  <p>
+    同一 MasterGroup 的 replicas 应跨故障域部署，并为任一节点故障后的 primary 提升预留容量。Coordinator active/standby 也应跨节点部署，但 Coordinator 不承载热路径，因此其资源规格可以小于 MasterNode。
+  </p>
+
+  <h3>9.5 场景视图</h3>
+  <p>
+    场景视图对应架构的 +1，用关键用例验证其他四个视图是否闭合。
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>场景</th>
+        <th>参与组件</th>
+        <th>关键判断</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>正常 Get</td>
+        <td>Client、owner MasterGroup primary</td>
+        <td>不访问 Coordinator；单 group primary 完成并按复制模式提交。</td>
+      </tr>
+      <tr>
+        <td>正常 Put</td>
+        <td>Client、owner MasterGroup primary、Storage Client</td>
+        <td>Master 使用本地 ResourceView；不阻塞等待 Coordinator。</td>
+      </tr>
+      <tr>
+        <td>扩容</td>
+        <td>Coordinator、Source Group、Target Group、Client</td>
+        <td>迁移按预算执行；cutover 通过 assignment generation 和 MOVED 完成。</td>
+      </tr>
+      <tr>
+        <td>缩容</td>
+        <td>Coordinator、Draining MasterNode、affected MasterGroups</td>
+        <td>先容量校验，再低 QPS slot group 优先迁移。</td>
+      </tr>
+      <tr>
+        <td>MasterNode 故障</td>
+        <td>affected MasterGroups、Coordinator、HA Backend、Client</td>
+        <td>各组独立提升 term 和 primary；slot owner/assignment_generation 不变。</td>
+      </tr>
+      <tr>
+        <td>Coordinator 故障</td>
+        <td>HA Backend、Standby Coordinator、MasterGroups</td>
+        <td>稳定 slot 前台读写继续；迁移编排暂停后恢复。</td>
+      </tr>
+      <tr>
+        <td>P99.9 抖动</td>
+        <td>MasterGroups、Coordinator</td>
+        <td>LatencyGuard 降低后台任务预算，必要时暂停迁移。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>10. API 与协议建议</h2>
+  <h3>10.1 客户端路由 API</h3>
+  <pre>
+GetClusterView() -> ClusterView
+WatchClusterView(view_revision) -> ClusterViewDelta
+
+RequestContext {
+  string tenant_id;
+  uint32_t slot_id;
+  string master_group_id;
+  uint64_t group_term;
+  uint64_t assignment_generation;
+  string request_id;
+}
+  </pre>
+
+  <h3>10.2 MasterNode / MasterGroup 上报 API</h3>
+  <pre>
+ReportShardStats(ShardStats) -> OK
+ReportMigrationState(MigrationState) -> OK
+ReportResourceUsage(ResourceUsage) -> OK
+  </pre>
+
+  <h3>10.3 Coordinator 控制 API</h3>
+  <pre>
+SubmitRebalancePlan(RebalancePlan) -> PlanId
+PauseMigration(PlanId) -> OK
+ResumeMigration(PlanId) -> OK
+DrainNode(node_id) -> OK
+UpdateBackgroundBudget(BackgroundBudget) -> OK
+  </pre>
+
+  <h3>10.4 路由错误码</h3>
+  <pre>
+MOVED(slot_id, target_group_id, target_endpoint, assignment_generation, group_term)
+ASK(slot_id, target_group_id, target_endpoint, assignment_generation, group_term)
+NOT_PRIMARY(master_group_id, primary_endpoint, current_term)
+STALE_TERM(master_group_id, current_term)
+TRYAGAIN(slot_id, reason)
+STALE_ASSIGNMENT(slot_id, current_generation)
+SLOT_NOT_OWNED(slot_id, owner_master_group_id)
+MASTER_READONLY(node_id)
+  </pre>
+
+  <h2>11. 新开发特性与独立验收清单</h2>
+  <p>
+    本节是可直接进入需求和测试系统的 feature backlog。每个特性必须能单独部署或使用 fake/mock 依赖进行验收；
+    “代码已合入”“接口已定义”不算验收完成。除特别说明外，所有故障用例都必须有自动化测试，所有状态变化都必须暴露指标和结构化日志。
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>ID / 特性</th>
+        <th>交付边界</th>
+        <th>独立验收标准</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>F01</code><br/>稳定 Slot Hash</td>
+        <td>定义 tenant-aware hash、16384 slots、跨语言测试向量和版本号；不包含远程路由。</td>
+        <td>至少 C++/Python 对 10,000 个固定输入产生完全一致的 slot；进程重启、编译优化级别变化后结果不变；非法 hash version 明确报错。</td>
+      </tr>
+      <tr>
+        <td><code>F02</code><br/>ClusterView 数据模型与持久化</td>
+        <td>序列化 MasterNode、MasterGroup、SlotGroupOwner、ClientControlOwner 及各自 fencing 字段；提供内存和 HA Backend adapter。</td>
+        <td>view 可 round-trip；CAS 拒绝旧 <code>view_revision</code>；进程重启恢复结果一致；未知字段可前向兼容；损坏记录不被静默接受。</td>
+      </tr>
+      <tr>
+        <td><code>F03</code><br/>ClusterView Watch</td>
+        <td>提供全量读取、增量 watch、断线续传和 compact 后回退全量读取。</td>
+        <td>连续提交 1,000 次 view 更新，watcher 不丢失且顺序一致；任意位置断线重连后收敛到最终 view；慢 watcher 不阻塞发布者。</td>
+      </tr>
+      <tr>
+        <td><code>F04</code><br/>客户端 Group 路由</td>
+        <td>实现 <code>key -> slot -> SlotGroup -> MasterGroup -> primary endpoint</code>，校验 group term 和 assignment_generation。</td>
+        <td>使用 fake view 将全量 slot 路由到预期 endpoint；收到 <code>NOT_PRIMARY</code>、<code>STALE_TERM</code>、<code>MOVED</code> 后在 bounded retry 内刷新并成功；Coordinator 不出现在正常 Get/Put 调用链。</td>
+      </tr>
+      <tr>
+        <td><code>F05</code><br/>Batch Regroup</td>
+        <td>按 MasterGroup 并行拆分 Batch，并按输入顺序合并逐 key 结果。</td>
+        <td>混合至少 3 个 group、重复 key 和部分失败时，输出顺序及错误一一对应；一个 group 超时不取消已完成 group；总等待不超过配置 deadline。</td>
+      </tr>
+      <tr>
+        <td><code>F06</code><br/>MasterNode Membership</td>
+        <td>实现 node register、lease renew、SUSPECT、UNAVAILABLE、DRAINING、INACTIVE 状态机。</td>
+        <td>fake clock 下验证每个合法转换；lease 到期在规定窗口内标记 UNAVAILABLE；旧 <code>node_incarnation_id</code> 无法续租或覆盖重启后的新实例；非法跳转被拒绝并记录原因。</td>
+      </tr>
+      <tr>
+        <td><code>F07</code><br/>MasterGroup 单副本运行时</td>
+        <td>一个 MasterNode 承载多个逻辑 group；每组隔离元数据、OpLog、snapshot、指标和 RPC queue。</td>
+        <td>单进程启动至少 32 个 group 并写入相同 key，各组数据互不串扰；单组 snapshot/restart 恢复不影响其他组；可按 group 查询 CPU、队列和 metadata bytes。</td>
+      </tr>
+      <tr>
+        <td><code>F08</code><br/>Group Term 与写 Fencing</td>
+        <td>所有写请求携带 <code>master_group_id + group_term</code>；旧 primary 无法提交写。</td>
+        <td>将 term 从 N 提升到 N+1 后，term=N 的 Put/Remove/任务完成通知全部返回 <code>STALE_TERM</code>；并发压力下旧 term 成功提交数为 0；读写错误包含 current term。</td>
+      </tr>
+      <tr>
+        <td><code>F09</code><br/>QUORUM Group 复制与选主</td>
+        <td>实现 3+ voter 的日志复制、commit index、leader election 和 learner catch-up。</td>
+        <td>3 节点组在任意 1 节点故障后已确认写不丢失并恢复服务；隔离旧 primary 后不能形成双写；失去多数派时拒绝写；learner 追平后状态 hash 与 leader 一致。</td>
+      </tr>
+      <tr>
+        <td><code>F10</code><br/>ASYNC_STANDBY 模式</td>
+        <td>实现异步 OpLog replay、replay position、显式提升和 RPO 暴露；不宣称 quorum 语义。</td>
+        <td>注入 replay lag 后指标准确反映差值；提升时返回可能丢失的 position/bytes；未取得 fencing token 的 follower 不可提升；文档/API 明确返回当前 ReplicationMode。</td>
+      </tr>
+      <tr>
+        <td><code>F11</code><br/>Group Placement 与成员变更</td>
+        <td>Coordinator 依据故障域和容量放置 replicas，采用 learner-add/catch-up/promote/remove 流程。</td>
+        <td>输入多机架拓扑时同组 replicas 不共故障域；目标不满足约束时计划被拒绝；成员变更中断后可恢复或回滚；任一时刻不产生两个有效 primary。</td>
+      </tr>
+      <tr>
+        <td><code>F12</code><br/>SlotGroup 静态分配</td>
+        <td>把 16384 slots 完整且无重叠地分配给多个 MasterGroup，并在服务端强制校验归属。</td>
+        <td>覆盖检查证明每个 slot 恰好一个 owner；非 owner 请求返回包含目标 group 的 <code>MOVED</code>；旧 <code>assignment_generation</code> 返回 <code>STALE_ASSIGNMENT</code>；组内切主不改变 assignment_generation。</td>
+      </tr>
+      <tr>
+        <td><code>F13</code><br/>SlotGroup 在线迁移</td>
+        <td>实现 IMPORTING、snapshot copy、committed replay、cutover fencing、MOVED 和 source cleanup。</td>
+        <td>持续并发 Put/Get 时迁移一个 SlotGroup，cutover 后 source/target 对象状态 hash 一致、已确认写零丢失、同一 key 无双 owner；任一阶段 kill/restart 均能恢复或安全回滚。</td>
+      </tr>
+      <tr>
+        <td><code>F14</code><br/>Segment Control-Owner 路由</td>
+        <td>按 client_id 将同一 Storage Client 的全部 segments 绑定到一个 MasterGroup，支持 control_generation 和 heartbeat redirect。</td>
+        <td>同一 client 的不同介质 segment 始终落到同组；组内切主只改变 endpoint/term；跨组迁移只提升 control_generation；旧 control owner 无法接受新 heartbeat 或控制写。</td>
+      </tr>
+      <tr>
+        <td><code>F15</code><br/>跨组任务投递</td>
+        <td>对象 owner 提交 TaskIntent，至少一次投递到 segment control-owner group，并以 task_id 幂等完成。</td>
+        <td>在投递前、投递后、执行后分别注入崩溃，最终任务恰好产生一次对象状态变化；重复消息不重复分配/释放；任一 term/generation 过期时刷新路由而不是执行。</td>
+      </tr>
+      <tr>
+        <td><code>F16</code><br/>Resource Capability 与 Telemetry</td>
+        <td>上报容量、读写带宽、IOPS、并发度、延迟桶、实时使用量、reserved、队列及采样时间。</td>
+        <td>fake Storage Client 上报后 ResourceView 在时限内可见；同一 segment_incarnation 下较小 sample_seq 的样本不会覆盖新样本；超过 freshness 阈值的 segment 被标为 stale；读/写及不同对象大小桶不被合并。</td>
+      </tr>
+      <tr>
+        <td><code>F17</code><br/>多维 Reservation</td>
+        <td>以 lease/CAS 原子预留 bytes、bandwidth、IOPS，支持 TTL、幂等键、commit 和 revoke。</td>
+        <td>100 个并发请求不会使任一资源维度超卖；相同幂等键只产生一份 reservation；TTL 后资源可回收；commit/revoke 重复调用结果稳定。</td>
+      </tr>
+      <tr>
+        <td><code>F18</code><br/>版本化 PlacementPolicy</td>
+        <td>实现硬约束过滤、可插拔评分、Top-K 有界 reserve 和 ScoreBreakdown；首版使用确定性加权评分。</td>
+        <td>容量不足、故障域冲突和能力不匹配的候选永不入选；固定快照与 policy version 输出完全可重放；每次决策可解释各分项；reserve 尝试不超过配置 K。</td>
+      </tr>
+      <tr>
+        <td><code>F24</code><br/>Delegated Extent Lease</td>
+        <td>Storage Client allocator 批量租出互不重叠的 extent range 和多维预算；MasterGroup 在租约内本地分配、后台续租和归还。</td>
+        <td>并发向两个 group 发放租约时 extent 零重叠；旧 segment_incarnation/control_generation 或过期 lease 无法 commit；正常 PutStart 不产生 allocator RPC；耗尽时有界触发后台批量 refill，当前请求快速失败而不无限等待。</td>
+      </tr>
+      <tr>
+        <td><code>F19</code><br/>Replica Read Selection</td>
+        <td>在已有 replicas 中根据健康、实时队列、带宽、时延和 locality 排序，不改变持久 placement。</td>
+        <td>注入慢副本后新读流量在观测窗口内转移，恢复后按 hysteresis 回切；无健康副本时返回明确错误；选择变化不产生数据迁移或 metadata ownership 变化。</td>
+      </tr>
+      <tr>
+        <td><code>F20</code><br/>BackgroundBudget 与 LatencyGuard</td>
+        <td>分别限制迁移、snapshot、offload、promotion、eviction；根据前台 P99.9 和队列闭环降速/恢复。</td>
+        <td>压测使 P99.9 超阈值后一个控制窗口内降低预算，连续健康窗口后渐进恢复；前台流量不经过 Coordinator；预算过期时采用保守默认值。</td>
+      </tr>
+      <tr>
+        <td><code>F21</code><br/>Coordinator HA</td>
+        <td>active/standby lease、fencing token、持久计划恢复；不承担 MasterGroup 日志提交。</td>
+        <td>双实例竞争时最多一个可提交 view；kill active 后 standby 恢复未完成迁移状态；切换期间稳定 group 的 Get/Put 持续成功；旧 Coordinator CAS 全部失败。</td>
+      </tr>
+      <tr>
+        <td><code>F22</code><br/>可观测性与一致性审计</td>
+        <td>提供 per-node/group/slot/client/segment 指标、结构化事件和只读审计 API。</td>
+        <td>自动审计能检测 slot 重叠/缺口、同 group 双 primary、replica 跨域违规、stale fencing token 和 reservation 泄漏；健康集群误报为 0；每个异常可定位到实体 ID 和 view revision。</td>
+      </tr>
+      <tr>
+        <td><code>F23</code><br/>故障注入与兼容性测试框架</td>
+        <td>可注入进程退出、网络分区、延迟、丢包、磁盘错误、时钟推进和旧版本客户端；输出确定性报告。</td>
+        <td>CI 可独立复现指定 seed；至少覆盖旧 primary 隔离、迁移中断、watch 断线、重复任务、过期 ResourceView；失败报告包含 seed、时间线和最终不变量检查。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>11.1 通用 Definition of Done</h3>
+  <ul>
+    <li>每项特性有独立 feature flag 或明确的启用条件，关闭时不改变现有单 Master 行为。</li>
+    <li>新增持久化结构必须包含 schema/version，并至少验证一次旧版本读取新版本中已知字段的兼容路径。</li>
+    <li>所有重试均有 deadline、最大次数和幂等键；验收不得依赖无限等待或人工查看日志。</li>
+    <li>性能相关特性必须同时报告吞吐、P50、P99、P99.9 和资源占用，并保存可比较的基线。</li>
+    <li>验收报告必须记录代码版本、配置、拓扑、随机 seed、开始/结束时间和不变量检查结果。</li>
+  </ul>
+
+  <h3>11.2 依赖关系与并行开发边界</h3>
+  <pre>
+基础契约： F01 -> F02 -> F03
+客户端：   F01 + F02 -> F04 -> F05
+Group：    F02 -> F07 -> F08 -> {F09 | F10} -> F11
+Slot：     F04 + F07 -> F12 -> F13
+Segment：  F02 + F07 -> F14 -> F15
+资源调度： F16 -> F17 -> {F18, F24}; F18 + F24 -> F19
+保护闭环： F16 -> F20
+系统 HA：  F03 + F11 + F13 -> F21
+质量体系： F22、F23 从第一阶段开始，并为其他特性提供验收 harness
+  </pre>
+  <p>
+    箭头表示生产集成依赖，不表示验收必须串行。例如 F04 可用 fake ClusterView 验收，F15 可用两个内存 MasterGroup
+    和 fake heartbeat 验收，F18 可使用固定 ResourceView 快照验收。这样各团队可以并行开发，同时保持每项交付可独立判定成功或失败。
+  </p>
+
+  <h2>12. 演进计划</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>阶段</th>
+        <th>内容</th>
+        <th>收益</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>阶段一</td>
+        <td>单 Master 暴露 16384 slot 的 ClusterView；客户端实现 slot 计算和路由缓存。</td>
+        <td>不改变部署即可验证客户端路由逻辑。</td>
+      </tr>
+      <tr>
+        <td>阶段二</td>
+        <td>多个单副本 MasterGroup 静态分配 SlotGroup；Batch regroup；MOVED/STALE_ASSIGNMENT。</td>
+        <td>核心元数据请求横向扩展。</td>
+      </tr>
+      <tr>
+        <td>阶段三</td>
+        <td>引入轻量 Coordinator，管理 view、resource summary 和后台预算。</td>
+        <td>为扩缩容、P99.9 保护和资源协同打基础。</td>
+      </tr>
+      <tr>
+        <td>阶段四</td>
+        <td>实现 slot group 在线迁移、snapshot copy、incremental replay、ASK/MOVED cutover。</td>
+        <td>支持在线扩缩容和 rebalance。</td>
+      </tr>
+      <tr>
+        <td>阶段五</td>
+        <td>为 MasterGroup 增加 replica、term、组内选主与 fencing；实现 Coordinator active/standby。</td>
+        <td>降低故障影响范围，提高可用性。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>13. 风险与约束</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>风险</th>
+        <th>影响</th>
+        <th>缓解措施</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Coordinator 被误用到热路径</td>
+        <td>成为新的 P99.9 瓶颈</td>
+        <td>接口约束：Get/Put 不调用 Coordinator；客户端只周期性或按错误刷新 view。</td>
+      </tr>
+      <tr>
+        <td>ResourceView 过期</td>
+        <td>PutStart 选择到高水位或不可用 segment</td>
+        <td>allocator lease/CAS 二次确认；失败快速换候选或返回错误。</td>
+      </tr>
+      <tr>
+        <td>迁移 replay lag 过大</td>
+        <td>cutover 窗口变长</td>
+        <td>lag 超阈值时暂停新迁移，降低前台写入冻结时间。</td>
+      </tr>
+      <tr>
+        <td>跨 slot Batch 尾延迟</td>
+        <td>最慢 shard 拉高整批响应</td>
+        <td>per-shard deadline、partial result、bounded retry。</td>
+      </tr>
+      <tr>
+        <td>热点 slot group</td>
+        <td>单 shard 局部热点</td>
+        <td>rebalance 避免迁移最热 group；必要时支持 hash tag 约束和 key-level split。</td>
+      </tr>
+      <tr>
+        <td>Coordinator split-brain</td>
+        <td>生成冲突 view 或迁移计划</td>
+        <td>Coordinator lease + fencing token；所有 view 更新通过 HA Backend CAS。</td>
+      </tr>
+      <tr>
+        <td>term、assignment_generation、control_generation 混用</td>
+        <td>普通切主触发无谓 slot 迁移，或旧 primary/旧 control owner 未被正确隔离</td>
+        <td>分别校验组内领导权、SlotGroup 归属和 client 控制归属；协议字段与错误码独立。</td>
+      </tr>
+      <tr>
+        <td>多个 group replicas 共置于同一故障域</td>
+        <td>单节点或单机架故障同时失去 quorum</td>
+        <td>group placement 使用反亲和约束，并在部署前做 N-1 failover capacity 校验。</td>
+      </tr>
+      <tr>
+        <td>异步主备被当作强一致复制</td>
+        <td>故障提升后丢失已确认写或产生分叉</td>
+        <td>ClusterView 明确暴露 <code>ReplicationMode</code>、commit/replay position 和可承诺的 RPO；需要 RPO=0 时使用 quorum 提交。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>14. 最终建议</h2>
+  <div class="ok">
+    <p>
+      轻量 Coordinator 路线是 Mooncake 分布式元数据面的推荐落地方案：它保留 Redis Cluster 风格的客户端直连和 slot redirect，避免中心化热路径；同时补足 Mooncake 相比 Redis 多出来的物理资源管理、冷热分级、slot 迁移限速和 P99.9 自动保护能力。
+    </p>
+  </div>
+
+  <p>
+    实施时应坚持四条红线：Coordinator 不代理前台请求；slot owner 是 MasterGroup 而不是裸 MasterNode；
+    term、assignment_generation、control_generation 分别保护组内领导权、slot 归属和 segment 控制归属；segment_incarnation 隔离重建前后的物理空间；所有迁移动作都必须带 fencing 和可观测的 P99.9 保护阈值。
+    只要这些边界成立，该设计既能横向扩展元数据吞吐，也能在扩缩容和故障场景下保持尾延迟可控。
+  </p>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      securityLevel: "strict",
+      theme: "base",
+      sequence: {
+        showSequenceNumbers: true,
+        mirrorActors: false,
+        useMaxWidth: true
+      }
+    });
+  </script>
+</body>
+</html>

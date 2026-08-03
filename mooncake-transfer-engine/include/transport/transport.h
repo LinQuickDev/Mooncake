@@ -85,6 +85,12 @@ class Transport {
         size_t transferred_bytes;
     };
 
+    struct NicLoadStats {
+        std::string device_name;
+        uint64_t inflight_bytes{0};
+        double ewma_bandwidth_bps{0.0};
+    };
+
     struct BatchDesc;
     struct TransferTask;
 
@@ -112,6 +118,7 @@ class Transport {
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
+        uint64_t trace_id = 0;
         std::string peer_nic_path;
         std::string source_location;
         SliceStatus status;
@@ -126,6 +133,12 @@ class Transport {
         std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
 
+        // Optional resource cleanup invoked exactly once before the slice is
+        // deleted or returned to the thread-local cache. The callback must not
+        // delete the slice.
+        using CleanupCallback = void (*)(Slice *);
+        CleanupCallback cleanup_callback = nullptr;
+
         union {
             struct {
                 uint64_t dest_addr;
@@ -133,7 +146,7 @@ class Transport {
                 mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                std::atomic<int> *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer
@@ -145,6 +158,8 @@ class Transport {
                 uint32_t max_retry_cnt;
                 void *r_seg;
                 void *l_seg;
+                uint8_t src_chip_id;
+                uint8_t dst_chip_id;
                 void *endpoint;
             } ub;
             struct {
@@ -152,6 +167,10 @@ class Transport {
                 void *cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
             } local;
+            struct {
+                void *event;  // cudaEvent_t
+                int device_id;
+            } nccl;
             struct {
                 uint64_t dest_addr;
             } tcp;
@@ -275,12 +294,20 @@ class Transport {
                 slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
                 tail_++;
                 slice->from_cache = true;
+                slice->peer_nic_path.clear();
+                slice->dest_rkeys.clear();
             }
 
             return slice;
         }
 
         void deallocate(Slice *slice) {
+            // Clear before invoking so a cached slice cannot carry a
+            // transport-specific cleanup callback into its next use.
+            auto cleanup = slice->cleanup_callback;
+            slice->cleanup_callback = nullptr;
+            if (cleanup) cleanup(slice);
+
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
                 return;

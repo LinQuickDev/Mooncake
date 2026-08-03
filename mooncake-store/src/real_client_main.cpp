@@ -1,10 +1,12 @@
 #include <gflags/gflags.h>
+#include <algorithm>
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
+#include "mooncake_logging.h"
 #include "real_client.h"
 
 using namespace mooncake;
@@ -27,6 +29,10 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
+DEFINE_int32(offload_rpc_thread_num, 8,
+             "Number of threads for the offload RPC server. "
+             "Effective only when --enable_offload and "
+             "--start_offload_rpc_server are true.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -83,10 +89,13 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::release_buffer_dummy>(&real_client);
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(
         &real_client);
+    server.register_handler<&RealClient::allocate_buffer_dummy>(&real_client);
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
+    server.register_handler<&RealClient::batch_get_offload_object_push>(
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
 }
@@ -100,9 +109,13 @@ int main(int argc, char *argv[]) {
     mooncake::ResourceTracker::getInstance();
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
-    if (!FLAGS_log_dir.empty()) {
+    // Guard against double init: globalConfig() (transfer engine) may already
+    // have called InitGoogleLogging and populated FLAGS_log_dir from
+    // MC_LOG_DIR.
+    if (!FLAGS_log_dir.empty() && !google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(argv[0]);
     }
+    mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
     size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);
@@ -112,13 +125,19 @@ int main(int argc, char *argv[]) {
 #endif
 
     auto client_inst = RealClient::create();
+    const size_t offload_rpc_thread_num =
+        static_cast<size_t>(std::max(1, FLAGS_offload_rpc_thread_num));
+    if (FLAGS_offload_rpc_thread_num <= 0) {
+        LOG(WARNING) << "Invalid --offload_rpc_thread_num="
+                     << FLAGS_offload_rpc_thread_num << ", using 1";
+    }
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size,
         local_buffer_size, FLAGS_protocol, FLAGS_device_names,
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id);
+        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port, offload_rpc_thread_num);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

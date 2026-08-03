@@ -53,16 +53,39 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Number of worker threads that concurrently handle inbound handshake
+    // requests on the listener. The legacy implementation processed requests
+    // strictly serially in a single thread, so under high concurrency (e.g.
+    // many small-file transfers firing simultaneous QP handshakes) the
+    // listener backlog was exhausted and clients hit the 60s read timeout,
+    // surfacing as TRANSFER_FAIL. Override via MC_HANDSHAKE_WORKER_THREADS.
+    int handshake_worker_threads = 16;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a
     // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
+    // Cooldown before retrying a failed RDMA peer rail. Override via
+    // MC_RDMA_RAIL_PAUSE_SECONDS.
+    uint64_t rdma_rail_pause_seconds = 30;
     bool metacache = true;
+    // Periodically refresh Transfer Engine metadata-derived local caches. 0
+    // disables the background poller and preserves the manual
+    // syncSegmentCache() behavior. Currently refreshes cached remote segment
+    // descriptors. Override via MC_TE_METADATA_REFRESH_INTERVAL_SECONDS.
+    uint64_t te_metadata_refresh_interval_seconds = 0;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    // Active-connect circuit-breaker. After an endpoint to a peer is torn down
+    // (path failure / QP fatal), pause active reconnection to that peer's
+    // address for this many milliseconds, so the posting worker is not
+    // blocked re-handshaking a likely-gone peer (a k8s rolling restart brings
+    // the pod back at a different podIP:port, so the old address is dead). The
+    // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
+    // Override via MC_CONN_PAUSE_TTL_MS.
+    int conn_pause_ttl_ms = 0;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
@@ -71,6 +94,7 @@ struct GlobalConfig {
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
+    bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
@@ -90,7 +114,7 @@ struct GlobalConfig {
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;
@@ -108,13 +132,34 @@ struct GlobalConfig {
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
+    // urma transport mode: "RM" (default), "RC", "UM"; override via
+    // MC_URMA_TRANS_MODE
+    std::string urma_trans_mode = "RM";
+    // urma active port: -1 (default) for auto-selection by scanning port
+    // attributes, >=0 for user-specified port index; override via
+    // MC_URMA_ACTIVE_PORT
+    int urma_active_port = -1;
+    // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_BALANCE
+    bool urma_bonding_balance = false;
+    // enable bonding multipath mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_MULTIPATH_ENABLE
+    bool urma_bonding_multipath = false;
+    // enable UB NUMA affinity: store splits the global segment into one
+    // segment per NIC-NUMA node, and transfers pin src/dst chip by NUMA.
+    // Independent from urma_bonding_multipath; default off; override via
+    // MC_UB_NUMA_AFFINITY_ENABLE
+    bool ub_numa_affinity = false;
 };
 
 struct RpcCommunicatorConfig {
     std::string listen_address;
     size_t thread_count = 0;
     size_t timeout_seconds = 30;
-    size_t pool_size = 10;
+    // Maximum number of cached RPC client connections per target endpoint.
+    // RPC client I/O threads are configured by
+    // MC_TE_RPC_CLIENT_IO_THREADS/MC_RPC_CLIENT_IO_THREADS.
+    size_t pool_size = 100;
 };
 
 void loadGlobalConfig(GlobalConfig& config);

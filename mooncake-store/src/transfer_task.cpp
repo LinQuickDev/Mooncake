@@ -8,10 +8,12 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 #include "device/accelerator_registry.h"
+#include "mooncake_logging.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_NOF
@@ -170,6 +172,18 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 }
 #endif
 
+namespace {
+
+std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
+    uint64_t trace_id) {
+    if (trace_id == 0 || mooncake::logging::CurrentTraceId() != 0) {
+        return nullptr;
+    }
+    return std::make_unique<mooncake::logging::ScopedTraceId>(trace_id);
+}
+
+}  // namespace
+
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
@@ -179,8 +193,8 @@ constexpr int kDefaultFilereadWorkers = 10;
 
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
-            << " workers";
+    MC_VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
+               << " workers";
 
     // Start worker threads
     workers_.reserve(kDefaultFilereadWorkers);
@@ -226,7 +240,7 @@ void FilereadWorkerPool::workerThread() {
     VLOG(2) << "FilereadWorkerPool worker thread started";
 
     while (true) {
-        FilereadTask task("", 0, {}, nullptr);
+        FilereadTask task("", 0, {}, nullptr, 0);
 
         // Wait for task or shutdown signal
         {
@@ -247,6 +261,7 @@ void FilereadWorkerPool::workerThread() {
 
         // Execute the task if we have one
         if (task.state) {
+            mooncake::logging::ScopedTraceId trace(task.trace_id);
             try {
                 if (!backend_) {
                     LOG(ERROR)
@@ -628,7 +643,7 @@ void MemcpyWorkerPool::workerThread() {
     VLOG(2) << "MemcpyWorkerPool worker thread started";
 
     while (true) {
-        MemcpyTask task({}, nullptr);
+        MemcpyTask task({}, nullptr, 0);
 
         // Wait for task or shutdown signal
         {
@@ -649,6 +664,7 @@ void MemcpyWorkerPool::workerThread() {
 
         // Execute the task if we have one
         if (task.state) {
+            mooncake::logging::ScopedTraceId trace(task.trace_id);
             try {
                 bool ok = true;
                 auto runtime_accelerator =
@@ -724,6 +740,7 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 bool TransferEngineOperationState::is_completed() {
+    [[maybe_unused]] auto trace = RestoreTraceIfMissing(trace_id());
     std::lock_guard<std::mutex> lock(mutex_);
     if (result_.has_value()) {
         return true;
@@ -734,6 +751,7 @@ bool TransferEngineOperationState::is_completed() {
 }
 
 void TransferEngineOperationState::check_task_status() {
+    [[maybe_unused]] auto trace = RestoreTraceIfMissing(trace_id());
     // Check all transfers in the batch.
     // Wait for ALL tasks to reach a terminal state before setting the result,
     // even if some have already failed. This prevents the caller from seeing
@@ -797,6 +815,7 @@ void TransferEngineOperationState::check_task_status() {
 }
 
 void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
+    [[maybe_unused]] auto trace = RestoreTraceIfMissing(trace_id());
     if (result_.has_value()) {
         LOG(ERROR) << "Attempting to set result multiple times for batch "
                    << batch_id_
@@ -812,6 +831,7 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 }
 
 void TransferEngineOperationState::wait_for_completion() {
+    [[maybe_unused]] auto trace = RestoreTraceIfMissing(trace_id());
     if (is_completed()) {
         return;
     }
@@ -915,6 +935,7 @@ TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
 bool TransferFuture::isReady() const { return state_->is_completed(); }
 
 ErrorCode TransferFuture::wait() {
+    [[maybe_unused]] auto trace = RestoreTraceIfMissing(state_->trace_id());
     if (!isReady()) {
         state_->wait_for_completion();
     }
@@ -1117,10 +1138,51 @@ TransferSubmitter::submit_batch_get_offload_object(
     return submitTransfer(requests);
 }
 
+std::optional<TransferFuture>
+TransferSubmitter::submit_batch_push_offload_object(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    if (keys.size() != src_pointers.size() ||
+        keys.size() != dst_slices.size()) {
+        MC_LOG(ERROR) << "submit_batch_push_offload_object size mismatch: keys="
+                      << keys.size() << ", src_pointers=" << src_pointers.size()
+                      << ", dst_slices=" << dst_slices.size();
+        return std::nullopt;
+    }
+    std::vector<TransferRequest> requests;
+    // Open the requester's segment once — all keys share requester_te_addr.
+    SegmentHandle seg = engine_.openSegment(requester_te_addr);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        MC_LOG(ERROR) << "Failed to open segment " << requester_te_addr;
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        // src is the owner's local ClientBuffer blob for this key (contiguous,
+        // registered via FileStorage::RegisterLocalMemory). It is split across
+        // the requester's possibly non-contiguous destination slices.
+        const uint64_t src = src_pointers[i];
+        uint64_t offset = 0;
+        for (const auto& dst : dst_slices[i]) {
+            TransferRequest request;
+            request.opcode = TransferRequest::WRITE;
+            request.source = reinterpret_cast<char*>(src + offset);
+            request.target_id = seg;
+            request.target_offset = dst.addr;
+            request.length = dst.size;
+            requests.emplace_back(request);
+            offset += dst.size;
+        }
+    }
+    return submitTransfer(requests);
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
-    auto state = std::make_shared<MemcpyOperationState>();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    auto state = std::make_shared<MemcpyOperationState>(trace_id);
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
@@ -1151,7 +1213,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     }
 
     // Submit memcpy operations to worker pool for async execution
-    MemcpyTask task(std::move(operations), state);
+    MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
 
     VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
@@ -1190,7 +1252,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
+        engine_, batch_id, batch_size, mooncake::logging::CurrentTraceId());
 
     return TransferFuture(state);
 }
@@ -1331,13 +1393,14 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code) {
-    auto state = std::make_shared<FilereadOperationState>();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    auto state = std::make_shared<FilereadOperationState>(trace_id);
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;
     size_t file_length = disk_replica.object_size;
 
     // Submit memcpy operations to worker pool for async execution
-    FilereadTask task(file_path, file_length, slices, state);
+    FilereadTask task(file_path, file_length, slices, state, trace_id);
     fileread_pool_->submitTask(std::move(task));
 
     VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;

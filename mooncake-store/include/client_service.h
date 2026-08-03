@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "client_buffer.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -42,11 +43,15 @@ class QueryResult {
     const std::vector<Replica::Descriptor> replicas;
     /** @brief Time point when the lease for this key expires */
     const std::chrono::steady_clock::time_point lease_timeout;
+    /** @brief Optional full-object checksum */
+    const std::optional<uint64_t> object_checksum;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param)
+                std::chrono::steady_clock::time_point lease_timeout_param,
+                std::optional<uint64_t> object_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
-          lease_timeout(lease_timeout_param) {}
+          lease_timeout(lease_timeout_param),
+          object_checksum(object_checksum_param) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -139,6 +144,11 @@ class Client {
     QueryByRegex(const std::string& str);
 
     /**
+     * @brief Returns unique offload RPC endpoints currently known by master.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> GetOffloadEndpoints();
+
+    /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
      * @return Vector of QueryResult objects containing replicas and lease
@@ -149,6 +159,10 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> VerifyObjectChecksum(
+        const std::string& object_key, const std::vector<Slice>& slices,
+        size_t object_size, std::optional<uint64_t> expected_checksum);
 
     /**
      * @brief Batch clear KV cache for specified object keys on a specific
@@ -425,6 +439,8 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    tl::expected<bool, ErrorCode> PollRemoveAll();
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 
@@ -496,6 +512,21 @@ class Client {
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_slices);
+
+    /**
+     * @brief Push counterpart of BatchGetOffloadObject, run on the data owner.
+     * WRITEs each key's staged ClientBuffer blob (src_pointers[i]) directly
+     * into the requester's destination slices over the transfer engine.
+     * @param requester_te_addr The requester's Transfer Engine endpoint.
+     * @param keys List of keys (one per src pointer / dst slice group).
+     * @param src_pointers Owner-local ClientBuffer addresses, one per key.
+     * @param dst_slices Per-key destination slices on the requester.
+     */
+    tl::expected<void, ErrorCode> BatchPushOffloadObject(
+        const std::string& requester_te_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& src_pointers,
+        const std::vector<std::vector<OffloadDstSlice>>& dst_slices);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -572,6 +603,25 @@ class Client {
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     /**
+     * @brief Warmup transport-level connections to all segments
+     * currently registered with the master.
+     *
+     * Allocates a buffer via the given ClientBufferAllocator (whose base is
+     * already registered with the transfer engine) and issues a 1-byte WRITE
+     * then READ per segment to trigger eager connection setup (e.g. RDMA QP
+     * handshakes). This amortises the first-transfer handshake latency and
+     * mitigates TRANSFER_FAIL caused by handshake storms under
+     * high-concurrency small-file workloads.
+     *
+     * @param allocator Client buffer allocator used to allocate/release the
+     *                 warmup buffer; its memory is already registered with
+     *                 the transfer engine.
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> warmup(
+        const std::shared_ptr<ClientBufferAllocator>& allocator);
+
+    /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
      *         For other modes, returns the logical local hostname used for
@@ -584,6 +634,10 @@ class Client {
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
     [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
+
+    // Return the total number of NUMA nodes (counted from the local topology,
+    // which has one cpu:N entry per node regardless of NIC presence).
+    [[nodiscard]] int GetNumaNodeCount() const;
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
@@ -659,6 +713,17 @@ class Client {
            const std::map<std::string, std::string>& labels = {},
            const std::string& tenant_id = "default");
 
+    /**
+     * @brief Prepare and use the storage backend for persisting data.
+     * Exposed to subclasses for testing only.
+     * @return ErrorCode::OK on success. On failure no storage backend is
+     * retained, so persistence stays disabled.
+     */
+    ErrorCode PrepareStorageBackend(const std::string& storage_root_dir,
+                                    const std::string& fsdir,
+                                    bool enable_eviction = true,
+                                    uint64_t quota_bytes = 0);
+
    private:
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -682,14 +747,9 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
-
-    /**
-     * @brief Prepare and use the storage backend for persisting data
-     */
-    void PrepareStorageBackend(const std::string& storage_root_dir,
-                               const std::string& fsdir,
-                               bool enable_eviction = true,
-                               uint64_t quota_bytes = 0);
+    tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
+        const std::string& object_key, const std::vector<Slice>& slices,
+        size_t object_size);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
@@ -761,6 +821,7 @@ class Client {
         const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
+    void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -821,6 +882,7 @@ class Client {
     const std::string host_id_;
     const std::string metadata_connstring_;
     const std::string protocol_;
+    const bool object_checksum_enabled_;
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive

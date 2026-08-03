@@ -33,6 +33,19 @@ target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
 
+add_executable(stress_cluster_bench stress_cluster_bench.cpp)
+target_link_libraries(
+  stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
+                               gflags::gflags glog::glog pthread)
+
+# Benchmark for RealClient::get_into_ranges with configurable value size,
+# fragments per key and keys per query.
+add_executable(stress_cluster_ranges_bench stress_cluster_ranges_bench.cpp)
+target_link_libraries(
+  stress_cluster_ranges_bench PRIVATE mooncake_store transfer_engine
+                                       asio_shared gflags::gflags glog::glog
+                                       pthread)
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
@@ -45,3 +58,10 @@ add_executable(batch_evict_bench batch_evict_bench.cpp)
 target_link_libraries(
   batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
+
+if(STORE_USE_ETCD)
+  add_executable(oplog_batch_bench oplog_batch_bench.cpp)
+  target_link_libraries(
+    oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
+                              JsonCpp::JsonCpp)
+endif()

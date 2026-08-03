@@ -113,6 +113,11 @@ if(WITH_STORE)
     store/engram_store_py.cpp
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+
+  include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
+  target_include_directories(store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/store)
+  target_link_libraries(store PRIVATE UbDiag::ubdiag_lib)
+
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
@@ -214,6 +219,7 @@ if(WITH_EP)
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_elastic_buffer.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
   # ep.so / pg.so link against engine.so by that exact bare name. Create a

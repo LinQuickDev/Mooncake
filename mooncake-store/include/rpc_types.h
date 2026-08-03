@@ -1,10 +1,18 @@
 #pragma once
 
+#include <optional>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
 
 namespace mooncake {
+
+struct ObjectMeta {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(ObjectMeta, key, object_checksum);
 
 /**
  * @brief Response structure for Ping operation
@@ -32,14 +40,18 @@ YLT_REFL(PingResponse, view_version_id, client_status);
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
+    std::optional<uint64_t> object_checksum;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
-    GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
-                           uint64_t lease_ttl_ms_param)
+    GetReplicaListResponse(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        uint64_t lease_ttl_ms_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
-          lease_ttl_ms(lease_ttl_ms_param) {}
+          lease_ttl_ms(lease_ttl_ms_param),
+          object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 
 struct CachedQueryResultResponse {
     bool success;
@@ -272,5 +284,44 @@ struct BatchGetOffloadObjectResponse {
 };
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
+
+// One destination slice on the requester side. In push mode the data owner
+// writes (one-sided) the on-disk blob of a key directly into these addresses.
+struct OffloadDstSlice {
+    uint64_t addr;
+    uint64_t size;
+
+    OffloadDstSlice() : addr(0), size(0) {}
+    OffloadDstSlice(uint64_t addr_param, uint64_t size_param)
+        : addr(addr_param), size(size_param) {}
+};
+YLT_REFL(OffloadDstSlice, addr, size);
+
+// Push-mode offload request. Unlike the pull path (where the requester gets
+// back ClientBuffer pointers and issues the RDMA READ itself), here the
+// requester hands the owner its own transfer engine endpoint and destination
+// slice addresses. The owner reads SSD into its registered ClientBuffer and
+// then WRITEs straight into the requester's memory, so the requester needs no
+// follow-up READ nor a separate release_offload_buffer RPC.
+struct BatchGetOffloadObjectPushRequest {
+    std::vector<std::string> keys;  // tenant-scoped storage keys
+    std::vector<int64_t> sizes;     // total bytes per key (for FileStorage)
+    std::string requester_te_addr;  // requester's transfer engine endpoint
+    std::vector<std::vector<OffloadDstSlice>> dst_slices;  // per-key dst slices
+    uint64_t trace_id{0};
+
+    BatchGetOffloadObjectPushRequest() = default;
+};
+YLT_REFL(BatchGetOffloadObjectPushRequest, keys, sizes, requester_te_addr,
+         dst_slices, trace_id);
+
+struct BatchGetOffloadObjectPushResponse {
+    ErrorCode error_code;  // overall result; data is already in requester memory
+
+    BatchGetOffloadObjectPushResponse() : error_code(ErrorCode::OK) {}
+    explicit BatchGetOffloadObjectPushResponse(ErrorCode error_code_param)
+        : error_code(error_code_param) {}
+};
+YLT_REFL(BatchGetOffloadObjectPushResponse, error_code);
 
 }  // namespace mooncake
