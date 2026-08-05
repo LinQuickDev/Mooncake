@@ -413,7 +413,7 @@ store_py::put_batch
 ## 7. 附录：PerfPoint 打点与日志对照表
 
 PerfPoint 定义在 `mooncake-integration/store/mooncake_perf_points.def`。
-使用 `ubdiag show` 可查看实时性能数据，配合日志进行交叉分析。
+使用 `spdiag show` 可查看实时性能数据，配合日志进行交叉分析。
 
 ### 7.0 `get_into` / `batch_get_into` 与 `get_buffer` / `batch_get_buffer` 是否一致
 
@@ -669,7 +669,7 @@ export MC_LOG_ENABLE=on
 **实现要点：**
 - 每个请求只掷一次骰子（`mooncake::logging::ShouldSampleHiFreqLog()`，线程本地无锁 RNG）；命中才**既输出
   日志又记录其 steady/system clock 计时**，未命中则跳过计时与输出，开销接近零。
-- 仅作用于 breakdown 这一条文本日志。**UbDiag `PerfPoint` 打点始终记录，不受采样影响**；`ERROR`/`WARNING`
+- 仅作用于 breakdown 这一条文本日志。**SpDiag `PerfPoint` 打点始终记录，不受采样影响**；`ERROR`/`WARNING`
   也照常每次输出。
 - breakdown 是原生 `LOG(INFO)`，可见性由本变量控制，**与 `MC_LOG_ENABLE` 无关**。
 - 解析与缓存：`mooncake-common/src/mooncake_logging.cpp::ParseHiFreqLogSampleRate`（进程内只解析一次）。

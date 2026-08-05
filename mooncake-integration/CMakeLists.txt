@@ -114,9 +114,9 @@ if(WITH_STORE)
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
 
-  include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
+  include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)
   target_include_directories(store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/store)
-  target_link_libraries(store PRIVATE UbDiag::ubdiag_lib)
+  target_link_libraries(store PRIVATE SpDiag::spdiag_lib)
 
   if(USE_ASCEND_DIRECT)
     target_link_libraries(

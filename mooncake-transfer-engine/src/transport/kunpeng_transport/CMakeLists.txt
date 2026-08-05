@@ -31,5 +31,5 @@ target_link_libraries(ub_transport
         JsonCpp::JsonCpp
         glog::glog
         pthread
-        UbDiag::ubdiag_lib
+        SpDiag::spdiag_lib
 )

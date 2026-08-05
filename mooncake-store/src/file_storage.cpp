@@ -19,13 +19,13 @@
 #include "file_interface.h"
 #endif
 
-// ubdiag perf points for the offload owner-side SSD path. UBDIAG_PROGRAM_NAME
+// spdiag perf points for the offload owner-side SSD path. SPDIAG_PROGRAM_NAME
 // must match the other TUs (store_py/real_client/client_service); each TU's
 // static initializer writes the shared detail::AutoProgramName(), and leaving
 // it nullptr here could clobber the program name depending on init order.
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 
@@ -451,11 +451,11 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     // allocation (OwnerAllocBuffer) and disk load (OwnerDiskLoad). End() is on
     // the success path only — the error early-returns let the dtor Abandon the
     // unfinished total sample.
-    UbDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
-                              UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
+                              SpDiag::PerfLevel::MODULE);
     pt_read.Start();
-    UbDiag::PerfPoint pt_alloc(PerfKey::GET_SSD_OWNER_ALLOC,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_alloc(PerfKey::GET_SSD_OWNER_ALLOC,
+                               SpDiag::PerfLevel::MODULE);
     pt_alloc.Start();
     const auto alloc_start = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
@@ -469,8 +469,8 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = allocate_res.value();
-    UbDiag::PerfPoint pt_load(PerfKey::GET_SSD_OWNER_LOAD,
-                              UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_load(PerfKey::GET_SSD_OWNER_LOAD,
+                              SpDiag::PerfLevel::MODULE);
     pt_load.Start();
     ScopedStorageReadStats stats_scope(breakdown_log ? &read_stats : nullptr);
     auto result = BatchLoad(allocated_batch->slices);
@@ -1285,8 +1285,8 @@ void FileStorage::ClientBufferGCThreadFunc() {
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     // Owner-side ClientBuffer release (OwnerReleaseBuffer); shared by the pull
     // path (release_offload_buffer RPC) and the push path (inline after WRITE).
-    UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
-                                 UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
+                                 SpDiag::PerfLevel::MODULE);
     pt_release.Start();
     const auto start = std::chrono::steady_clock::now();
     const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
