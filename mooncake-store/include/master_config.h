@@ -55,11 +55,23 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
+    // Master view lease TTL in seconds (HA leadership lease).
+    // When the lease expires without successful renewal, the Master
+    // is considered dead and a standby can take over.
+    int64_t master_view_lease_ttl_sec =
+        DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+
     // OpLog store configuration
     bool enable_oplog = false;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
+
+    // Metrics reporting to HA backend (etcd/redis).
+    bool enable_metrics_report_to_backend =
+        DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND;
+    int metrics_report_interval_sec = DEFAULT_METRICS_REPORT_INTERVAL_SEC;
+    int metrics_report_lease_ttl_sec = DEFAULT_METRICS_REPORT_LEASE_TTL_SEC;
 
     std::string cluster_id;
     std::string root_fs_dir;
@@ -193,6 +205,7 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    int64_t master_view_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     // OpLog store configuration
     bool enable_oplog = false;
     int oplog_poll_interval_ms = 1000;
@@ -200,6 +213,13 @@ class MasterServiceSupervisorConfig {
     uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+
+    // Metrics reporting to HA backend (etcd/redis).
+    bool enable_metrics_report_to_backend =
+        DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND;
+    int metrics_report_interval_sec = DEFAULT_METRICS_REPORT_INTERVAL_SEC;
+    int metrics_report_lease_ttl_sec = DEFAULT_METRICS_REPORT_LEASE_TTL_SEC;
+
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -323,12 +343,18 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        master_view_lease_ttl_sec = config.master_view_lease_ttl_sec;
         enable_oplog = config.enable_oplog;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
+
+        enable_metrics_report_to_backend =
+            config.enable_metrics_report_to_backend;
+        metrics_report_interval_sec = config.metrics_report_interval_sec;
+        metrics_report_lease_ttl_sec = config.metrics_report_lease_ttl_sec;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
 

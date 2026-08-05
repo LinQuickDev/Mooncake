@@ -36,8 +36,8 @@ using common::redis::SanitizeHashTagComponent;
 
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
 constexpr auto kMinimumRenewInterval = std::chrono::milliseconds(200);
-constexpr auto kRedisLeaseTtl =
-    std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC);
+// kRedisLeaseTtl is now derived from spec_.master_view_lease_ttl_sec
+// at runtime (see RedisLeaderCoordinator::redis_lease_ttl()).
 
 constexpr char kLeaderAddressField[] = "leader_address";
 constexpr char kViewVersionField[] = "view_version";
@@ -353,7 +353,7 @@ RedisLeaderCoordinator::TryAcquireLeadership(
 
         const auto ttl_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                kRedisLeaseTtl)
+                std::chrono::seconds(spec_.master_view_lease_ttl_sec))
                 .count();
         auto* raw_reply = static_cast<redisReply*>(
             redisCommand(context_, "EVAL %s 2 %b %b %b %lld %b",
@@ -416,7 +416,7 @@ RedisLeaderCoordinator::TryAcquireLeadership(
         .view = MasterView{.leader_address = leader_address,
                            .view_version = view_version},
         .owner_token = std::move(owner_token),
-        .lease_ttl = kRedisLeaseTtl,
+        .lease_ttl = std::chrono::seconds(spec_.master_view_lease_ttl_sec),
     };
 
     return AcquireLeadershipResult{

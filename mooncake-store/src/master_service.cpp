@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <iomanip>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -3045,6 +3046,15 @@ auto MasterService::GetOffloadEndpoints()
     std::vector<std::string> endpoints;
     endpoints.reserve(unique_endpoints.size());
     for (const auto& endpoint : unique_endpoints) {
+        // Debug: print hex dump of each endpoint to detect corruption
+        std::ostringstream hex_oss;
+        for (unsigned char c : endpoint) {
+            hex_oss << std::hex << std::setw(2) << std::setfill('0')
+                    << (int)c << ' ';
+        }
+        LOG(INFO) << "[GetOffloadEndpoints] endpoint=" << endpoint
+                  << " len=" << endpoint.size() << " hex=[" << hex_oss.str()
+                  << "]";
         endpoints.emplace_back(endpoint);
     }
     return endpoints;

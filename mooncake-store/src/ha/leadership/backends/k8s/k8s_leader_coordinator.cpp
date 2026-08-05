@@ -18,7 +18,8 @@ namespace k8s {
 
 namespace {
 
-constexpr int kDefaultLeaseDurationSec = 5;
+// kDefaultLeaseDurationSec is now derived from spec_.master_view_lease_ttl_sec
+// at runtime, with a sensible floor.
 constexpr int kDefaultRenewDeadlineSec = 3;
 constexpr int kDefaultRetryPeriodSec = 1;
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
@@ -114,13 +115,15 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
 
     // Start election goroutine
     err = K8sLeaseHelper::RunElection(
-        namespace_, lease_name_, leader_address, kDefaultLeaseDurationSec,
+        namespace_, lease_name_, leader_address,
+        static_cast<int>(spec_.master_view_lease_ttl_sec),
         kDefaultRenewDeadlineSec, kDefaultRetryPeriodSec);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
 
-    constexpr int kElectionTimeoutSec = 2 * kDefaultLeaseDurationSec;
+    const int kElectionTimeoutSec =
+        2 * static_cast<int>(spec_.master_view_lease_ttl_sec);
     int64_t transitions = 0;
     err = K8sLeaseHelper::WaitElected(namespace_, lease_name_,
                                       kElectionTimeoutSec, transitions);
@@ -147,7 +150,7 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
             MasterView{.leader_address = leader_address,
                        .view_version = static_cast<ViewVersionId>(transitions)},
         .owner_token = token,
-        .lease_ttl = std::chrono::seconds(kDefaultLeaseDurationSec),
+        .lease_ttl = std::chrono::seconds(spec_.master_view_lease_ttl_sec),
     };
 
     std::thread thread_to_join;
