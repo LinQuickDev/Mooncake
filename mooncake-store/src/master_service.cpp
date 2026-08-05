@@ -6231,6 +6231,18 @@ auto MasterService::NotifyOffloadSuccess(
             continue;
         }
 
+        // Debug: hex dump to detect corruption in transport_endpoint from RPC
+        {
+            std::ostringstream hex_oss;
+            for (unsigned char c : metadata.transport_endpoint) {
+                hex_oss << std::hex << std::setw(2) << std::setfill('0')
+                        << (int)c << ' ';
+            }
+            LOG(INFO) << "[NotifyOffloadSuccess] transport_endpoint="
+                      << metadata.transport_endpoint
+                      << " len=" << metadata.transport_endpoint.size()
+                      << " hex=[" << hex_oss.str() << "]";
+        }
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         bool handled_existing_object = false;
