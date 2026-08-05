@@ -6,7 +6,7 @@
 #include <string>
 #include <thread>
 
-#include "error_code.h"
+#include "types.h"
 
 namespace mooncake {
 namespace ha {
