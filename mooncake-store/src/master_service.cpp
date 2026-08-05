@@ -6278,6 +6278,28 @@ auto MasterService::NotifyOffloadSuccess(
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
+                        // Debug: verify transport_endpoint after AddReplicas
+                        obj_metadata.VisitReplicas(
+                            [](const Replica& rep) {
+                                return rep.is_local_disk_replica();
+                            },
+                            [](const Replica& rep) {
+                                const auto& ep =
+                                    rep.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .transport_endpoint;
+                                std::ostringstream hex_oss;
+                                for (unsigned char c : ep) {
+                                    hex_oss << std::hex << std::setw(2)
+                                            << std::setfill('0') << (int)c
+                                            << ' ';
+                                }
+                                LOG(INFO)
+                                    << "[NotifyOffloadSuccess][AfterAddReplicas]"
+                                    << " transport_endpoint=" << ep
+                                    << " len=" << ep.size()
+                                    << " hex=[" << hex_oss.str() << "]";
+                            });
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
