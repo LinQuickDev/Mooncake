@@ -85,7 +85,7 @@ void MasterMetricsReporter::ReportLoop() {
             }
         }
 
-        int64_t new_lease = 0;
+        EtcdLeaseId new_lease = 0;
         auto grant_err =
             EtcdHelper::GrantLease(config_.lease_ttl_sec, new_lease);
         if (grant_err != ErrorCode::OK) {
@@ -105,7 +105,7 @@ void MasterMetricsReporter::ReportLoop() {
         auto value = BuildMetricsJson();
 
         auto put_err = EtcdHelper::Put(key.data(), key.size(), value.data(),
-                                       value.size(), new_lease);
+                                       value.size());
         if (put_err != ErrorCode::OK) {
             LOG(WARNING) << "Failed to PUT metrics to etcd key=" << key << ": "
                          << toString(put_err);

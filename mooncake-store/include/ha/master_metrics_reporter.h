@@ -79,7 +79,7 @@ class MasterMetricsReporter {
 
     Config config_;
     std::string role_;
-    std::mutex role_mutex_;
+    mutable std::mutex role_mutex_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_requested_{false};
