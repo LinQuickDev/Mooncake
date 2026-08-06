@@ -194,8 +194,8 @@ std::string MasterMetricsReporter::BuildMetricsJson() const {
         auto now = std::chrono::system_clock::now();
         auto now_time_t = std::chrono::system_clock::to_time_t(now);
         std::tm tm_buf;
-        gmtime_r(&now_time_t, &tm_buf);
-        json << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%SZ");
+        localtime_r(&now_time_t, &tm_buf);
+        json << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%S+08:00");
     }
     json << "\"}";
     return json.str();
