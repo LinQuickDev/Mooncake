@@ -6245,6 +6245,21 @@ auto MasterService::NotifyOffloadSuccess(
         }
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        {
+            // Debug: verify Replica right after construction
+            const auto& dbg_ep_c = replica.get_descriptor()
+                                       .get_local_disk_descriptor()
+                                       .transport_endpoint;
+            std::ostringstream dbg_hex_c;
+            for (unsigned char c : dbg_ep_c) {
+                dbg_hex_c << std::hex << std::setw(2) << std::setfill('0')
+                          << (int)c << ' ';
+            }
+            LOG(INFO) << "[NotifyOffloadSuccess][AfterConstruct]"
+                      << " transport_endpoint=" << dbg_ep_c
+                      << " len=" << dbg_ep_c.size()
+                      << " hex=[" << dbg_hex_c.str() << "]";
+        }
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -6277,6 +6292,25 @@ auto MasterService::NotifyOffloadSuccess(
                             &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
+                        {
+                            // Debug: verify after emplace_back into local vector
+                            const auto& dbg_ep_v =
+                                replicas[0]
+                                    .get_descriptor()
+                                    .get_local_disk_descriptor()
+                                    .transport_endpoint;
+                            std::ostringstream dbg_hex_v;
+                            for (unsigned char c : dbg_ep_v) {
+                                dbg_hex_v << std::hex << std::setw(2)
+                                          << std::setfill('0') << (int)c
+                                          << ' ';
+                            }
+                            LOG(INFO)
+                                << "[NotifyOffloadSuccess][AfterEmplaceBack]"
+                                << " transport_endpoint=" << dbg_ep_v
+                                << " len=" << dbg_ep_v.size()
+                                << " hex=[" << dbg_hex_v.str() << "]";
+                        }
                         obj_metadata.AddReplicas(std::move(replicas));
                         // Debug: verify transport_endpoint after AddReplicas
                         obj_metadata.VisitReplicas(
