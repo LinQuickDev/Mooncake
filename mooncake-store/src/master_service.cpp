@@ -2659,6 +2659,10 @@ void MasterService::RestoreFromStandbySnapshot(
     // Clean up stale replicas restored from snapshot:
     // - MEMORY/NoF replicas have invalid handles (DummyBufferAllocator)
     // - LOCAL_DISK replicas belong to clients that are no longer alive
+    // Release the keepalive so that DummyBufferAllocator weak_ptrs expire,
+    // allowing has_invalid_mem_handle() to detect them.
+    standby_allocator_keepalive_.clear();
+
     // Since no clients are connected at startup, alive_clients is empty.
     const std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
     for (size_t i = 0; i < kNumShards; ++i) {
