@@ -998,9 +998,10 @@ class MasterService {
         uint64_t pending_replaced_quota_charge_bytes{0};
 
         void AddReplicas(std::vector<Replica>&& replicas) {
-            replicas_.insert(replicas_.end(),
-                             std::move_iterator(replicas.begin()),
-                             std::move_iterator(replicas.end()));
+            replicas_.reserve(replicas_.size() + replicas.size());
+            for (auto& replica : replicas) {
+                replicas_.push_back(std::move(replica));
+            }
         }
 
         std::vector<Replica> PopReplicas(
