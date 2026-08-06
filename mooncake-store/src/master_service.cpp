@@ -3046,15 +3046,6 @@ auto MasterService::GetOffloadEndpoints()
     std::vector<std::string> endpoints;
     endpoints.reserve(unique_endpoints.size());
     for (const auto& endpoint : unique_endpoints) {
-        // Debug: print hex dump of each endpoint to detect corruption
-        std::ostringstream hex_oss;
-        for (unsigned char c : endpoint) {
-            hex_oss << std::hex << std::setw(2) << std::setfill('0')
-                    << (int)c << ' ';
-        }
-        LOG(INFO) << "[GetOffloadEndpoints] endpoint=" << endpoint
-                  << " len=" << endpoint.size() << " hex=[" << hex_oss.str()
-                  << "]";
         endpoints.emplace_back(endpoint);
     }
     return endpoints;
@@ -6231,35 +6222,8 @@ auto MasterService::NotifyOffloadSuccess(
             continue;
         }
 
-        // Debug: hex dump to detect corruption in transport_endpoint from RPC
-        {
-            std::ostringstream hex_oss;
-            for (unsigned char c : metadata.transport_endpoint) {
-                hex_oss << std::hex << std::setw(2) << std::setfill('0')
-                        << (int)c << ' ';
-            }
-            LOG(INFO) << "[NotifyOffloadSuccess] transport_endpoint="
-                      << metadata.transport_endpoint
-                      << " len=" << metadata.transport_endpoint.size()
-                      << " hex=[" << hex_oss.str() << "]";
-        }
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        {
-            // Debug: verify Replica right after construction
-            const auto desc_c = replica.get_descriptor();
-            const auto& dbg_ep_c =
-                desc_c.get_local_disk_descriptor().transport_endpoint;
-            std::ostringstream dbg_hex_c;
-            for (unsigned char c : dbg_ep_c) {
-                dbg_hex_c << std::hex << std::setw(2) << std::setfill('0')
-                          << (int)c << ' ';
-            }
-            LOG(INFO) << "[NotifyOffloadSuccess][AfterConstruct]"
-                      << " transport_endpoint=" << dbg_ep_c
-                      << " len=" << dbg_ep_c.size()
-                      << " hex=[" << dbg_hex_c.str() << "]";
-        }
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -6292,47 +6256,7 @@ auto MasterService::NotifyOffloadSuccess(
                             &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
-                        {
-                            // Debug: verify after emplace_back into local vector
-                            const auto desc_v = replicas[0].get_descriptor();
-                            const auto& dbg_ep_v =
-                                desc_v.get_local_disk_descriptor()
-                                    .transport_endpoint;
-                            std::ostringstream dbg_hex_v;
-                            for (unsigned char c : dbg_ep_v) {
-                                dbg_hex_v << std::hex << std::setw(2)
-                                          << std::setfill('0') << (int)c
-                                          << ' ';
-                            }
-                            LOG(INFO)
-                                << "[NotifyOffloadSuccess][AfterEmplaceBack]"
-                                << " transport_endpoint=" << dbg_ep_v
-                                << " len=" << dbg_ep_v.size()
-                                << " hex=[" << dbg_hex_v.str() << "]";
-                        }
                         obj_metadata.AddReplicas(std::move(replicas));
-                        // Debug: verify transport_endpoint after AddReplicas
-                        obj_metadata.VisitReplicas(
-                            [](const Replica& rep) {
-                                return rep.is_local_disk_replica();
-                            },
-                            [](const Replica& rep) {
-                                const auto desc_a = rep.get_descriptor();
-                                const auto& ep =
-                                    desc_a.get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                std::ostringstream hex_oss;
-                                for (unsigned char c : ep) {
-                                    hex_oss << std::hex << std::setw(2)
-                                            << std::setfill('0') << (int)c
-                                            << ' ';
-                                }
-                                LOG(INFO)
-                                    << "[NotifyOffloadSuccess][AfterAddReplicas]"
-                                    << " transport_endpoint=" << ep
-                                    << " len=" << ep.size()
-                                    << " hex=[" << hex_oss.str() << "]";
-                            });
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
