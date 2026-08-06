@@ -8265,19 +8265,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         if (enable_oplog_) {
             auto reservation = ReserveBatchOpLogSlot();
-            // Retry on transient backpressure (pipeline full); the writer
-            // thread needs CPU time to drain committed entries into an etcd
-            // batch and release slots.
-            static constexpr int kMaxOpLogRetries = 5;
-            int retry = 0;
-            while (!reservation &&
-                   reservation.error() ==
-                       ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
-                   retry < kMaxOpLogRetries) {
-                std::this_thread::yield();
-                reservation = ReserveBatchOpLogSlot();
-                ++retry;
-            }
             if (!reservation) {
                 LOG(WARNING)
                     << "BatchEvict: OpLog reservation failed for key=" << key
