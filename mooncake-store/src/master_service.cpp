@@ -1826,9 +1826,31 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const {
     StaleHandleCleanupPlan plan;
     bool has_valid_after_cleanup = false;
+
+    // Check if a memory replica's owning client has not reconnected.
+    // During HA promotion, memory replicas use DummyBufferAllocator which
+    // always reports valid handles, so has_invalid_mem_handle() alone is
+    // insufficient — we must also check whether the client that owns the
+    // segment is no longer alive.
+    auto has_stale_memory_client = [&](const Replica& replica) {
+        if (!replica.is_memory_replica()) return false;
+        auto seg_names = replica.get_segment_names();
+        for (const auto& opt_name : seg_names) {
+            if (!opt_name.has_value()) return true;  // no segment → stale
+            auto client_id =
+                segment_manager_.getClientIdBySegmentName(*opt_name);
+            if (!client_id.has_value() ||
+                alive_clients.find(*client_id) == alive_clients.end()) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     for (const auto& replica : metadata.GetAllReplicas()) {
         const bool stale =
             (replica.has_invalid_mem_handle() ||
+             has_stale_memory_client(replica) ||
              replica.has_invalid_nof_handle() ||
              replica.has_stale_local_disk_client(alive_clients)) &&
             replica.is_completed();

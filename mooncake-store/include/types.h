@@ -98,7 +98,7 @@ static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
 // Grace period in seconds after promotion before cleaning up replicas
 // from clients that have not reconnected to the new master.
-static constexpr int64_t DEFAULT_POST_PROMOTION_CLEANUP_SEC = 10;
+static constexpr int64_t DEFAULT_POST_PROMOTION_CLEANUP_SEC = 30;
 
 // Metrics reporter defaults (push master storage metrics to HA backend)
 static constexpr bool DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND = false;
