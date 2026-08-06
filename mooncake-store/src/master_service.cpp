@@ -2656,6 +2656,29 @@ void MasterService::RestoreFromStandbySnapshot(
         }
     }
 
+    // Clean up LOCAL_DISK replicas restored from snapshot,
+    // since no clients are connected at startup.
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& [tenant_id, tenant_state] : shard->tenants) {
+            auto it = tenant_state.metadata.begin();
+            while (it != tenant_state.metadata.end()) {
+                auto& metadata = it->second;
+                bool had_local_disk = metadata.HasReplica(
+                    &Replica::fn_is_local_disk_replica);
+                if (had_local_disk) {
+                    EraseReplicasWithCacheTotalAccounting(
+                        metadata, &Replica::fn_is_local_disk_replica);
+                }
+                if (!metadata.IsValid()) {
+                    it = tenant_state.metadata.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
     // 4. Log the result.
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
               << segments.size()
@@ -2981,6 +3004,16 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    // Build the set of currently alive client UUIDs
+    std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
+    {
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        for (const auto& [client_id, host] : client_host_id_) {
+            alive_clients.insert(client_id);
+        }
+    }
+
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
@@ -2992,8 +3025,10 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
-                    [this](const Replica& replica) {
-                        return IsReplicaReadable(replica);
+                    [this, &alive_clients](const Replica& replica) {
+                        return IsReplicaReadable(replica) &&
+                               !replica.has_stale_local_disk_client(
+                                   alive_clients);
                     },
                     [&replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
@@ -3019,6 +3054,15 @@ auto MasterService::GetOffloadEndpoints()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::unordered_set<std::string> unique_endpoints;
 
+    // Build the set of currently alive client UUIDs
+    std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
+    {
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        for (const auto& [client_id, host] : client_host_id_) {
+            alive_clients.insert(client_id);
+        }
+    }
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
@@ -3026,9 +3070,11 @@ auto MasterService::GetOffloadEndpoints()
             for (const auto& metadata_it : tenant_it.second.metadata) {
                 const auto& metadata = metadata_it.second;
                 metadata.VisitReplicas(
-                    [](const Replica& replica) {
+                    [&alive_clients](const Replica& replica) {
                         return replica.is_completed() &&
-                               replica.is_local_disk_replica();
+                               replica.is_local_disk_replica() &&
+                               !replica.has_stale_local_disk_client(
+                                   alive_clients);
                     },
                     [&unique_endpoints](const Replica& replica) {
                         const auto desc = replica.get_descriptor();
@@ -3070,10 +3116,20 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
         const auto& metadata = accessor.Get();
 
+        // Build the set of currently alive client UUIDs
+        std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
+        {
+            std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+            for (const auto& [client_id, host] : client_host_id_) {
+                alive_clients.insert(client_id);
+            }
+        }
+
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
-            [this](const Replica& replica) {
-                return IsReplicaReadable(replica);
+            [this, &alive_clients](const Replica& replica) {
+                return IsReplicaReadable(replica) &&
+                       !replica.has_stale_local_disk_client(alive_clients);
             },
             [&replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
