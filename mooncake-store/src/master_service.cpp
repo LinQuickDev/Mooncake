@@ -3031,9 +3031,9 @@ auto MasterService::GetOffloadEndpoints()
                                replica.is_local_disk_replica();
                     },
                     [&unique_endpoints](const Replica& replica) {
+                        const auto desc = replica.get_descriptor();
                         const auto& endpoint =
-                            replica.get_descriptor()
-                                .get_local_disk_descriptor()
+                            desc.get_local_disk_descriptor()
                                 .transport_endpoint;
                         if (!endpoint.empty()) {
                             unique_endpoints.emplace(endpoint);
@@ -4041,7 +4041,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                        client_id;
         },
         [&replica](Replica& rep) {
-            const auto& desc =
+            const auto desc =
                 replica.get_descriptor().get_local_disk_descriptor();
             rep.update_local_disk_location(desc.transport_endpoint,
                                            desc.object_size);
@@ -6247,9 +6247,9 @@ auto MasterService::NotifyOffloadSuccess(
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         {
             // Debug: verify Replica right after construction
-            const auto& dbg_ep_c = replica.get_descriptor()
-                                       .get_local_disk_descriptor()
-                                       .transport_endpoint;
+            const auto desc_c = replica.get_descriptor();
+            const auto& dbg_ep_c =
+                desc_c.get_local_disk_descriptor().transport_endpoint;
             std::ostringstream dbg_hex_c;
             for (unsigned char c : dbg_ep_c) {
                 dbg_hex_c << std::hex << std::setw(2) << std::setfill('0')
@@ -6294,10 +6294,9 @@ auto MasterService::NotifyOffloadSuccess(
                         replicas.emplace_back(std::move(replica));
                         {
                             // Debug: verify after emplace_back into local vector
+                            const auto desc_v = replicas[0].get_descriptor();
                             const auto& dbg_ep_v =
-                                replicas[0]
-                                    .get_descriptor()
-                                    .get_local_disk_descriptor()
+                                desc_v.get_local_disk_descriptor()
                                     .transport_endpoint;
                             std::ostringstream dbg_hex_v;
                             for (unsigned char c : dbg_ep_v) {
@@ -6318,9 +6317,9 @@ auto MasterService::NotifyOffloadSuccess(
                                 return rep.is_local_disk_replica();
                             },
                             [](const Replica& rep) {
+                                const auto desc_a = rep.get_descriptor();
                                 const auto& ep =
-                                    rep.get_descriptor()
-                                        .get_local_disk_descriptor()
+                                    desc_a.get_local_disk_descriptor()
                                         .transport_endpoint;
                                 std::ostringstream hex_oss;
                                 for (unsigned char c : ep) {
@@ -6342,23 +6341,13 @@ auto MasterService::NotifyOffloadSuccess(
                         obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
                                 return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
+                                       rep.get_local_disk_client_id() ==
+                                           client_id;
                             },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
+                            [&metadata](Replica& rep) {
+                                rep.update_local_disk_location(
+                                    metadata.transport_endpoint,
+                                    metadata.data_size);
                             });
                     }
                     handled_existing_object = true;
