@@ -2656,21 +2656,17 @@ void MasterService::RestoreFromStandbySnapshot(
         }
     }
 
-    // Clean up LOCAL_DISK replicas restored from snapshot,
-    // since no clients are connected at startup.
+    // Clean up stale replicas restored from snapshot:
+    // - MEMORY/NoF replicas have invalid handles (DummyBufferAllocator)
+    // - LOCAL_DISK replicas belong to clients that are no longer alive
+    // Since no clients are connected at startup, alive_clients is empty.
+    const std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
-                auto& metadata = it->second;
-                bool had_local_disk = metadata.HasReplica(
-                    &Replica::fn_is_local_disk_replica);
-                if (had_local_disk) {
-                    EraseReplicasWithCacheTotalAccounting(
-                        metadata, &Replica::fn_is_local_disk_replica);
-                }
-                if (!metadata.IsValid()) {
+                if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
                     it = tenant_state.metadata.erase(it);
                 } else {
                     ++it;
