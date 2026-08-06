@@ -2663,21 +2663,60 @@ void MasterService::RestoreFromStandbySnapshot(
     // allowing has_invalid_mem_handle() to detect them.
     standby_allocator_keepalive_.clear();
 
+    // Diagnostic: count entries before cleanup
+    size_t entries_before = 0;
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard_ro(this, i);
+        for (const auto& [tid, ts] : shard_ro->tenants) {
+            entries_before += ts.metadata.size();
+        }
+    }
+    LOG(INFO) << "Startup cleanup: entries_before=" << entries_before;
+
     // Since no clients are connected at startup, alive_clients is empty.
     const std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
+    size_t erased_count = 0;
+    size_t kept_count = 0;
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
                 if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
+                    ++erased_count;
                     it = tenant_state.metadata.erase(it);
                 } else {
+                    // Diagnostic: log replica types for entries that survived
+                    std::string replica_info;
+                    it->second.VisitReplicas(
+                        [](const Replica&) { return true; },
+                        [&replica_info](const Replica& r) {
+                            if (!replica_info.empty())
+                                replica_info += ", ";
+                            replica_info +=
+                                (r.is_memory_replica()      ? "MEM"
+                                 : r.is_local_disk_replica() ? "LDISK"
+                                 : r.is_disk_replica()       ? "DISK"
+                                 : r.is_nof_replica()        ? "NOF"
+                                                             : "UNK");
+                            replica_info += r.is_completed() ? "/DONE"
+                                                            : "/PENDING";
+                        });
+                    // Only log first 5 surviving entries to avoid spam
+                    if (kept_count < 5) {
+                        LOG(WARNING)
+                            << "Startup cleanup: entry survived, key="
+                            << it->first << ", replicas=[" << replica_info
+                            << "]";
+                    }
+                    ++kept_count;
                     ++it;
                 }
             }
         }
     }
+    LOG(INFO) << "Startup cleanup: erased=" << erased_count
+              << ", kept=" << kept_count;
 
     // 4. Log the result.
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
