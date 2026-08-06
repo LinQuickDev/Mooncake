@@ -1920,15 +1920,17 @@ MasterService::EraseMetadata(
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
 
-    // Clean up offloading_task + dec_refcnt before erasing metadata.
+    // Clean up offloading_tasks + dec_refcnt before erasing metadata.
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
     auto offload_it = tenant_state.offloading_tasks.find(key);
     if (offload_it != tenant_state.offloading_tasks.end()) {
-        auto source = metadata.GetReplicaByID(offload_it->second.source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
+        for (const auto& task : offload_it->second) {
+            auto source = metadata.GetReplicaByID(task.source_id);
+            if (source != nullptr) {
+                source->dec_refcnt();
+            }
         }
         tenant_state.offloading_tasks.erase(offload_it);
 
@@ -3889,22 +3891,27 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
-        bool task_created = false;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
+            [this, &object_id, &tenant_state](Replica& replica) {
                 auto result = PushOffloadingQueue(object_id, replica);
-                if (result) {
-                    if (!task_created) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
-                    }
+                if (!result) {
+                    return;
+                }
+                // Protect EVERY source replica that actually got enqueued:
+                // with replica_num > 1 each replica queues on its own node's
+                // LOCAL_DISK segment, and an unprotected replica would be
+                // evicted before its offload completes (NACK -> lost SSD
+                // copy). refcnt is bumped once per enqueued queue so that
+                // task completion (per queue) releases exactly one hold.
+                auto& tasks = tenant_state.offloading_tasks[object_id.user_key];
+                const auto now = std::chrono::system_clock::now();
+                for (const auto& client_id : result.value()) {
+                    replica.inc_refcnt();
+                    tasks.push_back(
+                        OffloadingTask{replica.id(), now, client_id});
                 }
             });
     }
@@ -6106,12 +6113,23 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             auto task_it =
                 tenant_state.offloading_tasks.find(object_id.user_key);
             if (task_it != tenant_state.offloading_tasks.end()) {
-                auto source =
-                    accessor.Get().GetReplicaByID(task_it->second.source_id);
-                if (source) {
-                    source->dec_refcnt();
+                auto& tasks = task_it->second;
+                auto offload_it =
+                    std::find_if(tasks.begin(), tasks.end(),
+                                 [&client_id](const OffloadingTask& t) {
+                                     return t.source_client_id == client_id;
+                                 });
+                if (offload_it != tasks.end()) {
+                    auto source =
+                        accessor.Get().GetReplicaByID(offload_it->source_id);
+                    if (source) {
+                        source->dec_refcnt();
+                    }
+                    tasks.erase(offload_it);
+                    if (tasks.empty()) {
+                        tenant_state.offloading_tasks.erase(task_it);
+                    }
                 }
-                tenant_state.offloading_tasks.erase(task_it);
             }
         }
     }
@@ -6210,12 +6228,23 @@ auto MasterService::NotifyOffloadSuccess(
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        task_it->second.source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
+                    auto& tasks = task_it->second;
+                    auto offload_it =
+                        std::find_if(tasks.begin(), tasks.end(),
+                                     [&client_id](const OffloadingTask& t) {
+                                         return t.source_client_id == client_id;
+                                     });
+                    if (offload_it != tasks.end()) {
+                        auto source = accessor.Get().GetReplicaByID(
+                            offload_it->source_id);
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        tasks.erase(offload_it);
+                        if (tasks.empty()) {
+                            tenant_state.offloading_tasks.erase(task_it);
+                        }
                     }
-                    tenant_state.offloading_tasks.erase(task_it);
                 }
             }
             continue;
@@ -6244,12 +6273,23 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (task_it != tenant_state.offloading_tasks.end()) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(task_it->second.source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
+                    auto& tasks = task_it->second;
+                    auto offload_it =
+                        std::find_if(tasks.begin(), tasks.end(),
+                                     [&client_id](const OffloadingTask& t) {
+                                         return t.source_client_id == client_id;
+                                     });
+                    if (offload_it != tasks.end()) {
+                        auto source =
+                            obj_metadata.GetReplicaByID(offload_it->source_id);
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        tasks.erase(offload_it);
+                        if (tasks.empty()) {
+                            tenant_state.offloading_tasks.erase(task_it);
+                        }
                     }
-                    tenant_state.offloading_tasks.erase(task_it);
 
                     if (!obj_metadata.HasReplica(
                             &Replica::fn_is_local_disk_replica)) {
@@ -6322,12 +6362,14 @@ auto MasterService::NotifyOffloadSuccess(
     return {};
 }
 
-tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
+tl::expected<std::vector<UUID>, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
     }
+    std::vector<UUID> queued_clients;
+    queued_clients.reserve(segment_names.size());
     for (const auto& segment_name_it : segment_names) {
         if (!segment_name_it.has_value()) {
             continue;
@@ -6366,8 +6408,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+        queued_clients.push_back(client_id_it->second);
     }
-    return {};
+    return queued_clients;
 }
 
 // Promotion-on-hit
@@ -7476,23 +7519,34 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         for (auto task_it = tenant_state.offloading_tasks.begin();
              task_it != tenant_state.offloading_tasks.end();) {
-            const auto ttl =
-                task_it->second.start_time + put_start_release_timeout_sec_;
-            if (ttl > now) {
-                task_it++;
-                continue;
-            }
+            auto& tasks = task_it->second;
             auto metadata_it = tenant_state.metadata.find(task_it->first);
-            if (metadata_it != tenant_state.metadata.end()) {
-                auto source = metadata_it->second.GetReplicaByID(
-                    task_it->second.source_id);
-                if (source != nullptr) {
-                    source->dec_refcnt();
+            bool removed_any = false;
+            for (auto off = tasks.begin(); off != tasks.end();) {
+                const auto ttl =
+                    off->start_time + put_start_release_timeout_sec_;
+                if (ttl > now) {
+                    ++off;
+                    continue;
                 }
+                if (metadata_it != tenant_state.metadata.end()) {
+                    auto source =
+                        metadata_it->second.GetReplicaByID(off->source_id);
+                    if (source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                }
+                LOG(WARNING)
+                    << "Offloading task expired for key: " << task_it->first
+                    << " tenant=" << tenant_it->first;
+                off = tasks.erase(off);
+                removed_any = true;
             }
-            LOG(WARNING) << "Offloading task expired for key: "
-                         << task_it->first << " tenant=" << tenant_it->first;
-            task_it = tenant_state.offloading_tasks.erase(task_it);
+            if (removed_any && tasks.empty()) {
+                task_it = tenant_state.offloading_tasks.erase(task_it);
+            } else {
+                ++task_it;
+            }
         }
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
@@ -7880,10 +7934,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     }
                     auto result = PushOffloadingQueue(
                         MakeObjectIdentity(key, normalized_tenant), replica);
-                    if (result) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            key, OffloadingTask{replica.id(), now});
+                    if (result && !result.value().empty()) {
+                        auto& tasks = tenant_state.offloading_tasks[key];
+                        for (const auto& client_id : result.value()) {
+                            replica.inc_refcnt();
+                            tasks.push_back(
+                                OffloadingTask{replica.id(), now, client_id});
+                        }
                         queued = true;
                     }
                 });
@@ -8139,10 +8196,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (queued) return;  // only need to pin one replica for offload
                 auto result = PushOffloadingQueue(
                     MakeObjectIdentity(key, tenant_id), replica);
-                if (result) {
-                    replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
+                if (result && !result.value().empty()) {
+                    auto& tasks = tenant_state.offloading_tasks[key];
+                    for (const auto& client_id : result.value()) {
+                        replica.inc_refcnt();
+                        tasks.push_back(
+                            OffloadingTask{replica.id(), now, client_id});
+                    }
                     queued = true;
                 }
             });
