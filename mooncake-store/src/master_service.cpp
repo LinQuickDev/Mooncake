@@ -185,7 +185,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
-      post_promotion_cleanup_sec_(config.post_promotion_cleanup_sec),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -1826,31 +1825,9 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const {
     StaleHandleCleanupPlan plan;
     bool has_valid_after_cleanup = false;
-
-    // Check if a memory replica's owning client has not reconnected.
-    // During HA promotion, memory replicas use DummyBufferAllocator which
-    // always reports valid handles, so has_invalid_mem_handle() alone is
-    // insufficient — we must also check whether the client that owns the
-    // segment is no longer alive.
-    auto has_stale_memory_client = [&](const Replica& replica) {
-        if (!replica.is_memory_replica()) return false;
-        auto seg_names = replica.get_segment_names();
-        for (const auto& opt_name : seg_names) {
-            if (!opt_name.has_value()) return true;  // no segment → stale
-            auto client_id =
-                segment_manager_.getClientIdBySegmentName(*opt_name);
-            if (!client_id.has_value() ||
-                alive_clients.find(*client_id) == alive_clients.end()) {
-                return true;
-            }
-        }
-        return false;
-    };
-
     for (const auto& replica : metadata.GetAllReplicas()) {
         const bool stale =
             (replica.has_invalid_mem_handle() ||
-             has_stale_memory_client(replica) ||
              replica.has_invalid_nof_handle() ||
              replica.has_stale_local_disk_client(alive_clients)) &&
             replica.is_completed();
@@ -2686,16 +2663,6 @@ void MasterService::RestoreFromStandbySnapshot(
               << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
-
-    // 5. Schedule post-promotion stale replica cleanup after the grace period.
-    //    Clients need time to call ReMountSegment and rejoin ok_client_.
-    //    After the deadline, ClearInvalidHandles will remove replicas from
-    //    clients that failed to reconnect.
-    post_promotion_cleanup_deadline_ =
-        std::chrono::steady_clock::now() +
-        std::chrono::seconds(post_promotion_cleanup_sec_);
-    LOG(INFO) << "Scheduled post-promotion stale replica cleanup in "
-              << post_promotion_cleanup_sec_ << " seconds";
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
@@ -9175,17 +9142,6 @@ void MasterService::ClientMonitorFunc() {
                 }
             }
             RecomputeTenantEffectiveQuotas();
-        }
-
-        // One-shot post-promotion stale replica cleanup: after the grace
-        // period set by RestoreFromStandbySnapshot, scan all metadata and
-        // remove replicas from clients that have not reconnected.
-        if (post_promotion_cleanup_deadline_ <= now) {
-            post_promotion_cleanup_deadline_ =
-                std::chrono::steady_clock::time_point::max();
-            LOG(INFO) << "Running post-promotion stale replica cleanup...";
-            ClearInvalidHandles();
-            LOG(INFO) << "Post-promotion stale replica cleanup completed.";
         }
 
         pt_monitor.End(0);

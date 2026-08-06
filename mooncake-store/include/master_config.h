@@ -55,13 +55,6 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
-    // Seconds after promotion before a stale-replica sweep runs.
-    // During this grace window, clients that existed on the old master
-    // can reconnect (ReMountSegment / MountLocalDiskSegment) to
-    // protect their replicas from cleanup.
-    int64_t post_promotion_cleanup_sec =
-        DEFAULT_POST_PROMOTION_CLEANUP_SEC;
-
     // Master view lease TTL in seconds (HA leadership lease).
     // When the lease expires without successful renewal, the Master
     // is considered dead and a standby can take over.
@@ -505,7 +498,6 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    int64_t post_promotion_cleanup_sec = DEFAULT_POST_PROMOTION_CLEANUP_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -597,7 +589,6 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        post_promotion_cleanup_sec = config.post_promotion_cleanup_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -803,7 +794,6 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    int64_t post_promotion_cleanup_sec_ = DEFAULT_POST_PROMOTION_CLEANUP_SEC;
     int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms_ =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -900,11 +890,6 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
         client_live_ttl_sec_ = ttl;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_post_promotion_cleanup_sec(int64_t sec) {
-        post_promotion_cleanup_sec_ = sec;
         return *this;
     }
 
@@ -1172,7 +1157,6 @@ class MasterServiceConfig {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    int64_t post_promotion_cleanup_sec = DEFAULT_POST_PROMOTION_CLEANUP_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -1260,7 +1244,6 @@ class MasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        post_promotion_cleanup_sec = config.post_promotion_cleanup_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -1351,7 +1334,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
-    config.post_promotion_cleanup_sec = post_promotion_cleanup_sec_;
     config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;

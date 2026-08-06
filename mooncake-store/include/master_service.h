@@ -2014,13 +2014,6 @@ class MasterService {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_live_ttl_sec_;
-    // Grace period in seconds after promotion before cleaning up stale replicas
-    // from clients that failed to reconnect to the new master.
-    const int64_t post_promotion_cleanup_sec_;
-    // Deadline (steady_clock) after which a post-promotion stale-replica
-    // cleanup is scheduled. Set by RestoreFromStandbySnapshot.
-    std::chrono::steady_clock::time_point post_promotion_cleanup_deadline_{
-        std::chrono::steady_clock::time_point::max()};
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
