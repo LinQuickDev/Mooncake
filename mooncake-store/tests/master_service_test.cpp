@@ -741,7 +741,7 @@ TEST_F(MasterServiceTest, AddReplicaRecordsOneLocalDiskPerClient) {
     ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_b, key, 1024,
                                               "endpoint_B"));
 
-    auto resp = service_->GetReplicaList(key, "default");
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(resp.has_value());
 
     std::set<std::string> local_disk_endpoints;
@@ -770,7 +770,7 @@ TEST_F(MasterServiceTest, AddReplicaSameClientUpdatesInPlace) {
     ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
                                               "endpoint_A_new"));
 
-    auto resp = service_->GetReplicaList(key, "default");
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(resp.has_value());
 
     std::vector<std::string> local_disk_endpoints;
@@ -801,7 +801,7 @@ TEST_F(MasterServiceTest, AddReplicaMixedAppendAndUpdate) {
     ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
                                               "endpoint_A_new"));
 
-    auto resp = service_->GetReplicaList(key, "default");
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(resp.has_value());
 
     std::set<std::string> local_disk_endpoints;
@@ -815,6 +815,105 @@ TEST_F(MasterServiceTest, AddReplicaMixedAppendAndUpdate) {
     EXPECT_TRUE(local_disk_endpoints.count("endpoint_A_new"));
     EXPECT_TRUE(local_disk_endpoints.count("endpoint_B"));
     EXPECT_FALSE(local_disk_endpoints.count("endpoint_A_old"));
+}
+
+// A key with replica_num > 1 queues one offload task per MEMORY replica (one
+// per node's LOCAL_DISK segment). Every enqueued source replica must be
+// refcnt-protected: an eviction cycle running before the async offload
+// completes must NOT drop any of them, otherwise the corresponding SSD copy
+// would be lost (the worker NACKs the task once the source is gone). After
+// the offload completes (NotifyOffloadSuccess from each node), the holds are
+// released and the MEMORY replicas become evictable again.
+TEST_F(MasterServiceTest, PutEndProtectsAllOffloadSourceReplicasFromEviction) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(100)
+                              .set_default_kv_soft_pin_ttl(100)
+                              .set_enable_offload(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Two memory segments owned by two clients, each with an offload-enabled
+    // LOCAL_DISK segment.
+    constexpr size_t buffer_a = 0x300000000;
+    constexpr size_t buffer_b = 0x300000000 + 1024 * 1024 * 16;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    [[maybe_unused]] const auto ctx_a =
+        PrepareSimpleSegment(*service_, "segment_a", buffer_a, segment_size);
+    [[maybe_unused]] const auto ctx_b =
+        PrepareSimpleSegment(*service_, "segment_b", buffer_b, segment_size);
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(ctx_a.client_id, true).has_value());
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(ctx_b.client_id, true).has_value());
+
+    // One key with replica_num=2: replicas land on segment_a and segment_b.
+    const std::string key = "offload_race_key";
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_start = service_->PutStart(ctx_a.client_id, key,
+                                        TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(2u, put_start->size());
+    ASSERT_TRUE(service_
+                    ->PutEnd(ctx_a.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    // Each node's offload queue must hold one task for the key.
+    auto tasks_a = service_->OffloadObjectHeartbeat(ctx_a.client_id, true);
+    ASSERT_TRUE(tasks_a.has_value());
+    ASSERT_EQ(1u, tasks_a->size());
+    auto tasks_b = service_->OffloadObjectHeartbeat(ctx_b.client_id, true);
+    ASSERT_TRUE(tasks_b.has_value());
+    ASSERT_EQ(1u, tasks_b->size());
+
+    // Wait for lease/soft-pin expiry, then run an eviction cycle. Both MEMORY
+    // replicas are offload sources and must be refcnt-protected, so eviction
+    // must not remove them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    service_->RunBatchEvictForTesting(0.5, 0.4);
+
+    auto replica_list = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replica_list.has_value());
+    int memory_replicas = 0;
+    for (const auto& r : replica_list->replicas) {
+        if (r.is_memory_replica() && r.status == ReplicaStatus::COMPLETE) {
+            ++memory_replicas;
+        }
+    }
+    EXPECT_EQ(2, memory_replicas)
+        << "offload-source replicas must survive eviction while protected";
+
+    // Complete both offload tasks (one per node); the refcounts are released
+    // and the LOCAL_DISK replicas are recorded.
+    StorageObjectMetadata sm;
+    sm.bucket_id = 0;
+    sm.offset = 0;
+    sm.key_size = static_cast<int64_t>(key.size());
+    sm.data_size = 1024;
+    sm.transport_endpoint = "segment_a";
+    ASSERT_TRUE(service_->NotifyOffloadSuccess(ctx_a.client_id, *tasks_a, {sm})
+                    .has_value());
+    sm.transport_endpoint = "segment_b";
+    ASSERT_TRUE(service_->NotifyOffloadSuccess(ctx_b.client_id, *tasks_b, {sm})
+                    .has_value());
+
+    // With the holds released, an eviction cycle may now drop the MEMORY
+    // replicas (LOCAL_DISK copies exist, data is safe). Note: the
+    // GetReplicaList above renewed the object lease, so wait for it to
+    // expire again before eviction.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    service_->RunBatchEvictForTesting(0.5, 0.4);
+    auto replica_list2 = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replica_list2.has_value());
+    memory_replicas = 0;
+    for (const auto& r : replica_list2->replicas) {
+        if (r.is_memory_replica() && r.status == ReplicaStatus::COMPLETE) {
+            ++memory_replicas;
+        }
+    }
+    EXPECT_EQ(0, memory_replicas)
+        << "MEMORY replicas must become evictable after offload completes";
 }
 
 #ifdef USE_NOF

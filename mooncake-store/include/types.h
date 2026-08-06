@@ -96,6 +96,9 @@ static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 3;  // in seconds, old value is 5
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+// Grace period in seconds after promotion before cleaning up replicas
+// from clients that have not reconnected to the new master.
+static constexpr int64_t DEFAULT_POST_PROMOTION_CLEANUP_SEC = 10;
 
 // Metrics reporter defaults (push master storage metrics to HA backend)
 static constexpr bool DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND = false;

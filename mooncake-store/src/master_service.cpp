@@ -185,6 +185,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      post_promotion_cleanup_sec_(config.post_promotion_cleanup_sec),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -1927,9 +1928,11 @@ MasterService::EraseMetadata(
     // becomes an orphan that only expires after 600s.
     auto offload_it = tenant_state.offloading_tasks.find(key);
     if (offload_it != tenant_state.offloading_tasks.end()) {
-        auto source = metadata.GetReplicaByID(offload_it->second.source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
+        for (const auto& task : offload_it->second) {
+            auto source = metadata.GetReplicaByID(task.source_id);
+            if (source != nullptr) {
+                source->dec_refcnt();
+            }
         }
         tenant_state.offloading_tasks.erase(offload_it);
 
@@ -2661,6 +2664,16 @@ void MasterService::RestoreFromStandbySnapshot(
               << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+
+    // 5. Schedule post-promotion stale replica cleanup after the grace period.
+    //    Clients need time to call ReMountSegment and rejoin ok_client_.
+    //    After the deadline, ClearInvalidHandles will remove replicas from
+    //    clients that failed to reconnect.
+    post_promotion_cleanup_deadline_ =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(post_promotion_cleanup_sec_);
+    LOG(INFO) << "Scheduled post-promotion stale replica cleanup in "
+              << post_promotion_cleanup_sec_ << " seconds";
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
@@ -3923,22 +3936,21 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
-        bool task_created = false;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
+            [this, &object_id, &tenant_state](Replica& replica) {
                 auto result = PushOffloadingQueue(object_id, replica);
-                if (result) {
-                    if (!task_created) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
-                    }
+                if (!result) {
+                    return;
+                }
+                auto& tasks = tenant_state.offloading_tasks[object_id.user_key];
+                const auto now = std::chrono::system_clock::now();
+                for (const auto& client_id : result.value()) {
+                    replica.inc_refcnt();
+                    tasks.push_back(
+                        OffloadingTask{replica.id(), now, client_id});
                 }
             });
     }
@@ -6140,12 +6152,23 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             auto task_it =
                 tenant_state.offloading_tasks.find(object_id.user_key);
             if (task_it != tenant_state.offloading_tasks.end()) {
-                auto source =
-                    accessor.Get().GetReplicaByID(task_it->second.source_id);
-                if (source) {
-                    source->dec_refcnt();
+                auto& tasks = task_it->second;
+                auto offload_it =
+                    std::find_if(tasks.begin(), tasks.end(),
+                                 [&client_id](const OffloadingTask& t) {
+                                     return t.source_client_id == client_id;
+                                 });
+                if (offload_it != tasks.end()) {
+                    auto source =
+                        accessor.Get().GetReplicaByID(offload_it->source_id);
+                    if (source) {
+                        source->dec_refcnt();
+                    }
+                    tasks.erase(offload_it);
+                    if (tasks.empty()) {
+                        tenant_state.offloading_tasks.erase(task_it);
+                    }
                 }
-                tenant_state.offloading_tasks.erase(task_it);
             }
         }
     }
@@ -6244,12 +6267,23 @@ auto MasterService::NotifyOffloadSuccess(
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        task_it->second.source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
+                    auto& tasks = task_it->second;
+                    auto offload_it =
+                        std::find_if(tasks.begin(), tasks.end(),
+                                     [&client_id](const OffloadingTask& t) {
+                                         return t.source_client_id == client_id;
+                                     });
+                    if (offload_it != tasks.end()) {
+                        auto source =
+                            accessor.Get().GetReplicaByID(offload_it->source_id);
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        tasks.erase(offload_it);
+                        if (tasks.empty()) {
+                            tenant_state.offloading_tasks.erase(task_it);
+                        }
                     }
-                    tenant_state.offloading_tasks.erase(task_it);
                 }
             }
             continue;
@@ -6278,12 +6312,23 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (task_it != tenant_state.offloading_tasks.end()) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(task_it->second.source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
+                    auto& tasks = task_it->second;
+                    auto offload_it =
+                        std::find_if(tasks.begin(), tasks.end(),
+                                     [&client_id](const OffloadingTask& t) {
+                                         return t.source_client_id == client_id;
+                                     });
+                    if (offload_it != tasks.end()) {
+                        auto source =
+                            obj_metadata.GetReplicaByID(offload_it->source_id);
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        tasks.erase(offload_it);
+                        if (tasks.empty()) {
+                            tenant_state.offloading_tasks.erase(task_it);
+                        }
                     }
-                    tenant_state.offloading_tasks.erase(task_it);
 
                     if (!obj_metadata.HasReplica(
                             &Replica::fn_is_local_disk_replica)) {
@@ -6346,12 +6391,14 @@ auto MasterService::NotifyOffloadSuccess(
     return {};
 }
 
-tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
+tl::expected<std::vector<UUID>, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
     }
+    std::vector<UUID> queued_clients;
+    queued_clients.reserve(segment_names.size());
     for (const auto& segment_name_it : segment_names) {
         if (!segment_name_it.has_value()) {
             continue;
@@ -6390,8 +6437,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+        queued_clients.push_back(client_id_it->second);
     }
-    return {};
+    return queued_clients;
 }
 
 // Promotion-on-hit
@@ -7500,23 +7548,31 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         for (auto task_it = tenant_state.offloading_tasks.begin();
              task_it != tenant_state.offloading_tasks.end();) {
-            const auto ttl =
-                task_it->second.start_time + put_start_release_timeout_sec_;
-            if (ttl > now) {
-                task_it++;
-                continue;
-            }
+            auto& tasks = task_it->second;
             auto metadata_it = tenant_state.metadata.find(task_it->first);
-            if (metadata_it != tenant_state.metadata.end()) {
-                auto source = metadata_it->second.GetReplicaByID(
-                    task_it->second.source_id);
-                if (source != nullptr) {
-                    source->dec_refcnt();
+            for (auto t = tasks.begin(); t != tasks.end();) {
+                const auto ttl =
+                    t->start_time + put_start_release_timeout_sec_;
+                if (ttl > now) {
+                    t++;
+                    continue;
                 }
+                if (metadata_it != tenant_state.metadata.end()) {
+                    auto source = metadata_it->second.GetReplicaByID(
+                        t->source_id);
+                    if (source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                }
+                LOG(WARNING) << "Offloading task expired for key: "
+                             << task_it->first << " tenant=" << tenant_it->first;
+                t = tasks.erase(t);
             }
-            LOG(WARNING) << "Offloading task expired for key: "
-                         << task_it->first << " tenant=" << tenant_it->first;
-            task_it = tenant_state.offloading_tasks.erase(task_it);
+            if (tasks.empty()) {
+                task_it = tenant_state.offloading_tasks.erase(task_it);
+            } else {
+                task_it++;
+            }
         }
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
@@ -7904,10 +7960,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     }
                     auto result = PushOffloadingQueue(
                         MakeObjectIdentity(key, normalized_tenant), replica);
-                    if (result) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            key, OffloadingTask{replica.id(), now});
+                    if (result && !result.value().empty()) {
+                        auto& tasks = tenant_state.offloading_tasks[key];
+                        for (const auto& client_id : result.value()) {
+                            replica.inc_refcnt();
+                            tasks.push_back(
+                                OffloadingTask{replica.id(), now, client_id});
+                        }
                         queued = true;
                     }
                 });
@@ -8163,10 +8222,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (queued) return;  // only need to pin one replica for offload
                 auto result = PushOffloadingQueue(
                     MakeObjectIdentity(key, tenant_id), replica);
-                if (result) {
-                    replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
+                if (result && !result.value().empty()) {
+                    auto& tasks = tenant_state.offloading_tasks[key];
+                    for (const auto& client_id : result.value()) {
+                        replica.inc_refcnt();
+                        tasks.push_back(
+                            OffloadingTask{replica.id(), now, client_id});
+                    }
                     queued = true;
                 }
             });
@@ -8214,11 +8276,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         if (enable_oplog_) {
             auto reservation = ReserveBatchOpLogSlot();
+            // Retry on transient backpressure (pipeline full); the writer
+            // thread needs CPU time to drain committed entries into an etcd
+            // batch and release slots.
+            static constexpr int kMaxOpLogRetries = 5;
+            int retry = 0;
+            while (!reservation &&
+                   reservation.error() ==
+                       ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+                   retry < kMaxOpLogRetries) {
+                std::this_thread::yield();
+                reservation = ReserveBatchOpLogSlot();
+                ++retry;
+            }
             if (!reservation) {
                 LOG(WARNING)
                     << "BatchEvict: OpLog reservation failed for key=" << key
                     << ", err=" << static_cast<int>(reservation.error())
-                    << ", skipping eviction";
+                    << ", retries=" << retry << ", skipping eviction";
                 return false;
             }
             std::vector<ReplicaID> removed_ids;
@@ -8813,12 +8888,24 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                         metadata, is_evictable_nof_replica);
                     if (enable_oplog_) {
                         auto reservation = ReserveBatchOpLogSlot();
+                        // Retry on transient backpressure (pipeline full).
+                        static constexpr int kMaxOpLogRetries = 5;
+                        int retry = 0;
+                        while (!reservation &&
+                               reservation.error() ==
+                                   ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+                               retry < kMaxOpLogRetries) {
+                            std::this_thread::yield();
+                            reservation = ReserveBatchOpLogSlot();
+                            ++retry;
+                        }
                         if (!reservation) {
                             LOG(WARNING)
                                 << "NoFBatchEvict: OpLog reservation failed "
                                    "for key="
                                 << it->first << ", err="
                                 << static_cast<int>(reservation.error())
+                                << ", retries=" << retry
                                 << ", skipping eviction";
                             ++it;
                             continue;
@@ -9066,6 +9153,17 @@ void MasterService::ClientMonitorFunc() {
                 }
             }
             RecomputeTenantEffectiveQuotas();
+        }
+
+        // One-shot post-promotion stale replica cleanup: after the grace
+        // period set by RestoreFromStandbySnapshot, scan all metadata and
+        // remove replicas from clients that have not reconnected.
+        if (post_promotion_cleanup_deadline_ <= now) {
+            post_promotion_cleanup_deadline_ =
+                std::chrono::steady_clock::time_point::max();
+            LOG(INFO) << "Running post-promotion stale replica cleanup...";
+            ClearInvalidHandles();
+            LOG(INFO) << "Post-promotion stale replica cleanup completed.";
         }
 
         pt_monitor.End(0);

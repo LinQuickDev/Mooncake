@@ -1249,6 +1249,11 @@ class MasterService {
     struct OffloadingTask {
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
+        // Client whose LOCAL_DISK segment owns the queued offload task.
+        // A key may have one task per offloading node (one per MEMORY
+        // replica), so tasks are matched by (key, source_client_id) when
+        // workers report completion or failure.
+        UUID source_client_id;
     };
 
     // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -1319,7 +1324,8 @@ class MasterService {
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, const ReplicationTask>
             replication_tasks;
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
+        std::unordered_map<std::string, std::vector<OffloadingTask>>
+            offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
             promotion_candidates;
@@ -1593,7 +1599,11 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
-    tl::expected<void, ErrorCode> PushOffloadingQueue(
+    // Queues an offload task for `replica` on the LOCAL_DISK segment(s)
+    // mapped from the replica's MEMORY segment name(s). Returns the
+    // client_id(s) of the segment(s) the task was actually enqueued on;
+    // callers use them to record one protected OffloadingTask per queue.
+    tl::expected<std::vector<UUID>, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica);
 
     struct GracefulUnmountDeadlineRecord {
@@ -2004,6 +2014,13 @@ class MasterService {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_live_ttl_sec_;
+    // Grace period in seconds after promotion before cleaning up stale replicas
+    // from clients that failed to reconnect to the new master.
+    const int64_t post_promotion_cleanup_sec_;
+    // Deadline (steady_clock) after which a post-promotion stale-replica
+    // cleanup is scheduled. Set by RestoreFromStandbySnapshot.
+    std::chrono::steady_clock::time_point post_promotion_cleanup_deadline_{
+        std::chrono::steady_clock::time_point::max()};
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
