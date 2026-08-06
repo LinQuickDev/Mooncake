@@ -55,6 +55,13 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
+    // Seconds after promotion before a stale-replica sweep runs.
+    // During this grace window, clients that existed on the old master
+    // can reconnect (ReMountSegment / MountLocalDiskSegment) to
+    // protect their replicas from cleanup.
+    int64_t post_promotion_cleanup_sec =
+        DEFAULT_POST_PROMOTION_CLEANUP_SEC;
+
     // Master view lease TTL in seconds (HA leadership lease).
     // When the lease expires without successful renewal, the Master
     // is considered dead and a standby can take over.
