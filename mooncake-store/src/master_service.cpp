@@ -6329,7 +6329,7 @@ auto MasterService::NotifyOffloadSuccess(
                         SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
-                        obj_metadata.VisitReplicas(
+                        size_t updated = obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
                                 return rep.type() == ReplicaType::LOCAL_DISK &&
                                        rep.get_local_disk_client_id() ==
@@ -6340,6 +6340,15 @@ auto MasterService::NotifyOffloadSuccess(
                                     metadata.transport_endpoint,
                                     metadata.data_size);
                             });
+                        if (updated == 0) {
+                            std::vector<Replica> replicas;
+                            replicas.emplace_back(std::move(replica));
+                            obj_metadata.AddReplicas(std::move(replicas));
+                            auto& shard = accessor.GetShard();
+                            shard.OnDiskReplicaAdded(obj_metadata);
+                            SyncCacheTotalAccounting(obj_metadata);
+                            added_new_local_disk_replica = true;
+                        }
                     }
                     handled_existing_object = true;
                 }
