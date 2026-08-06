@@ -8278,7 +8278,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 LOG(WARNING)
                     << "BatchEvict: OpLog reservation failed for key=" << key
                     << ", err=" << static_cast<int>(reservation.error())
-                    << ", retries=" << retry << ", skipping eviction";
+                    << ", skipping eviction";
                 return false;
             }
             std::vector<ReplicaID> removed_ids;
