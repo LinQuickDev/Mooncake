@@ -2718,6 +2718,14 @@ void MasterService::RestoreFromStandbySnapshot(
     LOG(INFO) << "Startup cleanup: erased=" << erased_count
               << ", kept=" << kept_count;
 
+    // Decrement allocated_mem_size metric for all standby memory segments,
+    // since all stale replicas have been cleaned up and their allocators
+    // (DummyBufferAllocator) do not track allocation/deallocation.
+    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
+
     // 4. Log the result.
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
               << segments.size()
