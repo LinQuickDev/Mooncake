@@ -1,5 +1,7 @@
 #include "ha/master_metrics_reporter.h"
 
+#include <ctime>
+#include <iomanip>
 #include <sstream>
 #include <thread>
 
@@ -134,10 +136,10 @@ void MasterMetricsReporter::ReportLoop() {
 }
 
 std::string MasterMetricsReporter::BuildEtcdKey() const {
-    // Pattern: /{cluster_namespace}/masters/{master_id}
+    // Pattern: /{cluster_namespace}/masters/primary
+    // Always overwrites the same key so only the current primary is visible.
     std::ostringstream oss;
-    oss << '/' << config_.cluster_namespace << "/masters/"
-        << config_.master_id;
+    oss << '/' << config_.cluster_namespace << "/masters/primary";
     return oss.str();
 }
 
@@ -187,11 +189,15 @@ std::string MasterMetricsReporter::BuildMetricsJson() const {
          << "\"file_available_bytes\":" << file_available << ","
          << "\"key_count\":" << key_count << ","
          << "\"active_clients\":" << active_clients << ","
-         << "\"updated_at\":" << std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now()
-                                        .time_since_epoch())
-                                    .count()
-         << "}";
+         << "\"updated_at\":\"";
+    {
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_buf;
+        gmtime_r(&now_time_t, &tm_buf);
+        json << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%SZ");
+    }
+    json << "\"}";
     return json.str();
 }
 
