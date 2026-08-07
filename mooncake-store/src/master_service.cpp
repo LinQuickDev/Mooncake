@@ -4051,6 +4051,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
+    // Build OPLog payload BEFORE moving the replica, so that
+    // get_descriptor() is still valid on `replica`.
+    std::string oplog_payload;
+    bool oplog_required = false;
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
         for (const auto& existing : metadata.GetAllReplicas()) {
@@ -4079,17 +4083,17 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
             // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
             post.push_back(replica.get_descriptor());
         }
-
-        auto persist_result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post, metadata.group_id,
-                metadata.data_type));
-        if (!persist_result) {
-            return tl::make_unexpected(persist_result.error());
-        }
+        oplog_payload = SerializeMetadataForOpLogFromReplicaDescriptors(
+            metadata.client_id, metadata.size, post, metadata.group_id,
+            metadata.data_type);
+        oplog_required = true;
     }
 
+    // Step 1: Update metadata first for LOCAL_DISK replicas.
+    // This ensures the replica is registered immediately, even when the
+    // OPLog writer is backed up (e.g. during standby promotion recovery).
+    // LOCAL_DISK is a secondary replica type: losing its OPLog entry is
+    // recoverable because the client will re-register on remount.
     if (!replacing_existing) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
@@ -4097,9 +4101,23 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
         SyncCacheTotalAccounting(metadata);
+
+        // Step 2: Best-effort OPLog write.
+        if (oplog_required) {
+            auto persist_result = AppendOpLogVisibleBeforeDurable(
+                OpType::PUT_END, object_id.tenant_id.value(), key,
+                oplog_payload);
+            if (!persist_result) {
+                LOG(WARNING) << "AddReplica: OpLog skipped for local_disk"
+                             << " (metadata already updated), key=" << key
+                             << ", err="
+                             << static_cast<int>(persist_result.error());
+            }
+        }
         return true;
     }
-  
+
+    // Replace-existing path: update the existing LOCAL_DISK replica.
     // Record every LOCAL_DISK replica per owning client. First try to refresh
     // an existing replica owned by THIS client (idempotent re-offload or
     // restart re-registration only changes the endpoint/size). If this client
@@ -4122,6 +4140,17 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
+    }
+
+    // Best-effort OPLog write for replace-existing path.
+    if (oplog_required) {
+        auto persist_result = AppendOpLogVisibleBeforeDurable(
+            OpType::PUT_END, object_id.tenant_id.value(), key, oplog_payload);
+        if (!persist_result) {
+            LOG(WARNING) << "AddReplica: OpLog skipped for local_disk"
+                         << " (metadata already updated), key=" << key
+                         << ", err=" << static_cast<int>(persist_result.error());
+        }
     }
     return false;
 }
@@ -6417,11 +6446,12 @@ auto MasterService::NotifyOffloadSuccess(
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
                 }
-                LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                           << ", client_id=" << client_id
-                           << ", tenant_id=" << object_id.tenant_id.value()
-                           << ", key=" << object_id.user_key;
-                return tl::make_unexpected(res.error());
+                LOG(WARNING) << "Failed to add replica, skipping object: "
+                             << "error=" << res.error()
+                             << ", client_id=" << client_id
+                             << ", tenant_id=" << object_id.tenant_id.value()
+                             << ", key=" << object_id.user_key;
+                continue;
             }
             added_new_local_disk_replica = res.value();
         }
