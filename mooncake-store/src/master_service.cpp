@@ -2121,12 +2121,10 @@ void MasterService::ClearInvalidHandles(
                                 PersistStaleHandleCleanupForHA(
                                     "ClearInvalidHandles", tenant_it->first,
                                     it->first, it->second, cleanup_plan);
-                            if (!persist_result) {
+                            if (persist_result) {
                                 ++it;
                                 continue;
                             }
-                            ++it;
-                            continue;
                         }
                     }
                     if (CleanupStaleHandles(it->second, alive_clients,
@@ -2148,17 +2146,17 @@ void MasterService::ClearInvalidHandles(
                                             durable_entry,
                                             QuotaEraseMode::kFull);
                                     });
-                            if (!persist_result) {
-                                LOG(WARNING)
-                                    << "ClearInvalidHandles(last replica)"
-                                    << ": REMOVE persist failed for key="
-                                    << it->first << ", err="
-                                    << static_cast<int>(persist_result.error());
+                            if (persist_result) {
+                                // OPLog path succeeded – skip local erase.
                                 ++it;
                                 continue;
                             }
-                            ++it;
-                            continue;
+                            LOG(WARNING)
+                                << "ClearInvalidHandles(last replica)"
+                                << ": REMOVE persist failed for key="
+                                << it->first << ", err="
+                                << static_cast<int>(persist_result.error());
+                            // Fall through to local erase.
                         }
                     }
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
