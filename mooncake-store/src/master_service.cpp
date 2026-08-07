@@ -1913,6 +1913,54 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
+namespace {
+
+constexpr int kOplogRetryMaxAttempts = 10;
+constexpr int kOplogRetryMaxAttemptsUnavailable = 5;
+constexpr int kOplogRetryMaxDelayMs = 16;
+
+template <typename F>
+auto RetryOplogPersist(F&& persist_fn) -> decltype(std::declval<F>()()) {
+    for (int attempt = 0; attempt <= kOplogRetryMaxAttempts; ++attempt) {
+        auto result = persist_fn();
+        if (result) {
+            return result;
+        }
+        const ErrorCode err = result.error();
+
+        if (err == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+            // Slots full: writer is sealing the current batch and will
+            // free capacity imminently. Worth waiting.
+            if (attempt == kOplogRetryMaxAttempts) {
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::min(1 << attempt, kOplogRetryMaxDelayMs)));
+            continue;
+        }
+
+        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            // Writer not accepting: write_batch is retrying against the
+            // KV backend. Recovery depends on the backend; bail out
+            // earlier to avoid spinning on a persistent outage.
+            if (attempt >= kOplogRetryMaxAttemptsUnavailable) {
+                LOG(WARNING) << "Oplog writer not accepting after "
+                             << attempt << " retries, falling back to local";
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::min(1 << attempt, kOplogRetryMaxDelayMs)));
+            continue;
+        }
+
+        // Non-backpressure errors (INVALID_PARAMS etc.) — no retry.
+        return result;
+    }
+    // unreachable
+}
+
+}  // namespace
+
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
@@ -2118,9 +2166,12 @@ void MasterService::ClearInvalidHandles(
                     if (enable_ha_) {
                         if (enable_oplog_) {
                             auto persist_result =
-                                PersistStaleHandleCleanupForHA(
-                                    "ClearInvalidHandles", tenant_it->first,
-                                    it->first, it->second, cleanup_plan);
+                                RetryOplogPersist([&]() {
+                                    return PersistStaleHandleCleanupForHA(
+                                        "ClearInvalidHandles",
+                                        tenant_it->first, it->first,
+                                        it->second, cleanup_plan);
+                                });
                             if (persist_result) {
                                 ++it;
                                 continue;
@@ -2138,14 +2189,18 @@ void MasterService::ClearInvalidHandles(
                     if (enable_ha_) {
                         if (enable_oplog_) {
                             auto persist_result =
-                                AppendOpLogWithDurableFinalize(
-                                    OpType::REMOVE, tenant_it->first.value(),
-                                    it->first, {},
-                                    [this](const OpLogEntry& durable_entry) {
-                                        FinalizeMetadataEraseAfterDurable(
-                                            durable_entry,
-                                            QuotaEraseMode::kFull);
-                                    });
+                                RetryOplogPersist([&]() {
+                                    return AppendOpLogWithDurableFinalize(
+                                        OpType::REMOVE,
+                                        tenant_it->first.value(),
+                                        it->first, {},
+                                        [this](
+                                            const OpLogEntry& durable_entry) {
+                                            FinalizeMetadataEraseAfterDurable(
+                                                durable_entry,
+                                                QuotaEraseMode::kFull);
+                                        });
+                                });
                             if (persist_result) {
                                 // OPLog path succeeded – skip local erase.
                                 ++it;
