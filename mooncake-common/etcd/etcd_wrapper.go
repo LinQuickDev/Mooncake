@@ -714,6 +714,26 @@ func EtcdStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.
 	return 0
 }
 
+//export EtcdStorePutWithLeaseWrapper
+func EtcdStorePutWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
+	leaseId int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := cli.Put(ctx, k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
 // Create key if absent (CAS on CreateRevision==0).
 // Return:
 // - 0 on success

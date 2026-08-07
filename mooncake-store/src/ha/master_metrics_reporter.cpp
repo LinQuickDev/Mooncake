@@ -77,16 +77,9 @@ void MasterMetricsReporter::SetRole(const std::string& role) {
 }
 
 void MasterMetricsReporter::ReportLoop() {
+    EtcdLeaseId prev_lease = 0;
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
-        // ── 1. Grant a fresh lease (or keep existing) ──
-        {
-            std::lock_guard<std::mutex> lock(lease_mutex_);
-            if (lease_id_ != 0) {
-                EtcdHelper::RevokeLease(lease_id_);
-                lease_id_ = 0;
-            }
-        }
-
+        // ── 1. Grant a fresh lease ──
         EtcdLeaseId new_lease = 0;
         auto grant_err =
             EtcdHelper::GrantLease(config_.lease_ttl_sec, new_lease);
@@ -102,18 +95,31 @@ void MasterMetricsReporter::ReportLoop() {
             lease_id_ = new_lease;
         }
 
-        // ── 2. Collect metrics and PUT ──
+        // ── 2. PUT with lease (key is protected from this point) ──
         auto key = BuildEtcdKey();
         auto value = BuildMetricsJson();
 
-        auto put_err = EtcdHelper::Put(key.data(), key.size(), value.data(),
-                                       value.size());
+        auto put_err = EtcdHelper::PutWithLease(
+            key.data(), key.size(), value.data(), value.size(), new_lease);
         if (put_err != ErrorCode::OK) {
             LOG(WARNING) << "Failed to PUT metrics to etcd key=" << key << ": "
                          << toString(put_err);
+            // PUT failed — key still bound to prev_lease, clean up unused
+            // new_lease.
+            EtcdHelper::RevokeLease(new_lease);
+            {
+                std::lock_guard<std::mutex> lock(lease_mutex_);
+                lease_id_ = prev_lease;
+            }
+        } else {
+            // ── 3. Revoke old lease (key is already bound to new_lease) ──
+            if (prev_lease != 0) {
+                EtcdHelper::RevokeLease(prev_lease);
+            }
+            prev_lease = new_lease;
         }
 
-        // ── 3. Sleep until next cycle (check shutdown every second) ──
+        // ── 4. Sleep until next cycle (check shutdown every second) ──
         for (int i = 0;
              i < config_.report_interval_sec &&
              !shutdown_requested_.load(std::memory_order_acquire);
@@ -122,16 +128,14 @@ void MasterMetricsReporter::ReportLoop() {
         }
     }
 
-    // Final cleanup of the lease (Stop() also does this, but it's safe to
-    // double-revoke).
-    int64_t lease_to_revoke = 0;
+    // Final cleanup of the active lease (Stop() also does this, but it's safe
+    // to double-revoke).
+    if (prev_lease != 0) {
+        EtcdHelper::RevokeLease(prev_lease);
+    }
     {
         std::lock_guard<std::mutex> lock(lease_mutex_);
-        lease_to_revoke = lease_id_;
         lease_id_ = 0;
-    }
-    if (lease_to_revoke != 0) {
-        EtcdHelper::RevokeLease(lease_to_revoke);
     }
 }
 
