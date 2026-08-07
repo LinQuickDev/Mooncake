@@ -8878,7 +8878,6 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                    "for key="
                                 << it->first << ", err="
                                 << static_cast<int>(reservation.error())
-                                << ", retries=" << retry
                                 << ", skipping eviction";
                             ++it;
                             continue;
