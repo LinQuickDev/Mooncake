@@ -1042,7 +1042,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                        replica.status() !=
                                            ReplicaStatus::REMOVED &&
                                        replica.status() !=
-                                           ReplicaStatus::FAILED;
+                                           ReplicaStatus::FAILED &&
+                                       !replica.has_invalid_mem_handle();
                             },
                             [&](Replica& replica) {
                                 auto descriptor = replica.get_descriptor()
