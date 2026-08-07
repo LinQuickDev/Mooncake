@@ -6372,9 +6372,7 @@ auto MasterService::NotifyOffloadSuccess(
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
 
-                // Existing orphan objects can only bypass tenant registration
-                // for a master-admitted offload completion. Without this task
-                // marker, fall through to the regular registration check.
+                // Clean up the offloading task if present.
                 if (task_it != tenant_state.offloading_tasks.end()) {
                     auto& tasks = task_it->second;
                     auto offload_it =
@@ -6393,9 +6391,33 @@ auto MasterService::NotifyOffloadSuccess(
                             tenant_state.offloading_tasks.erase(task_it);
                         }
                     }
+                }
 
-                    if (!obj_metadata.HasReplica(
-                            &Replica::fn_is_local_disk_replica)) {
+                // Register / update the LOCAL_DISK replica for this
+                // object. Handles both the offload-completion case and
+                // the remount / re-registration case.
+                if (!obj_metadata.HasReplica(
+                        &Replica::fn_is_local_disk_replica)) {
+                    std::vector<Replica> replicas;
+                    replicas.emplace_back(std::move(replica));
+                    obj_metadata.AddReplicas(std::move(replicas));
+                    auto& shard = accessor.GetShard();
+                    shard.OnDiskReplicaAdded(obj_metadata);
+                    SyncCacheTotalAccounting(obj_metadata);
+                    added_new_local_disk_replica = true;
+                } else {
+                    size_t updated = obj_metadata.VisitReplicas(
+                        [client_id](const Replica& rep) {
+                            return rep.type() == ReplicaType::LOCAL_DISK &&
+                                   rep.get_local_disk_client_id() ==
+                                       client_id;
+                        },
+                        [&metadata](Replica& rep) {
+                            rep.update_local_disk_location(
+                                metadata.transport_endpoint,
+                                metadata.data_size);
+                        });
+                    if (updated == 0) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
@@ -6403,30 +6425,9 @@ auto MasterService::NotifyOffloadSuccess(
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
-                    } else {
-                        size_t updated = obj_metadata.VisitReplicas(
-                            [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_local_disk_client_id() ==
-                                           client_id;
-                            },
-                            [&metadata](Replica& rep) {
-                                rep.update_local_disk_location(
-                                    metadata.transport_endpoint,
-                                    metadata.data_size);
-                            });
-                        if (updated == 0) {
-                            std::vector<Replica> replicas;
-                            replicas.emplace_back(std::move(replica));
-                            obj_metadata.AddReplicas(std::move(replicas));
-                            auto& shard = accessor.GetShard();
-                            shard.OnDiskReplicaAdded(obj_metadata);
-                            SyncCacheTotalAccounting(obj_metadata);
-                            added_new_local_disk_replica = true;
-                        }
                     }
-                    handled_existing_object = true;
                 }
+                handled_existing_object = true;
             }
         }
 
