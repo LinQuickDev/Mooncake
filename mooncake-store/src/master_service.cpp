@@ -8872,17 +8872,6 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                         metadata, is_evictable_nof_replica);
                     if (enable_oplog_) {
                         auto reservation = ReserveBatchOpLogSlot();
-                        // Retry on transient backpressure (pipeline full).
-                        static constexpr int kMaxOpLogRetries = 5;
-                        int retry = 0;
-                        while (!reservation &&
-                               reservation.error() ==
-                                   ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
-                               retry < kMaxOpLogRetries) {
-                            std::this_thread::yield();
-                            reservation = ReserveBatchOpLogSlot();
-                            ++retry;
-                        }
                         if (!reservation) {
                             LOG(WARNING)
                                 << "NoFBatchEvict: OpLog reservation failed "
