@@ -1055,6 +1055,24 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                             restore.segment.te_endpoint ||
                                         descriptor.transport_endpoint_ ==
                                             restore.segment.name) {
+                                        // When multiple segments share the
+                                        // same endpoint (e.g. UB per-NUMA
+                                        // segments), disambiguate by
+                                        // checking whether the replica's
+                                        // buffer address falls within this
+                                        // segment's virtual address range
+                                        // [base, base+size).  Each
+                                        // per-NUMA segment occupies a
+                                        // contiguous and non-overlapping
+                                        // range, so at most one segment
+                                        // matches.
+                                        if (descriptor.buffer_address_ <
+                                                restore.segment.base ||
+                                            descriptor.buffer_address_ >=
+                                                restore.segment.base +
+                                                    restore.segment.size) {
+                                            continue;
+                                        }
                                         if (match != nullptr) {
                                             ambiguous_endpoint = true;
                                             return;
