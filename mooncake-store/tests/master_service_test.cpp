@@ -4412,7 +4412,7 @@ TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsPartialAllocation) {
     ReplicateConfig config;
     config.replica_num = 3;
     auto put_start_result = service_->PutStart(
-        client_id, "strict_partial_key", "default", 1024, config);
+        client_id, "strict_partial_key", TenantId::Default(), 1024, config);
     ASSERT_FALSE(put_start_result.has_value());
     ASSERT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_start_result.error());
     // Strict failures are surfaced as allocation failures, not as partial
@@ -4424,7 +4424,7 @@ TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsPartialAllocation) {
     ReplicateConfig full_config;
     full_config.replica_num = 2;
     auto full_result = service_->PutStart(
-        client_id, "strict_full_key", "default", 1024, full_config);
+        client_id, "strict_full_key", TenantId::Default(), 1024, full_config);
     ASSERT_TRUE(full_result.has_value());
     ASSERT_EQ(2u, full_result->size());
     ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
@@ -4452,7 +4452,7 @@ TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsDegradedDualReplica) {
         ReplicateConfig config;
         config.replica_num = 2;
         auto result = service_->PutStart(client_id, "degraded_dual_key",
-                                         "default", 1024, config);
+                                         TenantId::Default(), 1024, config);
         ASSERT_TRUE(result.has_value());
         ASSERT_EQ(1u, result->size());
         ASSERT_EQ(metrics.get_put_start_partial_allocations(),
@@ -4477,7 +4477,7 @@ TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsDegradedDualReplica) {
         ReplicateConfig config;
         config.replica_num = 2;
         auto result = service_->PutStart(client_id, "strict_dual_key",
-                                         "default", 1024, config);
+                                         TenantId::Default(), 1024, config);
         ASSERT_FALSE(result.has_value());
         ASSERT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, result.error());
         ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);

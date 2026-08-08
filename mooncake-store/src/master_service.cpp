@@ -2012,7 +2012,7 @@ MasterService::EraseMetadata(
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
 
-    // Clean up offloading_task + dec_refcnt before erasing metadata.
+    // Clean up offloading_tasks + dec_refcnt before erasing metadata.
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
