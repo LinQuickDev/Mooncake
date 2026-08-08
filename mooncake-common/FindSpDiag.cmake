@@ -22,10 +22,10 @@ endfunction()
 
 if(NOT MOONCAKE_ENABLE_SPDIAG)
   set(MOONCAKE_SPDIAG_GIT_REPOSITORY
-      "https://github.com/LinQuickDev/spdiag.git"
+      "https://gitcode.com/openeuler/spdiag.git"
       CACHE STRING "SpDiag repository used by Layer 0")
   set(MOONCAKE_SPDIAG_GIT_TAG
-      "8df2c2844d402e2e4dcd5ceab2424e8d36c5f99f"
+      "master"
       CACHE STRING "SpDiag revision used by Layer 0")
   set(MOONCAKE_SPDIAG_SOURCE_DIR
       ""
