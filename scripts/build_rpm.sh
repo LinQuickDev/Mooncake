@@ -10,10 +10,17 @@ set -x
 
 # Get build directory from environment variable or argument
 BUILD_DIR="${BUILD_DIR:-${1:-build}}"
-BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+if [[ "${BUILD_DIR}" = /* ]]; then
+    BUILD_DIR_ABS="${BUILD_DIR}"
+else
+    BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+fi
 
 # Get output directory from environment variable or argument
 OUTPUT_DIR="${OUTPUT_DIR:-${2:-rpm-output}}"
+if [[ "${OUTPUT_DIR}" != /* ]]; then
+    OUTPUT_DIR="$(pwd)/${OUTPUT_DIR}"
+fi
 
 # Detect current host architecture
 HOST_ARCH=$(uname -m)
@@ -50,6 +57,12 @@ rm -rf ${OUTPUT_DIR}/
 build_rpm_for_platform() {
     local PLATFORM=$1
     local LIB_DIR="lib64"
+    local BUILDROOT=""
+    local UBDIAG_CONFIG_RPM_FILE=""
+    local MOONCAKE_UBDIAG_LAYER=""
+    local MOONCAKE_UBDIAG_SYSTEM_LIBRARY=""
+    local MOONCAKE_UBDIAG_SYSTEM_CLI=""
+    local MOONCAKE_UBDIAG_SYSTEM_CONFIG=""
     
     echo "Building RPM for platform: ${PLATFORM}"
     
@@ -65,7 +78,8 @@ build_rpm_for_platform() {
     
     # Create RPM build directory structure for this platform
     mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-    mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}
+    BUILDROOT="rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}"
+    mkdir -p "${BUILDROOT}"
     
     # Create target directories in BUILDROOT
     mkdir -p rpmbuild/BUILDROOT/${PACKAGE_NAME}-${PACKAGE_VERSION}-${PACKAGE_RELEASE}.${PLATFORM}/{usr/{bin,${LIB_DIR},include},etc/mooncake}
@@ -76,12 +90,22 @@ build_rpm_for_platform() {
     echo "Copying executables..."
     
     # Determine build subdirectory based on platform
-    local PLATFORM_BUILD_DIR="${BUILD_DIR}"
+    local PLATFORM_BUILD_DIR="${BUILD_DIR_ABS}"
     if [ "${PLATFORM}" != "${HOST_ARCH}" ]; then
         # Cross-compilation path
-        PLATFORM_BUILD_DIR="${BUILD_DIR}-${PLATFORM}"
+        PLATFORM_BUILD_DIR="${BUILD_DIR_ABS}-${PLATFORM}"
         echo "Cross-compilation detected, looking in ${PLATFORM_BUILD_DIR}"
     fi
+
+    source "${PLATFORM_BUILD_DIR}/mooncake_ubdiag.env"
+    case "${MOONCAKE_UBDIAG_LAYER}" in
+        mock|system)
+            ;;
+        *)
+            echo "Error: Unknown Mooncake UbDiag layer: ${MOONCAKE_UBDIAG_LAYER}"
+            return 1
+            ;;
+    esac
     
     # mooncake_master
     if [ -f ${PLATFORM_BUILD_DIR}/mooncake-store/src/mooncake_master ]; then
@@ -170,6 +194,27 @@ build_rpm_for_platform() {
     else
         echo "Warning: store.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
+
+    if [ "${MOONCAKE_UBDIAG_LAYER}" = "system" ]; then
+        local ubdiag_library_dir
+        local ubdiag_library
+
+        cp "${MOONCAKE_UBDIAG_SYSTEM_CLI}" "${BUILDROOT}/usr/bin/ubdiag"
+        ubdiag_library_dir="$(dirname "${MOONCAKE_UBDIAG_SYSTEM_LIBRARY}")"
+        for ubdiag_library in "${ubdiag_library_dir}"/libubdiag.so*; do
+            if [ "$(readlink -f "${ubdiag_library}")" = \
+                 "${MOONCAKE_UBDIAG_SYSTEM_LIBRARY}" ]; then
+                cp -a "${ubdiag_library}" "${BUILDROOT}/usr/${LIB_DIR}/"
+            fi
+        done
+
+        if [ -n "${MOONCAKE_UBDIAG_SYSTEM_CONFIG}" ]; then
+            mkdir -p "${BUILDROOT}/etc/ubdiag"
+            cp "${MOONCAKE_UBDIAG_SYSTEM_CONFIG}" \
+                "${BUILDROOT}/etc/ubdiag/ubdiag.conf"
+            UBDIAG_CONFIG_RPM_FILE="%config(noreplace) /etc/ubdiag/ubdiag.conf"
+        fi
+    fi
     
     # -------------------------------------------------------------------------
     # Copy header files (only core headers for real_client and dummy_client)
@@ -210,8 +255,8 @@ build_rpm_for_platform() {
         "config_helper.h"
         "allocator.h"
         "allocation_strategy.h"
-        "client_buffer.hpp"
-        "aligned_client_buffer.hpp"
+        "client_buffer.h"
+        "aligned_client_buffer.h"
         "eviction_strategy.h"
         "metadata_store.h"
         "mmap_arena.h"
@@ -313,21 +358,11 @@ Requires(pre):  /usr/sbin/ldconfig
 ${PACKAGE_DESCRIPTION}
 
 %files
-/usr/bin/mooncake_master
-/usr/bin/mooncake_client
-/usr/bin/stress_cluster_bench
-/usr/bin/transfer_engine_bench
-/usr/${LIB_DIR}/libmooncake_store.so
-/usr/${LIB_DIR}/libtransfer_engine.so
-/usr/${LIB_DIR}/libmooncake_common.so
-/usr/${LIB_DIR}/libasio.so
-/usr/${LIB_DIR}/libetcd_wrapper.so
-/usr/${LIB_DIR}/libmooncake_engine.so
-/usr/${LIB_DIR}/libmooncake_store_python.so
-/usr/include/mooncake/*.h
-/usr/include/mooncake/*.hpp
-/etc/mooncake/master.yaml
-/etc/mooncake/master.json
+/usr/bin/*
+/usr/${LIB_DIR}/*
+/usr/include/mooncake/*
+%config(noreplace) /etc/mooncake/*
+${UBDIAG_CONFIG_RPM_FILE}
 
 %post
 /sbin/ldconfig
@@ -356,8 +391,9 @@ EOF
     
     # Build the RPM
     rpmbuild -bb \
+        --buildroot "$(pwd)/${BUILDROOT}" \
         --define "_topdir $(pwd)/rpmbuild" \
-        --define "_rpmdir $(pwd)/${OUTPUT_DIR}" \
+        --define "_rpmdir ${OUTPUT_DIR}" \
         rpmbuild/SPECS/${PACKAGE_NAME}-${PLATFORM}.spec
     
     # Move RPM to platform-specific directory

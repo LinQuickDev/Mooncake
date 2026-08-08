@@ -82,6 +82,9 @@ class UrmaContext : public UbContext {
     urma_jfr_t* jfr();
     urma_jfce_t* JFCE();
     urma_transport_mode_t transMode() const { return trans_mode_; }
+    uint64_t pendingSliceCount() const {
+        return worker_pool_ ? worker_pool_->pendingSliceCount() : 0;
+    }
     static bool uninit();
     static bool init();
 

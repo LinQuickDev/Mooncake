@@ -14,10 +14,13 @@
 
 #include "pyclient.h"
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
@@ -26,6 +29,9 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
+class UdsAcceptor;
+class UdsConnection;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -84,7 +90,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "",
         bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -381,6 +389,9 @@ class RealClient : public PyClient {
     batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
                                const UUID &client_id);
 
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
+        size_t size, const UUID &client_id);
+
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);
@@ -447,7 +458,8 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
-        size_t src_offset, size_t size, const UUID &client_id);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum, const UUID &client_id);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
@@ -506,7 +518,10 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        size_t offload_rpc_thread_num = 8,
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -532,7 +547,12 @@ class RealClient : public PyClient {
         uint64_t total_size;
         int64_t query_us;
         int64_t select_us;
+        int64_t local_endpoints_us;
+        int64_t select_replica_us;
         std::string replica_type;
+        size_t replica_count{0};
+        std::string local_endpoint{"-"};
+        std::string remote_endpoint{"-"};
     };
 
     tl::expected<RangedReadMetadata, ErrorCode>
@@ -546,11 +566,12 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity = false);
+        bool size_is_buffer_capacity, bool verify_checksum);
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(
@@ -680,7 +701,22 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             uint64_t trace_id = 0);
+
+    /**
+     * @brief Push-mode offload handler, run on the data owner. Reads the
+     * requested keys from SSD into the local ClientBuffer, WRITEs them
+     * directly into the requester's destination slices over the transfer
+     * engine, then releases the ClientBuffer locally. The requester therefore
+     * needs no follow-up READ nor a separate release_offload_buffer RPC.
+     * @param req keys/sizes plus the requester's TE endpoint and dst slices.
+     * @return per-batch result; data already landed in requester memory.
+     */
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+    batch_get_offload_object_push(
+        const BatchGetOffloadObjectPushRequest &req);
 
     /**
      * @brief Releases buffer associated with a specific batch_id.
@@ -688,7 +724,7 @@ class RealClient : public PyClient {
      * @param batch_id The unique identifier of the batch to release
      * @return true if batch was found and released, false otherwise
      */
-    bool release_offload_buffer(uint64_t batch_id);
+    bool release_offload_buffer(uint64_t batch_id, uint64_t trace_id = 0);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.
@@ -750,7 +786,10 @@ class RealClient : public PyClient {
         void *base = nullptr;
         size_t size = 0;
         std::string protocol;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
+
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -790,12 +829,29 @@ class RealClient : public PyClient {
         }
     };
 
+#if defined(USE_SUNRISE)
+    struct SunriseSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                sunrise_free_memory(ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#if defined(USE_SUNRISE)
+    std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
+        sunrise_segment_ptrs_;
+#endif
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>>
+        setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -888,18 +944,16 @@ class RealClient : public PyClient {
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;
-    std::jthread ipc_thread_;
-    std::atomic<bool> ipc_running_{false};
+    std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
     int stop_ipc_server();
-    void ipc_server_func();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
-    int start_http_server();
+    int start_http_server(int port);
     void stop_http_server();
 
-    void handle_ipc_shm_register(int client_sock);
-    void handle_ipc_shm_fd_request(int client_sock);
+    void handle_ipc_shm_register(UdsConnection &connection);
+    void handle_ipc_shm_fd_request(UdsConnection &connection);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(

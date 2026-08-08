@@ -24,12 +24,13 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <condition_variable>
+#include <mutex>
+#include <queue>
 #include <random>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
-
-#include <mutex>
 #endif
 
 #ifdef USE_HTTP
@@ -746,7 +747,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 }
 
                 struct timeval timeout;
-                timeout.tv_sec = 60;
+                timeout.tv_sec = 5;
                 timeout.tv_usec = 0;
                 if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                                sizeof(timeout))) {
@@ -762,6 +763,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 Json::Value local, peer;
 
                 auto [type, json_str] = readString(conn_fd);
+                if (type == HandShakeRequestType::Invalid) {
+                    close(conn_fd);
+                    continue;
+                }
+
                 std::string errs;
                 if (!parseJsonString(json_str, peer, &errs)) {
                     LOG(ERROR)

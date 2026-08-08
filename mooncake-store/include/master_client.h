@@ -12,13 +12,16 @@
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
+#include "environ.h"
 #include "client_metric.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
+#include "store_rpc_client_io_context.h"
 #include "task_manager.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 
@@ -45,6 +48,26 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
     }
 }
 
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+    RpcClientPool::PoolConfig config;
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
+    }
+
+    // Default request and connect timeouts remain coro_rpc's built-in 30s.
+    // A negative request timeout disables the per-request timer.
+    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
+        config.client_config.request_timeout_duration =
+            std::chrono::milliseconds(std::atoll(timeout_ms));
+    }
+    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
+        config.client_config.connect_timeout_duration =
+            std::chrono::milliseconds(std::atoll(connect_ms));
+    }
+    return config;
+}
+
 }  // namespace detail
 
 /**
@@ -54,11 +77,21 @@ class MasterClient {
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
-        : client_id_(client_id),
+        : client_accessor_(GetStoreRpcClientIoContextPool(), 
+                           detail::MakeMasterRpcClientPoolConfig()),
+          client_id_(client_id),
           tenant_id_(NormalizeTenantId(std::move(tenant_id))),
           metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
+        pool_conf.max_connection = Environ::Get().GetYltRpcPoolMaxConnection(
+            pool_conf.max_connection);
+        pool_conf.idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+                pool_conf.idle_timeout.count()));
+        pool_conf.short_connect_idle_timeout = std::chrono::milliseconds(
+            Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+                pool_conf.short_connect_idle_timeout.count()));
 
         // Disable alive_detect to prevent stale reconnection logs after HA
         // failover. Old client_pool objects remain in client_pools_ map and
@@ -76,7 +109,7 @@ class MasterClient {
     }
     ~MasterClient();
 
-    const std::string& tenant_id() const { return tenant_id_; }
+    const std::string& tenant_id() const { return tenant_id_.value(); }
 
     MasterClient(const MasterClient&) = delete;
     MasterClient& operator=(const MasterClient&) = delete;
@@ -204,12 +237,12 @@ class MasterClient {
 
     /**
      * @brief Ends a put operation
-     * @param key Object key
+     * @param object_meta Object key and optional checksum
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const std::string& key, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -217,7 +250,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys,
+        const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL);
 
     /**
@@ -257,10 +290,10 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const std::string& key, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const std::vector<std::string>& keys);
+        const std::vector<ObjectMeta>& object_metas);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
         const std::string& key, ReplicaType replica_type);
@@ -372,6 +405,15 @@ class MasterClient {
     GetAllNoFSegments();
 
     /**
+     * @brief Fetch all registered segment names from master.
+     * Used for pre-establishing connections during client setup.
+     * @return Vector of segment names (format: {ip}:{port}) on success,
+     * ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetAllSegments();
+
+    /**
      * @brief Gets all mounted NoF segments that match a segment name together
      * with their owner client ids.
      * @param segment_name Mounted NoF segment name
@@ -416,6 +458,12 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    /**
+     * @brief Poll whether master has requested a full SSD clear.
+     * @return true if client should clear all SSD files
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
@@ -432,6 +480,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetOffloadEndpoints();
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
@@ -663,6 +714,8 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
+    void WarmupRpcPool();
+
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
      * cannot reconnect to a different address, a new coro_rpc_client pool is
@@ -688,19 +741,19 @@ class MasterClient {
         std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
             client_pool_;
     };
-    RpcClientAccessor client_accessor_;
+
+    RpcClientPool client_accessor_;
 
     // The client identification.
     const UUID client_id_;
 
     // Tenant identity for this client instance.
-    const std::string tenant_id_;
+    const TenantId tenant_id_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
-
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client

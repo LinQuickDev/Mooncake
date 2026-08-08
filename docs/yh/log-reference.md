@@ -681,6 +681,34 @@ export MC_HIFREQ_LOG_SAMPLE_RATE=1.0
 export MC_HIFREQ_LOG_SAMPLE_RATE=0
 ```
 
+#### Correlated latency diagnostics
+
+High-frequency diagnostics now use deterministic `trace_id` sampling. A
+sampled request emits correlated `*_breakdown`, `transfer_diag`,
+`storage_read_breakdown`, `BatchGetReplicaListItem`, and
+`urma_queue_depth` records across worker threads and processes. SSD offload
+RPCs propagate the trace id to the storage owner. Calls without a trace id
+retain random local sampling.
+
+- `transfer_diag.submit_us`: validation, segment lookup, request construction,
+  and submission until a future is returned.
+- `transfer_diag.wait_us`: time blocked in `future.get()`.
+- `local_endpoints_us`: time spent locking and copying the locally mounted
+  Transfer Engine endpoint set.
+- `select_replica_us`: time spent scanning the returned replicas and choosing
+  the preferred complete replica.
+- Transfer-layer records intentionally do not carry object keys; correlate
+  them with Store records through the existing trace id.
+- `storage_read_breakdown.alloc_us`: owner ClientBuffer batch allocation.
+- `storage_read_breakdown.plan_us`: metadata lookup and read-plan construction.
+- `storage_read_breakdown.file_open_us`: path resolution and file open time.
+- `storage_read_breakdown.disk_read_us`: cumulative time inside actual
+  `read_aligned`/`vector_read` calls.
+- `storage_read_breakdown.total_us`: wall time of the owner `BatchGet`.
+
+Batch endpoint records are emitted as `batch_transfer_item`, one record per
+key. Transfer failure ERROR records are never sampled and include the key.
+
 ---
 
 ## 9. 异步日志与 TraceId

@@ -18,6 +18,7 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "replica.h"
+#include "rpc_types.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #ifdef USE_NOF
@@ -584,6 +585,16 @@ class TransferSubmitter {
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_slices);
+
+    // Push counterpart of submit_batch_get_offload_object, run on the data
+    // owner. WRITEs each key's on-disk blob (staged in the owner's local
+    // ClientBuffer at src_pointers[i]) directly into the requester's
+    // destination slices, opening the requester's segment once.
+    std::optional<TransferFuture> submit_batch_push_offload_object(
+        const std::string& requester_te_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& src_pointers,
+        const std::vector<std::vector<OffloadDstSlice>>& dst_slices);
 
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are

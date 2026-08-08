@@ -42,6 +42,14 @@ class UbWorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
+    uint64_t pendingSliceCount() const {
+        const uint64_t submitted =
+            submitted_slice_count_.load(std::memory_order_relaxed);
+        const uint64_t processed =
+            processed_slice_count_.load(std::memory_order_relaxed);
+        return submitted >= processed ? submitted - processed : 0;
+    }
+
    private:
     void performPostSend(int thread_id);
 
@@ -138,7 +146,9 @@ class UbContext {
           max_endpoints_(max_endpoints),
           worker_pool_(nullptr),
           active_(true),
-          show_work_request_flushed_error_(false) {}
+          show_work_request_flushed_error_(false),
+          multipath_(globalConfig().urma_bonding_multipath),
+          numa_affinity_(globalConfig().ub_numa_affinity) {}
 
     virtual ~UbContext() = default;
 
@@ -213,6 +223,10 @@ class UbContext {
     bool active() const { return active_; }
 
     void set_active(bool flag) { active_ = flag; }
+
+    bool multipath() const { return multipath_; }
+
+    bool numa_affinity() const { return numa_affinity_; }
 
     // EndPoint Management
     std::shared_ptr<UbEndPoint> endpoint() {
@@ -369,6 +383,10 @@ class UbContext {
     volatile bool active_;
 
     bool show_work_request_flushed_error_;
+
+    bool multipath_ = false;
+
+    bool numa_affinity_ = false;
 };
 }  // namespace mooncake
 

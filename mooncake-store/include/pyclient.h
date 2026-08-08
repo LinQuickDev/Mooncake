@@ -5,13 +5,16 @@
 #include <csignal>
 #include <map>
 #include <memory>
+#include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "file_storage.h"
@@ -140,6 +143,14 @@ struct ShmFdResponse {
 
 class ClientRequester {
    public:
+    struct RpcTiming {
+        uint64_t pool_lookup_us{0};
+        uint64_t rpc_call_us{0};
+        uint64_t result_get_us{0};
+        uint64_t result_parse_us{0};
+        uint64_t total_us{0};
+    };
+
     ClientRequester();
 
     /**
@@ -151,17 +162,33 @@ class ClientRequester {
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             RpcTiming *timing = nullptr);
 
     /**
-     * @brief Notifies remote FileStorage to release buffer after transfer
-     * completion. This is a fire-and-forget call - errors are logged but not
-     * propagated.
+     * @brief Push-mode offload: invoke the owner's push handler, which WRITEs
+     * the data straight into our destination slices. A single RPC replaces the
+     * pull path's get-pointers + READ + release_offload_buffer sequence.
+     * @param client_addr Network address of the remote FileStorage owner.
+     * @param req keys/sizes plus our TE endpoint and destination slices.
+     */
+    tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
+    batch_get_offload_object_push(
+        const std::string &client_addr,
+        const BatchGetOffloadObjectPushRequest &req,
+        RpcTiming *timing = nullptr);
+
+    /**
+     * @brief Synchronously notifies remote FileStorage to release its buffer
+     * after transfer completion. Errors are logged but not propagated because
+     * the owner's lease-based GC provides a fallback.
      * @param client_addr Network address of the remote FileStorage service.
      * @param batch_id The batch_id returned from batch_get_offload_object.
      */
     void release_offload_buffer(const std::string &client_addr,
-                                uint64_t batch_id);
+                                uint64_t batch_id, RpcTiming *timing = nullptr);
+
+    void WarmupRpcPool(const std::string &client_addr);
 
    private:
     /**
@@ -191,6 +218,8 @@ class ClientRequester {
     };
 
     mutable std::shared_mutex client_pool_mutex_;
+    mutable std::shared_mutex warmed_rpc_pool_mutex_;
+    std::unordered_set<std::string> warmed_rpc_pools_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
 
@@ -204,7 +233,7 @@ class ClientRequester {
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        const std::string &client_addr, Args &&...args);
+        const std::string &client_addr, RpcTiming *timing, Args &&...args);
 };
 
 // Python-specific wrapper class for client interface
@@ -225,7 +254,9 @@ class PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine,
         const std::string &ipc_socket_path, bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default") = 0;
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -368,6 +399,13 @@ class PyClient {
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 
+    virtual std::optional<BufferHandle> allocate_client_buffer(size_t size) {
+        if (!client_buffer_allocator_) {
+            return std::nullopt;
+        }
+        return client_buffer_allocator_->allocate(size);
+    }
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
@@ -398,7 +436,8 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     return CachedQueryResultResponse(GetReplicaListResponse(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
-        remaining_lease_ttl_ms(*query_result, now)));
+        remaining_lease_ttl_ms(*query_result, now),
+        query_result->object_checksum));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -410,7 +449,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     return QueryResult(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
-        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms));
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
+        cached_result.value.object_checksum);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

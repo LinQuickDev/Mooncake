@@ -12,6 +12,7 @@
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "uds_transport.h"
 #include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
@@ -213,16 +214,12 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
 }
 
 DummyClient::DummyClient()
-    : client_id_(generate_uuid()),
+    : client_accessor_(GetStoreRpcClientIoContextPool()),
+      client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
                                     false)) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    // Initialize client pools
-    coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    client_pools_ =
-        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf);
 }
 
 DummyClient::~DummyClient() { tearDownAll(); }
@@ -257,13 +254,9 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
 
     MutexLocker lock(&connect_mutex_);
     if (client_addr_param_ != server_address) {
-        // WARNING: The existing client pool cannot be erased. So if there are a
-        // lot of different addresses, there will be resource leak problems.
-        auto client_pool = client_pools_->at(server_address);
-        client_accessor_.SetClientPool(client_pool);
+        client_accessor_.GetOrCreateClientPool(server_address);
         client_addr_param_ = server_address;
     }
-    auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result = invoke_rpc<&RealClient::service_ready_internal, void>();
@@ -377,40 +370,21 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
         return -1;
     }
 
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
-        return -1;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-
-    // Use abstract namespace
-    std::string abstract_name = ipc_socket_path_;
-    if (abstract_name.size() > sizeof(addr.sun_path) - 2) {
-        LOG(ERROR) << "IPC socket path too long";
-        close(sock_fd);
-        return -1;
-    }
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, abstract_name.c_str(),
-            sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = sizeof(sa_family_t) + 1 + abstract_name.length();
-    LOG(INFO) << "Connecting to IPC socket: " << abstract_name;
-
-    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
+    UdsConnector connector(ipc_socket_path_);
+    LOG(INFO) << "Connecting to IPC socket: " << ipc_socket_path_;
+    auto connection_result = connector.connect();
+    if (!connection_result) {
+        LOG(ERROR) << "Failed to connect IPC socket '" << ipc_socket_path_
+                   << "': " << connection_result.error();
         // This is expected if RealClient is down
-        close(sock_fd);
         return -1;
     }
+    auto connection = std::move(connection_result.value());
 
     // Send request type first
     IpcRequestType type = IPC_SHM_REGISTER;
-    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
+    if (connection->sendRaw(&type, sizeof(type)) < 0) {
         LOG(ERROR) << "Failed to send IPC request type: " << strerror(errno);
-        close(sock_fd);
         return -1;
     }
 
@@ -423,20 +397,16 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
                                                      : kInvalidPhysicalDeviceId;
     req.is_local_buffer = is_local;
 
-    if (ipc_send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
+    if (connection->sendFd(shm->fd, &req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
-        close(sock_fd);
         return -1;
     }
 
     int status = -1;
-    if (recv(sock_fd, &status, sizeof(status), 0) < 0) {
+    if (connection->recvRaw(&status, sizeof(status)) < 0) {
         LOG(ERROR) << "Failed to receive response from RealClient";
-        close(sock_fd);
         return -1;
     }
-
-    close(sock_fd);
 
     if (status != 0) {
         LOG(ERROR) << "RealClient failed to map shared memory, error code: "
@@ -489,6 +459,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
     if (local_buffer_size > 0) {
         try {
             base_addr = shm_helper_->allocate(local_buffer_size);
+            local_buffer_base_ = base_addr;
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
             return -1;
@@ -498,6 +469,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         if (!local_buffer_shm) {
             LOG(ERROR) << "Failed to get shm segment for base address";
             shm_helper_->free(base_addr);
+            local_buffer_base_ = nullptr;
             return -1;
         }
 
@@ -506,6 +478,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 LOG(ERROR) << "Failed to register SHM via IPC";
                 // Register failed, cleanup
                 shm_helper_->free(local_buffer_shm->base_addr);
+                local_buffer_base_ = nullptr;
                 return -1;
             }
         } else {
@@ -513,6 +486,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 LOG(ERROR) << "Failed to register SHM via IPC";
                 // Register failed, cleanup
                 shm_helper_->free(local_buffer_shm->base_addr);
+                local_buffer_base_ = nullptr;
                 return -1;
             }
         }
@@ -532,7 +506,14 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    void* local_buffer_base = local_buffer_base_;
     unregister_shm();
+    if (local_buffer_base && shm_helper_ &&
+        shm_helper_->get_shm(local_buffer_base) &&
+        shm_helper_->free(local_buffer_base) != 0) {
+        LOG(ERROR) << "Failed to free dummy local shared memory";
+    }
+    local_buffer_base_ = nullptr;
 
     // Cleanup hot cache shm mapping
     if (hot_cache_base_) {
@@ -560,6 +541,23 @@ int DummyClient::tearDownAll() {
     }
 #endif
     return 0;
+}
+
+std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
+    auto result = invoke_rpc<&RealClient::allocate_buffer_dummy,
+                             std::tuple<uint64_t, size_t>>(size, client_id_);
+    if (!result.has_value()) {
+        return std::nullopt;
+    }
+
+    auto [dummy_addr, allocated_size] = result.value();
+    void* local_ptr = reinterpret_cast<void*>(dummy_addr);
+    auto release = [this, dummy_addr]() {
+        (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(dummy_addr,
+                                                                  client_id_);
+    };
+    return std::make_optional<BufferHandle>(local_ptr, allocated_size,
+                                            std::move(release));
 }
 
 int64_t DummyClient::unregister_shm() {
@@ -1022,7 +1020,7 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     const auto start_time = std::chrono::steady_clock::now();
     auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
                              tl::expected<int64_t, ErrorCode>>(
-        key, buf_addr, 0, 0, size, client_id_);
+        key, buf_addr, 0, 0, size, true, true, client_id_);
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }
@@ -1088,15 +1086,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
     results.reserve(keys.size());
     const auto now = std::chrono::steady_clock::now();
     for (const auto& cached_result : *cached_results) {
-        if (!cached_result.success) {
-            results.emplace_back(tl::unexpected(cached_result.error));
-            continue;
-        }
-        results.emplace_back(QueryResult(
-            std::vector<Replica::Descriptor>(
-                cached_result.value.replicas.begin(),
-                cached_result.value.replicas.end()),
-            now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms)));
+        results.emplace_back(
+            from_cached_query_result_response(cached_result, now));
     }
     return results;
 }
@@ -1133,8 +1124,8 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    auto results = batch_put_from({key}, {buffer}, {size}, config);
+    return results.empty() ? -1 : results[0];
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
@@ -1165,8 +1156,9 @@ int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
                                         void* metadata_buffer, size_t size,
                                         size_t metadata_size,
                                         const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    auto results = batch_put_from_multi_buffers(
+        {key}, {{metadata_buffer, buffer}}, {{metadata_size, size}}, config);
+    return results.empty() ? -1 : results[0];
 }
 
 std::vector<int> DummyClient::batch_put_from_multi_buffers(
@@ -1383,30 +1375,19 @@ int DummyClient::health_check() {
 }
 
 int DummyClient::request_hot_cache_fd() {
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
+    UdsConnector connector(ipc_socket_path_);
+    auto connection_result = connector.connect();
+    if (!connection_result) {
+        LOG(ERROR) << "Failed to connect IPC socket '" << ipc_socket_path_
+                   << "': " << connection_result.error();
         return -1;
     }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, ipc_socket_path_.c_str(),
-            sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = sizeof(sa_family_t) + 1 + ipc_socket_path_.length();
-
-    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
-        close(sock_fd);
-        return -1;
-    }
+    auto connection = std::move(connection_result.value());
 
     // Send request type
     IpcRequestType type = IPC_SHM_FD_REQUEST;
-    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
+    if (connection->sendRaw(&type, sizeof(type)) < 0) {
         LOG(ERROR) << "Failed to send IPC request type";
-        close(sock_fd);
         return -1;
     }
 
@@ -1415,16 +1396,14 @@ int DummyClient::request_hot_cache_fd() {
     req.client_id_first = client_id_.first;
     req.client_id_second = client_id_.second;
     req.segment_type = SHM_SEG_HOT_CACHE;
-    if (::send(sock_fd, &req, sizeof(req), 0) < 0) {
+    if (connection->sendRaw(&req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send ShmFdRequest";
-        close(sock_fd);
         return -1;
     }
 
     // Receive fd + response
     ShmFdResponse resp;
-    int fd = ipc_recv_fd(sock_fd, &resp, sizeof(resp));
-    close(sock_fd);
+    int fd = connection->recvFd(&resp, sizeof(resp));
 
     if (fd < 0 || resp.status != 0) {
         LOG(ERROR) << "Failed to receive hot cache fd, status=" << resp.status;
