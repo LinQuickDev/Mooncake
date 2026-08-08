@@ -1956,7 +1956,7 @@ auto RetryOplogPersist(F&& persist_fn) -> decltype(std::declval<F>()()) {
         // Non-backpressure errors (INVALID_PARAMS etc.) — no retry.
         return result;
     }
-    // unreachable
+    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
 }  // namespace
