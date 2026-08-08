@@ -1623,7 +1623,7 @@ def render_html(
 <thead><tr><th>operation</th><th>segment</th><th>count</th><th>avg</th>
 <th>p50</th><th>p95</th><th>p99</th><th>p999</th><th>p9999</th>
 <th>min</th><th>max</th></tr></thead>
-<tbody>{''.join(op_rows_html) or '<tr><td colspan=\"11\" class=\"empty\">no breakdown logs found</td></tr>'}</tbody>
+<tbody>{''.join(op_rows_html) or "<tr><td colspan='11' class='empty'>no breakdown logs found</td></tr>"}</tbody>
 </table></div></div>"""
 
     # Pod file stats section
@@ -1656,7 +1656,7 @@ def render_html(
 <th>chunk files (#c#)</th><th>chunk bytes</th><th>unique chunk keys</th>
 <th>other files</th><th>other bytes (known)</th>
 <th>sample chunk keys</th><th>sample other keys</th></tr></thead>
-<tbody>{''.join(pod_rows_html) or '<tr><td colspan=\"10\" class=\"empty\">no get-class logs found</td></tr>'}</tbody>
+<tbody>{''.join(pod_rows_html) or "<tr><td colspan='10' class='empty'>no get-class logs found</td></tr>"}</tbody>
 </table></div></div>"""
 
     # Slow requests section
@@ -1694,7 +1694,7 @@ def render_html(
 <th>ST queue</th><th>ST file open</th><th>ST disk read</th><th>ST total</th><th>ST release</th>
 <th>M pool</th><th>M rpc</th><th>M result</th><th>M total</th><th>M server</th>
 </tr></thead>
-<tbody>{''.join(slow_rows_html) or '<tr><td colspan=\"27\" class=\"empty\">no get_into_breakdown records</td></tr>'}</tbody>
+<tbody>{''.join(slow_rows_html) or "<tr><td colspan='27' class='empty'>no get_into_breakdown records</td></tr>"}</tbody>
 </table></div></div>"""
 
     # Per-target section
