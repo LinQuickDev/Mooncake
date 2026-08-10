@@ -543,7 +543,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         buckets_keys.emplace_back(std::move(keys));
     }
-
     auto complete_handler =
         [this, &task_by_storage_key](
             const std::vector<std::string>& keys,
@@ -816,6 +815,14 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     return enable_offloading;
 }
 
+void FileStorage::MarkRemoved(const std::string& key) {
+    storage_backend_->MarkRemoved(key);
+}
+
+void FileStorage::BatchMarkRemoved(const std::vector<std::string>& keys) {
+    storage_backend_->BatchMarkRemoved(keys);
+}
+
 tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
@@ -840,6 +847,28 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 metadata_resync_pending_.store(false);
             }
         });
+    }
+
+    // === STEP 0: Drain removed keys from master ===
+    // Master pushes {tenant_id, key} pairs to this client's removed_keys
+    // queue when a Remove/BatchRemove deletes a key that had a LOCAL_DISK
+    // replica here. We mark each as a tombstone so GC can reclaim SSD space.
+    {
+        auto remove_result =
+            client_->RemoveObjectHeartbeat(client_->getClientId());
+        if (remove_result) {
+            for (const auto& item : remove_result.value()) {
+                auto storage_key =
+                    MakeTenantScopedStorageKey(item.tenant_id, item.key);
+                storage_backend_->MarkRemoved(storage_key);
+            }
+            if (!remove_result.value().empty()) {
+                VLOG(1) << "RemoveObjectHeartbeat drained "
+                        << remove_result.value().size()
+                        << " removed key(s) from master";
+            }
+        }
+        // Errors are non-fatal: removed keys will be retried next heartbeat.
     }
 
     std::vector<OffloadTaskItem>

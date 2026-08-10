@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -47,6 +49,13 @@ struct BucketMetadata {
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
 
+    // Runtime-only (not serialized): bytes marked removed via MarkRemoved.
+    // Drives GC candidate selection (compact when deleted_bytes_ > 0).
+    mutable std::atomic<int64_t> deleted_bytes_{0};
+    // Runtime-only (not serialized): true while a GC compaction is in flight
+    // for this bucket, preventing re-entrant compaction.
+    mutable std::atomic<bool> compacting_{false};
+
     // Default constructor
     BucketMetadata() = default;
 
@@ -57,7 +66,9 @@ struct BucketMetadata {
           keys(other.keys),
           metadatas(other.metadatas),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          deleted_bytes_(0),
+          compacting_(false) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -66,7 +77,9 @@ struct BucketMetadata {
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          deleted_bytes_(0),
+          compacting_(false) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -203,6 +216,22 @@ struct BucketBackendConfig {
     false;  // Force disable eviction regardless of
     // eviction_policy. Set via
     // MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION.
+
+    // --- Explicit-delete-only GC config ---
+    // Enable background tombstone compaction GC.
+    bool gc_enable = true;
+    // GC scan interval in milliseconds.
+    int64_t gc_interval_ms = 1000;
+    // Compact a bucket when deleted bytes / bucket data size >= this ratio.
+    double gc_deleted_ratio = 0.25;
+    // Trigger GC when total_size / max_total_size >= this ratio.
+    double gc_high_watermark_ratio = 0.90;
+    // Max old buckets collected per GC round for cross-bucket merge.
+    int64_t gc_max_buckets_per_round = 1;
+    // Enable cross-bucket merge compaction (collect live keys from multiple
+    // tombstone buckets into one new bucket). When false, each bucket is
+    // compacted independently (no merge).
+    bool gc_merge_enable = true;
 
     bool Validate() const;
 
@@ -412,6 +441,15 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
+    // Mark a key as removed (tombstone) for explicit-delete-only GC.
+    // Default no-op: only BucketStorageBackend implements tombstone + GC.
+    // File-per-key and other backends inherit the no-op (do not delete files).
+    // Safe to call for keys not present in local storage (idempotent).
+    virtual void MarkRemoved(const std::string& /* key */) {}
+
+    // Batch variant: mark multiple keys as removed in one lock acquisition.
+    virtual void BatchMarkRemoved(
+        const std::vector<std::string>& /* keys */) {}
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
@@ -1005,11 +1043,58 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
+    // Explicit-delete-only GC: mark a key as tombstone (no disk IO).
+    // Removes key from object_bucket_map_ (immediately invisible to
+    // BatchLoad/IsExist) and bumps bucket deleted_bytes_.
+    // Idempotent: no-op if key not in local storage.
+    void MarkRemoved(const std::string& key) override;
+    void BatchMarkRemoved(const std::vector<std::string>& keys) override;
+
+    // Compact a single bucket: copy-on-write live keys to a new bucket,
+    // atomically swap mappings, delete old bucket file after reads drain.
+    // Returns true on success (or no-op), false on transient failure
+    // (will retry next round). Public to allow explicit compaction and
+    // testing (analogous to DeleteBucket).
+    bool CompactBucket(int64_t bucket_id);
+
+    // Compact multiple buckets into one new bucket (cross-bucket merge).
+    // Collects live keys from all given old buckets, groups them by
+    // bucket_keys_limit/bucket_size_limit, and writes ONE new bucket per
+    // round (the first group that fills up). If the first group doesn't
+    // fill a full bucket and there's no space pressure, the merge is
+    // deferred to the next round. Old buckets whose live keys are all
+    // migrated are deleted.
+    // Returns true on success (or deferred), false on transient failure.
+    bool CompactBuckets(const std::vector<int64_t>& bucket_ids,
+                        bool space_pressure = false);
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    // --- Background GC ---
+    // Select the best GC candidate bucket: deleted_bytes_>0, not compacting,
+    // highest deleted_ratio, then coldest last_access_ns_.
+    // Must be called with mutex_ held (exclusive).
+    // Returns buckets_.end() if no candidate.
+    std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
+    SelectGCCandidate();
+
+    // Background GC thread entry point.
+    void GCThreadFunc();
+
+    // Wait for in-flight reads on a bucket to drain (up to 10s).
+    void WaitForInflightReads(std::shared_ptr<BucketMetadata> bucket);
+
+    // Delete .bucket and .meta files for a bucket_id, ignore missing.
+    void DeleteBucketFiles(int64_t bucket_id);
+
+    // GC thread lifecycle members
+    std::atomic<bool> gc_running_{false};
+    std::thread gc_thread_;
+    std::mutex gc_mutex_;
+    std::condition_variable gc_cv_;
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,

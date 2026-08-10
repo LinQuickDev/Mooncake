@@ -253,6 +253,16 @@ struct PromotionTaskItem {
 };
 YLT_REFL(PromotionTaskItem, tenant_id, key, size);
 
+struct RemoveTaskItem {
+    std::string tenant_id;
+    std::string key;
+
+    bool operator==(const RemoveTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key;
+    }
+};
+YLT_REFL(RemoveTaskItem, tenant_id, key);
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB

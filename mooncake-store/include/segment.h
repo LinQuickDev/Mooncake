@@ -100,6 +100,12 @@ struct LocalDiskSegment {
     // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
         offloading_mutex_) promotion_objects;
+    // Keys removed via Remove/BatchRemove that had LOCAL_DISK replicas on
+    // this client. Populated by master's Remove when the key has a
+    // LOCAL_DISK replica. Drained by RemoveObjectHeartbeat RPC. Same locking as
+    // offloading_objects (offloading_mutex_).
+    std::vector<RemoveTaskItem> GUARDED_BY(
+        offloading_mutex_) removed_keys;
     // Set by master's RemoveAll. When the client sees this flag via
     // PollRemoveAll, it calls FileStorage::RemoveAll() to physically
     // delete all SSD files. Same locking as offloading_objects

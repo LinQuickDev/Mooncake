@@ -14,11 +14,13 @@
 #include <cctype>
 #include <optional>
 #include <regex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -132,6 +134,40 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
 
     config.disable_ssd_eviction =
         GetEnvOr<bool>("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", false);
+
+    config.gc_enable = GetEnvOr<bool>("MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE",
+                                       config.gc_enable);
+    config.gc_interval_ms =
+        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS",
+                          config.gc_interval_ms);
+    // Parse doubles manually: GetEnvOr uses std::stoll which cannot parse
+    // fractional values like "0.25".
+    {
+        const char* ratio_env =
+            std::getenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
+        if (ratio_env && !std::string(ratio_env).empty()) {
+            try {
+                config.gc_deleted_ratio = std::stod(std::string(ratio_env));
+            } catch (...) {
+                // keep default
+            }
+        }
+        const char* wm_env = std::getenv(
+            "MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO");
+        if (wm_env && !std::string(wm_env).empty()) {
+            try {
+                config.gc_high_watermark_ratio =
+                    std::stod(std::string(wm_env));
+            } catch (...) {
+                // keep default
+            }
+        }
+    }
+    config.gc_max_buckets_per_round = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND",
+        config.gc_max_buckets_per_round);
+    config.gc_merge_enable = GetEnvOr<bool>(
+        "MOONCAKE_OFFLOAD_BUCKET_GC_MERGE_ENABLE", config.gc_merge_enable);
 
     return config;
 }
@@ -1739,6 +1775,12 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    // Stop background GC thread first, before clearing any state it touches.
+    if (gc_running_.load(std::memory_order_acquire)) {
+        gc_running_.store(false, std::memory_order_release);
+        gc_cv_.notify_all();
+        if (gc_thread_.joinable()) gc_thread_.join();
+    }
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -2068,8 +2110,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Calculate aligned read range
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end =
-                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t data_end = actual_offset +
+                                   static_cast<int64_t>(plan.dest_slice.size);
                 int64_t aligned_end = static_cast<int64_t>(align_up(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
@@ -2095,8 +2137,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 }
             } else
 #endif
-            {
-                // Fallback to vector_read for non-UringFile
+        {
+            // Fallback to per-key vector_read for non-UringFile (PosixFile).
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
                 UbDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
                                            UbDiag::PerfLevel::MODULE);
@@ -2397,6 +2441,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
                    << std::endl;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Start background GC thread if enabled.
+    if (bucket_backend_config_.gc_enable) {
+        gc_running_.store(true, std::memory_order_release);
+        gc_thread_ = std::thread(&BucketStorageBackend::GCThreadFunc, this);
     }
 
     return {};
@@ -3430,6 +3480,541 @@ void BucketStorageBackend::RemoveAll() {
     }
 
     LOG(INFO) << "RemoveAll: removed " << bucket_ids.size() << " bucket(s)";
+}
+
+// --- Explicit-delete-only GC ---
+void BucketStorageBackend::MarkRemoved(const std::string& key) {
+    SharedMutexLocker lock(&mutex_);
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return;
+    }
+    int64_t bucket_id = it->second.bucket_id;
+    int64_t freed = it->second.data_size + it->second.key_size;
+    object_bucket_map_.erase(it);
+
+    auto bucket_it = buckets_.find(bucket_id);
+    if (bucket_it != buckets_.end()) {
+        bucket_it->second->deleted_bytes_.fetch_add(
+            freed, std::memory_order_relaxed);
+    }
+}
+
+void BucketStorageBackend::BatchMarkRemoved(
+    const std::vector<std::string>& keys) {
+    SharedMutexLocker lock(&mutex_);
+    for (const auto& key : keys) {
+        auto it = object_bucket_map_.find(key);
+        if (it == object_bucket_map_.end()) continue;
+        int64_t bucket_id = it->second.bucket_id;
+        int64_t freed = it->second.data_size + it->second.key_size;
+        object_bucket_map_.erase(it);
+
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it != buckets_.end()) {
+            bucket_it->second->deleted_bytes_.fetch_add(
+                freed, std::memory_order_relaxed);
+        }
+    }
+}
+
+std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
+BucketStorageBackend::SelectGCCandidate() {
+    // Must be called with mutex_ held (exclusive).
+    // Find bucket with highest deleted_ratio; tie-break by coldest
+    // last_access_ns_ (smallest). Skip buckets with deleted_bytes_==0
+    // or compacting_==true.
+    auto best_it = buckets_.end();
+    double best_ratio = 0.0;
+    int64_t best_ts = std::numeric_limits<int64_t>::max();
+
+    for (auto it = buckets_.begin(); it != buckets_.end(); ++it) {
+        const auto& bucket = it->second;
+        int64_t deleted =
+            bucket->deleted_bytes_.load(std::memory_order_relaxed);
+        if (deleted <= 0) continue;
+        if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
+
+        int64_t data_size = bucket->data_size;
+        if (data_size <= 0) continue;
+        double ratio =
+            static_cast<double>(deleted) / static_cast<double>(data_size);
+
+        int64_t ts = bucket->last_access_ns_.load(std::memory_order_relaxed);
+
+        if (ratio > best_ratio || (ratio == best_ratio && ts < best_ts)) {
+            best_ratio = ratio;
+            best_ts = ts;
+            best_it = it;
+        }
+    }
+    return best_it;
+}
+
+bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
+    return CompactBuckets({bucket_id}, true);
+}
+
+bool BucketStorageBackend::CompactBuckets(
+    const std::vector<int64_t>& bucket_ids, bool space_pressure) {
+    if (bucket_ids.empty()) return true;
+
+    // Step 1: lock-snapshot live keys from ALL old buckets + mark compacting_
+    struct LiveKeyInfo {
+        std::string key;
+        int64_t old_bucket_id;
+        BucketObjectMetadata meta;
+    };
+    std::vector<LiveKeyInfo> live_keys_info;
+    // old_bucket_id -> {shared_ptr, last_access_ns}
+    std::unordered_map<int64_t,
+                       std::pair<std::shared_ptr<BucketMetadata>, int64_t>>
+        old_buckets;
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (int64_t bid : bucket_ids) {
+            auto it = buckets_.find(bid);
+            if (it == buckets_.end()) continue;
+            auto& bucket = it->second;
+            if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
+            bucket->compacting_.store(true, std::memory_order_relaxed);
+            int64_t ts = bucket->last_access_ns_.load(
+                std::memory_order_relaxed);
+            old_buckets[bid] = {bucket, ts};
+
+            for (size_t i = 0; i < bucket->keys.size(); ++i) {
+                const auto& key = bucket->keys[i];
+                auto map_it = object_bucket_map_.find(key);
+                if (map_it != object_bucket_map_.end() &&
+                    map_it->second.bucket_id == bid) {
+                    live_keys_info.push_back(
+                        {key, bid, bucket->metadatas[i]});
+                }
+            }
+        }
+    }
+
+    if (old_buckets.empty()) return true;
+
+    auto reset_compacting = [&]() {
+        for (auto& [bid, pr] : old_buckets) {
+            pr.first->compacting_.store(false, std::memory_order_relaxed);
+        }
+    };
+
+    // Identify buckets with zero live keys — delete them immediately
+    // without waiting for merge. Buckets with live keys participate in
+    // the merge.
+    std::set<int64_t> buckets_with_live;
+    for (const auto& info : live_keys_info) {
+        buckets_with_live.insert(info.old_bucket_id);
+    }
+
+    std::vector<int64_t> empty_buckets;
+    for (auto& [bid, pr] : old_buckets) {
+        if (buckets_with_live.find(bid) == buckets_with_live.end()) {
+            empty_buckets.push_back(bid);
+        }
+    }
+
+    if (!empty_buckets.empty()) {
+        std::vector<std::shared_ptr<BucketMetadata>> to_drain;
+        {
+            SharedMutexLocker lock(&mutex_);
+            for (int64_t bid : empty_buckets) {
+                auto it = buckets_.find(bid);
+                if (it != buckets_.end()) {
+                    total_size_ -=
+                        it->second->data_size + it->second->meta_size;
+                    buckets_.erase(it);
+                    int64_t ts = old_buckets[bid].second;
+                    lru_index_.erase({ts, bid});
+                    to_drain.push_back(old_buckets[bid].first);
+                }
+            }
+        }
+        for (auto& bucket : to_drain) {
+            WaitForInflightReads(bucket);
+        }
+        for (int64_t bid : empty_buckets) {
+            DeleteBucketFiles(bid);
+        }
+        // Remove deleted buckets from old_buckets so they don't interfere
+        // with the merge logic below.
+        for (int64_t bid : empty_buckets) {
+            old_buckets.erase(bid);
+        }
+    }
+
+    // If no live keys remain (all buckets were empty), we're done.
+    if (live_keys_info.empty()) {
+        return true;
+    }
+
+    // Step 2: group live keys by bucket_keys_limit / bucket_size_limit
+    // using metadata only (no file IO). Only the FIRST group that fills up
+    // will be written as a new bucket; remaining keys are deferred to the
+    // next round.
+    struct GroupedKey {
+        std::string key;
+        int64_t old_bucket_id;
+        BucketObjectMetadata meta;
+        int64_t total_size;  // key_size + data_size
+    };
+    std::vector<GroupedKey> first_group_keys;
+    int64_t group_count = 0;
+    int64_t group_size = 0;
+
+    for (const auto& info : live_keys_info) {
+        int64_t key_total =
+            info.meta.key_size + info.meta.data_size;
+        if (group_count >= bucket_backend_config_.bucket_keys_limit ||
+            (group_count > 0 && group_size + key_total >
+                                    bucket_backend_config_.bucket_size_limit)) {
+            break;  // first group is full
+        }
+        first_group_keys.push_back(
+            {info.key, info.old_bucket_id, info.meta, key_total});
+        group_size += key_total;
+        ++group_count;
+    }
+
+    // Check if first group is full enough to write.
+    bool group_full =
+        (group_count >= bucket_backend_config_.bucket_keys_limit) ||
+        (group_size >= bucket_backend_config_.bucket_size_limit);
+    if (!group_full && !space_pressure) {
+        // Not enough live keys to fill a bucket; defer to next round.
+        LOG(INFO) << "[GC] CompactBuckets deferred: group_count="
+                  << group_count
+                  << " group_size=" << group_size
+                  << " bucket_keys_limit="
+                  << bucket_backend_config_.bucket_keys_limit
+                  << " bucket_size_limit="
+                  << bucket_backend_config_.bucket_size_limit
+                  << " total_live_keys=" << live_keys_info.size();
+        reset_compacting();
+        return true;
+    }
+
+    // Step 3: read ONLY the first group's live key data from old buckets
+    // (lock-free IO). Open each old bucket file once, read only the keys
+    // that are in the first group.
+    std::unordered_map<std::string, std::string> live_data_buffers;
+    std::unordered_map<std::string, std::vector<Slice>> first_group;
+
+    // Group first_group_keys by old_bucket_id to open each file once.
+    std::unordered_map<int64_t,
+                       std::vector<const GroupedKey*>> keys_by_bucket;
+    for (const auto& gk : first_group_keys) {
+        keys_by_bucket[gk.old_bucket_id].push_back(&gk);
+    }
+
+    for (auto& [bid, keys_ptr] : keys_by_bucket) {
+        auto& old_bucket = old_buckets[bid].first;
+        bool read_ok = true;
+        {
+            BucketReadGuard guard(old_bucket);
+            auto data_path = GetBucketDataPath(bid);
+            if (!data_path) {
+                read_ok = false;
+            } else {
+                auto file_result =
+                    OpenFile(data_path.value(), FileMode::Read);
+                if (!file_result) {
+                    read_ok = false;
+                } else {
+                    auto& file = file_result.value();
+                    for (const auto* gk : keys_ptr) {
+                        std::string data;
+                        data.resize(gk->meta.data_size);
+                        int64_t actual_offset =
+                            gk->meta.offset + gk->meta.key_size;
+                        iovec iov{data.data(),
+                                  static_cast<size_t>(gk->meta.data_size)};
+                        auto read_res =
+                            file->vector_read(&iov, 1, actual_offset);
+                        if (!read_res ||
+                            read_res.value() !=
+                                static_cast<size_t>(gk->meta.data_size)) {
+                            LOG(ERROR)
+                                << "CompactBuckets: read failed for key: "
+                                << gk->key << ", bucket_id=" << bid;
+                            read_ok = false;
+                            break;
+                        }
+                        live_data_buffers[gk->key] = std::move(data);
+                        first_group.emplace(
+                            gk->key,
+                            std::vector<Slice>{Slice{
+                                live_data_buffers[gk->key].data(),
+                                live_data_buffers[gk->key].size()}});
+                    }
+                }
+            }
+        }  // guard released
+
+        if (!read_ok) {
+            reset_compacting();
+            return false;
+        }
+    }
+
+    // Step 4: write the first group as a new bucket.
+    int64_t new_bucket_id = bucket_id_generator_->NextId();
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> new_metas;
+    auto build_result =
+        BuildBucket(new_bucket_id, first_group, iovs, new_metas);
+    if (!build_result) {
+        LOG(ERROR) << "CompactBuckets: BuildBucket failed";
+        reset_compacting();
+        return false;
+    }
+    auto write_result =
+        WriteBucket(new_bucket_id, build_result.value(), iovs);
+    if (!write_result) {
+        LOG(ERROR) << "CompactBuckets: WriteBucket failed";
+        reset_compacting();
+        return false;
+    }
+
+    // Step 5: atomic swap under lock with re-validation.
+    auto& new_bucket = build_result.value();
+    // Determine which old buckets have ALL their live keys migrated.
+    // A key is "migrated" if it's in the first_group AND still maps to an
+    // old bucket being compacted. Old buckets with no remaining live keys
+    // (all migrated or removed) can be deleted.
+    std::set<int64_t> old_bucket_ids_set(bucket_ids.begin(),
+                                         bucket_ids.end());
+    // Use the coldest last_access_ns among old buckets for the new bucket.
+    int64_t new_last_access_ns = std::numeric_limits<int64_t>::max();
+    for (auto& [bid, pr] : old_buckets) {
+        new_last_access_ns = std::min(new_last_access_ns, pr.second);
+    }
+    if (new_last_access_ns == std::numeric_limits<int64_t>::max()) {
+        new_last_access_ns = 0;
+    }
+
+    std::vector<int64_t> buckets_to_delete;
+    {
+        SharedMutexLocker lock(&mutex_);
+        // Re-validate and remap each key in the new bucket.
+        for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
+            const auto& key = new_bucket->keys[i];
+            auto map_it = object_bucket_map_.find(key);
+            if (map_it != object_bucket_map_.end() &&
+                old_bucket_ids_set.count(map_it->second.bucket_id)) {
+                // Still live at an old bucket -> remap to new bucket.
+                map_it->second = new_metas[i];
+            }
+            // else: key was removed or remapped -> skip.
+        }
+
+        // Insert new bucket.
+        total_size_ += new_bucket->data_size + new_bucket->meta_size;
+        new_bucket->last_access_ns_.store(
+            new_last_access_ns, std::memory_order_relaxed);
+        buckets_.emplace(new_bucket_id, new_bucket);
+        lru_index_.emplace(new_last_access_ns, new_bucket_id);
+
+        // Determine which old buckets can be deleted: those whose live keys
+        // are all now absent from object_bucket_map_ or remapped to the new
+        // bucket (i.e., no key still points at the old bucket).
+        for (auto& [bid, pr] : old_buckets) {
+            auto& old_bucket = pr.first;
+            bool has_remaining_live = false;
+            for (const auto& key : old_bucket->keys) {
+                auto map_it = object_bucket_map_.find(key);
+                if (map_it != object_bucket_map_.end() &&
+                    map_it->second.bucket_id == bid) {
+                    // This key is still live at the old bucket — it was not
+                    // in the first group (deferred to next round).
+                    has_remaining_live = true;
+                    break;
+                }
+            }
+            if (!has_remaining_live) {
+                buckets_to_delete.push_back(bid);
+            } else {
+                // Reset compacting_ so this bucket can be compacted later.
+                old_bucket->compacting_.store(false,
+                                              std::memory_order_relaxed);
+            }
+        }
+
+        // Remove old buckets that are fully migrated.
+        for (int64_t bid : buckets_to_delete) {
+            auto it = buckets_.find(bid);
+            if (it != buckets_.end()) {
+                total_size_ -=
+                    it->second->data_size + it->second->meta_size;
+                buckets_.erase(it);
+                int64_t ts = old_buckets[bid].second;
+                lru_index_.erase({ts, bid});
+            }
+        }
+    }
+
+    // Step 6: wait for inflight reads + delete old bucket files.
+    for (int64_t bid : buckets_to_delete) {
+        WaitForInflightReads(old_buckets[bid].first);
+        DeleteBucketFiles(bid);
+    }
+
+    return true;
+}
+
+void BucketStorageBackend::WaitForInflightReads(
+    std::shared_ptr<BucketMetadata> bucket) {
+    constexpr int kMaxSpinIterations = 1000;
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+    int spin_count = 0;
+    auto wait_start = std::chrono::steady_clock::now();
+    while (bucket->inflight_reads_.load(std::memory_order_acquire) > 0) {
+        if (++spin_count > kMaxSpinIterations) {
+            std::this_thread::yield();
+            spin_count = 0;
+            if (std::chrono::steady_clock::now() - wait_start >
+                kMaxWaitTime) {
+                LOG(ERROR) << "CompactBucket: timed out waiting for "
+                              "in-flight reads, inflight_reads="
+                           << bucket->inflight_reads_.load(
+                                  std::memory_order_relaxed);
+                break;
+            }
+        } else {
+            PAUSE();
+        }
+    }
+}
+
+void BucketStorageBackend::DeleteBucketFiles(int64_t bucket_id) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto data_path = GetBucketDataPath(bucket_id);
+    if (data_path) {
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path.value());
+        }
+        fs::remove(data_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "CompactBucket: failed to remove data file: "
+                       << data_path.value() << ", error: " << ec.message();
+        }
+    }
+    auto meta_path = GetBucketMetadataPath(bucket_id);
+    if (meta_path) {
+        ec.clear();
+        fs::remove(meta_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "CompactBucket: failed to remove meta file: "
+                       << meta_path.value() << ", error: " << ec.message();
+        }
+    }
+}
+
+// GCThreadFunc: background tombstone compaction loop.
+void BucketStorageBackend::GCThreadFunc() {
+    LOG(INFO) << "[GC] background compaction thread started";
+    while (gc_running_.load(std::memory_order_acquire)) {
+        // Sleep for gc_interval_ms or until woken for shutdown.
+        {
+            std::unique_lock<std::mutex> lock(gc_mutex_);
+            gc_cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(
+                    bucket_backend_config_.gc_interval_ms),
+                [this]() {
+                    return !gc_running_.load(std::memory_order_relaxed);
+                });
+        }
+        if (!gc_running_.load(std::memory_order_acquire)) break;
+
+        if (!bucket_backend_config_.gc_enable) continue;
+
+        // Check space pressure under shared lock (total_size_ is
+        // GUARDED_BY(mutex_)).
+        bool space_pressure = false;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            if (bucket_backend_config_.max_total_size > 0) {
+                double used_ratio =
+                    static_cast<double>(total_size_) /
+                    static_cast<double>(
+                        bucket_backend_config_.max_total_size);
+                space_pressure = used_ratio >=
+                                 bucket_backend_config_
+                                     .gc_high_watermark_ratio;
+            }
+        }
+
+        // Collect GC candidate buckets (up to gc_max_buckets_per_round).
+        std::vector<int64_t> candidates;
+        {
+            SharedMutexLocker lock(&mutex_);
+            int64_t count = 0;
+            for (auto it = buckets_.begin();
+                 it != buckets_.end() &&
+                 count < bucket_backend_config_.gc_max_buckets_per_round;
+                 ++it) {
+                int64_t deleted =
+                    it->second->deleted_bytes_.load(
+                        std::memory_order_relaxed);
+                if (deleted <= 0) continue;
+                if (it->second->compacting_.load(
+                        std::memory_order_relaxed))
+                    continue;
+                int64_t data_size = it->second->data_size;
+                double ratio =
+                    (data_size > 0)
+                        ? static_cast<double>(deleted) /
+                              static_cast<double>(data_size)
+                        : 0.0;
+                if (!space_pressure &&
+                    ratio < bucket_backend_config_.gc_deleted_ratio) {
+                    continue;
+                }
+                candidates.push_back(it->first);
+                ++count;
+            }
+        }
+
+        if (!candidates.empty()) {
+            if (bucket_backend_config_.gc_merge_enable &&
+                candidates.size() > 1) {
+                // Cross-bucket merge: collect live keys from multiple
+                // tombstone buckets into one new bucket.
+                if (CompactBuckets(candidates, space_pressure)) {
+                    LOG(INFO) << "[GC] merged " << candidates.size()
+                              << " bucket(s)";
+                } else {
+                    LOG(WARNING) << "[GC] CompactBuckets failed for "
+                                 << candidates.size()
+                                 << " bucket(s), will retry next round";
+                }
+            } else {
+                // Single-bucket compaction (one at a time).
+                int64_t compacted = 0;
+                for (int64_t bid : candidates) {
+                    if (CompactBuckets({bid}, space_pressure)) {
+                        ++compacted;
+                    } else {
+                        LOG(WARNING)
+                            << "[GC] CompactBuckets failed for bucket "
+                            << bid << ", will retry next round";
+                        break;
+                    }
+                }
+                if (compacted > 0) {
+                    LOG(INFO) << "[GC] compacted " << compacted
+                              << " bucket(s)";
+                }
+            }
+        }
+    }
+    LOG(INFO) << "[GC] background compaction thread stopped";
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(

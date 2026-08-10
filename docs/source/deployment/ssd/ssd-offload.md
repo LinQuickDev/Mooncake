@@ -185,6 +185,32 @@ Groups multiple objects into bucket files. Reduces filesystem overhead, supports
 
 Best for: general-purpose use, large-scale deployments.
 
+#### Explicit-Delete GC (tombstone compaction)
+
+To enable SSD space reclamation via `Remove`/`BatchRemove` (without LRU
+eviction deleting live keys), set:
+
+| Environment Variable | Required Value | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `lru` | Keeps `last_access_ns_` updated for GC cold-bucket selection |
+| `MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION` | `true` | Makes `PrepareEviction` a no-op so no bucket is ever evicted by LRU |
+
+GC tuning (optional):
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE` | `true` | Enable background tombstone compaction |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS` | `1000` | GC scan interval |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO` | `0.25` | Compact bucket when deleted bytes / data size >= this |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO` | `0.90` | Force compaction of any tombstone bucket when total size / max >= this |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND` | `1` | Max old buckets collected per GC round for cross-bucket merge |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_MERGE_ENABLE` | `true` | Enable cross-bucket merge: collect live keys from multiple tombstone buckets into one new bucket. When false, each bucket is compacted independently |
+
+**Important:** Only keys removed via `Remove`/`BatchRemove` are reclaimed.
+`RemoveByRegex`/`RemoveAll` do not trigger this GC. When no tombstone space
+is reclaimable and SSD is full, `BatchOffload` returns an error instead of
+deleting live keys.
+
 ### `file_per_key_storage_backend`
 
 Stores each object in an individual file. Simple and easy to inspect, but generates many small files at scale.
