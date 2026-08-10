@@ -2397,6 +2397,7 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
+    // SSD tombstone is handled by the storage node via RemoveObjectHeartbeat.
     return {};
 }
 
@@ -2436,7 +2437,9 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    return client_->BatchRemove(keys, force);
+    auto results = client_->BatchRemove(keys, force);
+    // SSD tombstone is handled by the storage node via RemoveObjectHeartbeat.
+    return results;
 }
 
 std::vector<int> RealClient::batchRemove(const std::vector<std::string> &keys,

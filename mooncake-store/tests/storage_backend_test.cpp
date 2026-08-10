@@ -2821,8 +2821,318 @@ TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadWriteDelete) {
 }
 
 //-----------------------------------------------------------------------------
-// Tests for FileRecord key tracking and eviction return values
+// Explicit-delete-only GC tests (tombstone + compaction)
 //-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_MarkRemovedHidesKey) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string k1 = "mark_k1";
+    std::string k2 = "mark_k2";
+    std::string v1 = "value1";
+    std::string v2 = "value2";
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf1 = std::make_unique<char[]>(v1.size());
+    auto buf2 = std::make_unique<char[]>(v2.size());
+    std::memcpy(buf1.get(), v1.data(), v1.size());
+    std::memcpy(buf2.get(), v2.data(), v2.size());
+    batch.emplace(k1, std::vector<Slice>{Slice{buf1.get(), v1.size()}});
+    batch.emplace(k2, std::vector<Slice>{Slice{buf2.get(), v2.size()}});
+
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value());
+
+    EXPECT_TRUE(storage_backend.IsExist(k1).value());
+    EXPECT_TRUE(storage_backend.IsExist(k2).value());
+
+    // Mark k1 removed
+    storage_backend.MarkRemoved(k1);
+
+    // k1 invisible, k2 still visible
+    EXPECT_FALSE(storage_backend.IsExist(k1).value());
+    EXPECT_TRUE(storage_backend.IsExist(k2).value());
+
+    // MarkRemoved is idempotent on absent key
+    storage_backend.MarkRemoved("nonexistent_key");  // no crash
+    storage_backend.MarkRemoved(k1);  // already removed, idempotent
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_CompactReclaimsDeletedKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    bucket_config.disable_ssd_eviction = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Offload 3 keys into one bucket
+    std::string k1 = "compact_k1", k2 = "compact_k2", k3 = "compact_k3";
+    std::string v1(1024, 'a'), v2(1024, 'b'), v3(1024, 'c');
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf1 = std::make_unique<char[]>(v1.size());
+    auto buf2 = std::make_unique<char[]>(v2.size());
+    auto buf3 = std::make_unique<char[]>(v3.size());
+    std::memcpy(buf1.get(), v1.data(), v1.size());
+    std::memcpy(buf2.get(), v2.data(), v2.size());
+    std::memcpy(buf3.get(), v3.data(), v3.size());
+    batch.emplace(k1, std::vector<Slice>{Slice{buf1.get(), v1.size()}});
+    batch.emplace(k2, std::vector<Slice>{Slice{buf2.get(), v2.size()}});
+    batch.emplace(k3, std::vector<Slice>{Slice{buf3.get(), v3.size()}});
+
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value());
+    int64_t old_bucket_id = offload_result.value();
+
+    // Mark k2 removed
+    storage_backend.MarkRemoved(k2);
+
+    // Compact the bucket
+    ASSERT_TRUE(storage_backend.CompactBucket(old_bucket_id));
+
+    // k1, k3 still loadable with correct data; k2 gone
+    EXPECT_TRUE(storage_backend.IsExist(k1).value());
+    EXPECT_TRUE(storage_backend.IsExist(k3).value());
+    EXPECT_FALSE(storage_backend.IsExist(k2).value());
+
+    // Verify k1, k3 data integrity
+    auto alloc = SimpleAllocator(128 * 1024 * 1024);
+    void* b1 = alloc.allocate(v1.size());
+    void* b3 = alloc.allocate(v3.size());
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch.emplace(k1, Slice{b1, v1.size()});
+    load_batch.emplace(k3, Slice{b3, v3.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load_batch));
+    EXPECT_EQ(std::string((char*)b1, v1.size()), v1);
+    EXPECT_EQ(std::string((char*)b3, v3.size()), v3);
+
+    // Old bucket file should be deleted
+    std::string old_data_path =
+        data_path + "/" + std::to_string(old_bucket_id) + ".bucket";
+    EXPECT_FALSE(fs::exists(old_data_path))
+        << "Old bucket file should be deleted after compaction";
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_MarkRemovedConcurrentLoad) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    bucket_config.disable_ssd_eviction = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string k1 = "conc_k1", k2 = "conc_k2";
+    std::string v1(4096, 'a'), v2(4096, 'b');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf1 = std::make_unique<char[]>(v1.size());
+    auto buf2 = std::make_unique<char[]>(v2.size());
+    std::memcpy(buf1.get(), v1.data(), v1.size());
+    std::memcpy(buf2.get(), v2.data(), v2.size());
+    batch.emplace(k1, std::vector<Slice>{Slice{buf1.get(), v1.size()}});
+    batch.emplace(k2, std::vector<Slice>{Slice{buf2.get(), v2.size()}});
+    ASSERT_TRUE(storage_backend.BatchOffload(
+        batch, [](const std::vector<std::string>&,
+                  std::vector<StorageObjectMetadata>&) {
+            return ErrorCode::OK;
+        }));
+
+    // Concurrent: load k1 in a thread while marking k2 removed.
+    auto alloc = SimpleAllocator(128 * 1024 * 1024);
+    void* b1 = alloc.allocate(v1.size());
+    std::thread loader([&]() {
+        std::unordered_map<std::string, Slice> load;
+        load.emplace(k1, Slice{b1, v1.size()});
+        auto r = storage_backend.BatchLoad(load);
+        ASSERT_TRUE(r);
+    });
+
+    storage_backend.MarkRemoved(k2);
+    loader.join();
+
+    // k1 data intact, k2 gone.
+    EXPECT_EQ(std::string((char*)b1, v1.size()), v1);
+    EXPECT_FALSE(storage_backend.IsExist(k2).value());
+    EXPECT_TRUE(storage_backend.IsExist(k1).value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_DisableEvictionNoopUnderPressure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    // Set global size limit smaller than a single bucket's reservation so
+    // IsEnableOffloading's quota check rejects the offload.
+    config.total_size_limit = 512;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    bucket_config.disable_ssd_eviction = true;
+    // bucket_size_limit (default 256MB) >> total_size_limit (512), so the
+    // quota check in IsEnableOffloading rejects without eviction.
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // disable_ssd_eviction=true means PrepareEviction is a no-op, so under
+    // space pressure no bucket is deleted. IsEnableOffloading rejects via
+    // the quota check instead.
+    std::string k = "pressure_k";
+    std::string v(2048, 'z');
+    auto buf = std::make_unique<char[]>(v.size());
+    std::memcpy(buf.get(), v.data(), v.size());
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(k, std::vector<Slice>{Slice{buf.get(), v.size()}});
+
+    auto result = storage_backend.BatchOffload(
+        batch, [](const std::vector<std::string>&,
+                  std::vector<StorageObjectMetadata>&) {
+            return ErrorCode::OK;
+        });
+    // Offload should be rejected by quota (no eviction to reclaim space).
+    EXPECT_FALSE(result.has_value());
+}
+
+//-----------------------------------------------------------------------------
+// Cross-bucket merge compaction tests
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_CrossBucketMergeCompaction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    bucket_config.disable_ssd_eviction = true;
+    // Set keys_limit=2 so 2 keys fill a bucket. We'll create 2 buckets with
+    // 2 keys each (4 keys total), remove 1 key from each (2 tombstones),
+    // then CompactBuckets should merge the 2 remaining live keys from each
+    // bucket into 1 new bucket.
+    bucket_config.bucket_keys_limit = 2;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Offload 4 keys into 2 buckets (bucket_keys_limit=2).
+    // Batch 1: k1, k2 -> bucket A
+    // Batch 2: k3, k4 -> bucket B
+    auto offload_batch = [&](const std::vector<std::pair<std::string, std::string>>& kvs) {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        std::vector<std::unique_ptr<char[]>> bufs;
+        for (const auto& [k, v] : kvs) {
+            auto buf = std::make_unique<char[]>(v.size());
+            std::memcpy(buf.get(), v.data(), v.size());
+            bufs.push_back(std::move(buf));
+            batch.emplace(k, std::vector<Slice>{
+                Slice{bufs.back().get(), v.size()}});
+        }
+        return storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) {
+                return ErrorCode::OK;
+            });
+    };
+
+    std::string k1 = "merge_k1", k2 = "merge_k2";
+    std::string k3 = "merge_k3", k4 = "merge_k4";
+    std::string v1(1024, 'a'), v2(1024, 'b');
+    std::string v3(1024, 'c'), v4(1024, 'd');
+
+    auto offload_a = offload_batch({{k1, v1}, {k2, v2}});
+    ASSERT_TRUE(offload_a.has_value());
+    int64_t bucket_a = offload_a.value();
+    auto offload_b = offload_batch({{k3, v3}, {k4, v4}});
+    ASSERT_TRUE(offload_b.has_value());
+    int64_t bucket_b = offload_b.value();
+
+    // Remove k2 from bucket A and k4 from bucket B (tombstones).
+    storage_backend.MarkRemoved(k2);
+    storage_backend.MarkRemoved(k4);
+
+    // CompactBuckets should merge live keys k1, k3 into a new bucket.
+    // bucket_keys_limit=2, so k1+k3 fills exactly one bucket.
+    ASSERT_TRUE(storage_backend.CompactBuckets({bucket_a, bucket_b}));
+
+    // k1 and k3 must still be readable with correct data.
+    EXPECT_TRUE(storage_backend.IsExist(k1).value());
+    EXPECT_TRUE(storage_backend.IsExist(k3).value());
+    // k2 and k4 must be gone.
+    EXPECT_FALSE(storage_backend.IsExist(k2).value());
+    EXPECT_FALSE(storage_backend.IsExist(k4).value());
+
+    // Verify data integrity.
+    auto alloc = SimpleAllocator(128 * 1024 * 1024);
+    void* b1 = alloc.allocate(v1.size());
+    void* b3 = alloc.allocate(v3.size());
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch.emplace(k1, Slice{b1, v1.size()});
+    load_batch.emplace(k3, Slice{b3, v3.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load_batch));
+    EXPECT_EQ(std::string((char*)b1, v1.size()), v1);
+    EXPECT_EQ(std::string((char*)b3, v3.size()), v3);
+
+    // Old bucket files should be deleted (both A and B fully migrated).
+    std::string path_a = data_path + "/" + std::to_string(bucket_a) + ".bucket";
+    std::string path_b = data_path + "/" + std::to_string(bucket_b) + ".bucket";
+    EXPECT_FALSE(fs::exists(path_a))
+        << "Old bucket A file should be deleted after merge";
+    EXPECT_FALSE(fs::exists(path_b))
+        << "Old bucket B file should be deleted after merge";
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_MergeDeferredWhenNotFull) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    bucket_config.disable_ssd_eviction = true;
+    // keys_limit=2: need 2 live keys to fill a bucket.
+    bucket_config.bucket_keys_limit = 2;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Offload 2 keys into 1 bucket.
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf1 = std::make_unique<char[]>(1024);
+    auto buf2 = std::make_unique<char[]>(1024);
+    std::memset(buf1.get(), 'x', 1024);
+    std::memset(buf2.get(), 'y', 1024);
+    batch.emplace("defer_k1", std::vector<Slice>{Slice{buf1.get(), 1024}});
+    batch.emplace("defer_k2", std::vector<Slice>{Slice{buf2.get(), 1024}});
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value());
+    int64_t bucket_id = offload_result.value();
+
+    // Remove k2 — only 1 live key (k1) remains. Not enough for keys_limit=2.
+    storage_backend.MarkRemoved("defer_k2");
+
+    // CompactBuckets without space_pressure should defer (return true, no
+    // compaction). The old bucket should still exist.
+    ASSERT_TRUE(storage_backend.CompactBuckets({bucket_id}, false));
+    EXPECT_TRUE(storage_backend.IsExist("defer_k1").value());
+    // Old bucket file should still exist (not compacted).
+    std::string path = data_path + "/" + std::to_string(bucket_id) + ".bucket";
+    EXPECT_TRUE(fs::exists(path))
+        << "Bucket should not be compacted when live keys don't fill a bucket";
+
+    // With space_pressure=true, compaction should proceed even if not full.
+    ASSERT_TRUE(storage_backend.CompactBuckets({bucket_id}, true));
+    EXPECT_TRUE(storage_backend.IsExist("defer_k1").value());
+    EXPECT_FALSE(fs::exists(path))
+        << "Bucket should be compacted under space pressure";
+}
+
 
 TEST_F(StorageBackendTest, StoreObjectReturnsEvictedKeys) {
     std::string test_dir = data_path + "/evict_return_test";

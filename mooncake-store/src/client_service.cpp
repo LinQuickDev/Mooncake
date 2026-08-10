@@ -3505,6 +3505,11 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+Client::RemoveObjectHeartbeat(const UUID& client_id) {
+    return master_client_.RemoveObjectHeartbeat(client_id);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,
