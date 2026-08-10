@@ -313,6 +313,22 @@ ErrorCode EtcdHelper::Put(const char* key, const size_t key_size,
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdHelper::PutWithLease(const char* key, const size_t key_size,
+                                   const char* value, const size_t value_size,
+                                   EtcdLeaseId lease_id) {
+    char* err_msg = nullptr;
+    int ret = EtcdStorePutWithLeaseWrapper(
+        const_cast<char*>(key), (int)key_size, const_cast<char*>(value),
+        (int)value_size, lease_id, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "key=" << std::string(key, key_size)
+                   << ", lease_id=" << lease_id << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::Create(const char* key, const size_t key_size,
                              const char* value, const size_t value_size) {
     char* err_msg = nullptr;
@@ -574,6 +590,18 @@ ErrorCode EtcdHelper::Put(const char* key, const size_t key_size,
     (void)key_size;
     (void)value;
     (void)value_size;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::PutWithLease(const char* key, const size_t key_size,
+                                   const char* value, const size_t value_size,
+                                   EtcdLeaseId lease_id) {
+    (void)key;
+    (void)key_size;
+    (void)value;
+    (void)value_size;
+    (void)lease_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }

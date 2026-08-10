@@ -163,6 +163,20 @@ class EtcdHelper {
                          const char* value, const size_t value_size);
 
     /*
+     * @brief Put a key-value pair to etcd with a lease.
+     *        The key will be automatically deleted when the lease expires.
+     * @param key: The key to put.
+     * @param key_size: The size of the key in bytes.
+     * @param value: The value to put.
+     * @param value_size: The size of the value in bytes.
+     * @param lease_id: The lease id to bind to the key.
+     * @return: Error code.
+     */
+    static ErrorCode PutWithLease(const char* key, const size_t key_size,
+                                  const char* value, const size_t value_size,
+                                  EtcdLeaseId lease_id);
+
+    /*
      * @brief Create a key-value pair in etcd if the key does not already exist.
      *        This is implemented via etcd transaction (CreateRevision == 0).
      * @return: OK on success; ETCD_TRANSACTION_FAIL if key already exists.

@@ -12,6 +12,7 @@
 #include <cstdlib>  // for atexit
 #include <cstdio>   // for snprintf (t0 wall-clock formatting)
 #include <ctime>    // for localtime_r / strftime (t0 wall-clock formatting)
+#include <iomanip>  // for hex dump debug
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -7181,6 +7182,17 @@ void ClientRequester::WarmupRpcPool(const std::string &client_addr) {
         return;
     }
 
+    // Debug: hex dump to detect corruption in endpoint from RPC
+    {
+        std::ostringstream hex_oss;
+        for (unsigned char c : client_addr) {
+            hex_oss << std::hex << std::setw(2) << std::setfill('0')
+                    << (int)c << ' ';
+        }
+        LOG(INFO) << "[WarmupRpcPool] endpoint=" << client_addr
+                  << " len=" << client_addr.size() << " hex=[" << hex_oss.str()
+                  << "]";
+    }
     LOG(INFO) << "Warming up offload RPC pool for " << client_addr << " to "
               << target_connections << " connection(s), max_connection="
               << client_pool->get_pool_config().max_connection;

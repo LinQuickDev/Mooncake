@@ -495,6 +495,13 @@ class SegmentManager {
     bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
                              std::string& te_endpoint) const;
 
+    // Returns the client_id that owns the segment with the given name,
+    // or nullopt if the segment is not registered.
+    // Used by post-promotion cleanup to determine whether a memory
+    // replica's owning client has reconnected.
+    std::optional<UUID> getClientIdBySegmentName(
+        const std::string& segment_name) const;
+
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

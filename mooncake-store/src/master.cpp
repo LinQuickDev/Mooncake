@@ -266,6 +266,12 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_int64(master_view_lease_ttl_sec,
+             mooncake::DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+             "TTL in seconds for the HA master-view lease. "
+             "If the lease expires, the master is considered dead and "
+             "a standby can take over. Reduce for faster failover, "
+             "increase for higher tolerance to network hiccups.");
 DEFINE_int64(
     client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
     "Seconds a client stays considered alive after the last heartbeat. "
@@ -302,6 +308,21 @@ DEFINE_uint32(oplog_batch_max_entries, 1024,
               "batch-record OpLog waiting batch.");
 DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
               "Maximum time to retry transient batch OpLog standby errors.");
+
+// Metrics reporting to HA backend (etcd/redis)
+DEFINE_bool(enable_metrics_report_to_backend,
+            mooncake::DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND,
+            "Periodically push master storage metrics to the HA backend "
+            "(etcd/redis) so external monitoring services can discover "
+            "cluster-wide usage without scraping each master's /metrics "
+            "endpoint.");
+DEFINE_int32(metrics_report_interval_sec,
+             mooncake::DEFAULT_METRICS_REPORT_INTERVAL_SEC,
+             "Interval in seconds between master metrics pushes.");
+DEFINE_int32(metrics_report_lease_ttl_sec,
+             mooncake::DEFAULT_METRICS_REPORT_LEASE_TTL_SEC,
+             "TTL in seconds for the dedicated metrics-report lease. "
+             "Must be > metrics_report_interval_sec.");
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
@@ -571,6 +592,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_ha_backend_connstring);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
+    default_config.GetInt64("master_view_lease_ttl_sec",
+                            &master_config.master_view_lease_ttl_sec,
+                            FLAGS_master_view_lease_ttl_sec);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
@@ -584,6 +608,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("batch_oplog_retry_timeout_sec",
                              &master_config.batch_oplog_retry_timeout_sec,
                              FLAGS_batch_oplog_retry_timeout_sec);
+    default_config.GetBool("enable_metrics_report_to_backend",
+                           &master_config.enable_metrics_report_to_backend,
+                           FLAGS_enable_metrics_report_to_backend);
+    default_config.GetInt32("metrics_report_interval_sec",
+                            &master_config.metrics_report_interval_sec,
+                            FLAGS_metrics_report_interval_sec);
+    default_config.GetInt32("metrics_report_lease_ttl_sec",
+                            &master_config.metrics_report_lease_ttl_sec,
+                            FLAGS_metrics_report_lease_ttl_sec);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",
@@ -985,6 +1018,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
+    if ((google::GetCommandLineFlagInfo("master_view_lease_ttl_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.master_view_lease_ttl_sec =
+            FLAGS_master_view_lease_ttl_sec;
+    }
     if ((google::GetCommandLineFlagInfo("client_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1031,6 +1071,27 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.batch_oplog_retry_timeout_sec =
             FLAGS_batch_oplog_retry_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_metrics_report_to_backend",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_metrics_report_to_backend =
+            FLAGS_enable_metrics_report_to_backend;
+    }
+    if ((google::GetCommandLineFlagInfo("metrics_report_interval_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metrics_report_interval_sec =
+            FLAGS_metrics_report_interval_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("metrics_report_lease_ttl_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metrics_report_lease_ttl_sec =
+            FLAGS_metrics_report_lease_ttl_sec;
     }
     if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
          !info.is_default) ||
