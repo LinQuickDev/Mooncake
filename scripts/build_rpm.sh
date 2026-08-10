@@ -58,11 +58,11 @@ build_rpm_for_platform() {
     local PLATFORM=$1
     local LIB_DIR="lib64"
     local BUILDROOT=""
-    local UBDIAG_CONFIG_RPM_FILE=""
-    local MOONCAKE_UBDIAG_LAYER=""
-    local MOONCAKE_UBDIAG_SYSTEM_LIBRARY=""
-    local MOONCAKE_UBDIAG_SYSTEM_CLI=""
-    local MOONCAKE_UBDIAG_SYSTEM_CONFIG=""
+    local SPDIAG_CONFIG_RPM_FILE=""
+    local MOONCAKE_SPDIAG_LAYER=""
+    local MOONCAKE_SPDIAG_SYSTEM_LIBRARY=""
+    local MOONCAKE_SPDIAG_SYSTEM_CLI=""
+    local MOONCAKE_SPDIAG_SYSTEM_CONFIG=""
     
     echo "Building RPM for platform: ${PLATFORM}"
     
@@ -97,12 +97,12 @@ build_rpm_for_platform() {
         echo "Cross-compilation detected, looking in ${PLATFORM_BUILD_DIR}"
     fi
 
-    source "${PLATFORM_BUILD_DIR}/mooncake_ubdiag.env"
-    case "${MOONCAKE_UBDIAG_LAYER}" in
+    source "${PLATFORM_BUILD_DIR}/mooncake_spdiag.env"
+    case "${MOONCAKE_SPDIAG_LAYER}" in
         mock|system)
             ;;
         *)
-            echo "Error: Unknown Mooncake UbDiag layer: ${MOONCAKE_UBDIAG_LAYER}"
+            echo "Error: Unknown Mooncake SpDiag layer: ${MOONCAKE_SPDIAG_LAYER}"
             return 1
             ;;
     esac
@@ -195,24 +195,24 @@ build_rpm_for_platform() {
         echo "Warning: store.so not found in ${PLATFORM_BUILD_DIR}, skipping..."
     fi
 
-    if [ "${MOONCAKE_UBDIAG_LAYER}" = "system" ]; then
-        local ubdiag_library_dir
-        local ubdiag_library
+    if [ "${MOONCAKE_SPDIAG_LAYER}" = "system" ]; then
+        local spdiag_library_dir
+        local spdiag_library
 
-        cp "${MOONCAKE_UBDIAG_SYSTEM_CLI}" "${BUILDROOT}/usr/bin/ubdiag"
-        ubdiag_library_dir="$(dirname "${MOONCAKE_UBDIAG_SYSTEM_LIBRARY}")"
-        for ubdiag_library in "${ubdiag_library_dir}"/libubdiag.so*; do
-            if [ "$(readlink -f "${ubdiag_library}")" = \
-                 "${MOONCAKE_UBDIAG_SYSTEM_LIBRARY}" ]; then
-                cp -a "${ubdiag_library}" "${BUILDROOT}/usr/${LIB_DIR}/"
+        cp "${MOONCAKE_SPDIAG_SYSTEM_CLI}" "${BUILDROOT}/usr/bin/spdiag"
+        spdiag_library_dir="$(dirname "${MOONCAKE_SPDIAG_SYSTEM_LIBRARY}")"
+        for spdiag_library in "${spdiag_library_dir}"/libspdiag.so*; do
+            if [ "$(readlink -f "${spdiag_library}")" = \
+                 "${MOONCAKE_SPDIAG_SYSTEM_LIBRARY}" ]; then
+                cp -a "${spdiag_library}" "${BUILDROOT}/usr/${LIB_DIR}/"
             fi
         done
 
-        if [ -n "${MOONCAKE_UBDIAG_SYSTEM_CONFIG}" ]; then
-            mkdir -p "${BUILDROOT}/etc/ubdiag"
-            cp "${MOONCAKE_UBDIAG_SYSTEM_CONFIG}" \
-                "${BUILDROOT}/etc/ubdiag/ubdiag.conf"
-            UBDIAG_CONFIG_RPM_FILE="%config(noreplace) /etc/ubdiag/ubdiag.conf"
+        if [ -n "${MOONCAKE_SPDIAG_SYSTEM_CONFIG}" ]; then
+            mkdir -p "${BUILDROOT}/etc/spdiag"
+            cp "${MOONCAKE_SPDIAG_SYSTEM_CONFIG}" \
+                "${BUILDROOT}/etc/spdiag/spdiag.conf"
+            SPDIAG_CONFIG_RPM_FILE="%config(noreplace) /etc/spdiag/spdiag.conf"
         fi
     fi
     
@@ -362,7 +362,7 @@ ${PACKAGE_DESCRIPTION}
 /usr/${LIB_DIR}/*
 /usr/include/mooncake/*
 %config(noreplace) /etc/mooncake/*
-${UBDIAG_CONFIG_RPM_FILE}
+${SPDIAG_CONFIG_RPM_FILE}
 
 %post
 /sbin/ldconfig

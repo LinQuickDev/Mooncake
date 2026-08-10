@@ -524,7 +524,7 @@ class StressBenchmark {
         if (warmup_ret != 0) {
             LOG(WARNING) << "Warmup had errors, continuing anyway";
         }
-        system("ubdiag clear");
+        system("spdiag clear");
 
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,

@@ -27,9 +27,9 @@
 #include "error.h"
 #include "mooncake_logging.h"
 #include "transfer_metadata_plugin.h"
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -95,8 +95,8 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
-        UbDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_ENCODE,
-                             UbDiag::PerfLevel::DEBUG);
+        SpDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_ENCODE,
+                             SpDiag::PerfLevel::DEBUG);
         pt.Start();
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
@@ -149,8 +149,8 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
-        UbDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_DECODE,
-                             UbDiag::PerfLevel::DEBUG);
+        SpDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_DECODE,
+                             SpDiag::PerfLevel::DEBUG);
         pt.Start();
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());

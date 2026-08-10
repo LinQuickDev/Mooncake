@@ -23,9 +23,9 @@
 #include "integration_utils.h"
 #include "buffer_pool.h"
 
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {
@@ -475,8 +475,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::bytes get(const std::string &key) {
-        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET,
-                             UbDiag::PerfLevel::SUB_SYSTEM);
+        SpDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
         pt.Start();
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
@@ -488,8 +488,8 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL,
-                                      UbDiag::PerfLevel::KEY_MODULE);
+            SpDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
             pt_full.Start();
             auto buffer_handle = store_->get_buffer(key);
             pt_full.End(buffer_handle ? 0 : -1);
@@ -525,8 +525,8 @@ class MooncakeStorePyWrapper {
         auto start = std::chrono::steady_clock::now();
         LOG(INFO) << "get_batch start num_keys[" << keys.size() << "]";
 
-        UbDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET_BATCH,
-                             UbDiag::PerfLevel::SUB_SYSTEM);
+        SpDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET_BATCH,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
         pt.Start();
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
@@ -544,8 +544,8 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL,
-                                      UbDiag::PerfLevel::KEY_MODULE);
+            SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
             pt_full.Start();
             auto batch_data = store_->batch_get_buffer(keys);
             pt_full.End(0);
@@ -2787,12 +2787,12 @@ PYBIND11_MODULE(store, m) {
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
 
-                UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT,
-                                     UbDiag::PerfLevel::SUB_SYSTEM);
+                SpDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT,
+                                     SpDiag::PerfLevel::SUB_SYSTEM);
                 pt.Start();
                 py::gil_scoped_release release;
-                UbDiag::PerfPoint pt_full(PerfKey::PUT_INTERNAL_FULL,
-                                          UbDiag::PerfLevel::KEY_MODULE);
+                SpDiag::PerfPoint pt_full(PerfKey::PUT_INTERNAL_FULL,
+                                          SpDiag::PerfLevel::KEY_MODULE);
                 pt_full.Start();
                 auto ret = self.store_->put(
                     key,
@@ -2842,8 +2842,8 @@ PYBIND11_MODULE(store, m) {
                const ReplicateConfig &config = ReplicateConfig{}) {
                 auto start = std::chrono::steady_clock::now();
 
-                UbDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT_BATCH,
-                                     UbDiag::PerfLevel::SUB_SYSTEM);
+                SpDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT_BATCH,
+                                     SpDiag::PerfLevel::SUB_SYSTEM);
                 pt.Start();
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
@@ -2864,8 +2864,8 @@ PYBIND11_MODULE(store, m) {
                           << "] total_size[" << total_size << "]";
 
                 py::gil_scoped_release release;
-                UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL,
-                                          UbDiag::PerfLevel::KEY_MODULE);
+                SpDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL,
+                                          SpDiag::PerfLevel::KEY_MODULE);
                 pt_full.Start();
                 auto ret = self.store_->put_batch(keys, spans, config);
                 pt_full.End(ret == 0 ? 0 : -1);

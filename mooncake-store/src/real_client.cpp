@@ -45,9 +45,9 @@
 #include "environ.h"
 #include "shm_helper.h"
 #include "memory_location.h"
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -2041,8 +2041,8 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
                                  : std::chrono::system_clock::time_point{};
     auto t_alloc = t0;
-    UbDiag::PerfPoint pt_alloc(PerfKey::PUT_INTERNAL_ALLOC_BUFFER,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_alloc(PerfKey::PUT_INTERNAL_ALLOC_BUFFER,
+                               SpDiag::PerfLevel::MODULE);
     pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
     pt_alloc.End(alloc_result ? 0 : -1);
@@ -2052,8 +2052,8 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    UbDiag::PerfPoint pt_memcpy(PerfKey::PUT_INTERNAL_MEM_COPY,
-                                UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_memcpy(PerfKey::PUT_INTERNAL_MEM_COPY,
+                                SpDiag::PerfLevel::MODULE);
     pt_memcpy.Start();
     auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
@@ -2062,8 +2062,8 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     }
     pt_memcpy.End(0);
 
-    UbDiag::PerfPoint pt_split(PerfKey::PUT_INTERNAL_SPLIT_SLICES,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_split(PerfKey::PUT_INTERNAL_SPLIT_SLICES,
+                               SpDiag::PerfLevel::MODULE);
     pt_split.Start();
     std::vector<Slice> slices = split_into_slices(buffer_handle);
     pt_split.End(0);
@@ -2168,8 +2168,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         auto &key = keys[i];
         auto &value = values[i];
         total_bytes += value.size_bytes();
-        UbDiag::PerfPoint pt_alloc(PerfKey::PUT_BATCH_INTERNAL_ALLOC_BUFFER,
-                                   UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_alloc(PerfKey::PUT_BATCH_INTERNAL_ALLOC_BUFFER,
+                                   SpDiag::PerfLevel::MODULE);
         pt_alloc.Start();
         auto alloc_result =
             client_buffer_allocator->allocate(value.size_bytes());
@@ -2181,8 +2181,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        UbDiag::PerfPoint pt_memcpy(PerfKey::PUT_BATCH_INTERNAL_MEM_COPY,
-                                    UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_memcpy(PerfKey::PUT_BATCH_INTERNAL_MEM_COPY,
+                                    SpDiag::PerfLevel::MODULE);
         pt_memcpy.Start();
         auto scatter_result =
             gather_maybe_device_to_host(buffer_handle.ptr(), value.data(),
@@ -2191,8 +2191,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(scatter_result.error());
         }
         pt_memcpy.End(0);
-        UbDiag::PerfPoint pt_split(PerfKey::PUT_BATCH_INTERNAL_SPLIT_SLICES,
-                                   UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_split(PerfKey::PUT_BATCH_INTERNAL_SPLIT_SLICES,
+                                   SpDiag::PerfLevel::MODULE);
         pt_split.Start();
         auto slices = split_into_slices(buffer_handle);
         pt_split.End(0);
@@ -3011,8 +3011,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     std::string remote_endpoint = "-";
 
     // Query the object info
-    UbDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY,
+                               SpDiag::PerfLevel::MODULE);
     pt_query.Start();
     auto query_result = client_->Query(key);
     if (breakdown_log) t_query = std::chrono::steady_clock::now();
@@ -3038,8 +3038,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // then LOCAL_DISK, then DISK.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
-    UbDiag::PerfPoint pt_select(PerfKey::GET_INTERNAL_SELECT_REPLICA,
-                                UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_select(PerfKey::GET_INTERNAL_SELECT_REPLICA,
+                                SpDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
     if (breakdown_log) {
@@ -3078,8 +3078,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // Allocate buffer
-    UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTERNAL_ALLOC_BUFFER,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_alloc(PerfKey::GET_INTERNAL_ALLOC_BUFFER,
+                               SpDiag::PerfLevel::MODULE);
     pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
@@ -3134,8 +3134,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
-        UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTERNAL_SSD_READ,
-                                 UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_ssd(PerfKey::GET_INTERNAL_SSD_READ,
+                                 SpDiag::PerfLevel::MODULE);
         pt_ssd.Start();
         const auto &endpoint =
             best_replica->get_local_disk_descriptor().transport_endpoint;
@@ -3179,7 +3179,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const PerfKey read_key = replica.is_memory_replica()
                                  ? PerfKey::GET_INTERNAL_MEM_READ
                                  : PerfKey::GET_INTERNAL_DISK_READ;
-    UbDiag::PerfPoint pt_read(read_key, UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_read(read_key, SpDiag::PerfLevel::MODULE);
     pt_read.Start();
     std::vector<Slice> slices;
     allocateSlices(slices, replica, buffer_handle->ptr());
@@ -3202,8 +3202,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
         [&]() {
-            UbDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL_FULL,
-                                      UbDiag::PerfLevel::KEY_MODULE);
+            SpDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL_FULL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
             pt_full.Start();
             auto result = get_buffer_internal(key, client_buffer_allocator_);
             pt_full.End(result ? 0 : -1);
@@ -3455,8 +3455,8 @@ RealClient::batch_get_buffer_internal(
     std::string replica_types_log;
 
     // 1. Query metadata for all keys
-    UbDiag::PerfPoint pt_bquery(PerfKey::GET_BATCH_INTERNAL_QUERY,
-                                UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_bquery(PerfKey::GET_BATCH_INTERNAL_QUERY,
+                                SpDiag::PerfLevel::MODULE);
     pt_bquery.Start();
     auto query_results = client_->BatchQuery(keys);
     if (breakdown_log) t_query = std::chrono::steady_clock::now();
@@ -3502,8 +3502,8 @@ RealClient::batch_get_buffer_internal(
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        UbDiag::PerfPoint pt_bsel(PerfKey::GET_BATCH_INTERNAL_SELECT_REPLICA,
-                                  UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_bsel(PerfKey::GET_BATCH_INTERNAL_SELECT_REPLICA,
+                                  SpDiag::PerfLevel::MODULE);
         pt_bsel.Start();
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
@@ -3543,8 +3543,8 @@ RealClient::batch_get_buffer_internal(
 
         auto &allocator = client_buffer_allocator ? client_buffer_allocator
                                                   : client_buffer_allocator_;
-        UbDiag::PerfPoint pt_balloc(PerfKey::GET_BATCH_INTERNAL_ALLOC_BUFFER,
-                                    UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_balloc(PerfKey::GET_BATCH_INTERNAL_ALLOC_BUFFER,
+                                    SpDiag::PerfLevel::MODULE);
         pt_balloc.Start();
         auto alloc_result = allocator->allocate(total_size);
         pt_balloc.End(alloc_result ? 0 : -1);
@@ -3599,8 +3599,8 @@ RealClient::batch_get_buffer_internal(
 
     // 3. Execute batch get for memory/disk replicas
     if (!valid_ops.empty()) {
-        UbDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ,
-                                  UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_bget(PerfKey::GET_BATCH_INTERNAL_MEMDISH_READ,
+                                  SpDiag::PerfLevel::MODULE);
         pt_bget.Start();
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
@@ -3634,8 +3634,8 @@ RealClient::batch_get_buffer_internal(
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
     if (!disk_ops.empty()) {
-        UbDiag::PerfPoint pt_bssd(PerfKey::GET_BATCH_INTERNAL_SSD_READ,
-                                  UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_bssd(PerfKey::GET_BATCH_INTERNAL_SSD_READ,
+                                  SpDiag::PerfLevel::MODULE);
         pt_bssd.Start();
         // Group by transport endpoint
         std::unordered_map<std::string,
@@ -3734,8 +3734,8 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
         [&]() {
-            UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL_FULL,
-                                      UbDiag::PerfLevel::KEY_MODULE);
+            SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL_FULL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
             pt_full.Start();
             auto result = batch_get_buffer_internal(keys);
             pt_full.End(0);
@@ -3836,8 +3836,8 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_query(PerfKey::GET_INTO_INTERNAL_QUERY,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_query(PerfKey::GET_INTO_INTERNAL_QUERY,
+                               SpDiag::PerfLevel::MODULE);
     pt_query.Start();
     auto query_result = client_->Query(key);
     auto t_query = std::chrono::steady_clock::now();
@@ -3860,8 +3860,8 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
 
     // Select best replica: prefer local MEMORY, then any MEMORY,
     // then LOCAL_DISK, then DISK.
-    UbDiag::PerfPoint pt_select(PerfKey::GET_INTO_INTERNAL_SELECT_REPLICA,
-                                UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_select(PerfKey::GET_INTO_INTERNAL_SELECT_REPLICA,
+                                SpDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
     auto t_local_endpoints = std::chrono::steady_clock::now();
@@ -3945,8 +3945,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // directly to SSD RPC (same pattern as single-buffer batch_get_into;
         // GPU buffers are pre-registered by vLLM via register_buffer).
         if (replica.is_local_disk_replica()) {
-            UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTO_INTERNAL_SSD_READ,
-                                     UbDiag::PerfLevel::MODULE);
+            SpDiag::PerfPoint pt_ssd(PerfKey::GET_INTO_INTERNAL_SSD_READ,
+                                     SpDiag::PerfLevel::MODULE);
             pt_ssd.Start();
             const auto &endpoint =
                 replica.get_local_disk_descriptor().transport_endpoint;
@@ -3972,8 +3972,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         if (replica.is_disk_replica()) {
             // DISK full read: local file I/O (vector_read) cannot write to
             // GPU memory. Use temp CPU buffer, then scatter to dst.
-            UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTO_INTERNAL_ALLOC_BUFFER,
-                                       UbDiag::PerfLevel::MODULE);
+            SpDiag::PerfPoint pt_alloc(PerfKey::GET_INTO_INTERNAL_ALLOC_BUFFER,
+                                       SpDiag::PerfLevel::MODULE);
             pt_alloc.Start();
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
             pt_alloc.End(alloc_result ? 0 : -1);
@@ -3987,8 +3987,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
             auto filtered_qr =
                 FilterQueryResult(query_result, replica, verify_checksum);
-            UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_DISK_READ,
-                                      UbDiag::PerfLevel::MODULE);
+            SpDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_DISK_READ,
+                                      SpDiag::PerfLevel::MODULE);
             pt_read.Start();
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
             pt_read.End(get_result ? 0 : -1);
@@ -4047,8 +4047,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
         auto filtered_qr =
             FilterQueryResult(query_result, replica, verify_checksum);
-        UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
-                                  UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
+                                  SpDiag::PerfLevel::MODULE);
         pt_read.Start();
         auto get_result = client_->Get(key, filtered_qr, slices);
         pt_read.End(get_result ? 0 : -1);
@@ -4070,8 +4070,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
-        UbDiag::PerfPoint pt_alloc(PerfKey::GET_INTO_INTERNAL_ALLOC_BUFFER,
-                                   UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_alloc(PerfKey::GET_INTO_INTERNAL_ALLOC_BUFFER,
+                                   SpDiag::PerfLevel::MODULE);
         pt_alloc.Start();
         auto alloc_result = client_buffer_allocator_->allocate(buf_size);
         pt_alloc.End(alloc_result ? 0 : -1);
@@ -4099,8 +4099,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
-                UbDiag::PerfPoint pt_ssd(PerfKey::GET_INTO_INTERNAL_SSD_READ,
-                                         UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfPoint pt_ssd(PerfKey::GET_INTO_INTERNAL_SSD_READ,
+                                         SpDiag::PerfLevel::MODULE);
                 pt_ssd.Start();
                 const auto &endpoint =
                     replica.get_local_disk_descriptor().transport_endpoint;
@@ -4125,8 +4125,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 allocateSlices(tmp_slices, replica, tmp_buf);
                 auto filtered_qr =
                     FilterQueryResult(query_result, replica, false);
-                UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_DISK_READ,
-                                          UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_DISK_READ,
+                                          SpDiag::PerfLevel::MODULE);
                 pt_read.Start();
                 auto get_result = client_->Get(key, filtered_qr, tmp_slices);
                 pt_read.End(get_result ? 0 : -1);
@@ -4180,8 +4180,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     std::vector<Slice> slices;
     slices.emplace_back(Slice{dst, size});
 
-    UbDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
-                              UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_read(PerfKey::GET_INTO_INTERNAL_MEM_READ,
+                              SpDiag::PerfLevel::MODULE);
     pt_read.Start();
     auto get_result = client_->Get(key, query_result, slices, src_offset);
     pt_read.End(get_result ? 0 : -1);
@@ -4298,8 +4298,8 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
-            UbDiag::PerfPoint pt_full(PerfKey::GET_INTO_INTERNAL,
-                                      UbDiag::PerfLevel::KEY_MODULE);
+            SpDiag::PerfPoint pt_full(PerfKey::GET_INTO_INTERNAL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
             pt_full.Start();
             auto result =
                 get_into_range_internal(key, buffer, 0, 0, size, true, true);
@@ -5183,8 +5183,8 @@ std::vector<int64_t> RealClient::batch_get_into(
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
-                UbDiag::PerfPoint pt_full(PerfKey::GET_BATCH_INTO_INTERNAL,
-                                          UbDiag::PerfLevel::KEY_MODULE);
+                SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_INTO_INTERNAL,
+                                          SpDiag::PerfLevel::KEY_MODULE);
                 pt_full.Start();
                 auto result = batch_get_into_internal(keys, buffers, sizes);
                 pt_full.End(0);
@@ -5467,8 +5467,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     // Query metadata for all keys
-    UbDiag::PerfPoint pt_query(PerfKey::GET_BATCH_INTO_INTERNAL_QUERY,
-                               UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_query(PerfKey::GET_BATCH_INTO_INTERNAL_QUERY,
+                               SpDiag::PerfLevel::MODULE);
     pt_query.Start();
     const auto query_results = client_->BatchQuery(keys);
     if (breakdown_log) t_query = std::chrono::steady_clock::now();
@@ -5521,9 +5521,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        UbDiag::PerfPoint pt_select(
+        SpDiag::PerfPoint pt_select(
             PerfKey::GET_BATCH_INTO_INTERNAL_SELECT_REPLICA,
-            UbDiag::PerfLevel::MODULE);
+            SpDiag::PerfLevel::MODULE);
         pt_select.Start();
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
@@ -5652,8 +5652,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
-        UbDiag::PerfPoint pt_mem_read(PerfKey::GET_BATCH_INTO_INTERNAL_MEM_READ,
-                                      UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_mem_read(PerfKey::GET_BATCH_INTO_INTERNAL_MEM_READ,
+                                      SpDiag::PerfLevel::MODULE);
         pt_mem_read.Start();
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
@@ -5699,9 +5699,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     tl::unexpected(ErrorCode::INVALID_REPLICA);
                 continue;
             }
-            UbDiag::PerfPoint pt_alloc(
+            SpDiag::PerfPoint pt_alloc(
                 PerfKey::GET_BATCH_INTO_INTERNAL_ALLOC_BUFFER,
-                UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfLevel::MODULE);
             pt_alloc.Start();
             auto alloc_result =
                 client_buffer_allocator_->allocate(op.total_size);
@@ -5727,9 +5727,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         }
 
         if (!disk_batch_keys.empty()) {
-            UbDiag::PerfPoint pt_disk_read(
+            SpDiag::PerfPoint pt_disk_read(
                 PerfKey::GET_BATCH_INTO_INTERNAL_DISK_READ,
-                UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfLevel::MODULE);
             pt_disk_read.Start();
             auto disk_results = client_->BatchGet(
                 disk_batch_keys, disk_batch_qrs, disk_batch_slices);
@@ -5791,8 +5791,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        UbDiag::PerfPoint pt_ssd_read(PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
-                                      UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_ssd_read(PerfKey::GET_BATCH_INTO_INTERNAL_SSD_READ,
+                                      SpDiag::PerfLevel::MODULE);
         pt_ssd_read.Start();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
             offload_objects_it.first, offload_objects_it.second);
@@ -6677,20 +6677,20 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     struct CallState {
         CallState()
             : pt_queue(PerfKey::GET_SSD_OWNER_RPC_QUEUE,
-                       UbDiag::PerfLevel::DEBUG),
+                       SpDiag::PerfLevel::DEBUG),
               pt_batch_get(PerfKey::GET_SSD_OWNER_RPC_BATCH_GET,
-                           UbDiag::PerfLevel::MODULE),
+                           SpDiag::PerfLevel::MODULE),
               pt_resume(PerfKey::GET_SSD_OWNER_RPC_RESUME,
-                        UbDiag::PerfLevel::DEBUG) {}
+                        SpDiag::PerfLevel::DEBUG) {}
         std::vector<std::string> keys;
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
         uint64_t trace_id;
         std::chrono::steady_clock::time_point worker_start;
         std::chrono::steady_clock::time_point worker_end;
-        UbDiag::PerfPoint pt_queue;
-        UbDiag::PerfPoint pt_batch_get;
-        UbDiag::PerfPoint pt_resume;
+        SpDiag::PerfPoint pt_queue;
+        SpDiag::PerfPoint pt_batch_get;
+        SpDiag::PerfPoint pt_resume;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
@@ -6807,11 +6807,11 @@ RealClient::batch_get_offload_object_push(
     struct CallState {
         CallState()
             : pt_queue(PerfKey::GET_SSD_OWNER_RPC_QUEUE,
-                       UbDiag::PerfLevel::DEBUG),
+                       SpDiag::PerfLevel::DEBUG),
               pt_batch_get(PerfKey::GET_SSD_OWNER_RPC_BATCH_GET,
-                           UbDiag::PerfLevel::MODULE),
+                           SpDiag::PerfLevel::MODULE),
               pt_resume(PerfKey::GET_SSD_OWNER_RPC_RESUME,
-                        UbDiag::PerfLevel::DEBUG) {}
+                        SpDiag::PerfLevel::DEBUG) {}
         BatchGetOffloadObjectPushRequest req;
         std::shared_ptr<FileStorage> file_storage;
         Client *client;
@@ -6821,9 +6821,9 @@ RealClient::batch_get_offload_object_push(
         uint64_t batch_get_us{0};
         uint64_t transfer_us{0};
         uint64_t release_us{0};
-        UbDiag::PerfPoint pt_queue;
-        UbDiag::PerfPoint pt_batch_get;
-        UbDiag::PerfPoint pt_resume;
+        SpDiag::PerfPoint pt_queue;
+        SpDiag::PerfPoint pt_batch_get;
+        SpDiag::PerfPoint pt_resume;
     };
     auto state = std::make_unique<CallState>();
     state->req = req;
@@ -6856,8 +6856,8 @@ RealClient::batch_get_offload_object_push(
             }
             const uint64_t batch_id = result.value().batch_id;
             // WRITE the staged blobs straight into the requester's memory.
-            UbDiag::PerfPoint pt_write(PerfKey::GET_SSD_OWNER_PUSH_WRITE,
-                                       UbDiag::PerfLevel::MODULE);
+            SpDiag::PerfPoint pt_write(PerfKey::GET_SSD_OWNER_PUSH_WRITE,
+                                       SpDiag::PerfLevel::MODULE);
             pt_write.Start();
             const auto transfer_start = std::chrono::steady_clock::now();
             auto write_result = s->client->BatchPushOffloadObject(
@@ -7003,8 +7003,8 @@ RealClient::batch_get_into_offload_object_internal(
         push_req.dst_slices = std::move(dst_slices);
         push_req.trace_id = mooncake::logging::CurrentTraceId();
 
-        UbDiag::PerfPoint pt_push(PerfKey::GET_SSD_OFFLOAD_RPC,
-                                  UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_push(PerfKey::GET_SSD_OFFLOAD_RPC,
+                                  SpDiag::PerfLevel::MODULE);
         pt_push.Start();
         const auto rpc_start = std::chrono::steady_clock::now();
         ClientRequester::RpcTiming rpc_timing;
@@ -7042,8 +7042,8 @@ RealClient::batch_get_into_offload_object_internal(
         return {};
     }
 
-    UbDiag::PerfPoint pt_rpc(PerfKey::GET_SSD_OFFLOAD_RPC,
-                             UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_rpc(PerfKey::GET_SSD_OFFLOAD_RPC,
+                             SpDiag::PerfLevel::MODULE);
     pt_rpc.Start();
     const auto rpc_start = std::chrono::steady_clock::now();
     ClientRequester::RpcTiming rpc_timing;
@@ -7066,8 +7066,8 @@ RealClient::batch_get_into_offload_object_internal(
                    << keys.size() << ", got=" << batchGetResp->pointers.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    UbDiag::PerfPoint pt_transfer(PerfKey::GET_SSD_TRANSFER_DATA,
-                                  UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_transfer(PerfKey::GET_SSD_TRANSFER_DATA,
+                                  SpDiag::PerfLevel::MODULE);
     pt_transfer.Start();
     const auto transfer_start = std::chrono::steady_clock::now();
     auto result =
@@ -7101,8 +7101,8 @@ RealClient::batch_get_into_offload_object_internal(
 
     // Release the owner buffer immediately after transfer completion. This RPC
     // is synchronous; measuring it separately exposes owner lock/reclaim stalls.
-    UbDiag::PerfPoint pt_release(PerfKey::GET_SSD_RELEASE_BUFFER,
-                                 UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_release(PerfKey::GET_SSD_RELEASE_BUFFER,
+                                 SpDiag::PerfLevel::MODULE);
     pt_release.Start();
     const auto release_start = std::chrono::steady_clock::now();
     ClientRequester::RpcTiming release_timing;
@@ -7314,8 +7314,8 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     const std::string &client_addr, RpcTiming *timing, Args &&...args) {
     const auto total_start = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_pool(PerfKey::GET_SSD_OFFLOAD_RPC_POOL,
-                              UbDiag::PerfLevel::DEBUG);
+    SpDiag::PerfPoint pt_pool(PerfKey::GET_SSD_OFFLOAD_RPC_POOL,
+                              SpDiag::PerfLevel::DEBUG);
     pt_pool.Start();
     auto client_pool = client_pools_->at(client_addr);
     pt_pool.End(0);
@@ -7328,8 +7328,8 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             const auto rpc_call_start = std::chrono::steady_clock::now();
-            UbDiag::PerfPoint pt_rpc_call(
-                PerfKey::GET_SSD_OFFLOAD_RPC_CALL, UbDiag::PerfLevel::DEBUG);
+            SpDiag::PerfPoint pt_rpc_call(
+                PerfKey::GET_SSD_OFFLOAD_RPC_CALL, SpDiag::PerfLevel::DEBUG);
             pt_rpc_call.Start();
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
@@ -7349,9 +7349,9 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
             const auto result_get_start = std::chrono::steady_clock::now();
-            UbDiag::PerfPoint pt_result_get(
+            SpDiag::PerfPoint pt_result_get(
                 PerfKey::GET_SSD_OFFLOAD_RPC_RESULT_GET,
-                UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfLevel::MODULE);
             pt_result_get.Start();
             auto result = co_await std::move(ret.value());
             pt_result_get.End(result ? 0 : -1);

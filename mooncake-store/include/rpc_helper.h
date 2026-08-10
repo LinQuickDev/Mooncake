@@ -43,7 +43,7 @@ concept TlExpected = is_tl_expected<std::decay_t<T>>::value;
  * @tparam LogRequestCallable A callable object that logs the request
  * parameters.
  * @param rpc_name The name of the RPC function for logging.
- * @param perf_key Optional ubdiag perf point key. Pass std::nullopt (or use
+ * @param perf_key Optional spdiag perf point key. Pass std::nullopt (or use
  *                 the 5-arg overload below) for RPCs that do not need
  *                 instrumentation, e.g. low-frequency admin calls.
  * @param rpc_call The callable that performs the actual RPC call.
@@ -59,11 +59,11 @@ auto execute_rpc(std::string_view rpc_name, std::optional<PerfKey> perf_key,
                  IncReqMetric&& inc_req_metric, IncFailMetric&& inc_fail_metric)
     requires TlExpected<std::invoke_result_t<RpcCallable>>
 {
-    // Optional ubdiag perf point (good/bad split by rc == 0).
-    std::unique_ptr<UbDiag::PerfPoint> pt;
+    // Optional spdiag perf point (good/bad split by rc == 0).
+    std::unique_ptr<SpDiag::PerfPoint> pt;
     if (perf_key.has_value()) {
-        pt = std::make_unique<UbDiag::PerfPoint>(*perf_key,
-                                                 UbDiag::PerfLevel::SUB_SYSTEM);
+        pt = std::make_unique<SpDiag::PerfPoint>(*perf_key,
+                                                 SpDiag::PerfLevel::SUB_SYSTEM);
         pt->Start();
     }
 
@@ -98,7 +98,7 @@ auto execute_rpc(std::string_view rpc_name, std::optional<PerfKey> perf_key,
 }
 
 /**
- * @brief Backward-compatible 5-arg overload for RPCs that do not need ubdiag
+ * @brief Backward-compatible 5-arg overload for RPCs that do not need spdiag
  * instrumentation. Forwards to the 6-arg form with perf_key = std::nullopt, so
  * existing call sites continue to compile unchanged.
  */

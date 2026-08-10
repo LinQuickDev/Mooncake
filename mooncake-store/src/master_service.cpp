@@ -3620,8 +3620,8 @@ auto MasterService::AllocateAndInsertMetadata(
             ssd_provider = &*ssd_access;
         }
 
-        UbDiag::PerfPoint pt_alloc_mem(PerfKey::MASTER_PUT_ALLOCATE_MEM,
-                                       UbDiag::PerfLevel::KEY_MODULE);
+        SpDiag::PerfPoint pt_alloc_mem(PerfKey::MASTER_PUT_ALLOCATE_MEM,
+                                       SpDiag::PerfLevel::KEY_MODULE);
         pt_alloc_mem.Start();
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
@@ -3660,8 +3660,8 @@ auto MasterService::AllocateAndInsertMetadata(
         std::vector<std::string> preferred_segments =
             config.preferred_nof_segments;
 
-        UbDiag::PerfPoint pt_alloc_nof(PerfKey::MASTER_PUT_ALLOCATE_NOF,
-                                       UbDiag::PerfLevel::KEY_MODULE);
+        SpDiag::PerfPoint pt_alloc_nof(PerfKey::MASTER_PUT_ALLOCATE_NOF,
+                                       SpDiag::PerfLevel::KEY_MODULE);
         pt_alloc_nof.Start();
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.nof_replica_num,
@@ -7440,8 +7440,8 @@ void MasterService::EvictionThreadFunc() {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
             {
-                UbDiag::PerfPoint pt_discard(PerfKey::MASTER_BG_DISCARD_EXPIRED,
-                                             UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfPoint pt_discard(PerfKey::MASTER_BG_DISCARD_EXPIRED,
+                                             SpDiag::PerfLevel::MODULE);
                 pt_discard.Start();
                 std::shared_lock<std::shared_mutex> shared_lock(
                     snapshot_mutex_);
@@ -8267,8 +8267,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
-    UbDiag::PerfPoint pt_evict(PerfKey::MASTER_BG_BATCH_EVICT,
-                               UbDiag::PerfLevel::KEY_MODULE);
+    SpDiag::PerfPoint pt_evict(PerfKey::MASTER_BG_BATCH_EVICT,
+                               SpDiag::PerfLevel::KEY_MODULE);
     pt_evict.Start();
 
     if (evict_ratio_target < evict_ratio_lowerbound) {
@@ -8997,8 +8997,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
 void MasterService::NoFBatchEvict(double evict_ratio_target,
                                   double evict_ratio_lowerbound) {
-    UbDiag::PerfPoint pt_nof_evict(PerfKey::MASTER_BG_NOF_BATCH_EVICT,
-                                   UbDiag::PerfLevel::KEY_MODULE);
+    SpDiag::PerfPoint pt_nof_evict(PerfKey::MASTER_BG_NOF_BATCH_EVICT,
+                                   SpDiag::PerfLevel::KEY_MODULE);
     pt_nof_evict.Start();
 
     if (evict_ratio_target < evict_ratio_lowerbound) {
@@ -9204,8 +9204,8 @@ void MasterService::ClientMonitorFunc() {
                        boost::hash<UUID>>
         client_ttl;
     while (client_monitor_running_) {
-        UbDiag::PerfPoint pt_monitor(PerfKey::MASTER_BG_CLIENT_MONITOR,
-                                     UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_monitor(PerfKey::MASTER_BG_CLIENT_MONITOR,
+                                     SpDiag::PerfLevel::MODULE);
         pt_monitor.Start();
 
         auto now = std::chrono::steady_clock::now();
@@ -9233,8 +9233,8 @@ void MasterService::ClientMonitorFunc() {
 
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
-            UbDiag::PerfPoint pt_unmount(PerfKey::MASTER_BG_CLIENT_UNMOUNT,
-                                         UbDiag::PerfLevel::MODULE);
+            SpDiag::PerfPoint pt_unmount(PerfKey::MASTER_BG_CLIENT_UNMOUNT,
+                                         SpDiag::PerfLevel::MODULE);
             pt_unmount.Start();
             // Notify graceful unmount scheduler to drop pending records
             // for expired clients. The actual unmount is handled below.
