@@ -25,7 +25,7 @@ if(NOT MOONCAKE_ENABLE_SPDIAG)
       "https://gitcode.com/openeuler/spdiag.git"
       CACHE STRING "SpDiag repository used by Layer 0")
   set(MOONCAKE_SPDIAG_GIT_TAG
-      "master"
+      "46b7b84371a6935eaca93763fbb7cb3b4bccfbe2"
       CACHE STRING "SpDiag revision used by Layer 0")
   set(MOONCAKE_SPDIAG_SOURCE_DIR
       ""
