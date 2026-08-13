@@ -96,7 +96,7 @@ bool UbTransport::stagingEnabled() const {
 }
 
 bool UbTransport::isDevicePointer(const void* ptr) const {
-    if (!stagingEnabled() || !ptr) return false;
+    if (!ptr) return false;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -109,6 +109,55 @@ bool UbTransport::isDevicePointer(const void* ptr) const {
 #else
     return false;
 #endif
+}
+
+bool UbTransport::isLogicalDeviceRange(const void* ptr, size_t length) const {
+    if (!ptr || length == 0) return false;
+    uint64_t addr = reinterpret_cast<uint64_t>(ptr);
+    std::lock_guard<std::mutex> lock(device_region_mutex_);
+    for (const auto& region : device_regions_) {
+        if (addr < region.addr || length > region.length) continue;
+        if (addr - region.addr <= region.length - length) return true;
+    }
+    return false;
+}
+
+int UbTransport::registerLogicalDeviceRegion(void* addr, size_t length,
+                                             const std::string& location,
+                                             bool remote_accessible) {
+    if (!addr || length == 0) return ERR_INVALID_ARGUMENT;
+    uint64_t start = reinterpret_cast<uint64_t>(addr);
+    if (start + length < start) return ERR_INVALID_ARGUMENT;
+    uint64_t end = start + length;
+    std::lock_guard<std::mutex> lock(device_region_mutex_);
+    for (const auto& region : device_regions_) {
+        uint64_t region_start = region.addr;
+        uint64_t region_end = region.addr + region.length;
+        if (start < region_end && region_start < end) {
+            LOG(ERROR) << "UbTransport: logical device region overlaps, addr="
+                       << addr << " length=" << length;
+            return ERR_ADDRESS_OVERLAPPED;
+        }
+    }
+    device_regions_.push_back(
+        DeviceRegion{start, length, location, remote_accessible});
+    LOG(INFO) << "UbTransport: registered logical device region addr=" << addr
+              << " length=" << length << " location=" << location;
+    return 0;
+}
+
+int UbTransport::unregisterLogicalDeviceRegion(void* addr) {
+    if (!addr) return ERR_INVALID_ARGUMENT;
+    uint64_t start = reinterpret_cast<uint64_t>(addr);
+    std::lock_guard<std::mutex> lock(device_region_mutex_);
+    for (auto it = device_regions_.begin(); it != device_regions_.end(); ++it) {
+        if (it->addr != start) continue;
+        LOG(INFO) << "UbTransport: unregistered logical device region addr="
+                  << addr << " length=" << it->length;
+        device_regions_.erase(it);
+        return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
 }
 
 bool UbTransport::copyDeviceToHost(void* dst, const void* src,
@@ -392,7 +441,17 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      const std::string& name,
                                      bool remote_accessible,
                                      bool update_metadata) {
-    (void)remote_accessible;
+    if (isDevicePointer(addr)) {
+        if (!stagingEnabled()) {
+            LOG(ERROR) << "UbTransport: refusing to register device memory "
+                          "while CPU staging is disabled, addr="
+                       << addr << " length=" << length;
+            return ERR_INVALID_ARGUMENT;
+        }
+        return registerLogicalDeviceRegion(addr, length, name,
+                                           remote_accessible);
+    }
+
     BufferDesc buffer_desc;
     for (auto& context : context_list_) {
         int ret = context->registerMemoryRegion((uint64_t)addr, length);
@@ -437,6 +496,9 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
+    int logical_rc = unregisterLogicalDeviceRegion(addr);
+    if (logical_rc == 0) return 0;
+
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
     for (auto& context : context_list_)
@@ -527,7 +589,6 @@ Status UbTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
     std::unordered_map<std::shared_ptr<UbContext>, std::vector<Slice*>>
         slices_to_post;
-    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
@@ -546,6 +607,17 @@ Status UbTransport::submitTransferTask(
         bool staged_request = false;
 
         if (isDevicePointer(request.source)) {
+            if (!stagingEnabled()) {
+                return Status::InvalidArgument(
+                    "UbTransport: device pointer requires CPU staging");
+            }
+            if (!isLogicalDeviceRange(request.source, request.length)) {
+                return Status::AddressNotRegistered(
+                    "UbTransport: device pointer is not registered as a "
+                    "logical UB device region, address: " +
+                    std::to_string(
+                        reinterpret_cast<uintptr_t>(request.source)));
+            }
             auto staging_status = acquireStaging(request.length, staging_lease);
             if (!staging_status.ok()) return staging_status;
 
@@ -576,6 +648,8 @@ Status UbTransport::submitTransferTask(
             attachStaging(&task, staging_state);
         }
 
+        auto local_segment_desc =
+            metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         auto request_buffer_id = -1, request_device_id = -1;
 
         if (selectDevice(local_segment_desc.get(), (uint64_t)effective_source,

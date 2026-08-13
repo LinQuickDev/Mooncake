@@ -96,6 +96,13 @@ class UbTransport : public Transport {
         size_t size = 0;
     };
 
+    struct DeviceRegion {
+        uint64_t addr = 0;
+        size_t length = 0;
+        std::string location;
+        bool remote_accessible = true;
+    };
+
     struct StagingState {
         void* original_device_ptr = nullptr;
         void* staging_ptr = nullptr;
@@ -111,6 +118,11 @@ class UbTransport : public Transport {
 
     bool stagingEnabled() const;
     bool isDevicePointer(const void* ptr) const;
+    bool isLogicalDeviceRange(const void* ptr, size_t length) const;
+    int registerLogicalDeviceRegion(void* addr, size_t length,
+                                    const std::string& location,
+                                    bool remote_accessible);
+    int unregisterLogicalDeviceRegion(void* addr);
     bool copyDeviceToHost(void* dst, const void* src, size_t size) const;
     bool copyHostToDevice(void* dst, const void* src, size_t size) const;
     Status acquireStaging(size_t size, StagingLease& lease);
@@ -167,6 +179,8 @@ class UbTransport : public Transport {
 
     mutable std::once_flag staging_config_once_;
     mutable bool staging_enabled_ = false;
+    mutable std::mutex device_region_mutex_;
+    std::vector<DeviceRegion> device_regions_;
     std::mutex staging_pool_mutex_;
     void* staging_pool_base_ = nullptr;
     size_t staging_pool_size_ = 0;
