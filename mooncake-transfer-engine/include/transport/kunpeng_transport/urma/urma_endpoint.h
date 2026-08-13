@@ -62,6 +62,7 @@ class UrmaContext : public UbContext {
     int doProcessContextEvents() override;
     void* retrieveRemoteSeg(const std::string& value) override;
     int poll(int num_entries, Transport::Slice** failed_slices, int& num_failed,
+             std::vector<Transport::Slice*>& deferred_success_slices,
              std::unordered_map<volatile int*, int>& jetty_depth_set,
              int jfc_index) override;
     volatile int* outstandingCount(int jfc_index) override;

@@ -635,6 +635,7 @@ bool UrmaContext::transEidFromString(const std::string& eid_str,
 
 int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
                       int& num_failed,
+                      std::vector<Transport::Slice*>& deferred_success_slices,
                       std::unordered_map<volatile int*, int>& jetty_depth_set,
                       int jfc_index) {
     num_failed = 0;
@@ -662,9 +663,17 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
             jetty_depth_set[depth] = 1;
 
         if (cr[i].status == URMA_CR_SUCCESS) {
+            if (engine().shouldDeferSuccess(slice)) {
+                deferred_success_slices.push_back(slice);
+                continue;
+            }
             // Safe to publish here — we are done with this slice and do not
             // return it to the caller, so no one else will deref it.
-            slice->markSuccess();
+            if (engine().isStagedSlice(slice)) {
+                engine().onStagedSliceSuccess(slice);
+            } else {
+                slice->markSuccess();
+            }
             continue;
         }
 
