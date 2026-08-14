@@ -1,5 +1,5 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
-include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -61,7 +61,7 @@ target_link_libraries(
          numa
          asio_shared
          yalantinglibs::yalantinglibs
-         UbDiag::ubdiag_lib)
+         SpDiag::spdiag_lib)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

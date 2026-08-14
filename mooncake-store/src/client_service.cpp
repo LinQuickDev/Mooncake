@@ -44,9 +44,9 @@
 #include "environ.h"
 #include "mooncake_logging.h"
 
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 
@@ -1685,8 +1685,8 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    UbDiag::PerfPoint pt_full(PerfKey::PUT_SINGLE_FULL,
-                              UbDiag::PerfLevel::KEY_MODULE);
+    SpDiag::PerfPoint pt_full(PerfKey::PUT_SINGLE_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
@@ -1780,8 +1780,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         DetermineFinalizeDecision(config, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
-        UbDiag::PerfPoint pt_end(PerfKey::PUT_SINGLE_PUT_END,
-                                 UbDiag::PerfLevel::MODULE);
+        SpDiag::PerfPoint pt_end(PerfKey::PUT_SINGLE_PUT_END,
+                                 SpDiag::PerfLevel::MODULE);
         pt_end.Start();
         auto end_result = master_client_.PutEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
@@ -2122,8 +2122,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
-    UbDiag::PerfPoint pt_batch_start(PerfKey::PUT_BATCH_PUT_START,
-                                     UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_batch_start(PerfKey::PUT_BATCH_PUT_START,
+                                     SpDiag::PerfLevel::MODULE);
     pt_batch_start.Start();
     auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
@@ -2815,8 +2815,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    UbDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_FULL,
-                              UbDiag::PerfLevel::KEY_MODULE);
+    SpDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {

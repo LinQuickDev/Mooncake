@@ -83,6 +83,9 @@ struct HABackendSpec {
     HABackendType type = HABackendType::UNKNOWN;
     std::string connstring;
     ClusterNamespace cluster_namespace;
+    // TTL in seconds for the master-view lease.  Controls how fast
+    // a standby detects a dead primary and initiates failover.
+    int64_t master_view_lease_ttl_sec = 3;
 };
 
 struct MasterView {

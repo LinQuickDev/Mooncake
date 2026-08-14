@@ -20,9 +20,9 @@
 #include "config.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 
@@ -750,8 +750,8 @@ bool UrmaContext::init() {
 // start define the UrmaEndpot method
 int UrmaEndpoint::construct(GlobalConfig& config) {
     auto t0 = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_construct(PerfKey::UB_ENDPOINT_CONSTRUCT,
-                                   UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_construct(PerfKey::UB_ENDPOINT_CONSTRUCT,
+                                   SpDiag::PerfLevel::MODULE);
     pt_construct.Start();
     size_t num_jetty_list = config.num_jetty_per_ep;
     size_t max_wr_depth = config.max_wr;
@@ -795,8 +795,8 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
         // attr.shared.jfc = jfc;
         attr.shared.jfr = context_->jfr();
         auto t_create_start = std::chrono::steady_clock::now();
-        UbDiag::PerfPoint pt_create(PerfKey::UB_ENDPOINT_CREATE_JETTY,
-                                    UbDiag::PerfLevel::DEBUG);
+        SpDiag::PerfPoint pt_create(PerfKey::UB_ENDPOINT_CREATE_JETTY,
+                                    SpDiag::PerfLevel::DEBUG);
         pt_create.Start();
         jetty_list_[i] = urma_create_jetty(context_->urma_context_, &attr);
         auto create_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -887,8 +887,8 @@ const std::string UrmaEndpoint::toString() const {
 
 int UrmaEndpoint::setupConnectionsByActive() {
     auto t0 = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_active(PerfKey::UB_ENDPOINT_ACTIVE_SETUP,
-                                UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_active(PerfKey::UB_ENDPOINT_ACTIVE_SETUP,
+                                SpDiag::PerfLevel::MODULE);
     pt_active.Start();
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
@@ -940,8 +940,8 @@ int UrmaEndpoint::setupConnectionsByActive() {
     }
 
     auto t_handshake_start = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_handshake(PerfKey::UB_ENDPOINT_ACTIVE_HANDSHAKE,
-                                   UbDiag::PerfLevel::DEBUG);
+    SpDiag::PerfPoint pt_handshake(PerfKey::UB_ENDPOINT_ACTIVE_HANDSHAKE,
+                                   SpDiag::PerfLevel::DEBUG);
     pt_handshake.Start();
     int rc = context_->engine().sendHandshake(peer_server_name, local_desc,
                                               peer_desc);
@@ -1045,8 +1045,8 @@ void UrmaEndpoint::disconnectUnlocked() {
 int UrmaEndpoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                             HandShakeDesc& local_desc) {
     auto t0 = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_passive(PerfKey::UB_ENDPOINT_PASSIVE_SETUP,
-                                 UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_passive(PerfKey::UB_ENDPOINT_PASSIVE_SETUP,
+                                 SpDiag::PerfLevel::MODULE);
     pt_passive.Start();
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
@@ -1310,8 +1310,8 @@ int UrmaEndpoint::doSetupConnection(const std::string& peer_eid,
                                     std::vector<uint32_t> peer_jetty_num_list,
                                     std::string* reply_msg) {
     auto t0 = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_setup_all(PerfKey::UB_ENDPOINT_DO_SETUP_ALL,
-                                   UbDiag::PerfLevel::DEBUG);
+    SpDiag::PerfPoint pt_setup_all(PerfKey::UB_ENDPOINT_DO_SETUP_ALL,
+                                   SpDiag::PerfLevel::DEBUG);
     pt_setup_all.Start();
     if (jetty_list_.size() != peer_jetty_num_list.size()) {
         std::string message =
@@ -1367,8 +1367,8 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     rjetty.flag.value = 0;
     LOG(INFO) << "Peer jetty id = " << peer_jetty_num;
     auto t_import_start = std::chrono::steady_clock::now();
-    UbDiag::PerfPoint pt_import(PerfKey::UB_ENDPOINT_IMPORT_JETTY,
-                                UbDiag::PerfLevel::DEBUG);
+    SpDiag::PerfPoint pt_import(PerfKey::UB_ENDPOINT_IMPORT_JETTY,
+                                SpDiag::PerfLevel::DEBUG);
     pt_import.Start();
     urma_target_jetty_t* imported_jetty =
         urma_import_jetty(context_->urma_context_, &rjetty, &urma_token);
@@ -1386,8 +1386,8 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     }
     if (context_->transMode() == URMA_TM_RC) {
         auto t_bind_start = std::chrono::steady_clock::now();
-        UbDiag::PerfPoint pt_bind(PerfKey::UB_ENDPOINT_BIND_JETTY,
-                                  UbDiag::PerfLevel::DEBUG);
+        SpDiag::PerfPoint pt_bind(PerfKey::UB_ENDPOINT_BIND_JETTY,
+                                  SpDiag::PerfLevel::DEBUG);
         pt_bind.Start();
         urma_status_t ret = urma_bind_jetty(jetty, imported_jetty);
         auto bind_us = std::chrono::duration_cast<std::chrono::microseconds>(

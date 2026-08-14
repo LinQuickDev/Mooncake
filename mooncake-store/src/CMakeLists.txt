@@ -47,6 +47,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    ha/master_metrics_reporter.cpp
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
@@ -310,9 +311,9 @@ target_link_libraries(
          asio_shared
   PRIVATE transfer_engine)
 
-# UbDiag instrumentation
-include(${CMAKE_SOURCE_DIR}/mooncake-common/FindUbDiag.cmake)
-target_link_libraries(mooncake_store PRIVATE UbDiag::ubdiag_lib)
+# SpDiag instrumentation
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)
+target_link_libraries(mooncake_store PRIVATE SpDiag::spdiag_lib)
 target_include_directories(mooncake_store PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
 
@@ -360,7 +361,7 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared
-          UbDiag::ubdiag_lib)
+          SpDiag::spdiag_lib)
 # mooncake_store is static and propagates optional runtime dependencies to its
 # consumers. The metadata-only master does not use accelerator staging, so drop
 # those dependencies when they do not satisfy any symbols in the final binary.
@@ -378,7 +379,7 @@ add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
                                               asio_shared
-                                              UbDiag::ubdiag_lib)
+                                              SpDiag::spdiag_lib)
 set_target_properties(mooncake_master mooncake_client
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

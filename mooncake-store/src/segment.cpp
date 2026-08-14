@@ -1638,4 +1638,14 @@ bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
     te_endpoint = seg.te_endpoint;
     return true;
 }
+
+std::optional<UUID> SegmentManager::getClientIdBySegmentName(
+    const std::string& segment_name) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    auto it = client_by_name_.find(segment_name);
+    if (it == client_by_name_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
 }  // namespace mooncake

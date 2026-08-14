@@ -14,10 +14,12 @@
 
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
+#include "ha/master_metrics_reporter.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
 #include "rpc_service.h"
+#include "types.h"
 
 namespace mooncake {
 namespace ha {
@@ -77,6 +79,7 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
         .type = backend_type.value(),
         .connstring = connstring,
         .cluster_namespace = config.cluster_id,
+        .master_view_lease_ttl_sec = config.master_view_lease_ttl_sec,
     };
 }
 
@@ -218,6 +221,18 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
 int RunSupervisorLoop(const HABackendSpec& spec,
                       const MasterServiceSupervisorConfig& config,
                       MasterAdminServer& admin_server) {
+    // ── Metrics reporter (writes master capacity/usage to HA backend) ──
+    MasterMetricsReporter::Config reporter_config;
+    reporter_config.enabled = config.enable_metrics_report_to_backend;
+    reporter_config.report_interval_sec = config.metrics_report_interval_sec;
+    reporter_config.lease_ttl_sec = config.metrics_report_lease_ttl_sec;
+    reporter_config.master_id = UuidToString(generate_uuid());
+    reporter_config.local_hostname = config.local_hostname;
+    reporter_config.cluster_namespace = config.cluster_id;
+    reporter_config.ha_backend_connstring =
+        ResolveHABackendConnstring(config);
+    MasterMetricsReporter metrics_reporter(reporter_config);
+
     auto label_reconciler = MakeLeaderLabelReconciler(config);
     label_reconciler.SetLeader(false);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
@@ -432,7 +447,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session,
             [&server, &admin_server, &serve_shutdown_requested,
-             &label_reconciler](auto reason) {
+             &label_reconciler, &metrics_reporter](auto reason) {
+                metrics_reporter.Stop();
                 serve_shutdown_requested.store(true, std::memory_order_release);
                 admin_server.SetServiceAvailable(false);
                 label_reconciler.SetLeader(false);
@@ -476,11 +492,15 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
             ActivateServingState(admin_server, wrapped_master_service,
                                  label_reconciler);
+            metrics_reporter.SetRole("primary");
+            metrics_reporter.Start();
         }
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
+        metrics_reporter.Stop();
+        metrics_reporter.SetRole("standby");
         StopLeadershipMonitor(leadership_monitor_handle);
         DeactivateServingState(admin_server, label_reconciler);
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);

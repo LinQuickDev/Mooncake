@@ -341,8 +341,8 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
     const auto t0 = sample ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
-    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
-                         UbDiag::PerfLevel::SUB_SYSTEM);
+    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_GET_REPLICA,
+                         SpDiag::PerfLevel::SUB_SYSTEM);
     pt.Start();
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
@@ -582,8 +582,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_START,
-                         UbDiag::PerfLevel::SUB_SYSTEM);
+    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_START,
+                         SpDiag::PerfLevel::SUB_SYSTEM);
     pt.Start();
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
@@ -691,8 +691,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         trace_scope_ =
             std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
     }
-    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_END,
-                         UbDiag::PerfLevel::SUB_SYSTEM);
+    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_END,
+                         SpDiag::PerfLevel::SUB_SYSTEM);
     pt.Start();
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = object_metas.size();
@@ -735,8 +735,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
-    UbDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_REVOKE,
-                         UbDiag::PerfLevel::SUB_SYSTEM);
+    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_BATCH_PUT_REVOKE,
+                         SpDiag::PerfLevel::SUB_SYSTEM);
     pt.Start();
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();

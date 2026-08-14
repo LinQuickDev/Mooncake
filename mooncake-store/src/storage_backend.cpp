@@ -51,10 +51,10 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 
-// ubdiag perf points for the offload owner-side disk load breakdown.
-#define UBDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define UBDIAG_PROGRAM_NAME "mooncake_store"
-#include "ubdiag/auto_perf.h"
+// spdiag perf points for the offload owner-side disk load breakdown.
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 
@@ -1967,8 +1967,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // Phase 1: build read plan under lock (OwnerLoadPlan). Pure in-memory
     // metadata lookups; the error early-returns let the dtor Abandon the
     // unfinished sample.
-    UbDiag::PerfPoint pt_plan(PerfKey::GET_SSD_OWNER_LOAD_PLAN,
-                              UbDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_plan(PerfKey::GET_SSD_OWNER_LOAD_PLAN,
+                              SpDiag::PerfLevel::MODULE);
     pt_plan.Start();
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
@@ -2121,8 +2121,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Zero-copy path: read directly into the slice buffer.
                 // dest_slice.ptr is 4096-aligned and oversized (from
                 // AllocateBatch) to accommodate the full aligned read range.
-                UbDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
-                                           UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
+                                           SpDiag::PerfLevel::MODULE);
                 pt_uring.Start();
                 read_res = uring_file->read_aligned(
                     plan.dest_slice.ptr, aligned_size, aligned_offset);
@@ -2142,8 +2142,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             for (const auto& plan : read_plans) {
                 int64_t actual_offset = plan.offset + plan.key_size;
                 iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                UbDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
-                                           UbDiag::PerfLevel::MODULE);
+                SpDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
+                                           SpDiag::PerfLevel::MODULE);
                 pt_posix.Start();
                 read_res = file->vector_read(&iov, 1, actual_offset);
                 pt_posix.End(read_res ? 0 : -1);
