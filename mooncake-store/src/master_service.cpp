@@ -9400,6 +9400,7 @@ void MasterService::ClientMonitorFunc() {
                 }
             }
             RecomputeTenantEffectiveQuotas();
+            pt_unmount.End(0);
         }
 
         pt_monitor.End(0);
