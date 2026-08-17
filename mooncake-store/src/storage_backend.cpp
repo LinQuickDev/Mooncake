@@ -2186,6 +2186,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
+        }
     }
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
