@@ -26,7 +26,7 @@
 #include <thread>
 #include <vector>
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "types.h"

@@ -859,7 +859,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (remove_result) {
             for (const auto& item : remove_result.value()) {
                 auto storage_key =
-                    MakeTenantScopedStorageKey(item.tenant_id, item.key);
+                    TenantId(item.tenant_id).MakeScopedKey(item.key);
                 storage_backend_->MarkRemoved(storage_key);
             }
             if (!remove_result.value().empty()) {

@@ -2139,15 +2139,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 #endif
         {
             // Fallback to per-key vector_read for non-UringFile (PosixFile).
-            for (const auto& plan : read_plans) {
-                int64_t actual_offset = plan.offset + plan.key_size;
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                SpDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
-                                           SpDiag::PerfLevel::MODULE);
-                pt_posix.Start();
-                read_res = file->vector_read(&iov, 1, actual_offset);
-                pt_posix.End(read_res ? 0 : -1);
-            }
+            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+            SpDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
+                                       SpDiag::PerfLevel::MODULE);
+            pt_posix.Start();
+            read_res = file->vector_read(&iov, 1, actual_offset);
+            pt_posix.End(read_res ? 0 : -1);
             if (stats) {
                 const auto read_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3516,39 +3513,6 @@ void BucketStorageBackend::BatchMarkRemoved(
                 freed, std::memory_order_relaxed);
         }
     }
-}
-
-std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-BucketStorageBackend::SelectGCCandidate() {
-    // Must be called with mutex_ held (exclusive).
-    // Find bucket with highest deleted_ratio; tie-break by coldest
-    // last_access_ns_ (smallest). Skip buckets with deleted_bytes_==0
-    // or compacting_==true.
-    auto best_it = buckets_.end();
-    double best_ratio = 0.0;
-    int64_t best_ts = std::numeric_limits<int64_t>::max();
-
-    for (auto it = buckets_.begin(); it != buckets_.end(); ++it) {
-        const auto& bucket = it->second;
-        int64_t deleted =
-            bucket->deleted_bytes_.load(std::memory_order_relaxed);
-        if (deleted <= 0) continue;
-        if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
-
-        int64_t data_size = bucket->data_size;
-        if (data_size <= 0) continue;
-        double ratio =
-            static_cast<double>(deleted) / static_cast<double>(data_size);
-
-        int64_t ts = bucket->last_access_ns_.load(std::memory_order_relaxed);
-
-        if (ratio > best_ratio || (ratio == best_ratio && ts < best_ts)) {
-            best_ratio = ratio;
-            best_ts = ts;
-            best_it = it;
-        }
-    }
-    return best_it;
 }
 
 bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {

@@ -1073,13 +1073,6 @@ class BucketStorageBackend : public StorageBackendInterface {
 
    private:
     // --- Background GC ---
-    // Select the best GC candidate bucket: deleted_bytes_>0, not compacting,
-    // highest deleted_ratio, then coldest last_access_ns_.
-    // Must be called with mutex_ held (exclusive).
-    // Returns buckets_.end() if no candidate.
-    std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-    SelectGCCandidate();
-
     // Background GC thread entry point.
     void GCThreadFunc();
 

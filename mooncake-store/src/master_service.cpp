@@ -5676,7 +5676,7 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
             if (it != client_local_disk_segment.end()) {
                 MutexLocker locker(&it->second->offloading_mutex_);
                 it->second->removed_keys.push_back(
-                    RemoveTaskItem{tenant_id, key});
+                    RemoveTaskItem{tenant_id.value(), key});
             }
         }
     }
@@ -6167,7 +6167,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                         MutexLocker locker(
                             &seg_it->second->offloading_mutex_);
                         seg_it->second->removed_keys.push_back(
-                            RemoveTaskItem{normalized_tenant, key});
+                            RemoveTaskItem{normalized_tenant.value(), key});
                     }
                 }
             }
