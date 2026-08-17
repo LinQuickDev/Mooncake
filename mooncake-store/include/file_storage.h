@@ -54,8 +54,9 @@ class FileStorage {
     // Forward explicit-delete tombstone to the storage backend.
     // For BucketStorageBackend: marks tombstone + enables GC.
     // For other backends: no-op (default in StorageBackendInterface).
-    void MarkRemoved(const std::string& key);
-    void BatchMarkRemoved(const std::vector<std::string>& keys);
+    tl::expected<void, ErrorCode> MarkRemoved(const std::string& key);
+    tl::expected<void, ErrorCode> BatchMarkRemoved(
+        const std::vector<std::string>& keys);
 
    private:
     friend class FileStorageTest;

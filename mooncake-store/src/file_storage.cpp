@@ -815,12 +815,14 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     return enable_offloading;
 }
 
-void FileStorage::MarkRemoved(const std::string& key) {
-    storage_backend_->MarkRemoved(key);
+tl::expected<void, ErrorCode> FileStorage::MarkRemoved(
+    const std::string& key) {
+    return storage_backend_->MarkRemoved(key);
 }
 
-void FileStorage::BatchMarkRemoved(const std::vector<std::string>& keys) {
-    storage_backend_->BatchMarkRemoved(keys);
+tl::expected<void, ErrorCode> FileStorage::BatchMarkRemoved(
+    const std::vector<std::string>& keys) {
+    return storage_backend_->BatchMarkRemoved(keys);
 }
 
 tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
@@ -857,13 +859,26 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         auto remove_result =
             client_->RemoveObjectHeartbeat(client_->getClientId());
         if (remove_result) {
+            bool all_marked = true;
             for (const auto& item : remove_result.value()) {
                 auto storage_key =
                     TenantId(item.tenant_id).MakeScopedKey(item.key);
-                storage_backend_->MarkRemoved(storage_key);
+                auto mark_result = storage_backend_->MarkRemoved(storage_key);
+                if (!mark_result) {
+                    all_marked = false;
+                    LOG(ERROR) << "Failed to persist remove tombstone: "
+                               << mark_result.error();
+                    break;
+                }
             }
-            if (!remove_result.value().empty()) {
-                VLOG(1) << "RemoveObjectHeartbeat drained "
+            if (all_marked && !remove_result.value().empty()) {
+                auto ack_result = client_->AckRemoveObjectHeartbeat(
+                    client_->getClientId(), remove_result.value());
+                if (!ack_result) {
+                    LOG(ERROR) << "Failed to ACK remove tasks: "
+                               << ack_result.error();
+                }
+                VLOG(1) << "RemoveObjectHeartbeat processed "
                         << remove_result.value().size()
                         << " removed key(s) from master";
             }

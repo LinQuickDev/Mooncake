@@ -42,6 +42,10 @@ struct BucketMetadata {
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
 
+    // Persisted tombstones. Init filters these keys before rebuilding the
+    // in-memory object index.
+    std::vector<std::string> tombstones;
+
     // Runtime-only fields (not serialized) for safe deletion support
     // Tracks number of in-flight reads to enable safe bucket deletion
     mutable std::atomic<int32_t> inflight_reads_{0};
@@ -55,6 +59,10 @@ struct BucketMetadata {
     // Runtime-only (not serialized): true while a GC compaction is in flight
     // for this bucket, preventing re-entrant compaction.
     mutable std::atomic<bool> compacting_{false};
+    // Runtime-only version of the bucket's deletion state. Compaction captures
+    // this value with its read snapshot and validates it before publishing a
+    // new bucket, so a concurrent deletion cannot publish stale data.
+    uint64_t generation_{0};
 
     // Default constructor
     BucketMetadata() = default;
@@ -65,10 +73,12 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(other.keys),
           metadatas(other.metadatas),
+          tombstones(other.tombstones),
           inflight_reads_(0),
           last_access_ns_(0),
           deleted_bytes_(0),
-          compacting_(false) {}
+          compacting_(false),
+          generation_(0) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -76,10 +86,12 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
+          tombstones(std::move(other.tombstones)),
           inflight_reads_(0),
           last_access_ns_(0),
           deleted_bytes_(0),
-          compacting_(false) {}
+          compacting_(false),
+          generation_(0) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -88,6 +100,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
+            tombstones = other.tombstones;
             // Don't copy runtime state
         }
         return *this;
@@ -100,12 +113,13 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
+            tombstones = std::move(other.tombstones);
             // Don't move runtime state
         }
         return *this;
     }
 };
-YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+YLT_REFL(BucketMetadata, data_size, keys, metadatas, tombstones);
 
 /**
  * @brief RAII guard for tracking in-flight bucket reads.
@@ -445,11 +459,16 @@ class StorageBackendInterface {
     // Default no-op: only BucketStorageBackend implements tombstone + GC.
     // File-per-key and other backends inherit the no-op (do not delete files).
     // Safe to call for keys not present in local storage (idempotent).
-    virtual void MarkRemoved(const std::string& /* key */) {}
+    virtual tl::expected<void, ErrorCode> MarkRemoved(
+        const std::string& /* key */) {
+        return {};
+    }
 
     // Batch variant: mark multiple keys as removed in one lock acquisition.
-    virtual void BatchMarkRemoved(
-        const std::vector<std::string>& /* keys */) {}
+    virtual tl::expected<void, ErrorCode> BatchMarkRemoved(
+        const std::vector<std::string>& /* keys */) {
+        return {};
+    }
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
@@ -1047,8 +1066,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Removes key from object_bucket_map_ (immediately invisible to
     // BatchLoad/IsExist) and bumps bucket deleted_bytes_.
     // Idempotent: no-op if key not in local storage.
-    void MarkRemoved(const std::string& key) override;
-    void BatchMarkRemoved(const std::vector<std::string>& keys) override;
+    tl::expected<void, ErrorCode> MarkRemoved(
+        const std::string& key) override;
+    tl::expected<void, ErrorCode> BatchMarkRemoved(
+        const std::vector<std::string>& keys) override;
 
     // Compact a single bucket: copy-on-write live keys to a new bucket,
     // atomically swap mappings, delete old bucket file after reads drain.

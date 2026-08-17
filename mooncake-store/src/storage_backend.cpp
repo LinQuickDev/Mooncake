@@ -2333,13 +2333,23 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
                 for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
+                    const auto& key = metadata_it->second->keys[i];
+                    if (std::find(metadata_it->second->tombstones.begin(),
+                                  metadata_it->second->tombstones.end(), key) !=
+                        metadata_it->second->tombstones.end()) {
+                        metadata_it->second->deleted_bytes_.fetch_add(
+                            metadata_it->second->metadatas[i].key_size +
+                                metadata_it->second->metadatas[i].data_size,
+                            std::memory_order_relaxed);
+                        continue;
+                    }
                     object_bucket_map_.emplace(
-                        metadata_it->second->keys[i],
-                        StorageObjectMetadata{
-                            metadata_it->first,
-                            metadata_it->second->metadatas[i].offset,
-                            metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size, ""});
+                        key, StorageObjectMetadata{
+                                 metadata_it->first,
+                                 metadata_it->second->metadatas[i].offset,
+                                 metadata_it->second->metadatas[i].key_size,
+                                 metadata_it->second->metadatas[i].data_size,
+                                 ""});
                 }
             }
         }
@@ -3480,39 +3490,43 @@ void BucketStorageBackend::RemoveAll() {
 }
 
 // --- Explicit-delete-only GC ---
-void BucketStorageBackend::MarkRemoved(const std::string& key) {
+tl::expected<void, ErrorCode> BucketStorageBackend::MarkRemoved(
+    const std::string& key) {
     SharedMutexLocker lock(&mutex_);
     auto it = object_bucket_map_.find(key);
     if (it == object_bucket_map_.end()) {
-        return;
+        return {};
     }
     int64_t bucket_id = it->second.bucket_id;
     int64_t freed = it->second.data_size + it->second.key_size;
-    object_bucket_map_.erase(it);
-
     auto bucket_it = buckets_.find(bucket_id);
-    if (bucket_it != buckets_.end()) {
-        bucket_it->second->deleted_bytes_.fetch_add(
-            freed, std::memory_order_relaxed);
+    if (bucket_it == buckets_.end()) {
+        return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
     }
+    auto bucket = bucket_it->second;
+    const auto object_metadata = it->second;
+    object_bucket_map_.erase(it);
+    bucket->tombstones.push_back(key);
+    auto persist_result = StoreBucketMetadata(bucket_id, bucket);
+    if (!persist_result) {
+        object_bucket_map_.emplace(key, object_metadata);
+        bucket->tombstones.pop_back();
+        return tl::make_unexpected(persist_result.error());
+    }
+    bucket->deleted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+    ++bucket->generation_;
+    return {};
 }
 
-void BucketStorageBackend::BatchMarkRemoved(
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchMarkRemoved(
     const std::vector<std::string>& keys) {
-    SharedMutexLocker lock(&mutex_);
     for (const auto& key : keys) {
-        auto it = object_bucket_map_.find(key);
-        if (it == object_bucket_map_.end()) continue;
-        int64_t bucket_id = it->second.bucket_id;
-        int64_t freed = it->second.data_size + it->second.key_size;
-        object_bucket_map_.erase(it);
-
-        auto bucket_it = buckets_.find(bucket_id);
-        if (bucket_it != buckets_.end()) {
-            bucket_it->second->deleted_bytes_.fetch_add(
-                freed, std::memory_order_relaxed);
+        auto result = MarkRemoved(key);
+        if (!result) {
+            return result;
         }
     }
+    return {};
 }
 
 bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
@@ -3534,6 +3548,7 @@ bool BucketStorageBackend::CompactBuckets(
     std::unordered_map<int64_t,
                        std::pair<std::shared_ptr<BucketMetadata>, int64_t>>
         old_buckets;
+    std::unordered_map<int64_t, uint64_t> old_bucket_generations;
     {
         SharedMutexLocker lock(&mutex_);
         for (int64_t bid : bucket_ids) {
@@ -3545,6 +3560,7 @@ bool BucketStorageBackend::CompactBuckets(
             int64_t ts = bucket->last_access_ns_.load(
                 std::memory_order_relaxed);
             old_buckets[bid] = {bucket, ts};
+            old_bucket_generations[bid] = bucket->generation_;
 
             for (size_t i = 0; i < bucket->keys.size(); ++i) {
                 const auto& key = bucket->keys[i];
@@ -3763,6 +3779,23 @@ bool BucketStorageBackend::CompactBuckets(
     std::vector<int64_t> buckets_to_delete;
     {
         SharedMutexLocker lock(&mutex_);
+        for (const auto& [bid, pr] : old_buckets) {
+            auto current_it = buckets_.find(bid);
+            auto generation_it = old_bucket_generations.find(bid);
+            if (current_it == buckets_.end() ||
+                generation_it == old_bucket_generations.end() ||
+                current_it->second->generation_ != generation_it->second) {
+                // A delete changed the source bucket after the snapshot. The
+                // data file was built from a stale view, so do not publish it
+                // or replace any object mappings with it.
+                lock.unlock();
+                CleanupOrphanedBucket(new_bucket_id);
+                reset_compacting();
+                LOG(INFO) << "CompactBuckets discarded stale snapshot for "
+                          << "bucket_id=" << bid;
+                return true;
+            }
+        }
         // Re-validate and remap each key in the new bucket.
         for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
             const auto& key = new_bucket->keys[i];
