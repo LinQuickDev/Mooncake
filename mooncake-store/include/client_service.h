@@ -463,6 +463,9 @@ class Client {
     [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
     RemoveObjectHeartbeat(const UUID& client_id);
 
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
+
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * L2->L1 promotion. Returns the new replica's descriptor that the caller

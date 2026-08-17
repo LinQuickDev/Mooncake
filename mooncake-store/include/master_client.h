@@ -493,14 +493,11 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
-    /**
-     * @brief Drain the removed_keys queue from master. Returns {tenant_id,
-     * key} pairs that were removed via Remove/BatchRemove and had LOCAL_DISK
-     * replicas on this client. The caller should MarkRemoved each key to
-     * trigger SSD tombstone + GC compaction.
-     */
+    /** Fetch pending remove tasks without removing them from the queue. */
     [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
     RemoveObjectHeartbeat(const UUID& client_id);
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

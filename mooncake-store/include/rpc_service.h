@@ -219,13 +219,10 @@ class WrappedMasterService {
 
     tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
 
-    tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
-    RemoveObjectHeartbeat(const UUID& client_id);
-
-    tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
-    RemoveObjectHeartbeat(const UUID& client_id);
-
-    tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
+    tl::expected<std::vector<RemoveTaskItem>, ErrorCode> RemoveObjectHeartbeat(
+        const UUID& client_id);
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
