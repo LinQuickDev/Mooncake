@@ -255,6 +255,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::AckRemoveObjectHeartbeat> {
+    static constexpr const char* value = "AckRemoveObjectHeartbeat";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
     static constexpr const char* value = "PromotionAllocStart";
 };
