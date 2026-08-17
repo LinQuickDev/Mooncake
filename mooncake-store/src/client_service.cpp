@@ -3510,6 +3510,11 @@ Client::RemoveObjectHeartbeat(const UUID& client_id) {
     return master_client_.RemoveObjectHeartbeat(client_id);
 }
 
+tl::expected<void, ErrorCode> Client::AckRemoveObjectHeartbeat(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks) {
+    return master_client_.AckRemoveObjectHeartbeat(client_id, tasks);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,

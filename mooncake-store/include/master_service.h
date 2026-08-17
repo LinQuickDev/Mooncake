@@ -727,16 +727,12 @@ class MasterService {
     auto PromotionObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
 
-    /**
-     * @brief Drain the removed_keys queue for a client.
-     *
-     * Returns the list of {tenant_id, key} pairs that were removed via
-     * Remove/BatchRemove and had LOCAL_DISK replicas on this client. The
-     * client should call MarkRemoved on each key to trigger SSD tombstone
-     * marking + GC compaction.
-     */
+    /** Fetch pending remove tasks without removing them from the queue. */
     auto RemoveObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode>;
+    auto AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
@@ -1544,6 +1540,8 @@ class MasterService {
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+    void EnqueueRemoveTasks(const std::vector<UUID>& holder_ids,
+                            const RemoveTaskItem& task);
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(

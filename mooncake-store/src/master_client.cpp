@@ -255,6 +255,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::AckRemoveObjectHeartbeat> {
+    static constexpr const char* value = "AckRemoveObjectHeartbeat";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
     static constexpr const char* value = "PromotionAllocStart";
 };
@@ -1206,6 +1211,15 @@ MasterClient::RemoveObjectHeartbeat(const UUID& client_id) {
     timer.LogRequest("client_id=", client_id.first, ":", client_id.second);
     return invoke_rpc<&WrappedMasterService::RemoveObjectHeartbeat,
                       std::vector<RemoveTaskItem>>(client_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeat(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks) {
+    ScopedVLogTimer timer(1, "MasterClient::AckRemoveObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id.first, ":", client_id.second,
+                     " tasks=", tasks.size());
+    return invoke_rpc<&WrappedMasterService::AckRemoveObjectHeartbeat, void>(
+        client_id, tasks);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
