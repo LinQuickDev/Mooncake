@@ -219,18 +219,34 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
-                                                     bool enable_offloading) {
+ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& local_disk_segment_id, uint64_t mount_epoch,
+    uint32_t capabilities) {
     auto exist_segment_it =
         segment_manager_->client_local_disk_segment_.find(client_id);
     if (exist_segment_it !=
         segment_manager_->client_local_disk_segment_.end()) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=local_disk_segment_already_exists";
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        MutexLocker locker(&exist_segment_it->second->offloading_mutex_);
+        if (exist_segment_it->second->enable_offloading == enable_offloading &&
+            exist_segment_it->second->local_disk_segment_id ==
+                local_disk_segment_id &&
+            exist_segment_it->second->mount_epoch == mount_epoch &&
+            exist_segment_it->second->capabilities == capabilities) {
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", warn=local_disk_segment_already_exists";
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        }
+        exist_segment_it->second->enable_offloading = enable_offloading;
+        exist_segment_it->second->local_disk_segment_id = local_disk_segment_id;
+        exist_segment_it->second->mount_epoch = mount_epoch;
+        exist_segment_it->second->capabilities = capabilities;
+        return ErrorCode::OK;
     }
     segment_manager_->client_local_disk_segment_.emplace(
-        client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
+        client_id, std::make_shared<LocalDiskSegment>(
+                       enable_offloading, local_disk_segment_id, mount_epoch,
+                       capabilities));
     return ErrorCode::OK;
 }
 

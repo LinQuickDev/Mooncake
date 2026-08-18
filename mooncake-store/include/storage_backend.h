@@ -33,18 +33,17 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
+    ObjectIncarnation object_incarnation;
+    bool tombstoned{false};
 };
-YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size, object_incarnation,
+         tombstoned);
 
 struct BucketMetadata {
-    int64_t meta_size;
-    int64_t data_size;
+    int64_t meta_size{0};
+    int64_t data_size{0};
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
-
-    // Persisted tombstones. Init filters these keys before rebuilding the
-    // in-memory object index.
-    std::vector<std::string> tombstones;
 
     // Runtime-only fields (not serialized) for safe deletion support
     // Tracks number of in-flight reads to enable safe bucket deletion
@@ -52,17 +51,8 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
-
-    // Runtime-only (not serialized): bytes marked removed via MarkRemoved.
-    // Drives GC candidate selection (compact when deleted_bytes_ > 0).
-    mutable std::atomic<int64_t> deleted_bytes_{0};
-    // Runtime-only (not serialized): true while a GC compaction is in flight
-    // for this bucket, preventing re-entrant compaction.
-    mutable std::atomic<bool> compacting_{false};
-    // Runtime-only version of the bucket's deletion state. Compaction captures
-    // this value with its read snapshot and validates it before publishing a
-    // new bucket, so a concurrent deletion cannot publish stale data.
-    uint64_t generation_{0};
+    mutable std::mutex operation_mutex_;
+    mutable std::atomic<bool> mutation_in_progress_{false};
 
     // Default constructor
     BucketMetadata() = default;
@@ -73,12 +63,9 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(other.keys),
           metadatas(other.metadatas),
-          tombstones(other.tombstones),
           inflight_reads_(0),
           last_access_ns_(0),
-          deleted_bytes_(0),
-          compacting_(false),
-          generation_(0) {}
+          mutation_in_progress_(false) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -86,12 +73,9 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
-          tombstones(std::move(other.tombstones)),
           inflight_reads_(0),
           last_access_ns_(0),
-          deleted_bytes_(0),
-          compacting_(false),
-          generation_(0) {}
+          mutation_in_progress_(false) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -100,7 +84,6 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
-            tombstones = other.tombstones;
             // Don't copy runtime state
         }
         return *this;
@@ -113,13 +96,38 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
-            tombstones = std::move(other.tombstones);
             // Don't move runtime state
         }
         return *this;
     }
 };
-YLT_REFL(BucketMetadata, data_size, keys, metadatas, tombstones);
+YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+
+struct BucketGcIntent {
+    uint32_t version{1};
+    bool committed{false};
+    int64_t target_bucket_id{-1};
+    std::vector<int64_t> source_bucket_ids;
+};
+YLT_REFL(BucketGcIntent, version, committed, target_bucket_id,
+         source_bucket_ids);
+
+enum class LocalDeleteResult {
+    kRemoved,
+    kAlreadyRemoved,
+    kStaleVersion,
+    kRetryableFailure,
+};
+
+struct LocalDeleteTaskResult {
+    LocalDeleteTaskId task_id;
+    LocalDeleteResult result{LocalDeleteResult::kRetryableFailure};
+    ErrorCode error{ErrorCode::OK};
+
+    [[nodiscard]] bool IsTerminal() const {
+        return result != LocalDeleteResult::kRetryableFailure;
+    }
+};
 
 /**
  * @brief RAII guard for tracking in-flight bucket reads.
@@ -226,26 +234,9 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
-    bool disable_ssd_eviction =
-    false;  // Force disable eviction regardless of
-    // eviction_policy. Set via
-    // MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION.
-
-    // --- Explicit-delete-only GC config ---
-    // Enable background tombstone compaction GC.
     bool gc_enable = true;
-    // GC scan interval in milliseconds.
-    int64_t gc_interval_ms = 1000;
-    // Compact a bucket when deleted bytes / bucket data size >= this ratio.
+    int64_t gc_interval_seconds = 10;
     double gc_deleted_ratio = 0.25;
-    // Trigger GC when total_size / max_total_size >= this ratio.
-    double gc_high_watermark_ratio = 0.90;
-    // Max old buckets collected per GC round for cross-bucket merge.
-    int64_t gc_max_buckets_per_round = 1;
-    // Enable cross-bucket merge compaction (collect live keys from multiple
-    // tombstone buckets into one new bucket). When false, each bucket is
-    // compacted independently (no merge).
-    bool gc_merge_enable = true;
 
     bool Validate() const;
 
@@ -390,29 +381,6 @@ struct FileStorageConfig {
     static FileStorageConfig FromEnvironment();
 };
 
-struct StorageReadStats {
-    uint64_t plan_us{0};
-    uint64_t file_open_us{0};
-    uint64_t disk_read_us{0};
-    uint64_t slowest_disk_read_us{0};
-    std::string slowest_key{"-"};
-    std::string io_mode{"unknown"};
-    std::string status{"ok"};
-    std::string error_key{"-"};
-    ErrorCode error_code{ErrorCode::OK};
-};
-
-StorageReadStats* CurrentStorageReadStats();
-
-class ScopedStorageReadStats {
-   public:
-    explicit ScopedStorageReadStats(StorageReadStats* stats);
-    ~ScopedStorageReadStats();
-
-   private:
-    StorageReadStats* previous_;
-};
-
 class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
@@ -455,20 +423,6 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
-    // Mark a key as removed (tombstone) for explicit-delete-only GC.
-    // Default no-op: only BucketStorageBackend implements tombstone + GC.
-    // File-per-key and other backends inherit the no-op (do not delete files).
-    // Safe to call for keys not present in local storage (idempotent).
-    virtual tl::expected<void, ErrorCode> MarkRemoved(
-        const std::string& /* key */) {
-        return {};
-    }
-
-    // Batch variant: mark multiple keys as removed in one lock acquisition.
-    virtual tl::expected<void, ErrorCode> BatchMarkRemoved(
-        const std::vector<std::string>& /* keys */) {
-        return {};
-    }
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
@@ -478,6 +432,23 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
+        const std::vector<LocalDeleteTask>& tasks) {
+        std::vector<LocalDeleteTaskResult> results;
+        results.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            results.push_back({task.task_id,
+                               LocalDeleteResult::kRetryableFailure,
+                               ErrorCode::UNAVAILABLE_IN_CURRENT_MODE});
+        }
+        return results;
+    }
+    virtual int64_t GetReclaimableBytes() const { return 0; }
+    virtual bool RequestGarbageCollection(
+        bool /* require_disk_pressure */ = false) {
+        return false;
     }
 
     FileStorageConfig file_storage_config_;
@@ -1012,7 +983,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        const std::unordered_map<std::string, ObjectIncarnation>*
+            object_incarnations = nullptr);
 
     void ClearUngroupedOffloadingObjects();
 
@@ -1062,53 +1035,16 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
-    // Explicit-delete-only GC: mark a key as tombstone (no disk IO).
-    // Removes key from object_bucket_map_ (immediately invisible to
-    // BatchLoad/IsExist) and bumps bucket deleted_bytes_.
-    // Idempotent: no-op if key not in local storage.
-    tl::expected<void, ErrorCode> MarkRemoved(
-        const std::string& key) override;
-    tl::expected<void, ErrorCode> BatchMarkRemoved(
-        const std::vector<std::string>& keys) override;
-
-    // Compact a single bucket: copy-on-write live keys to a new bucket,
-    // atomically swap mappings, delete old bucket file after reads drain.
-    // Returns true on success (or no-op), false on transient failure
-    // (will retry next round). Public to allow explicit compaction and
-    // testing (analogous to DeleteBucket).
-    bool CompactBucket(int64_t bucket_id);
-
-    // Compact multiple buckets into one new bucket (cross-bucket merge).
-    // Collects live keys from all given old buckets, groups them by
-    // bucket_keys_limit/bucket_size_limit, and writes ONE new bucket per
-    // round (the first group that fills up). If the first group doesn't
-    // fill a full bucket and there's no space pressure, the merge is
-    // deferred to the next round. Old buckets whose live keys are all
-    // migrated are deleted.
-    // Returns true on success (or deferred), false on transient failure.
-    bool CompactBuckets(const std::vector<int64_t>& bucket_ids,
-                        bool space_pressure = false);
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
+        const std::vector<LocalDeleteTask>& tasks) override;
+    int64_t GetReclaimableBytes() const override;
+    bool RequestGarbageCollection(bool require_disk_pressure = false) override;
+
    private:
-    // --- Background GC ---
-    // Background GC thread entry point.
-    void GCThreadFunc();
-
-    // Wait for in-flight reads on a bucket to drain (up to 10s).
-    void WaitForInflightReads(std::shared_ptr<BucketMetadata> bucket);
-
-    // Delete .bucket and .meta files for a bucket_id, ignore missing.
-    void DeleteBucketFiles(int64_t bucket_id);
-
-    // GC thread lifecycle members
-    std::atomic<bool> gc_running_{false};
-    std::thread gc_thread_;
-    std::mutex gc_mutex_;
-    std::condition_variable gc_cv_;
-
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1122,8 +1058,31 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
 
+    tl::expected<void, ErrorCode> StoreBucketMetadataAtomically(
+        int64_t bucket_id, BucketMetadata& bucket_metadata);
+
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    struct GcCandidate {
+        int64_t bucket_id;
+        std::shared_ptr<BucketMetadata> bucket;
+        int64_t live_bytes;
+        int64_t reclaimable_bytes;
+        size_t live_keys;
+    };
+
+    std::vector<GcCandidate> SelectGcCandidates(bool under_pressure);
+    tl::expected<bool, ErrorCode> RunGarbageCollectionOnce(bool under_pressure);
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> WriteGcReplacement(
+        int64_t target_bucket_id, const std::vector<GcCandidate>& sources);
+    tl::expected<void, ErrorCode> RecoverGarbageCollection();
+    tl::expected<void, ErrorCode> StoreGcIntent(const BucketGcIntent& intent);
+    tl::expected<void, ErrorCode> RemoveGcIntent();
+    tl::expected<void, ErrorCode> SyncStorageDirectory() const;
+    bool FinalizeGcSource(const GcCandidate& source);
+    void GarbageCollectionThreadFunc();
+    static int64_t BucketReclaimableBytes(const BucketMetadata& bucket);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -1151,7 +1110,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
      */
-    void CleanupOrphanedBucket(int64_t bucket_id);
+    bool CleanupOrphanedBucket(int64_t bucket_id);
 
     /**
      * @brief Rollback a committed bucket from the local index when
@@ -1267,6 +1226,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::atomic<int64_t> reclaimable_bytes_{0};
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
@@ -1282,9 +1242,17 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
+    std::mutex gc_mutex_;
+    std::condition_variable gc_cv_;
+    std::thread gc_thread_;
+    std::atomic<bool> gc_stop_{false};
+    bool gc_requested_{false};
+
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+    std::unordered_map<std::string, ObjectIncarnation> GUARDED_BY(
+        offloading_mutex_) offloading_object_incarnations_;
 
     // File handle cache for UringFile to avoid repeated open/close overhead
     mutable Mutex file_cache_mutex_;

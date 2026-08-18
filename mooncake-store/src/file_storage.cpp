@@ -1,35 +1,156 @@
 #include "file_storage.h"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <locale>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
-#include "mooncake_logging.h"
-#include "storage_backend.h"
+#include "bool_parser.h"
 #include "client_metric.h"
+#include "environ.h"
+#include "local_delete.h"
+#include "storage_backend.h"
 #include "utils.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
 
-// spdiag perf points for the offload owner-side SSD path. SPDIAG_PROGRAM_NAME
-// must match the other TUs (store_py/real_client/client_service); each TU's
-// static initializer writes the shared detail::AutoProgramName(), and leaving
-// it nullptr here could clobber the program name depending on init order.
-#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
-#define SPDIAG_PROGRAM_NAME "mooncake_store"
-#include "spdiag/auto_perf.h"
-
 namespace mooncake {
 
 namespace {
+
+constexpr std::string_view kLocalDiskSegmentIdMarker =
+    ".mooncake_local_disk_segment_id";
+
+const char* LocalDeleteResultLabel(LocalDeleteResult result) {
+    switch (result) {
+        case LocalDeleteResult::kRemoved:
+            return "removed";
+        case LocalDeleteResult::kAlreadyRemoved:
+            return "already_removed";
+        case LocalDeleteResult::kStaleVersion:
+            return "stale_version";
+        case LocalDeleteResult::kRetryableFailure:
+            return "retryable_failure";
+    }
+    return "unknown";
+}
+
+tl::expected<std::string, ErrorCode> ReadLocalDiskSegmentId(
+    const std::filesystem::path& marker_path) {
+    std::ifstream input(marker_path);
+    std::string id;
+    if (!input || !std::getline(input, id) || id.empty()) {
+        LOG(ERROR) << "Invalid LOCAL_DISK identity marker: " << marker_path;
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return id;
+}
+
+tl::expected<std::string, ErrorCode> LoadOrCreateLocalDiskSegmentId(
+    const std::string& storage_path) {
+    namespace fs = std::filesystem;
+    const fs::path directory(storage_path);
+    const fs::path marker_path =
+        directory / fs::path(kLocalDiskSegmentIdMarker);
+    std::error_code ec;
+    if (fs::exists(marker_path, ec)) {
+        return ReadLocalDiskSegmentId(marker_path);
+    }
+    if (ec) {
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    bool has_unmarked_data = false;
+    for (const auto& entry : fs::directory_iterator(directory, ec)) {
+        if (entry.path() != marker_path) {
+            has_unmarked_data = true;
+            break;
+        }
+    }
+    if (ec) {
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    const char* adopt_unmarked =
+        std::getenv("MC_STORE_ADOPT_UNMARKED_LOCAL_DISK");
+    if (has_unmarked_data && (adopt_unmarked == nullptr ||
+                              std::string_view(adopt_unmarked) != "1")) {
+        LOG(ERROR) << "LOCAL_DISK path contains data without identity marker: "
+                   << storage_path
+                   << "; set MC_STORE_ADOPT_UNMARKED_LOCAL_DISK=1 once to "
+                      "adopt this directory";
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    if (has_unmarked_data) {
+        LOG(WARNING) << "Creating LOCAL_DISK identity marker for existing path "
+                     << storage_path;
+    }
+
+    const std::string id = UuidToString(generate_uuid());
+    const std::string contents = id + "\n";
+    const int fd =
+        ::open(marker_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            return ReadLocalDiskSegmentId(marker_path);
+        }
+        LOG(ERROR) << "Failed to create LOCAL_DISK identity marker: "
+                   << std::strerror(errno);
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    size_t written = 0;
+    while (written < contents.size()) {
+        const ssize_t n =
+            ::write(fd, contents.data() + written, contents.size() - written);
+        if (n <= 0) {
+            ::close(fd);
+            fs::remove(marker_path, ec);
+            return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        written += static_cast<size_t>(n);
+    }
+    const bool file_synced = ::fsync(fd) == 0;
+    const bool file_closed = ::close(fd) == 0;
+    const int directory_fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    const bool directory_synced =
+        directory_fd >= 0 && ::fsync(directory_fd) == 0;
+    if (directory_fd >= 0) {
+        ::close(directory_fd);
+    }
+    if (!file_synced || !file_closed || !directory_synced) {
+        fs::remove(marker_path, ec);
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return id;
+}
+
+tl::expected<int, ErrorCode> AcquireLocalDiskLock(
+    const std::string& storage_path) {
+    const auto lock_path =
+        std::filesystem::path(storage_path) / ".mooncake_local_disk.lock";
+    const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        LOG(ERROR) << "LOCAL_DISK path is already mounted: " << storage_path;
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return fd;
+}
 
 double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
     if (raw_value.empty()) {
@@ -51,13 +172,13 @@ double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
 }
 
 double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = GetEnvStringOr(name, "");
+    const auto raw_value = Environ::GetString(name, "");
     return ParseEnvRatioOr(raw_value, default_value);
 }
 
 double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
                      double default_value) {
-    const auto preferred_value = GetEnvStringOr(preferred_name, "");
+    const auto preferred_value = Environ::GetString(preferred_name, "");
     if (!preferred_value.empty()) {
         return ParseEnvRatioOr(preferred_value, default_value);
     }
@@ -66,16 +187,10 @@ double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
 
 bool GetEnvBoolStringOr(const char* name, bool default_value) {
     const auto raw_value =
-        GetEnvStringOr(name, default_value ? "true" : "false");
-    if (raw_value == "1" || raw_value == "true" || raw_value == "TRUE" ||
-        raw_value == "True") {
-        return true;
-    }
-    if (raw_value == "0" || raw_value == "false" || raw_value == "FALSE" ||
-        raw_value == "False") {
-        return false;
-    }
-    return default_value;
+        Environ::GetString(name, default_value ? "true" : "false");
+    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
+                                    .trim_ascii_whitespace = false})
+        .value_or(default_value);
 }
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
@@ -87,9 +202,14 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
         auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
         const int64_t size =
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(key),
-                                        .size = size});
+        const ObjectIncarnation object_incarnation =
+            i < metadatas.size() ? metadatas[i].GetObjectIncarnation()
+                                 : ObjectIncarnation{};
+        tasks.push_back(
+            OffloadTaskItem{.tenant_id = tenant_id.value(),
+                            .key = std::move(key),
+                            .size = size,
+                            .object_incarnation = object_incarnation});
     }
     return tasks;
 }
@@ -100,8 +220,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
     auto storage_backend_descriptor =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                       "bucket_storage_backend");
+        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                           "bucket_storage_backend");
 
     if (storage_backend_descriptor == "bucket_storage_backend") {
         config.storage_backend_type = StorageBackendType::kBucket;
@@ -116,32 +236,32 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         LOG(ERROR) << "Unknown storage backend.";
     }
 
-    config.storage_filepath = GetEnvStringOr(
+    config.storage_filepath = Environ::GetString(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
 
-    config.local_buffer_size = GetEnvOr<int64_t>(
+    config.local_buffer_size = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.scanmeta_iterator_keys_limit = GetEnvOr<int64_t>(
+    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
+        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
                           config.scanmeta_iterator_keys_limit));
 
-    config.total_keys_limit = GetEnvOr<int64_t>(
+    config.total_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
 
-    config.total_size_limit = GetEnvOr<int64_t>(
+    config.total_size_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
 
     config.heartbeat_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
                            config.heartbeat_interval_seconds);
     config.client_buffer_gc_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
                            config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
-        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
 
     config.enable_disk_watermark_eviction =
@@ -156,10 +276,13 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                       "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
                       config.disk_eviction_low_watermark_ratio);
 
-    auto use_uring_str =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
-                       GetEnvStringOr("MOONCAKE_USE_URING", "false"));
-    config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
+    const auto use_uring_str =
+        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
+                           Environ::GetString("MOONCAKE_USE_URING", "false"));
+    config.use_uring =
+        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
+                                     .trim_ascii_whitespace = false})
+            .value_or(false);
 
     return config;
 }
@@ -318,6 +441,12 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    storage_backend_.reset();
+    if (local_disk_lock_fd_ >= 0) {
+        ::flock(local_disk_lock_fd_, LOCK_UN);
+        ::close(local_disk_lock_fd_);
+        local_disk_lock_fd_ = -1;
+    }
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -327,10 +456,29 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                    << register_memory_result.error();
         return register_memory_result;
     }
+    if (config_.storage_backend_type == StorageBackendType::kBucket) {
+        auto identity =
+            LoadOrCreateLocalDiskSegmentId(config_.storage_filepath);
+        if (!identity) {
+            return tl::unexpected(identity.error());
+        }
+        local_disk_segment_id_ = std::move(identity.value());
+        auto disk_lock = AcquireLocalDiskLock(config_.storage_filepath);
+        if (!disk_lock) {
+            return tl::unexpected(disk_lock.error());
+        }
+        local_disk_lock_fd_ = disk_lock.value();
+        local_disk_capabilities_ = kLocalDiskCapabilityObjectTombstoneV1;
+    }
     auto init_storage_backend_result = storage_backend_->Init();
     if (!init_storage_backend_result) {
         LOG(ERROR) << "Failed to init storage backend: "
                    << init_storage_backend_result.error();
+        if (local_disk_lock_fd_ >= 0) {
+            ::flock(local_disk_lock_fd_, LOCK_UN);
+            ::close(local_disk_lock_fd_);
+            local_disk_lock_fd_ = -1;
+        }
         return init_storage_backend_result;
     }
     auto enable_offloading_result = IsEnableOffloading();
@@ -349,13 +497,16 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
-        auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+        auto mount_file_storage_result = client_->MountLocalDiskSegment(
+            enable_offloading_, local_disk_segment_id_,
+            local_disk_capabilities_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
-            return mount_file_storage_result;
+            return tl::unexpected(mount_file_storage_result.error());
         }
+        local_disk_mount_epoch_ = mount_file_storage_result->mount_epoch;
+        local_disk_capabilities_ = mount_file_storage_result->capabilities;
     }
     // Report configured SSD capacity to Master so it can populate
     // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
@@ -372,18 +523,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     auto scan_meta_result = storage_backend_->ScanMeta(
         [this](const std::vector<std::string>& keys,
                std::vector<StorageObjectMetadata>& metadatas) {
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
-            if (!add_object_result) {
-                LOG(ERROR) << "Failed to add object to master: "
-                           << add_object_result.error();
-                return add_object_result.error();
-            }
-            return ErrorCode::OK;
+            return ReconcileScannedObjects(keys, metadatas);
         });
 
     if (!scan_meta_result) {
@@ -412,72 +552,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
-    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool breakdown_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
-    const uint64_t total_bytes =
-        std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
-    uint64_t alloc_us = 0;
-    StorageReadStats read_stats;
-    auto log_breakdown = [&](const char* fallback_status,
-                             ErrorCode fallback_error) {
-        if (!breakdown_log) return;
-        const auto total_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - start_time)
-                .count();
-        const char* status =
-            read_stats.status == "ok" ? fallback_status
-                                      : read_stats.status.c_str();
-        const ErrorCode error =
-            read_stats.error_code == ErrorCode::OK ? fallback_error
-                                                   : read_stats.error_code;
-        MC_LOG(INFO) << "storage_read_breakdown num_keys=" << keys.size()
-                     << " total_bytes=" << total_bytes
-                     << " alloc_us=" << alloc_us
-                     << " plan_us=" << read_stats.plan_us
-                     << " file_open_us=" << read_stats.file_open_us
-                     << " disk_read_us=" << read_stats.disk_read_us
-                     << " total_us=" << total_us
-                     << " slowest_key=" << read_stats.slowest_key
-                     << " slowest_disk_read_us="
-                     << read_stats.slowest_disk_read_us
-                     << " io_mode=" << read_stats.io_mode
-                     << " status=" << status
-                     << " error_key=" << read_stats.error_key
-                     << " error_code=" << static_cast<int>(error);
-    };
-    // Owner-side SSD read total (OwnerSsdRead); broken down into buffer
-    // allocation (OwnerAllocBuffer) and disk load (OwnerDiskLoad). End() is on
-    // the success path only — the error early-returns let the dtor Abandon the
-    // unfinished total sample.
-    SpDiag::PerfPoint pt_read(PerfKey::GET_SSD_OWNER_READ,
-                              SpDiag::PerfLevel::MODULE);
-    pt_read.Start();
-    SpDiag::PerfPoint pt_alloc(PerfKey::GET_SSD_OWNER_ALLOC,
-                               SpDiag::PerfLevel::MODULE);
-    pt_alloc.Start();
-    const auto alloc_start = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
-    alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                   std::chrono::steady_clock::now() - alloc_start)
-                   .count();
-    pt_alloc.End(allocate_res ? 0 : -1);
     if (!allocate_res) {
         LOG(ERROR) << "Failed to allocate batch objects";
-        log_breakdown("alloc_fail", allocate_res.error());
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = allocate_res.value();
-    SpDiag::PerfPoint pt_load(PerfKey::GET_SSD_OWNER_LOAD,
-                              SpDiag::PerfLevel::MODULE);
-    pt_load.Start();
-    ScopedStorageReadStats stats_scope(breakdown_log ? &read_stats : nullptr);
     auto result = BatchLoad(allocated_batch->slices);
-    pt_load.End(result ? 0 : -1);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
-        log_breakdown("read_fail", result.error());
         return tl::make_unexpected(result.error());
     }
 
@@ -504,9 +587,12 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
-    log_breakdown("ok", ErrorCode::OK);
-    pt_read.End(0);
     return batch_result;
+}
+
+bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
+    return error == ErrorCode::INVALID_READ ||
+           error == ErrorCode::OBJECT_ALREADY_EXISTS;
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -515,13 +601,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return {};
     }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
+    std::unordered_map<std::string, ObjectIncarnation> object_incarnations;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
+    object_incarnations.reserve(offloading_objects.size());
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
             TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
+        object_incarnations.emplace(storage_key, task.GetObjectIncarnation());
         task_by_storage_key.emplace(storage_key, task);
     }
 
@@ -529,7 +618,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, &object_incarnations);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -543,23 +632,27 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         buckets_keys.emplace_back(std::move(keys));
     }
+
     auto complete_handler =
         [this, &task_by_storage_key](
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
-        for (auto& metadata : metadatas) {
-            metadata.transport_endpoint = local_rpc_addr_;
-        }
         std::vector<OffloadTaskItem> tasks;
         tasks.reserve(keys.size());
-        for (const auto& key : keys) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto& key = keys[i];
             auto it = task_by_storage_key.find(key);
             if (it == task_by_storage_key.end()) {
                 LOG(ERROR) << "Offload task not found for storage key";
                 return ErrorCode::INVALID_KEY;
             }
             tasks.push_back(it->second);
+            if (i < metadatas.size()) {
+                metadatas[i].transport_endpoint = local_rpc_addr_;
+                metadatas[i].object_incarnation =
+                    it->second.GetObjectIncarnation();
+            }
         }
         auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
@@ -575,6 +668,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // orphaned offloading_tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
+    // Set when a whole-cycle error aborts the bucket loop early. We still fall
+    // through to the NACK flush below before returning it, so no drained key is
+    // left waiting on the TTL reaper.
+    std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
@@ -652,6 +749,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
 
+        // If every object in this bucket failed D2H staging, host_batch_object
+        // is empty (those keys are already in failed_tasks). Skip BatchOffload,
+        // which rejects an empty map as INVALID_KEY and would otherwise trip
+        // the whole-cycle abort below for a bucket that has nothing left to
+        // persist. staging_bufs can still be non-empty here (an object whose
+        // first slices copied fine but a later one failed), so hand those
+        // buffers back before continuing: the release loop after BatchOffload
+        // is unreachable on this path.
+        if (host_batch_object.empty()) {
+            for (auto& buf : staging_bufs) {
+                pinned_buffer_pool_->Release(std::move(buf));
+            }
+            continue;
+        }
+
         auto offload_start = std::chrono::steady_clock::now();
         auto bucket_complete_handler =
             [this, offload_start, complete_handler](
@@ -691,18 +803,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
+            // This bucket did not persist, so report its keys back to the
+            // master as failed regardless of whether we continue or abort.
+            // Doing it here (rather than only on the soft path) keeps their
+            // offloading tasks and source-replica refcounts from leaking until
+            // the put_start_release_timeout_sec_ TTL reaper fires.
+            for (const auto& [key, _] : host_batch_object) {
+                failed_tasks.push_back(task_by_storage_key.at(key));
+            }
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                // Disk is over the key-count limit: stop offloading entirely.
                 MutexLocker locker(&offloading_mutex_);
                 enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() == ErrorCode::INVALID_READ) {
-                for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key.at(key));
-                }
-            } else {
-                return tl::make_unexpected(offload_res.error());
+            if (!IsPerBucketSoftOffloadError(offload_res.error())) {
+                // Whole-cycle error (KEYS_ULTRA_LIMIT or any hard failure):
+                // stop processing further buckets, but fall through to the NACK
+                // flush below so every drained key is released. Unvisited
+                // buckets are not yet in all_bucket_keys, so the sweep NACKs
+                // them too; this bucket's keys were just pushed above.
+                abort_error = offload_res.error();
+                break;
             }
+            // Soft per-bucket error: keep processing the remaining buckets.
         }
     }
 
@@ -718,7 +841,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         std::vector<StorageObjectMetadata> failed_metadatas;
         failed_metadatas.reserve(failed_tasks.size());
         for (size_t i = 0; i < failed_tasks.size(); ++i) {
-            failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
+            failed_metadatas.push_back(
+                StorageObjectMetadata{-1, 0, 0, -1, "", {}});
         }
         auto result =
             client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
@@ -728,7 +852,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                          << result.error() << " count: " << failed_tasks.size();
         }
     }
-
+    if (abort_error) {
+        return tl::make_unexpected(*abort_error);
+    }
     return {};
 }
 
@@ -786,6 +912,15 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
         return {};
     }
 
+    // Reclaim dead records before evicting live LOCAL_DISK replicas. The
+    // backend only signals its GC worker here; no compaction I/O runs on the
+    // heartbeat thread.
+    if (storage_backend_->GetReclaimableBytes() > 0 &&
+        storage_backend_->RequestGarbageCollection(
+            /* require_disk_pressure = */ true)) {
+        return {};
+    }
+
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         config_.disk_eviction_high_watermark_ratio,
         config_.disk_eviction_low_watermark_ratio,
@@ -815,16 +950,6 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     return enable_offloading;
 }
 
-tl::expected<void, ErrorCode> FileStorage::MarkRemoved(
-    const std::string& key) {
-    return storage_backend_->MarkRemoved(key);
-}
-
-tl::expected<void, ErrorCode> FileStorage::BatchMarkRemoved(
-    const std::vector<std::string>& keys) {
-    return storage_backend_->BatchMarkRemoved(keys);
-}
-
 tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
@@ -851,41 +976,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         });
     }
 
-    // === STEP 0: Drain removed keys from master ===
-    // Master pushes {tenant_id, key} pairs to this client's removed_keys
-    // queue when a Remove/BatchRemove deletes a key that had a LOCAL_DISK
-    // replica here. We mark each as a tombstone so GC can reclaim SSD space.
-    {
-        auto remove_result =
-            client_->RemoveObjectHeartbeat(client_->getClientId());
-        if (remove_result) {
-            bool all_marked = true;
-            for (const auto& item : remove_result.value()) {
-                auto storage_key =
-                    TenantId(item.tenant_id).MakeScopedKey(item.key);
-                auto mark_result = storage_backend_->MarkRemoved(storage_key);
-                if (!mark_result) {
-                    all_marked = false;
-                    LOG(ERROR) << "Failed to persist remove tombstone: "
-                               << mark_result.error();
-                    break;
-                }
-            }
-            if (all_marked && !remove_result.value().empty()) {
-                auto ack_result = client_->AckRemoveObjectHeartbeat(
-                    client_->getClientId(), remove_result.value());
-                if (!ack_result) {
-                    LOG(ERROR) << "Failed to ACK remove tasks: "
-                               << ack_result.error();
-                }
-                VLOG(1) << "RemoveObjectHeartbeat processed "
-                        << remove_result.value().size()
-                        << " removed key(s) from master";
-            }
-        }
-        // Errors are non-fatal: removed keys will be retried next heartbeat.
-    }
-
     std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
 
@@ -904,9 +994,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = client_->MountLocalDiskSegment(
+                    enable_offloading_, local_disk_segment_id_,
+                    local_disk_capabilities_);
                 if (remount_result) {
+                    local_disk_mount_epoch_ = remount_result->mount_epoch;
+                    local_disk_capabilities_ = remount_result->capabilities;
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
                     // "SSD Storage: X / Y").  This was lost on restart;
@@ -976,6 +1069,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
 
+    auto delete_result = ProcessLocalDeleteTasks();
+    if (!delete_result) {
+        LOG(WARNING) << "LOCAL_DISK delete processing failed: "
+                     << delete_result.error();
+    }
+
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
     // promotion is best-effort and must never break offload.
@@ -990,6 +1089,116 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                      << disk_eviction_result.error();
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessLocalDeleteTasks() {
+    if (client_ == nullptr || local_disk_segment_id_.empty() ||
+        (local_disk_capabilities_ & kLocalDiskCapabilityObjectTombstoneV1) ==
+            0) {
+        return {};
+    }
+
+    constexpr uint32_t kDeleteBatchLimit = 128;
+    std::vector<LocalDeleteTask> tasks;
+    auto fetch = client_->FetchLocalDeleteTasks(local_disk_segment_id_,
+                                                local_disk_mount_epoch_,
+                                                kDeleteBatchLimit, tasks);
+    if (!fetch || tasks.empty()) {
+        return fetch;
+    }
+
+    for (auto& task : tasks) {
+        task.key = TenantId(task.tenant_id).MakeScopedKey(task.key);
+    }
+    const auto results = storage_backend_->BatchMarkDeleted(tasks);
+    if (results.size() != tasks.size()) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<LocalDeleteTaskId> terminal_task_ids;
+    terminal_task_ids.reserve(results.size());
+    bool tombstone_created = false;
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& result = results[i];
+        const auto& task = tasks[i];
+        VLOG(1) << "LOCAL_DISK delete task=" << task.task_id.high << "-"
+                << task.task_id.low
+                << ", storage_id=" << task.local_disk_segment_id
+                << ", tenant=" << task.tenant_id
+                << ", key_hash=" << std::hash<std::string>{}(task.key)
+                << ", incarnation=" << task.object_incarnation.high << "-"
+                << task.object_incarnation.low
+                << ", bucket=" << task.expected_bucket_id
+                << ", result=" << LocalDeleteResultLabel(result.result);
+        if (result.IsTerminal()) {
+            terminal_task_ids.push_back(result.task_id);
+        }
+        tombstone_created |= result.result == LocalDeleteResult::kRemoved;
+    }
+    if (tombstone_created) {
+        storage_backend_->RequestGarbageCollection();
+    }
+    if (terminal_task_ids.empty()) {
+        return {};
+    }
+    return client_->AckLocalDeleteTasks(
+        local_disk_segment_id_, local_disk_mount_epoch_, terminal_task_ids);
+}
+
+ErrorCode FileStorage::ReconcileScannedObjects(
+    const std::vector<std::string>& keys,
+    std::vector<StorageObjectMetadata>& metadatas) {
+    for (auto& metadata : metadatas) {
+        metadata.transport_endpoint = local_rpc_addr_;
+    }
+    auto objects = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+    if (local_disk_segment_id_.empty() ||
+        (local_disk_capabilities_ & kLocalDiskCapabilityObjectTombstoneV1) ==
+            0) {
+        auto notify = client_->NotifyOffloadSuccess(objects, metadatas);
+        return notify ? ErrorCode::OK : notify.error();
+    }
+    auto decisions = client_->ReconcileLocalDiskObjects(
+        local_disk_segment_id_, local_disk_mount_epoch_, objects);
+    if (!decisions || decisions->size() != objects.size()) {
+        return decisions ? ErrorCode::INTERNAL_ERROR : decisions.error();
+    }
+
+    std::vector<LocalDeleteTask> stale;
+    std::vector<OffloadTaskItem> retained_objects;
+    std::vector<StorageObjectMetadata> retained_metadatas;
+    for (size_t i = 0; i < objects.size(); ++i) {
+        if ((*decisions)[i] != 0) {
+            retained_objects.push_back(objects[i]);
+            retained_metadatas.push_back(metadatas[i]);
+            continue;
+        }
+        stale.push_back(LocalDeleteTask{
+            .task_id = GenerateLocalDeleteTaskId(),
+            .local_disk_segment_id = local_disk_segment_id_,
+            .tenant_id = objects[i].tenant_id,
+            .key = TenantId(objects[i].tenant_id).MakeScopedKey(objects[i].key),
+            .object_incarnation = objects[i].GetObjectIncarnation(),
+            .expected_bucket_id = metadatas[i].bucket_id,
+        });
+    }
+
+    bool tombstone_created = false;
+    for (const auto& result : storage_backend_->BatchMarkDeleted(stale)) {
+        if (!result.IsTerminal()) {
+            return result.error;
+        }
+        tombstone_created |= result.result == LocalDeleteResult::kRemoved;
+    }
+    if (tombstone_created) {
+        storage_backend_->RequestGarbageCollection();
+    }
+    if (retained_objects.empty()) {
+        return ErrorCode::OK;
+    }
+    auto notify =
+        client_->NotifyOffloadSuccess(retained_objects, retained_metadatas);
+    return notify ? ErrorCode::OK : notify.error();
 }
 
 void FileStorage::RemoveAll() {
@@ -1214,9 +1423,15 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
+    // The buffer pool backs SSD-offload read results that are fetched by
+    // remote peers via RDMA READ.  It must therefore be registered with
+    // remote_accessible=true so its BufferDesc publishes an rkey; otherwise
+    // every remote read of an offloaded object fails with "No rkey for MR
+    // access" (the pool is only reachable through the address-range lookup,
+    // and with remote_accessible=false the rkey array is left empty).
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, true);
+        kWildcardLocation, true, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
@@ -1327,36 +1542,17 @@ void FileStorage::ClientBufferGCThreadFunc() {
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
-    // Owner-side ClientBuffer release (OwnerReleaseBuffer); shared by the pull
-    // path (release_offload_buffer RPC) and the push path (inline after WRITE).
-    SpDiag::PerfPoint pt_release(PerfKey::GET_SSD_OWNER_RELEASE,
-                                 SpDiag::PerfLevel::MODULE);
-    pt_release.Start();
-    const auto start = std::chrono::steady_clock::now();
-    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
-        mooncake::logging::CurrentTraceId());
     MutexLocker locker(&client_buffer_mutex_);
     auto it = client_buffer_allocated_batches_.find(batch_id);
-    const bool found = it != client_buffer_allocated_batches_.end();
-    if (found) {
+    if (it != client_buffer_allocated_batches_.end()) {
         VLOG(1) << "Releasing buffer for batch_id: " << batch_id
                 << " (transfer completed)";
         client_buffer_allocated_batches_.erase(it);
-    } else {
-        VLOG(1) << "batch_id " << batch_id
-                << " not found (may have been GC'd already)";
+        return true;
     }
-    const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                              std::chrono::steady_clock::now() - start)
-                              .count();
-    if (breakdown_log) {
-        MC_LOG(INFO) << "storage_release_breakdown batch_id=" << batch_id
-                     << " total_us=" << total_us
-                     << " found=" << (found ? 1 : 0)
-                     << " status=" << (found ? "ok" : "not_found");
-    }
-    pt_release.End(found ? 0 : -1);
-    return found;
+    VLOG(1) << "batch_id " << batch_id
+            << " not found (may have been GC'd already)";
+    return false;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
@@ -1372,33 +1568,24 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     storage_backend_->ResetScanIterator();
     LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
                  "storage_backend_->ScanMeta()";
-    auto scan_meta_result =
-        storage_backend_->ScanMeta(
-            [this, &total_keys, &total_batches, &total_failures](
-                const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metadatas) {
-                total_batches++;
-                total_keys += keys.size();
-                for (auto& metadata : metadatas) {
-                    metadata.transport_endpoint = local_rpc_addr_;
-                }
-                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-                auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
-                if (!add_object_result) {
-                    total_failures++;
-                    LOG(ERROR)
-                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                        << "failed for batch " << total_batches << " with "
-                        << keys.size()
-                        << " keys, error: " << add_object_result.error();
-                    return add_object_result.error();
-                }
-                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                          << "succeeded for batch " << total_batches << " with "
-                          << keys.size() << " keys";
-                return ErrorCode::OK;
-            });
+    auto scan_meta_result = storage_backend_->ScanMeta(
+        [this, &total_keys, &total_batches, &total_failures](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) {
+            total_batches++;
+            total_keys += keys.size();
+            const auto reconcile = ReconcileScannedObjects(keys, metadatas);
+            if (reconcile != ErrorCode::OK) {
+                total_failures++;
+                LOG(ERROR) << "ReRegisterOffloadedObjects: reconciliation "
+                           << "failed for batch " << total_batches << " with "
+                           << keys.size() << " keys, error: " << reconcile;
+                return reconcile;
+            }
+            LOG(INFO) << "ReRegisterOffloadedObjects: reconciled batch "
+                      << total_batches << " with " << keys.size() << " keys";
+            return ErrorCode::OK;
+        });
 
     LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
               << scan_meta_result.has_value();
