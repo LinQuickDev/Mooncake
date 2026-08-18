@@ -3606,9 +3606,14 @@ std::vector<LocalDeleteTaskResult> BucketStorageBackend::BatchMarkDeleted(
             if (active_it == buckets_.end() || active_it->second != bucket) {
                 for (size_t index : indexes) {
                     results[index] = {tasks[index].task_id,
-                                      LocalDeleteResult::kStaleVersion,
-                                      ErrorCode::OK};
+                                      LocalDeleteResult::kRetryableFailure,
+                                      ErrorCode::INTERNAL_ERROR};
                 }
+                // GC may have relocated the same incarnation into a
+                // replacement bucket after the initial resolution. Do not
+                // report StaleVersion here: the caller would ACK the task and
+                // lose the delete intent. Returning a retryable result makes
+                // the next fetch resolve object_bucket_map_ again.
                 continue;
             }
             bool expected = false;
@@ -3673,8 +3678,17 @@ std::vector<LocalDeleteTaskResult> BucketStorageBackend::BatchMarkDeleted(
             SharedMutexLocker lock(&mutex_);
             auto active_it = buckets_.find(bucket_id);
             if (active_it == buckets_.end() || active_it->second != bucket) {
+                for (size_t index : changed_indexes) {
+                    results[index] = {tasks[index].task_id,
+                                      LocalDeleteResult::kRetryableFailure,
+                                      ErrorCode::INTERNAL_ERROR};
+                }
                 bucket->mutation_in_progress_.store(false,
                                                     std::memory_order_release);
+                // The bucket was replaced while the metadata rewrite was in
+                // flight. The durable result cannot be associated with the
+                // active bucket, so leave all tasks pending for re-resolution
+                // instead of ACKing kRemoved against a stale bucket.
                 continue;
             }
             total_size_ += updated.meta_size - bucket->meta_size;
