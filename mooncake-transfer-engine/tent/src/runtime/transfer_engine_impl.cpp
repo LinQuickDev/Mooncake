@@ -329,7 +329,8 @@ Status TransferEngineImpl::construct() {
 
     topology_ = std::make_shared<Topology>();
     auto loader = &Platform::getLoader(conf_);
-    CHECK_STATUS(topology_->discover({loader}));
+    CHECK_STATUS(topology_->discover(
+        {loader}, conf_->get("transports/ub/enable", false)));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
