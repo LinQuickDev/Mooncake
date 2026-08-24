@@ -23,6 +23,7 @@ struct BufferKey {
 struct RequestBoundaryInfo {
     std::optional<BufferKey> source_key;
     std::optional<BufferKey> target_key;
+    std::optional<uint64_t> receiver_credit_data_capacity;
 };
 
 struct MergeResult {
