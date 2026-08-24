@@ -38,6 +38,9 @@ class EndpointStore final {
     // therefore cannot evict a replacement generation N+1.
     bool retire(const UbEndpointKey& key, uint64_t generation);
     bool retire(const std::shared_ptr<UbEndpoint>& endpoint);
+    // Atomically unpublishes every endpoint backed by a failed local device.
+    // Cleanup errors are quarantined for clear()/shutdown retry.
+    Status retireLocalDevice(Topology::NicID local_topology_id);
     Status clear();
     [[nodiscard]] size_t size() const;
 
@@ -46,6 +49,12 @@ class EndpointStore final {
         std::shared_ptr<UbEndpoint> endpoint;
         uint64_t insertion_order{0};
     };
+
+    // Called with mutex_ held. Native retirement remains under the store lock
+    // so another failure-progress poll cannot observe an endpoint in the gap
+    // between unpublication and quarantine insertion.
+    Status retireLocked(std::shared_ptr<UbEndpoint>& endpoint);
+    Status retryQuarantinedLocked();
 
     std::shared_ptr<UrmaAdapter> adapter_;
     const size_t max_size_;

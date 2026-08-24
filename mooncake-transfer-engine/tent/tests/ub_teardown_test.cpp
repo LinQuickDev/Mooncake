@@ -13,6 +13,8 @@
 
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/endpoint.h"
+#include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/topology_attrs.h"
 
 namespace mooncake::tent::ub {
@@ -527,6 +529,134 @@ TEST(UbTeardown, ContextShutdownRetainsContextAfterCloseFailure) {
     EXPECT_EQ(context->state(), UbContext::State::kClosed);
     EXPECT_FALSE(context->handle());
     EXPECT_EQ(adapter->live_contexts, 0);
+}
+
+TEST(UbTeardown, ContextRequiresCleanupDrainAndEveryJfcBeforeRecovery) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0, 2);
+
+    context->addInflight(64);
+    EXPECT_TRUE(context->markUnavailable());
+    EXPECT_FALSE(context->markUnavailable());
+    EXPECT_EQ(context->state(), UbContext::State::kFailed);
+    EXPECT_FALSE(context->recordPollSuccess(0, 0));
+    context->completeFailureCleanup();
+    EXPECT_FALSE(context->recordPollSuccess(0, 0));
+    context->removeInflight(64);
+    EXPECT_FALSE(context->recordPollSuccess(0, 0));
+    EXPECT_TRUE(context->recordPollSuccess(1, 0));
+    EXPECT_TRUE(context->active());
+    EXPECT_EQ(context->recoveryCount(), 1u);
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
+TEST(UbTeardown, NewPollErrorInvalidatesEarlierJfcHealth) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0, 2);
+
+    ASSERT_TRUE(context->markUnavailable());
+    const uint64_t failure_started_ns = context->failureStartedNs();
+    ASSERT_NE(failure_started_ns, 0U);
+    context->completeFailureCleanup();
+    EXPECT_FALSE(context->recordPollSuccess(0, 0));
+    EXPECT_FALSE(context->markUnavailable());
+    EXPECT_EQ(context->failureStartedNs(), failure_started_ns);
+    EXPECT_FALSE(context->recordPollSuccess(1, 0));
+    EXPECT_TRUE(context->recordPollSuccess(0, 0));
+    EXPECT_TRUE(context->active());
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
+TEST(UbTeardown, EndpointStoreUnpublishesEveryEndpointForFailedDevice) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    EndpointStore store(adapter, 8, 1);
+    std::shared_ptr<UbEndpoint> first;
+    std::shared_ptr<UbEndpoint> second;
+    ASSERT_TRUE(store
+                    .getOrCreate(UbEndpointKey{0, 123, 8, "peer/ub:test:8"},
+                                 context, first)
+                    .ok());
+    ASSERT_TRUE(store
+                    .getOrCreate(UbEndpointKey{0, 123, 9, "peer/ub:test:9"},
+                                 context, second)
+                    .ok());
+    ASSERT_EQ(store.size(), 2u);
+
+    UbBootstrapDesc peer;
+    peer.protocol_version = 1;
+    peer.local_eid = makeDevice(8).eid;
+    peer.endpoint_generation = 7;
+    peer.jetty_ids = {11};
+    ASSERT_TRUE(first->bind(peer).ok());
+    ASSERT_TRUE(first->tryAcquireOutstanding(64));
+
+    EXPECT_TRUE(context->markUnavailable());
+    EXPECT_TRUE(store.retireLocalDevice(0).IsTooManyRequests());
+    EXPECT_EQ(store.size(), 0u);
+    EXPECT_EQ(first->state(), UbEndpoint::State::kDestroying);
+    EXPECT_EQ(second->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_FALSE(context->recordPollSuccess(0, 0));
+
+    adapter->delete_jetty_failures = 2;
+    first->releaseOutstanding(64);
+    EXPECT_EQ(first->state(), UbEndpoint::State::kDestroying);
+    EXPECT_FALSE(store.retireLocalDevice(0).ok());
+    EXPECT_TRUE(store.retireLocalDevice(0).ok());
+    context->completeFailureCleanup();
+    EXPECT_TRUE(context->recordPollSuccess(0, 0));
+    EXPECT_EQ(first->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_TRUE(store.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
+TEST(UbTeardown, EndpointRetireRetainsJettyAfterDeleteFailure) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:test:9"}, context, adapter, 1);
+    ASSERT_TRUE(endpoint->prepare().ok());
+    ASSERT_EQ(endpoint->state(), UbEndpoint::State::kPrepared);
+    ASSERT_EQ(endpoint->jettyCount(), 1u);
+
+    adapter->delete_jetty_failures = 1;
+    EXPECT_FALSE(endpoint->retire().ok());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kDestroying);
+    EXPECT_EQ(endpoint->jettyCount(), 1u);
+    EXPECT_TRUE(endpoint->jetty(0));
+
+    EXPECT_TRUE(endpoint->retire().ok());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_EQ(endpoint->jettyCount(), 0u);
+    EXPECT_EQ(adapter->delete_jetty_calls, 2);
+    endpoint.reset();
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
+TEST(UbTeardown, EndpointStoreReapsQuarantineBeforeReplacementAtCapacity) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    EndpointStore store(adapter, 1, 1);
+    const UbEndpointKey old_key{0, 123, 8, "peer/ub:test:8"};
+    std::shared_ptr<UbEndpoint> old_endpoint;
+    ASSERT_TRUE(store.getOrCreate(old_key, context, old_endpoint).ok());
+
+    adapter->delete_jetty_failures = 1;
+    EXPECT_TRUE(store.retire(old_endpoint));
+    EXPECT_EQ(old_endpoint->state(), UbEndpoint::State::kDestroying);
+    EXPECT_EQ(store.size(), 0u);
+
+    std::shared_ptr<UbEndpoint> replacement;
+    ASSERT_TRUE(store
+                    .getOrCreate(UbEndpointKey{0, 123, 9, "peer/ub:test:9"},
+                                 context, replacement)
+                    .ok());
+    EXPECT_EQ(old_endpoint->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_NE(replacement, old_endpoint);
+    EXPECT_EQ(store.size(), 1u);
+
+    EXPECT_TRUE(store.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
 }
 
 }  // namespace

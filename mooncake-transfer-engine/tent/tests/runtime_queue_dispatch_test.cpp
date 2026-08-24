@@ -460,7 +460,14 @@ TEST(RuntimeQueueDispatch, RejectsCancellationForUnsupportedTransport) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::atomic<bool> complete{false};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&complete](const Request& request, int) {
+            return complete.load(std::memory_order_acquire)
+                       ? TransferStatus{TransferStatusEnum::COMPLETED,
+                                        request.length}
+                       : TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
     fake_rdma->cancellation_supported = false;
     installFakeRdma(engine, fake_rdma);
 
@@ -476,6 +483,7 @@ TEST(RuntimeQueueDispatch, RejectsCancellationForUnsupportedTransport) {
     EXPECT_TRUE(engine.cancelTransfer(batch, 0).IsNotImplemented());
     EXPECT_EQ(fake_rdma->cancel_calls.load(), 0);
 
+    complete.store(true, std::memory_order_release);
     TransferStatus status{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);

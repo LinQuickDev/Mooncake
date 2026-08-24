@@ -43,6 +43,55 @@ struct EndpointResolveRequest {
 using EndpointResolver = std::function<Status(const EndpointResolveRequest&,
                                               std::shared_ptr<UbEndpoint>&)>;
 using EndpointRetirer = std::function<void(const std::shared_ptr<UbEndpoint>&)>;
+using LocalDeviceFailureHandler =
+    std::function<Status(Topology::NicID local_topology_id)>;
+
+// Lexicographic path score. Capacity is a hard preference, topology locality
+// remains the primary policy choice, and live pressure breaks ties before
+// learned bandwidth. The deterministic tail makes concurrent workers agree on
+// an order while retry_order rotates otherwise-equivalent rails on retry.
+struct UbPathSelectionScore {
+    bool quota_available{false};
+    size_t topology_rank{Topology::DevicePriorityRanks};
+    double normalized_inflight{1.0};
+    double normalized_quota_wrs{1.0};
+    uint64_t endpoint_outstanding_wrs{0};
+    uint64_t endpoint_outstanding_bytes{0};
+    bool has_bandwidth_sample{false};
+    double ewma_bandwidth_bytes_per_second{-1.0};
+    size_t retry_order{0};
+    Topology::NicID local_topology_id{-1};
+    int remote_device_id{-1};
+};
+
+[[nodiscard]] inline bool betterUbPathScore(
+    const UbPathSelectionScore& lhs, const UbPathSelectionScore& rhs) noexcept {
+    if (lhs.quota_available != rhs.quota_available) return lhs.quota_available;
+    if (lhs.topology_rank != rhs.topology_rank)
+        return lhs.topology_rank < rhs.topology_rank;
+    if (lhs.normalized_inflight != rhs.normalized_inflight)
+        return lhs.normalized_inflight < rhs.normalized_inflight;
+    if (lhs.normalized_quota_wrs != rhs.normalized_quota_wrs)
+        return lhs.normalized_quota_wrs < rhs.normalized_quota_wrs;
+    if (lhs.endpoint_outstanding_wrs != rhs.endpoint_outstanding_wrs) {
+        return lhs.endpoint_outstanding_wrs < rhs.endpoint_outstanding_wrs;
+    }
+    if (lhs.endpoint_outstanding_bytes != rhs.endpoint_outstanding_bytes) {
+        return lhs.endpoint_outstanding_bytes < rhs.endpoint_outstanding_bytes;
+    }
+    if (lhs.has_bandwidth_sample != rhs.has_bandwidth_sample)
+        return lhs.has_bandwidth_sample;
+    if (lhs.has_bandwidth_sample && lhs.ewma_bandwidth_bytes_per_second !=
+                                        rhs.ewma_bandwidth_bytes_per_second) {
+        return lhs.ewma_bandwidth_bytes_per_second >
+               rhs.ewma_bandwidth_bytes_per_second;
+    }
+    if (lhs.retry_order != rhs.retry_order)
+        return lhs.retry_order < rhs.retry_order;
+    if (lhs.local_topology_id != rhs.local_topology_id)
+        return lhs.local_topology_id < rhs.local_topology_id;
+    return lhs.remote_device_id < rhs.remote_device_id;
+}
 
 // Native UB scheduler. Posting lanes own request selection and URMA post;
 // poller lanes own completion dispatch. A monotonic numeric token, never a raw
@@ -55,7 +104,8 @@ class UbWorkers final {
               SegmentManager* segment_manager, UbBufferManager* buffers,
               RailMonitor* rail_monitor, QuotaManager* quota, UbParams params,
               EndpointResolver endpoint_resolver,
-              EndpointRetirer endpoint_retirer = {});
+              EndpointRetirer endpoint_retirer = {},
+              LocalDeviceFailureHandler local_device_failure_handler = {});
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -86,6 +136,10 @@ class UbWorkers final {
     };
     struct Route;
     struct Inflight;
+    struct LocalDeviceCandidate {
+        Topology::NicID id{-1};
+        size_t topology_rank{Topology::DevicePriorityRanks};
+    };
 
     void postingLoop(size_t worker_index);
     void pollingLoop(size_t poller_index);
@@ -96,8 +150,11 @@ class UbWorkers final {
     Status buildRoute(const PendingSlice& pending, Route& route);
     Status chooseAndResolveEndpoint(const PendingSlice& pending, Route& route,
                                     std::shared_ptr<UbEndpoint>& endpoint,
-                                    UbPostPath& path);
+                                    UbPostPath& path,
+                                    QuotaReservation& reservation);
     void handleCompletion(const Completion& completion);
+    void handleLocalDeviceFailure(const UbContextPtr& context);
+    void progressLocalDeviceFailure(const UbContextPtr& context);
     void scanTimeouts();
     void releaseInflight(const std::shared_ptr<Inflight>& inflight);
     void resolveInflight(const std::shared_ptr<Inflight>& inflight,
@@ -110,7 +167,7 @@ class UbWorkers final {
     void failUnposted(const PendingSlice& pending,
                       TransferStatusEnum outcome = FAILED);
     uint64_t nextCompletionToken();
-    std::vector<Topology::NicID> orderedLocalDevices(
+    std::vector<LocalDeviceCandidate> orderedLocalDevices(
         const PendingSlice& pending) const;
     static std::vector<Topology::NicID> orderedRemoteDevices(
         const SegmentDesc& segment, const BufferDesc& buffer);
@@ -126,6 +183,12 @@ class UbWorkers final {
     const UbParams params_;
     EndpointResolver endpoint_resolver_;
     EndpointRetirer endpoint_retirer_;
+    LocalDeviceFailureHandler local_device_failure_handler_;
+    // Serializes endpoint-store retirement progress across JFC pollers. The
+    // handler temporarily moves quarantined endpoints out of the store while
+    // retrying cleanup, so a second poller must not observe a false empty
+    // barrier and reactivate the context early.
+    mutable std::mutex local_device_failure_mutex_;
 
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
