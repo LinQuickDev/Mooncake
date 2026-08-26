@@ -304,7 +304,7 @@ VChunkBenchmarkResult RunScenario(const std::string& path, size_t object_size,
         master_metrics.states[static_cast<size_t>(VChunkStatus::ACTIVE)];
     result.creating_objects_after_cleanup =
         master_metrics.states[static_cast<size_t>(VChunkStatus::CREATING)];
-    result.allocator_bytes_after_cleanup = master.GetVChunkAllocatedBytes();
+    result.allocator_bytes_after_cleanup = master_metrics.allocated_bytes;
     result.batch_ids_after_cleanup = data_plane.ActiveBatches();
     result.data_mismatches = mismatches.load();
     if (path == "legacy" && legacy.Size() != 0)
@@ -341,7 +341,8 @@ int main(int argc, char** argv) {
             }
         }
         const auto decision = AnalyzeVChunkBenchmark(
-            results, FLAGS_min_throughput_gain, FLAGS_max_p99_regression);
+            results, FLAGS_min_throughput_gain, FLAGS_max_p99_regression,
+            config.production_equivalent_data_plane);
         const auto report = BuildVChunkBenchmarkReport(config, results, decision);
         Json::StreamWriterBuilder writer;
         writer["indentation"] = "  ";

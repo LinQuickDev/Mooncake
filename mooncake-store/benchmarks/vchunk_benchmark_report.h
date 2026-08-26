@@ -17,6 +17,7 @@ struct VChunkBenchmarkConfig {
     uint64_t seed{0};
     uint32_t failure_every_n{0};
     uint32_t transfer_delay_us{0};
+    bool production_equivalent_data_plane{false};
 };
 
 struct VChunkBenchmarkResult {
@@ -63,7 +64,8 @@ double Percentile(std::vector<double> values, double percentile);
 VChunkBenchmarkDecision AnalyzeVChunkBenchmark(
     const std::vector<VChunkBenchmarkResult>& results,
     double minimum_throughput_gain_ratio,
-    double maximum_p99_regression_ratio);
+    double maximum_p99_regression_ratio,
+    bool production_equivalent_data_plane);
 Json::Value ToJson(const VChunkBenchmarkConfig& config);
 Json::Value ToJson(const VChunkBenchmarkResult& result);
 Json::Value ToJson(const VChunkBenchmarkDecision& decision);

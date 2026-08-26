@@ -9,6 +9,13 @@ size_t SafeKeyId(const TenantId& tenant_id, const std::string& key) {
     return std::hash<std::string>{}(tenant_id.MakeScopedKey(key));
 }
 
+bool CountsForCircuitBreaker(ErrorCode error) {
+    return error == ErrorCode::NO_AVAILABLE_HANDLE ||
+           error == ErrorCode::TRANSFER_FAIL || error == ErrorCode::RPC_TIMEOUT ||
+           error == ErrorCode::ETCD_OPERATION_ERROR ||
+           error == ErrorCode::RPC_FAIL;
+}
+
 }  // namespace
 
 VChunkClient::VChunkClient(bool enabled, MasterService& master,
@@ -41,12 +48,15 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
         return ErrorCode::NO_AVAILABLE_HANDLE;
     }
     if (!source || length == 0 || timeout_.count() <= 0 || !now_ms_) {
+        metrics_->Observe(VChunkOperation::PUT, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
     auto created = master_.VChunkPutStart(tenant_id, key, length, false,
                                            now_ms_());
     if (!created) {
-        consecutive_put_failures_.fetch_add(1);
+        if (CountsForCircuitBreaker(created.error())) {
+            consecutive_put_failures_.fetch_add(1);
+        }
         metrics_->Observe(
             VChunkOperation::PUT, false,
             std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
@@ -59,6 +69,10 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
     const auto deadline = Clock::now() + timeout_;
     ErrorCode transfer = ErrorCode::TRANSFER_FAIL;
     for (uint32_t attempt = 0; attempt <= max_retries_; ++attempt) {
+        if (Clock::now() >= deadline) {
+            transfer = ErrorCode::RPC_TIMEOUT;
+            break;
+        }
         transfer = data_plane_.Write(*created, source, length, deadline);
         if (transfer == ErrorCode::OK ||
             (transfer != ErrorCode::TRANSFER_FAIL &&
@@ -70,13 +84,15 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
         }
     }
     if (transfer != ErrorCode::OK) {
-        for (const auto& slice : created->slices) {
+        if (!created->slices.empty()) {
+            const auto& slice = created->slices.front();
             LOG(ERROR) << "vchunk write failed tenant=" << tenant_id.value()
                        << " key_id=" << SafeKeyId(tenant_id, key)
                        << " vchunk_id=" << created->vchunk_id
                        << " status=" << static_cast<int>(created->status)
                        << " slice_index=" << slice.slice_index
                        << " segment=" << slice.target_segment_name
+                       << " slice_count=" << created->slice_count
                        << " error=" << static_cast<int>(transfer);
         }
         const auto revoke = master_.VChunkPutRevoke(
@@ -121,18 +137,25 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         return legacy_.Get(tenant_id, key, destination, length);
     }
     if (!destination || timeout_.count() <= 0) {
+        metrics_->Observe(VChunkOperation::GET, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
     auto read = master_.AcquireVChunkRead(tenant_id, key);
     if (!read) {
+        metrics_->Observe(VChunkOperation::GET, false, 0);
         return read.error();
     }
     if (read->record().total_size != length) {
+        metrics_->Observe(VChunkOperation::GET, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
     const auto deadline = Clock::now() + timeout_;
     ErrorCode result = ErrorCode::TRANSFER_FAIL;
     for (uint32_t attempt = 0; attempt <= max_retries_; ++attempt) {
+        if (Clock::now() >= deadline) {
+            result = ErrorCode::RPC_TIMEOUT;
+            break;
+        }
         result = data_plane_.Read(read->record(), destination, length, deadline);
         if (result == ErrorCode::OK ||
             (result != ErrorCode::TRANSFER_FAIL &&
@@ -149,7 +172,8 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         metrics_->AddTransferFailure();
     }
     if (result != ErrorCode::OK) {
-        for (const auto& slice : read->record().slices) {
+        if (!read->record().slices.empty()) {
+            const auto& slice = read->record().slices.front();
             LOG(ERROR) << "vchunk read failed tenant=" << tenant_id.value()
                        << " key_id=" << SafeKeyId(tenant_id, key)
                        << " vchunk_id=" << read->record().vchunk_id
@@ -157,6 +181,7 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
                        << static_cast<int>(read->record().status)
                        << " slice_index=" << slice.slice_index
                        << " segment=" << slice.target_segment_name
+                       << " slice_count=" << read->record().slice_count
                        << " error=" << static_cast<int>(result);
         }
     }
@@ -175,6 +200,7 @@ ErrorCode VChunkClient::Remove(const TenantId& tenant_id,
         return legacy_.Remove(tenant_id, key);
     }
     if (!now_ms_) {
+        metrics_->Observe(VChunkOperation::REMOVE, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
     const auto result = master_.RemoveVChunk(tenant_id, key, now_ms_());

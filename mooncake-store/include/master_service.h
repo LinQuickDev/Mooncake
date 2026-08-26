@@ -262,7 +262,6 @@ class MasterService {
     tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
                                                        size_t max_scan);
     VChunkMetricsSnapshot GetVChunkMetrics() const;
-    size_t GetVChunkAllocatedBytes() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is

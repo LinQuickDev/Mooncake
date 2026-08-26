@@ -1,5 +1,7 @@
 #include "vchunk_master_manager.h"
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -38,16 +40,17 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     const auto scoped_key = ScopedKey(tenant_id, key);
     {
         std::lock_guard<std::mutex> guard(mutex_);
-        if (entries_.contains(scoped_key)) {
+        if (entries_.contains(scoped_key) || pending_puts_.contains(scoped_key)) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
         size_t creating = 0;
         for (const auto& [_, entry] : entries_) {
             creating += entry->record.status == VChunkStatus::CREATING;
         }
-        if (creating >= config_.max_creating_objects) {
+        if (creating + pending_puts_.size() >= config_.max_creating_objects) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
+        pending_puts_.insert(scoped_key);
     }
 
     const auto slice_size_level =
@@ -56,12 +59,14 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     if (total_size > std::numeric_limits<uint64_t>::max() - (slice_size - 1) ||
         (total_size + slice_size - 1) / slice_size >
             config_.max_slice_count) {
+        ReleasePendingPut(scoped_key);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     auto allocation = AllocateVChunk(allocator_manager, total_size,
                                      slice_size_level, excluded_segments);
     if (!allocation) {
+        ReleasePendingPut(scoped_key);
         metrics_->AddAllocationFailure();
         return tl::make_unexpected(allocation.error());
     }
@@ -90,18 +95,17 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     }
     const auto serialized = SerializeVChunkMetadata(record, config_);
     if (!serialized) {
+        ReleasePendingPut(scoped_key);
         return tl::make_unexpected(serialized.error());
     }
     if (const auto error = metadata_store_->Put(record);
         error != ErrorCode::OK) {
+        ReleasePendingPut(scoped_key);
         return tl::make_unexpected(error);
     }
 
     std::lock_guard<std::mutex> guard(mutex_);
-    if (entries_.contains(scoped_key)) {
-        metadata_store_->Remove(record);
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-    }
+    pending_puts_.erase(scoped_key);
     const auto snapshot = record;
     entries_.emplace(scoped_key, std::move(entry));
     metrics_->AddSlices(snapshot.slice_count);
@@ -241,17 +245,25 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
         return records.error();
     }
     std::lock_guard<std::mutex> guard(mutex_);
+    // Validate the complete snapshot before mutating the store so recovery is
+    // deterministic even when List() returns records in a different order.
     for (const auto& record : *records) {
         const auto validation = ValidateVChunkMetadata(record, config_);
         if (validation != ErrorCode::OK) {
             return validation;
         }
-        const bool creating_expired =
-            record.status == VChunkStatus::CREATING &&
-            now_ms >= record.last_updated_at_ms &&
-            static_cast<uint64_t>(now_ms - record.last_updated_at_ms) >=
-                config_.creating_timeout_ms;
-        if (creating_expired || record.status == VChunkStatus::RELEASING ||
+        // Allocator reservations are process-local. A persisted ACTIVE record
+        // must never be published until its exact ranges have been reserved
+        // again, otherwise new allocations can overlap it.
+        if (record.status == VChunkStatus::ACTIVE) {
+            return ErrorCode::REPLICA_IS_GONE;
+        }
+    }
+    for (const auto& record : *records) {
+        // CREATING records cannot be resumed safely either: their buffers were
+        // owned by the previous process. Treat all incomplete writes as stale.
+        if (record.status == VChunkStatus::CREATING ||
+            record.status == VChunkStatus::RELEASING ||
             record.status == VChunkStatus::RELEASED ||
             record.status == VChunkStatus::FAILED) {
             const auto error = metadata_store_->Remove(record);
@@ -260,14 +272,6 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
             }
             continue;
         }
-        const auto scoped_key =
-            ScopedKey(TenantId(record.tenant_id), record.key);
-        if (entries_.contains(scoped_key)) {
-            continue;
-        }
-        auto entry = std::make_shared<Entry>();
-        entry->record = record;
-        entries_.emplace(scoped_key, std::move(entry));
     }
     RefreshStateMetricsLocked();
     return ErrorCode::OK;
@@ -281,8 +285,18 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
     std::lock_guard<std::mutex> guard(mutex_);
     size_t scanned = 0;
     size_t removed = 0;
-    for (auto it = entries_.begin(); it != entries_.end() && scanned < max_scan;) {
+    if (entries_.empty()) {
+        reaper_cursor_key_.clear();
+        return removed;
+    }
+    auto it = reaper_cursor_key_.empty() ? entries_.begin()
+                                         : entries_.find(reaper_cursor_key_);
+    if (it == entries_.end()) it = entries_.begin();
+    const size_t scan_limit = std::min(max_scan, entries_.size());
+    while (!entries_.empty() && scanned < scan_limit) {
         ++scanned;
+        auto next = std::next(it);
+        if (next == entries_.end()) next = entries_.begin();
         const auto& record = it->second->record;
         const bool time_is_valid = now_ms >= record.last_updated_at_ms;
         const auto age = time_is_valid
@@ -296,17 +310,20 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
              (record.status == VChunkStatus::RELEASING &&
               age >= config_.releasing_timeout_ms));
         if (!expired) {
-            ++it;
+            it = next;
             continue;
         }
         if (const auto error = metadata_store_->Remove(record);
             error != ErrorCode::OK) {
             return tl::make_unexpected(error);
         }
-        it = entries_.erase(it);
+        entries_.erase(it);
         ++removed;
         metrics_->AddRollback();
+        if (entries_.empty()) break;
+        it = next;
     }
+    reaper_cursor_key_ = entries_.empty() ? std::string() : it->first;
     RefreshStateMetricsLocked();
     return removed;
 }
@@ -315,30 +332,29 @@ VChunkMetricsSnapshot VChunkMasterManager::MetricsSnapshot() const {
     return metrics_->Snapshot();
 }
 
-size_t VChunkMasterManager::AllocatedBytes() const {
-    std::lock_guard<std::mutex> guard(mutex_);
-    size_t bytes = 0;
-    for (const auto& [_, entry] : entries_) {
-        for (const auto& buffer : entry->buffers) {
-            if (buffer) bytes += buffer->size();
-        }
-    }
-    return bytes;
-}
-
 void VChunkMasterManager::RefreshStateMetricsLocked() {
     std::array<uint64_t, 5> counts{};
+    uint64_t allocated_bytes = 0;
     for (const auto& [_, entry] : entries_) {
         ++counts[static_cast<size_t>(entry->record.status)];
+        for (const auto& buffer : entry->buffers) {
+            if (buffer) allocated_bytes += buffer->size();
+        }
     }
     for (size_t i = 0; i < counts.size(); ++i) {
         metrics_->SetStateCount(static_cast<VChunkStatus>(i), counts[i]);
     }
+    metrics_->SetAllocatedBytes(allocated_bytes);
 }
 
 size_t VChunkMasterManager::SizeForTesting() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return entries_.size();
+}
+
+void VChunkMasterManager::ReleasePendingPut(const std::string& scoped_key) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    pending_puts_.erase(scoped_key);
 }
 
 }  // namespace mooncake

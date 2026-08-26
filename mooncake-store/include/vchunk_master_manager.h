@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -67,7 +68,6 @@ class VChunkMasterManager {
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
                                                 size_t max_scan);
     VChunkMetricsSnapshot MetricsSnapshot() const;
-    size_t AllocatedBytes() const;
 
     size_t SizeForTesting() const;
 
@@ -80,12 +80,15 @@ class VChunkMasterManager {
     static std::string ScopedKey(const TenantId& tenant_id,
                                  const std::string& key);
     void RefreshStateMetricsLocked();
+    void ReleasePendingPut(const std::string& scoped_key);
 
     const VChunkConfig config_;
     const std::shared_ptr<VChunkMetadataStore> metadata_store_;
     const std::shared_ptr<VChunkMetrics> metrics_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
+    std::unordered_set<std::string> pending_puts_;
+    std::string reaper_cursor_key_;
 };
 
 }  // namespace mooncake

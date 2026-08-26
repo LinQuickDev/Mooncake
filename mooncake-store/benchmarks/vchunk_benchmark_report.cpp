@@ -20,7 +20,8 @@ double Percentile(std::vector<double> values, double percentile) {
 VChunkBenchmarkDecision AnalyzeVChunkBenchmark(
     const std::vector<VChunkBenchmarkResult>& results,
     double minimum_throughput_gain_ratio,
-    double maximum_p99_regression_ratio) {
+    double maximum_p99_regression_ratio,
+    bool production_equivalent_data_plane) {
     VChunkBenchmarkDecision decision;
     decision.correctness_passed = true;
     decision.cleanup_passed = true;
@@ -62,11 +63,14 @@ VChunkBenchmarkDecision AnalyzeVChunkBenchmark(
     }
     decision.recommend_full_design = decision.correctness_passed &&
                                      decision.cleanup_passed &&
-                                     decision.performance_gain_found;
+                                     decision.performance_gain_found &&
+                                     production_equivalent_data_plane;
     if (!decision.correctness_passed) {
         decision.priority = "correctness_and_failure_cleanup";
     } else if (!decision.cleanup_passed) {
         decision.priority = "resource_lifecycle";
+    } else if (!production_equivalent_data_plane) {
+        decision.priority = "production_data_plane_validation";
     } else if (!decision.performance_gain_found) {
         decision.priority = "multi_batch_and_parallel_read";
     } else {
@@ -98,6 +102,8 @@ Json::Value ToJson(const VChunkBenchmarkConfig& config) {
     value["seed"] = Json::UInt64(config.seed);
     value["failure_every_n"] = config.failure_every_n;
     value["transfer_delay_us"] = config.transfer_delay_us;
+    value["production_equivalent_data_plane"] =
+        config.production_equivalent_data_plane;
     return value;
 }
 

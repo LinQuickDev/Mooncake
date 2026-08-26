@@ -239,11 +239,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
-    if (config.vchunk_config.enabled && config.enable_ha &&
-        (!config.vchunk_metadata_store ||
-         !config.vchunk_metadata_store->IsPersistent())) {
+    if (config.vchunk_config.enabled && config.enable_ha) {
         throw std::invalid_argument(
-            "vchunk requires an explicit persistent metadata store in HA mode");
+            "vchunk HA is not supported until allocator ranges can be restored");
     }
     if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
         const auto error = vchunk_manager_.Recover(getCurrentTimeInMilli());
@@ -616,10 +614,6 @@ tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
 
 VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
     return vchunk_manager_.MetricsSnapshot();
-}
-
-size_t MasterService::GetVChunkAllocatedBytes() const {
-    return vchunk_manager_.AllocatedBytes();
 }
 
 void MasterService::VChunkReaperThreadFunc() {

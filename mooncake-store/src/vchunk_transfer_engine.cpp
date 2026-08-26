@@ -12,11 +12,15 @@ class BatchGuard {
     BatchGuard(TransferEngine& engine, size_t size)
         : engine_(engine), id_(engine.allocateBatchID(size)) {}
     ~BatchGuard() {
-        if (id_ != INVALID_BATCH_ID) {
-            engine_.freeBatchID(id_);
-        }
+        TryFree();
     }
     BatchID id() const { return id_; }
+    bool TryFree() {
+        if (id_ == INVALID_BATCH_ID) return true;
+        if (!engine_.freeBatchID(id_).ok()) return false;
+        id_ = INVALID_BATCH_ID;
+        return true;
+    }
 
    private:
     TransferEngine& engine_;
@@ -101,15 +105,24 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
     if (batch.id() == INVALID_BATCH_ID) {
         return ErrorCode::TRANSFER_FAIL;
     }
-    if (!engine_.submitTransfer(batch.id(), *requests).ok()) {
-        return ErrorCode::TRANSFER_FAIL;
-    }
-    while (std::chrono::steady_clock::now() < deadline) {
+    const bool submit_failed =
+        !engine_.submitTransfer(batch.id(), *requests).ok();
+    if (submit_failed && batch.TryFree()) return ErrorCode::TRANSFER_FAIL;
+    bool deadline_exceeded = false;
+    for (;;) {
+        deadline_exceeded = deadline_exceeded ||
+                            std::chrono::steady_clock::now() >= deadline;
         TransferStatus status{};
         if (!engine_.getBatchTransferStatus(batch.id(), status).ok()) {
-            return ErrorCode::TRANSFER_FAIL;
+            // Do not release an in-flight batch: TransferEngine may still be
+            // using the caller's buffer. Keep draining until a terminal state.
+            if (batch.TryFree()) return ErrorCode::TRANSFER_FAIL;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
         }
         if (status.s == TransferStatusEnum::COMPLETED) {
+            if (submit_failed) return ErrorCode::TRANSFER_FAIL;
+            if (deadline_exceeded) return ErrorCode::RPC_TIMEOUT;
             return status.transferred_bytes == length ? ErrorCode::OK
                                                       : ErrorCode::TRANSFER_FAIL;
         }
@@ -117,11 +130,11 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
             status.s == TransferStatusEnum::TIMEOUT ||
             status.s == TransferStatusEnum::CANCELED ||
             status.s == TransferStatusEnum::INVALID) {
-            return ErrorCode::TRANSFER_FAIL;
+            return deadline_exceeded ? ErrorCode::RPC_TIMEOUT
+                                     : ErrorCode::TRANSFER_FAIL;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    return ErrorCode::RPC_TIMEOUT;
 }
 
 }  // namespace mooncake

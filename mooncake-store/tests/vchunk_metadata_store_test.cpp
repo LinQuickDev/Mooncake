@@ -82,6 +82,11 @@ TEST(VChunkMetadataStoreTest, PutStartIsNotVisibleWhenDurableWriteFails) {
     EXPECT_EQ(result.error(), ErrorCode::ETCD_OPERATION_ERROR);
     EXPECT_EQ(manager.SizeForTesting(), 0U);
     EXPECT_EQ(fixture.allocator->size(), 0U);
+
+    fixture.store->fail_put = false;
+    EXPECT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                 "key", 4096, false, 11)
+                    .has_value());
 }
 
 TEST(VChunkMetadataStoreTest, PersistsCreatingThenActiveBeforeVisibility) {
@@ -98,7 +103,7 @@ TEST(VChunkMetadataStoreTest, PersistsCreatingThenActiveBeforeVisibility) {
     EXPECT_EQ(fixture.store->records[0].status, VChunkStatus::ACTIVE);
 }
 
-TEST(VChunkMetadataStoreTest, RecoveryKeepsActiveAndCleansExpiredCreating) {
+TEST(VChunkMetadataStoreTest, RecoveryRejectsActiveWithoutAllocatorRestore) {
     StoreFixture fixture;
     VChunkMetadataRecord active;
     {
@@ -122,11 +127,23 @@ TEST(VChunkMetadataStoreTest, RecoveryKeepsActiveAndCleansExpiredCreating) {
     ASSERT_EQ(fixture.store->Put(expired), ErrorCode::OK);
 
     VChunkMasterManager recovered(fixture.config, fixture.store);
-    ASSERT_EQ(recovered.Recover(200), ErrorCode::OK);
-    EXPECT_TRUE(recovered.Get(TenantId("tenant"), "active").has_value());
-    EXPECT_EQ(recovered.Get(TenantId("tenant"), "expired").error(),
-              ErrorCode::OBJECT_NOT_FOUND);
-    ASSERT_EQ(fixture.store->List()->size(), 1U);
+    EXPECT_EQ(recovered.Recover(200), ErrorCode::REPLICA_IS_GONE);
+    EXPECT_EQ(recovered.SizeForTesting(), 0U);
+    // Validation is atomic: no incomplete record is removed when an ACTIVE
+    // record makes the whole snapshot unsafe to restore.
+    ASSERT_EQ(fixture.store->List()->size(), 2U);
+}
+
+TEST(VChunkMetadataStoreTest, RecoveryCleansIncompleteWrites) {
+    StoreFixture fixture;
+    VChunkMasterManager writer(fixture.config, fixture.store);
+    ASSERT_TRUE(writer.PutStart(fixture.allocators, TenantId("tenant"),
+                                "creating", 4096, false, 10)
+                    .has_value());
+
+    VChunkMasterManager recovered(fixture.config, fixture.store);
+    EXPECT_EQ(recovered.Recover(20), ErrorCode::OK);
+    EXPECT_TRUE(fixture.store->List()->empty());
 }
 
 TEST(VChunkMetadataStoreTest, ReaperIsBoundedAndRetryable) {

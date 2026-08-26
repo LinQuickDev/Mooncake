@@ -57,6 +57,7 @@ VChunkMetricsSnapshot VChunkMetrics::Snapshot() const {
     result.retries = retries_.load();
     result.rollbacks = rollbacks_.load();
     result.metadata_bytes = metadata_bytes_.load();
+    result.allocated_bytes = allocated_bytes_.load();
     for (size_t i = 0; i < slice_size_distribution_.size(); ++i) {
         result.slice_size_distribution[i] =
             slice_size_distribution_[i].load();

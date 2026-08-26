@@ -31,7 +31,7 @@ TEST(VChunkBenchmarkReportTest, ComputesNearestRankPercentiles) {
 TEST(VChunkBenchmarkReportTest, RecommendsFullDesignWhenGainIsRepeatable) {
     std::vector<VChunkBenchmarkResult> results{
         Result("legacy", 100, 1000), Result("vchunk", 120, 1050)};
-    const auto decision = AnalyzeVChunkBenchmark(results, 1.10, 1.10);
+    const auto decision = AnalyzeVChunkBenchmark(results, 1.10, 1.10, true);
     EXPECT_TRUE(decision.correctness_passed);
     EXPECT_TRUE(decision.cleanup_passed);
     EXPECT_TRUE(decision.performance_gain_found);
@@ -44,7 +44,7 @@ TEST(VChunkBenchmarkReportTest, CleanupLeakBlocksRecommendation) {
     vchunk.allocator_bytes_after_cleanup = 4096;
     std::vector<VChunkBenchmarkResult> results{Result("legacy", 100, 1000),
                                                vchunk};
-    const auto decision = AnalyzeVChunkBenchmark(results, 1.10, 1.10);
+    const auto decision = AnalyzeVChunkBenchmark(results, 1.10, 1.10, true);
     EXPECT_FALSE(decision.cleanup_passed);
     EXPECT_FALSE(decision.recommend_full_design);
     EXPECT_EQ(decision.priority, "resource_lifecycle");
@@ -54,7 +54,7 @@ TEST(VChunkBenchmarkReportTest, DataMismatchBlocksRecommendation) {
     auto vchunk = Result("vchunk", 130, 900);
     vchunk.data_mismatches = 1;
     const auto decision = AnalyzeVChunkBenchmark(
-        {Result("legacy", 100, 1000), vchunk}, 1.10, 1.10);
+        {Result("legacy", 100, 1000), vchunk}, 1.10, 1.10, true);
     EXPECT_FALSE(decision.correctness_passed);
     EXPECT_EQ(decision.priority, "correctness_and_failure_cleanup");
 }
@@ -66,13 +66,23 @@ TEST(VChunkBenchmarkReportTest, EmitsMachineReadableConfigAndDecision) {
     config.concurrencies = {8};
     config.operations_per_scenario = 10;
     auto legacy = Result("legacy", 100, 1000);
-    const auto decision = AnalyzeVChunkBenchmark({legacy}, 1.10, 1.10);
+    const auto decision =
+        AnalyzeVChunkBenchmark({legacy}, 1.10, 1.10, false);
     const auto report = BuildVChunkBenchmarkReport(config, {legacy}, decision);
     EXPECT_EQ(report["schema_version"].asInt(), 1);
     EXPECT_EQ(report["config"]["object_sizes"][0].asUInt64(), 4096U);
     EXPECT_EQ(report["results"][0]["path"].asString(), "legacy");
     EXPECT_TRUE(report["decision"].isObject());
     EXPECT_TRUE(report["decision"]["known_limitations"].isArray());
+}
+
+TEST(VChunkBenchmarkReportTest, SyntheticDataPlaneCannotRecommendProduction) {
+    const auto decision = AnalyzeVChunkBenchmark(
+        {Result("legacy", 100, 1000), Result("vchunk", 130, 900)}, 1.10,
+        1.10, false);
+    EXPECT_TRUE(decision.performance_gain_found);
+    EXPECT_FALSE(decision.recommend_full_design);
+    EXPECT_EQ(decision.priority, "production_data_plane_validation");
 }
 
 }  // namespace
