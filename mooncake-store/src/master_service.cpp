@@ -618,6 +618,10 @@ VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
     return vchunk_manager_.MetricsSnapshot();
 }
 
+size_t MasterService::GetVChunkAllocatedBytes() const {
+    return vchunk_manager_.AllocatedBytes();
+}
+
 void MasterService::VChunkReaperThreadFunc() {
     std::unique_lock<std::mutex> lock(vchunk_reaper_mutex_);
     while (vchunk_reaper_running_) {

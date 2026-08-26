@@ -315,6 +315,17 @@ VChunkMetricsSnapshot VChunkMasterManager::MetricsSnapshot() const {
     return metrics_->Snapshot();
 }
 
+size_t VChunkMasterManager::AllocatedBytes() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    size_t bytes = 0;
+    for (const auto& [_, entry] : entries_) {
+        for (const auto& buffer : entry->buffers) {
+            if (buffer) bytes += buffer->size();
+        }
+    }
+    return bytes;
+}
+
 void VChunkMasterManager::RefreshStateMetricsLocked() {
     std::array<uint64_t, 5> counts{};
     for (const auto& [_, entry] : entries_) {

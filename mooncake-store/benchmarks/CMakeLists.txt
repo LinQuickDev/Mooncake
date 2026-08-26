@@ -65,3 +65,8 @@ if(STORE_USE_ETCD)
     oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
                               JsonCpp::JsonCpp)
 endif()
+
+add_executable(vchunk_bench vchunk_bench.cpp vchunk_benchmark_report.cpp)
+target_link_libraries(
+  vchunk_bench PRIVATE mooncake_store cachelib_memory_allocator
+                       JsonCpp::JsonCpp gflags::gflags glog::glog pthread)

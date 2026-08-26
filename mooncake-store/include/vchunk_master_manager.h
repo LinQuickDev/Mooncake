@@ -67,6 +67,7 @@ class VChunkMasterManager {
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
                                                 size_t max_scan);
     VChunkMetricsSnapshot MetricsSnapshot() const;
+    size_t AllocatedBytes() const;
 
     size_t SizeForTesting() const;
 
