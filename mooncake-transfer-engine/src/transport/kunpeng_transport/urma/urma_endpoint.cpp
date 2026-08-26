@@ -1303,17 +1303,16 @@ bool UrmaEndpoint::processWrCompletion(
 
     if (cr.status != URMA_CR_WR_FLUSH_ERR ||
         context_->traceWorkRequestFlushedErrors())
-        LOG(ERROR) << "Worker: Process failed for slice (opcode: "
-                   << slice->opcode << ", source_addr: " << slice->source_addr
-                   << ", length: " << slice->length
-                   << ", dest_addr: " << (void*)slice->ub.dest_addr
-                   << ", local_nic: " << context_->deviceName()
-                   << ", peer_nic: " << slice->peer_nic_path
-                   << ", dest_seg_tokenid: "
-                   << static_cast<urma_target_seg_t*>(slice->ub.r_seg)
-                          ->seg.token_id
-                   << ", retry_cnt: " << slice->ub.retry_cnt
-                   << "): " << cr.status << ", jfc idx : " << jfc_index;
+        LOG(ERROR)
+            << "Worker: Process failed for slice (opcode: " << slice->opcode
+            << ", source_addr: " << slice->source_addr
+            << ", length: " << slice->length
+            << ", dest_addr: " << (void*)slice->ub.dest_addr
+            << ", local_nic: " << context_->deviceName()
+            << ", peer_nic: " << slice->peer_nic_path << ", dest_seg_tokenid: "
+            << static_cast<urma_target_seg_t*>(slice->ub.r_seg)->seg.token_id
+            << ", retry_cnt: " << slice->ub.retry_cnt << "): " << cr.status
+            << ", jfc idx : " << jfc_index;
 
     failed_slices.push_back(slice);
     return true;
@@ -1342,8 +1341,8 @@ int UrmaEndpoint::rebuildJettyUnlocked(
         if (flushed == 0) break;
         for (int j = 0; j < flushed; ++j) {
             if (flush_crs[j].status == URMA_CR_WR_FLUSH_ERR_DONE) continue;
-            if (processWrCompletion(flush_crs[j], jetty_depth_set, failed_slices,
-                                    deferred_deletes, -1,
+            if (processWrCompletion(flush_crs[j], jetty_depth_set,
+                                    failed_slices, deferred_deletes, -1,
                                     /*allow_error_trigger=*/false)) {
                 ++resolved_wr_count;
             }
@@ -1477,8 +1476,7 @@ int UrmaEndpoint::recreateJettyUnlocked(int slot, urma_jfc_t* reuse_jfc,
     attr.jfs_cfg = jfs_cfg;
     attr.jfs_cfg.jfc = reuse_jfc ? reuse_jfc : context_->jfc();
     attr.shared.jfr = reuse_jfr ? reuse_jfr : context_->jfr();
-    urma_jetty_t* new_jetty =
-        urma_create_jetty(context_->urma_context_, &attr);
+    urma_jetty_t* new_jetty = urma_create_jetty(context_->urma_context_, &attr);
     if (!new_jetty) {
         PLOG(ERROR) << "Failed to create jetty during rebuild";
         return ERR_ENDPOINT;
