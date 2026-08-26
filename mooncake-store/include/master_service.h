@@ -255,6 +255,8 @@ class MasterService {
                               const std::string& vchunk_id);
     tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
         const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
+        const TenantId& tenant_id, const std::string& key) const;
     ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
                            int64_t now_ms);
 

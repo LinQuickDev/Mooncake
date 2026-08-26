@@ -51,7 +51,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
         return tl::make_unexpected(allocation.error());
     }
 
-    auto entry = std::make_unique<Entry>();
+    auto entry = std::make_shared<Entry>();
     auto& record = entry->record;
     record.vchunk_id = UuidToString(generate_uuid());
     record.tenant_id = tenant_id.value();
@@ -137,6 +137,16 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
 
 tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::Get(
     const TenantId& tenant_id, const std::string& key) const {
+    auto handle = AcquireRead(tenant_id, key);
+    if (!handle) {
+        return tl::make_unexpected(handle.error());
+    }
+    return handle->record();
+}
+
+tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
+VChunkMasterManager::AcquireRead(const TenantId& tenant_id,
+                                 const std::string& key) const {
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -145,7 +155,10 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::Get(
     if (it->second->record.status != VChunkStatus::ACTIVE) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
-    return it->second->record;
+    ReadHandle handle;
+    handle.record_ = it->second->record;
+    handle.lifetime_ = it->second;
+    return handle;
 }
 
 ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,

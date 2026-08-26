@@ -575,6 +575,12 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::GetVChunk(
     return vchunk_manager_.Get(tenant_id, key);
 }
 
+tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
+MasterService::AcquireVChunkRead(const TenantId& tenant_id,
+                                 const std::string& key) const {
+    return vchunk_manager_.AcquireRead(tenant_id, key);
+}
+
 ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
                                       const std::string& key,
                                       int64_t now_ms) {

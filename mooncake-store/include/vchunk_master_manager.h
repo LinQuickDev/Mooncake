@@ -23,6 +23,17 @@ namespace mooncake {
 // SegmentManager allocator access guard while PutStart uses AllocatorManager.
 class VChunkMasterManager {
    public:
+    class ReadHandle {
+       public:
+        ReadHandle() = default;
+        const VChunkMetadataRecord& record() const { return record_; }
+
+       private:
+        friend class VChunkMasterManager;
+        VChunkMetadataRecord record_;
+        std::shared_ptr<const void> lifetime_;
+    };
+
     explicit VChunkMasterManager(VChunkConfig config);
 
     VChunkMasterManager(const VChunkMasterManager&) = delete;
@@ -41,6 +52,8 @@ class VChunkMasterManager {
 
     tl::expected<VChunkMetadataRecord, ErrorCode> Get(
         const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<ReadHandle, ErrorCode> AcquireRead(
+        const TenantId& tenant_id, const std::string& key) const;
 
     ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
                      int64_t now_ms);
@@ -58,7 +71,7 @@ class VChunkMasterManager {
 
     const VChunkConfig config_;
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::unique_ptr<Entry>> entries_;
+    std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
 };
 
 }  // namespace mooncake

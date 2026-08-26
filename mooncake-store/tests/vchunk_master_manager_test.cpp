@@ -157,6 +157,28 @@ TEST(VChunkMasterManagerTest, GetAndRemoveAreSerializedSafely) {
     EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
 }
 
+TEST(VChunkMasterManagerTest, ReadLeaseDefersBufferReleaseAfterRemove) {
+    ManagerFixture fixture;
+    VChunkMasterManager manager(EnabledConfig());
+    const TenantId tenant("tenant-a");
+    auto created = manager.PutStart(fixture.allocators, tenant, "key", 8192,
+                                    false, 100);
+    ASSERT_TRUE(created.has_value());
+    ASSERT_EQ(manager.PutEnd(tenant, "key", created->vchunk_id, 200),
+              ErrorCode::OK);
+
+    const auto allocated = fixture.first->size() + fixture.second->size();
+    ASSERT_GT(allocated, 0U);
+    {
+        auto read = manager.AcquireRead(tenant, "key");
+        ASSERT_TRUE(read.has_value());
+        EXPECT_EQ(manager.Remove(tenant, "key", 300), ErrorCode::OK);
+        EXPECT_FALSE(manager.Get(tenant, "key").has_value());
+        EXPECT_EQ(fixture.first->size() + fixture.second->size(), allocated);
+    }
+    EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
+}
+
 TEST(VChunkMasterManagerTest, DisabledConfigurationRejectsCreation) {
     ManagerFixture fixture;
     VChunkMasterManager manager(VChunkConfig{});
