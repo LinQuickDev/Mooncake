@@ -20,7 +20,7 @@ namespace {
 Segment MakeSegment(const std::string& name, uintptr_t base) {
     Segment segment;
     segment.name = name;
-    segment.base = reinterpret_cast<void*>(base);
+    segment.base = base;
     segment.size = 32U * 1024U * 1024U;
     segment.protocol = "tcp";
     segment.te_endpoint = name;
