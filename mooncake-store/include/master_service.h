@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -36,6 +37,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "vchunk_master_manager.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -241,6 +243,20 @@ class MasterService {
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
+        const TenantId& tenant_id, const std::string& key,
+        uint64_t total_size, bool is_ssd_segment, int64_t now_ms,
+        const std::set<std::string>& excluded_segments = {});
+    ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
+                           const std::string& vchunk_id, int64_t now_ms);
+    ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
+                              const std::string& key,
+                              const std::string& vchunk_id);
+    tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
+        const TenantId& tenant_id, const std::string& key) const;
+    ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
+                           int64_t now_ms);
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -2340,6 +2356,7 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
+    VChunkMasterManager vchunk_manager_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

@@ -84,6 +84,8 @@ set(MOONCAKE_STORE_SOURCES
     memory_alloc.cpp
     vchunk_config.cpp
     vchunk_metadata.cpp
+    vchunk_allocation_strategy.cpp
+    vchunk_master_manager.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
 

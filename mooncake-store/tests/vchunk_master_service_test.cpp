@@ -1,0 +1,68 @@
+#include "master_service.h"
+
+#include <gtest/gtest.h>
+
+#include <string>
+
+#include "master_config.h"
+#include "types.h"
+
+namespace mooncake {
+namespace {
+
+Segment MakeVChunkSegment(const std::string& name, uintptr_t base) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = name;
+    segment.base = base;
+    segment.size = 64U * 1024U * 1024U;
+    segment.te_endpoint = name;
+    return segment;
+}
+
+TEST(VChunkMasterServiceTest, BuilderPropagatesVChunkConfiguration) {
+    VChunkConfig vchunk_config;
+    vchunk_config.enabled = true;
+    vchunk_config.max_slice_count = 128;
+    const auto config = MasterServiceConfig::builder()
+                            .set_vchunk_config(vchunk_config)
+                            .build();
+    EXPECT_TRUE(config.vchunk_config.enabled);
+    EXPECT_EQ(config.vchunk_config.max_slice_count, 128U);
+}
+
+TEST(VChunkMasterServiceTest, ExposesIsolatedVChunkControlPlane) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.vchunk_config.enabled = true;
+    MasterService service(config);
+    const auto client_id = generate_uuid();
+    ASSERT_TRUE(service
+                    .MountSegment(
+                        MakeVChunkSegment("vchunk-segment-a", 0x900000000ULL),
+                        client_id)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .MountSegment(
+                        MakeVChunkSegment("vchunk-segment-b", 0xA00000000ULL),
+                        client_id)
+                    .has_value());
+
+    const TenantId tenant("tenant-a");
+    auto created =
+        service.VChunkPutStart(tenant, "key", 10U * 1024U, false, 100);
+    ASSERT_TRUE(created.has_value());
+    EXPECT_EQ(created->row_size, 2U);
+    EXPECT_EQ(service.VChunkPutEnd(tenant, "key", created->vchunk_id, 200),
+              ErrorCode::OK);
+
+    auto active = service.GetVChunk(tenant, "key");
+    ASSERT_TRUE(active.has_value());
+    EXPECT_EQ(active->status, VChunkStatus::ACTIVE);
+    EXPECT_EQ(service.RemoveVChunk(tenant, "key", 300), ErrorCode::OK);
+    EXPECT_EQ(service.GetVChunk(tenant, "key").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+}
+
+}  // namespace
+}  // namespace mooncake

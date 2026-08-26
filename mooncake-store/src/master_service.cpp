@@ -213,6 +213,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
+      vchunk_manager_(config.vchunk_config),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
@@ -542,6 +543,43 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
+    const TenantId& tenant_id, const std::string& key, uint64_t total_size,
+    bool is_ssd_segment, int64_t now_ms,
+    const std::set<std::string>& excluded_segments) {
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.PutStart(allocator_access.getAllocatorManager(),
+                                    tenant_id, key, total_size,
+                                    is_ssd_segment, now_ms,
+                                    excluded_segments);
+}
+
+ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      const std::string& vchunk_id,
+                                      int64_t now_ms) {
+    return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+}
+
+ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,
+                                         const std::string& key,
+                                         const std::string& vchunk_id) {
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.PutRevoke(tenant_id, key, vchunk_id);
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::GetVChunk(
+    const TenantId& tenant_id, const std::string& key) const {
+    return vchunk_manager_.Get(tenant_id, key);
+}
+
+ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      int64_t now_ms) {
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.Remove(tenant_id, key, now_ms);
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
