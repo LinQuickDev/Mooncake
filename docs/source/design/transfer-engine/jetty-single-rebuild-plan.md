@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Jetty ACK Timeout（status=9）单 Jetty 重建方案
 
 状态：实现中（分支 `feat/jetty-ack-timeout-single-rebuild`）— **权威方案**（取代已废弃的 `jetty-ack-timeout-rebuild.md`）

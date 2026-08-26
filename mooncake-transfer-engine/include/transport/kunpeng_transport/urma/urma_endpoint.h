@@ -89,8 +89,7 @@ class UrmaContext : public UbContext {
     void registerJettyOwner(uint32_t jetty_id, UrmaEndpoint* endpoint,
                             int slot);
     void unregisterJettyOwner(uint32_t jetty_id);
-    bool findJettyOwner(uint32_t jetty_id, UrmaEndpoint** endpoint,
-                        int* slot);
+    bool findJettyOwner(uint32_t jetty_id, UrmaEndpoint** endpoint, int* slot);
     void addDrainingEndpoint(UrmaEndpoint* endpoint);
     void removeDrainingEndpoint(UrmaEndpoint* endpoint);
     void checkJettyDrainTimeouts();
@@ -197,7 +196,8 @@ class UrmaEndpoint : public UbEndPoint {
 
     const std::string toString() const override;
 
-    // Called from UrmaContext::poll on ACK timeout / flush-done / drain timeout.
+    // Called from UrmaContext::poll on ACK timeout / flush-done / drain
+    // timeout.
     void onJettyError(int slot);
     void onFlushDone(int slot);
     void checkDrainTimeout();

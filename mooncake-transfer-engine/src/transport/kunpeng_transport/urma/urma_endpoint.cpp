@@ -1156,7 +1156,8 @@ void UrmaEndpoint::onJettyError(int slot) {
     {
         RWSpinlock::WriteGuard guard(lock_);
         if (slot < 0 || slot >= static_cast<int>(jetty_list_.size())) return;
-        if (jetty_state_[slot] == DRAINING || jetty_state_[slot] == REBUILDING) {
+        if (jetty_state_[slot] == DRAINING ||
+            jetty_state_[slot] == REBUILDING) {
             return;  // idempotent
         }
         // Serial rebuild: at most one non-ACTIVE jetty per endpoint.
@@ -1313,8 +1314,7 @@ int UrmaEndpoint::rebuildJettyUnlocked(int slot) {
     attr.jfs_cfg = jfs_cfg;
     attr.jfs_cfg.jfc = reuse_jfc ? reuse_jfc : context_->jfc();
     attr.shared.jfr = reuse_jfr ? reuse_jfr : context_->jfr();
-    urma_jetty_t* new_jetty =
-        urma_create_jetty(context_->urma_context_, &attr);
+    urma_jetty_t* new_jetty = urma_create_jetty(context_->urma_context_, &attr);
     if (!new_jetty) {
         PLOG(ERROR) << "Failed to create jetty during rebuild";
         return ERR_ENDPOINT;
