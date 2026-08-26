@@ -18,7 +18,10 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 #include "common.h"
 #include "config.h"
 #include "urma_api.h"
@@ -47,6 +50,8 @@ static urma_import_seg_flag_t import_flag = {
            .reserved = 0}};
 
 // define the UrmaContext class
+class UrmaEndpoint;
+
 class UrmaContext : public UbContext {
     friend class UrmaEndpoint;
 
@@ -80,6 +85,15 @@ class UrmaContext : public UbContext {
     urma_jfce_t* JFCE();
     static bool uninit();
     static bool init();
+
+    void registerJettyOwner(uint32_t jetty_id, UrmaEndpoint* endpoint,
+                            int slot);
+    void unregisterJettyOwner(uint32_t jetty_id);
+    bool findJettyOwner(uint32_t jetty_id, UrmaEndpoint** endpoint,
+                        int* slot);
+    void addDrainingEndpoint(UrmaEndpoint* endpoint);
+    void removeDrainingEndpoint(UrmaEndpoint* endpoint);
+    void checkJettyDrainTimeouts();
 
    private:
     int construct(GlobalConfig& config) override;
@@ -146,11 +160,21 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
+
+    RWSpinlock jetty_owner_lock_;
+    struct JettyOwner {
+        UrmaEndpoint* endpoint = nullptr;
+        int slot = -1;
+    };
+    std::unordered_map<uint32_t, JettyOwner> jetty_owner_map_;
+    std::unordered_set<UrmaEndpoint*> draining_endpoints_;
 };
 
 // define the UrmaEndpoint class
 class UrmaEndpoint : public UbEndPoint {
    public:
+    enum JettyState { ACTIVE = 0, DRAINING = 1, REBUILDING = 2 };
+
     UrmaEndpoint(UrmaContext* context)
         : context_(context), jfc_outstanding_(nullptr) {}
 
@@ -173,6 +197,13 @@ class UrmaEndpoint : public UbEndPoint {
 
     const std::string toString() const override;
 
+    // Called from UrmaContext::poll on ACK timeout / flush-done / drain timeout.
+    void onJettyError(int slot);
+    void onFlushDone(int slot);
+    void checkDrainTimeout();
+
+    int findSlotByDepth(volatile int* depth) const;
+
    private:
     void disconnectUnlocked() override;
 
@@ -187,6 +218,12 @@ class UrmaEndpoint : public UbEndPoint {
                           uint32_t peer_jetty_num,
                           std::string* reply_msg = nullptr);
 
+    bool hasNonActiveJettyUnlocked() const;
+    int selectActiveJettyUnlocked();
+    int rebuildJettyUnlocked(int slot);
+
+    static constexpr uint64_t kJettyDrainTimeoutNs = 3000000000ull;  // 3s
+
    private:
     UrmaContext* context_;
     urma_token_t urma_token = {.token = 0xACFE};
@@ -195,6 +232,13 @@ class UrmaEndpoint : public UbEndPoint {
     int max_wr_depth_;
     volatile int* jfc_outstanding_;
     std::unordered_map<urma_jetty_t*, urma_target_jetty_t*> imported_jetty_map_;
+
+    std::vector<JettyState> jetty_state_;
+    std::unordered_map<uint32_t, int> jetty_id_map_;
+    std::vector<uint32_t> peer_jetty_id_;
+    std::string peer_eid_;
+    uint64_t drain_start_ns_ = 0;
+    int draining_slot_ = -1;
 };
 }  // namespace mooncake
 #endif  // URMA_ENDPOINT_H

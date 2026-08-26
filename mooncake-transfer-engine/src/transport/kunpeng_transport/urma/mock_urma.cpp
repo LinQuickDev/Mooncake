@@ -346,11 +346,12 @@ urma_jetty_t *urma_create_jetty(urma_context_t *ctx, urma_jetty_cfg_t *cfg) {
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
+    static std::atomic<uint32_t> next_jetty_id{1};
     urma_jetty_t *jetty = new urma_jetty_t;
     memset(&jetty->jetty_id.eid, 0, sizeof(urma_eid_t));
     jetty->jetty_id.eid.raw[0] = 1;
     jetty->jetty_id.uasid = 0;
-    jetty->jetty_id.id = 1;
+    jetty->jetty_id.id = next_jetty_id.fetch_add(1);
     jetty->jetty_cfg = *cfg;
     jetty->remote_jetty = nullptr;
     jetty_map[jetty] = 1;
@@ -418,6 +419,16 @@ urma_status_t urma_modify_jetty(urma_jetty_t *jetty, urma_jetty_attr_t *attr) {
         return URMA_EINVAL;
     }
     return URMA_SUCCESS;
+}
+
+int urma_flush_jetty(urma_jetty_t *jetty, int cr_cnt, urma_cr_t *cr) {
+    (void)cr_cnt;
+    (void)cr;
+    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
+        return -1;
+    }
+    return 0;
 }
 
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,

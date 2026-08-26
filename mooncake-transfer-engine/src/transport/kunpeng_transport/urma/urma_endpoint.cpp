@@ -518,11 +518,55 @@ bool UrmaContext::transEidFromString(const std::string& eid_str,
     return index == URMA_EID_SIZE;
 }
 
+void UrmaContext::registerJettyOwner(uint32_t jetty_id, UrmaEndpoint* endpoint,
+                                     int slot) {
+    RWSpinlock::WriteGuard guard(jetty_owner_lock_);
+    jetty_owner_map_[jetty_id] = JettyOwner{endpoint, slot};
+}
+
+void UrmaContext::unregisterJettyOwner(uint32_t jetty_id) {
+    RWSpinlock::WriteGuard guard(jetty_owner_lock_);
+    jetty_owner_map_.erase(jetty_id);
+}
+
+bool UrmaContext::findJettyOwner(uint32_t jetty_id, UrmaEndpoint** endpoint,
+                                 int* slot) {
+    RWSpinlock::ReadGuard guard(jetty_owner_lock_);
+    auto it = jetty_owner_map_.find(jetty_id);
+    if (it == jetty_owner_map_.end()) return false;
+    if (endpoint) *endpoint = it->second.endpoint;
+    if (slot) *slot = it->second.slot;
+    return true;
+}
+
+void UrmaContext::addDrainingEndpoint(UrmaEndpoint* endpoint) {
+    RWSpinlock::WriteGuard guard(jetty_owner_lock_);
+    draining_endpoints_.insert(endpoint);
+}
+
+void UrmaContext::removeDrainingEndpoint(UrmaEndpoint* endpoint) {
+    RWSpinlock::WriteGuard guard(jetty_owner_lock_);
+    draining_endpoints_.erase(endpoint);
+}
+
+void UrmaContext::checkJettyDrainTimeouts() {
+    std::vector<UrmaEndpoint*> endpoints;
+    {
+        RWSpinlock::ReadGuard guard(jetty_owner_lock_);
+        endpoints.assign(draining_endpoints_.begin(),
+                         draining_endpoints_.end());
+    }
+    for (auto* endpoint : endpoints) {
+        if (endpoint) endpoint->checkDrainTimeout();
+    }
+}
+
 int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
                       int& num_failed,
                       std::unordered_map<volatile int*, int>& jetty_depth_set,
                       int jfc_index) {
     num_failed = 0;
+    checkJettyDrainTimeouts();
     urma_cr_t cr[num_entries];
     int nr_poll = urma_poll_jfc(jfc_list_[jfc_index].native, num_entries, cr);
     if (nr_poll < 0) {
@@ -530,11 +574,26 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
                    << device_name_;
         return ERR_CONTEXT;
     }
+    int wr_completions = 0;
     for (int i = 0; i < nr_poll; ++i) {
+        // Fake fence CQE: user_ctx is invalid; match by local_id only.
+        if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {
+            UrmaEndpoint* endpoint = nullptr;
+            int slot = -1;
+            if (findJettyOwner(cr[i].local_id, &endpoint, &slot) && endpoint) {
+                endpoint->onFlushDone(slot);
+            } else {
+                LOG(WARNING) << "FLUSH_ERR_DONE for unknown jetty local_id="
+                             << cr[i].local_id << " on " << device_name_;
+            }
+            continue;
+        }
+
         auto slice = (Transport::Slice*)cr[i].user_ctx;
         if (!slice) {
             continue;
         }
+        ++wr_completions;
 
         // All deref of `slice` (including the jetty_depth aggregation below)
         // MUST happen before markSuccess(): once that publishes completion,
@@ -551,6 +610,22 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
             // return it to the caller, so no one else will deref it.
             slice->markSuccess();
             continue;
+        }
+
+        if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
+            auto* endpoint = static_cast<UrmaEndpoint*>(slice->ub.endpoint);
+            if (endpoint) {
+                int slot = endpoint->findSlotByDepth(depth);
+                if (slot < 0) {
+                    UrmaEndpoint* mapped = nullptr;
+                    int mapped_slot = -1;
+                    if (findJettyOwner(cr[i].local_id, &mapped, &mapped_slot) &&
+                        mapped == endpoint) {
+                        slot = mapped_slot;
+                    }
+                }
+                if (slot >= 0) endpoint->onJettyError(slot);
+            }
         }
 
         if (cr[i].status != URMA_CR_WR_FLUSH_ERR ||
@@ -576,7 +651,8 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
         // safely deref it.
         failed_slices[num_failed++] = slice;
     }
-    return nr_poll;
+    // Exclude FLUSH_ERR_DONE from outstanding accounting (it was never posted).
+    return wr_completions;
 }
 
 volatile int* UrmaContext::outstandingCount(int jfc_index) {
@@ -626,6 +702,12 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
     }
 
     jetty_list_.resize(num_jetty_list);
+    jetty_state_.assign(num_jetty_list, ACTIVE);
+    peer_jetty_id_.assign(num_jetty_list, 0);
+    jetty_id_map_.clear();
+    peer_eid_.clear();
+    drain_start_ns_ = 0;
+    draining_slot_ = -1;
     auto* jfc = context_->jfc();
     jfc_outstanding_ = (volatile int*)jfc->jfc_cfg.user_ctx;
 
@@ -660,8 +742,11 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
             PLOG(ERROR) << "Failed to create jetty";
             return ERR_ENDPOINT;
         }
-        LOG(INFO) << "Create jetty success, jetty id = "
-                  << jetty_list_[i]->jetty_id.id << " ,jetty jfc id = "
+        uint32_t jetty_id = jetty_list_[i]->jetty_id.id;
+        jetty_id_map_[jetty_id] = static_cast<int>(i);
+        context_->registerJettyOwner(jetty_id, this, static_cast<int>(i));
+        LOG(INFO) << "Create jetty success, jetty id = " << jetty_id
+                  << " ,jetty jfc id = "
                   << jetty_list_[i]->jetty_cfg.jfs_cfg.jfc->jfc_id.id << " : "
                   << jfc->jfc_id.id;
     }
@@ -672,19 +757,25 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
 
 int UrmaEndpoint::deconstruct() {
     int ret = 0;
+    context_->removeDrainingEndpoint(this);
     for (size_t i = 0; i < jetty_list_.size(); ++i) {
         auto imported_it = imported_jetty_map_.find(jetty_list_[i]);
         auto imported_jetty = (imported_it != imported_jetty_map_.end())
                                   ? imported_it->second
                                   : nullptr;
-        ret = urma_unbind_jetty(jetty_list_[i]);
-        if (ret) PLOG(ERROR) << "Failed to unbind jetty";
+        if (jetty_list_[i]) {
+            context_->unregisterJettyOwner(jetty_list_[i]->jetty_id.id);
+            ret = urma_unbind_jetty(jetty_list_[i]);
+            if (ret) PLOG(ERROR) << "Failed to unbind jetty";
+        }
         if (imported_jetty != nullptr) {
             ret = urma_unimport_jetty(imported_jetty);
             if (ret) PLOG(ERROR) << "Failed to unimport jetty";
         }
-        ret = urma_delete_jetty(jetty_list_[i]);
-        if (ret) PLOG(ERROR) << "Failed to delete jetty";
+        if (jetty_list_[i]) {
+            ret = urma_delete_jetty(jetty_list_[i]);
+            if (ret) PLOG(ERROR) << "Failed to delete jetty";
+        }
         // After destroying QP, the wr_depth_list_ won't change
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
@@ -698,7 +789,14 @@ int UrmaEndpoint::deconstruct() {
         }
     }
     jetty_list_.clear();
+    jetty_state_.clear();
+    jetty_id_map_.clear();
+    peer_jetty_id_.clear();
+    peer_eid_.clear();
+    draining_slot_ = -1;
+    drain_start_ns_ = 0;
     delete[] wr_depth_list_;
+    wr_depth_list_ = nullptr;
     imported_jetty_map_.clear();
     return 0;
 }
@@ -791,8 +889,12 @@ int UrmaEndpoint::setupConnectionsByActive() {
 void UrmaEndpoint::disconnectUnlocked() {
     urma_jetty_attr_t attr;
     memset(&attr, 0, sizeof(attr));
+    attr.mask = JETTY_STATE;
     attr.state = URMA_JETTY_STATE_RESET;
 
+    context_->removeDrainingEndpoint(this);
+    draining_slot_ = -1;
+    drain_start_ns_ = 0;
     for (size_t i = 0; i < jetty_list_.size(); ++i) {
         int ret = urma_modify_jetty(jetty_list_[i], &attr);
         if (ret) PLOG(ERROR) << "Failed to modify jetty to RESET";
@@ -812,7 +914,11 @@ void UrmaEndpoint::disconnectUnlocked() {
             __sync_fetch_and_sub(jfc_outstanding_, wr_depth_list_[i]);
             wr_depth_list_[i] = 0;
         }
+        jetty_state_[i] = ACTIVE;
     }
+    imported_jetty_map_.clear();
+    peer_jetty_id_.assign(jetty_list_.size(), 0);
+    peer_eid_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
@@ -873,7 +979,8 @@ int UrmaEndpoint::submitPostSend(
     std::vector<Transport::Slice*>& failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
-    int jetty_index = SimpleRandom::Get().next(jetty_list_.size());
+    int jetty_index = selectActiveJettyUnlocked();
+    if (jetty_index < 0) return 0;
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[jetty_index],
                             (int)slice_list.size());
     wr_count =
@@ -929,8 +1036,6 @@ int UrmaEndpoint::submitPostSend(
     }
     __sync_fetch_and_add(&wr_depth_list_[jetty_index], wr_count);
     __sync_fetch_and_add(jfc_outstanding_, wr_count);
-    if (jetty_list_[jetty_index]->remote_jetty == NULL) {
-    }
     int rc =
         urma_post_jetty_send_wr(jetty_list_[jetty_index], wr_list, &bad_wr);
     if (rc) {
@@ -968,6 +1073,7 @@ int UrmaEndpoint::doSetupConnection(const std::string& peer_eid,
         return ERR_INVALID_ARGUMENT;
     }
 
+    peer_eid_ = peer_eid;
     for (int jetty_index = 0; jetty_index < (int)jetty_list_.size();
          ++jetty_index) {
         int ret = doSetupConnection(
@@ -1011,9 +1117,258 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
         return ERR_ENDPOINT;
     }
     imported_jetty_map_[jetty] = imported_jetty;
+    peer_jetty_id_[jetty_index] = peer_jetty_num;
+    jetty_state_[jetty_index] = ACTIVE;
     LOG(INFO) << "Bind jetty success, local jetty id:" << jetty->jetty_id.id
               << ", remote jetty id:" << peer_jetty_num;
 
+    return 0;
+}
+
+int UrmaEndpoint::findSlotByDepth(volatile int* depth) const {
+    if (!depth || !wr_depth_list_) return -1;
+    for (size_t i = 0; i < jetty_list_.size(); ++i) {
+        if (&wr_depth_list_[i] == depth) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool UrmaEndpoint::hasNonActiveJettyUnlocked() const {
+    for (auto state : jetty_state_) {
+        if (state != ACTIVE) return true;
+    }
+    return false;
+}
+
+int UrmaEndpoint::selectActiveJettyUnlocked() {
+    if (jetty_list_.empty()) return -1;
+    const int n = static_cast<int>(jetty_list_.size());
+    int start = SimpleRandom::Get().next(n);
+    for (int i = 0; i < n; ++i) {
+        int idx = (start + i) % n;
+        if (jetty_state_[idx] == ACTIVE) return idx;
+    }
+    return -1;
+}
+
+void UrmaEndpoint::onJettyError(int slot) {
+    bool delete_ep = false;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (slot < 0 || slot >= static_cast<int>(jetty_list_.size())) return;
+        if (jetty_state_[slot] == DRAINING || jetty_state_[slot] == REBUILDING) {
+            return;  // idempotent
+        }
+        // Serial rebuild: at most one non-ACTIVE jetty per endpoint.
+        if (hasNonActiveJettyUnlocked()) {
+            LOG(INFO) << "Skip jetty rebuild for slot " << slot
+                      << ": another jetty is already draining/rebuilding on "
+                      << toString();
+            return;
+        }
+        if (!jetty_list_[slot]) return;
+
+        urma_jetty_attr_t attr{};
+        attr.mask = JETTY_STATE;
+        attr.state = URMA_JETTY_STATE_ERROR;
+        int ret = urma_modify_jetty(jetty_list_[slot], &attr);
+        if (ret) {
+            PLOG(ERROR) << "Failed to modify jetty to ERROR, slot=" << slot
+                        << " jetty_id=" << jetty_list_[slot]->jetty_id.id;
+            context_->removeDrainingEndpoint(this);
+            draining_slot_ = -1;
+            drain_start_ns_ = 0;
+            delete_ep = true;
+        } else {
+            jetty_state_[slot] = DRAINING;
+            draining_slot_ = slot;
+            drain_start_ns_ = getCurrentTimeInNano();
+            context_->addDrainingEndpoint(this);
+            LOG(WARNING) << "Jetty ACK timeout: start drain slot=" << slot
+                         << " jetty_id=" << jetty_list_[slot]->jetty_id.id
+                         << " on " << toString();
+        }
+    }
+    if (delete_ep) {
+        LOG(ERROR) << "Jetty rebuild fallback to deleteEndpoint: "
+                   << "modify_jetty(ERROR) failed on " << toString();
+        context_->deleteEndpointByPtr(this);
+    }
+}
+
+void UrmaEndpoint::onFlushDone(int slot) {
+    bool delete_ep = false;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (slot < 0 || slot >= static_cast<int>(jetty_list_.size())) return;
+        if (jetty_state_[slot] != DRAINING) return;
+        jetty_state_[slot] = REBUILDING;
+        LOG(INFO) << "Jetty flush-done: rebuild slot=" << slot << " on "
+                  << toString();
+        if (rebuildJettyUnlocked(slot)) {
+            context_->removeDrainingEndpoint(this);
+            draining_slot_ = -1;
+            drain_start_ns_ = 0;
+            delete_ep = true;
+        }
+    }
+    if (delete_ep) {
+        LOG(ERROR) << "Jetty rebuild fallback to deleteEndpoint: "
+                   << "rebuildJetty failed on " << toString();
+        context_->deleteEndpointByPtr(this);
+    }
+}
+
+void UrmaEndpoint::checkDrainTimeout() {
+    bool delete_ep = false;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (draining_slot_ < 0) return;
+        int slot = draining_slot_;
+        if (slot >= static_cast<int>(jetty_state_.size()) ||
+            jetty_state_[slot] != DRAINING) {
+            return;
+        }
+        uint64_t now = getCurrentTimeInNano();
+        if (now - drain_start_ns_ < kJettyDrainTimeoutNs) return;
+        LOG(ERROR) << "Jetty drain timed out after "
+                   << ((now - drain_start_ns_) / 1000000ull)
+                   << "ms, slot=" << slot << " on " << toString();
+        context_->removeDrainingEndpoint(this);
+        draining_slot_ = -1;
+        drain_start_ns_ = 0;
+        delete_ep = true;
+    }
+    if (delete_ep) {
+        LOG(ERROR) << "Jetty rebuild fallback to deleteEndpoint: "
+                   << "flush-done timeout on " << toString();
+        context_->deleteEndpointByPtr(this);
+    }
+}
+
+int UrmaEndpoint::rebuildJettyUnlocked(int slot) {
+    auto* old_jetty = jetty_list_[slot];
+    if (!old_jetty) return ERR_ENDPOINT;
+    const uint32_t old_id = old_jetty->jetty_id.id;
+    const uint32_t peer_id = peer_jetty_id_[slot];
+    const uint64_t started_ns = drain_start_ns_;
+    urma_jfc_t* reuse_jfc = old_jetty->jetty_cfg.jfs_cfg.jfc;
+    urma_jfr_t* reuse_jfr = old_jetty->jetty_cfg.shared.jfr;
+
+    // 1) Flush residual WRs (may overlap with already-polled CRs).
+    urma_cr_t flush_crs[64];
+    while (true) {
+        int flushed = urma_flush_jetty(old_jetty, 64, flush_crs);
+        if (flushed < 0) {
+            PLOG(ERROR) << "urma_flush_jetty failed, slot=" << slot;
+            return ERR_ENDPOINT;
+        }
+        if (flushed == 0) break;
+        // Completions for these WRs should already have been (or will be)
+        // accounted via poll; do not touch slice pointers from flush CRs.
+    }
+
+    // 2) Unbind / unimport old peer view.
+    auto imported_it = imported_jetty_map_.find(old_jetty);
+    urma_target_jetty_t* old_imported =
+        (imported_it != imported_jetty_map_.end()) ? imported_it->second
+                                                   : nullptr;
+    int ret = urma_unbind_jetty(old_jetty);
+    if (ret) PLOG(ERROR) << "Failed to unbind jetty before rebuild";
+    if (old_imported) {
+        ret = urma_unimport_jetty(old_imported);
+        if (ret) PLOG(ERROR) << "Failed to unimport jetty before rebuild";
+        imported_jetty_map_.erase(imported_it);
+    }
+
+    // 3) Delete old jetty and clear outstanding depth for this slot.
+    context_->unregisterJettyOwner(old_id);
+    jetty_id_map_.erase(old_id);
+    ret = urma_delete_jetty(old_jetty);
+    if (ret) {
+        PLOG(ERROR) << "Failed to delete jetty during rebuild";
+        jetty_list_[slot] = nullptr;
+        return ERR_ENDPOINT;
+    }
+    jetty_list_[slot] = nullptr;
+    if (wr_depth_list_[slot] != 0) {
+        __sync_fetch_and_sub(jfc_outstanding_, wr_depth_list_[slot]);
+        wr_depth_list_[slot] = 0;
+    }
+
+    // 4) Create replacement jetty with the same JFC/JFR config.
+    urma_jfs_cfg_t jfs_cfg = {
+        .depth = 2048,
+        .trans_mode = URMA_TM_RC,
+        .priority = 15,
+        .max_sge = 5,
+        .rnr_retry = 7,
+        .err_timeout = 17,
+        .user_ctx = 0,
+    };
+    urma_jetty_flag_t jetty_flag = {};
+    jetty_flag.bs.share_jfr = 1;
+    urma_jetty_cfg_t attr{};
+    attr.flag = jetty_flag;
+    attr.jfs_cfg = jfs_cfg;
+    attr.jfs_cfg.jfc = reuse_jfc ? reuse_jfc : context_->jfc();
+    attr.shared.jfr = reuse_jfr ? reuse_jfr : context_->jfr();
+    urma_jetty_t* new_jetty =
+        urma_create_jetty(context_->urma_context_, &attr);
+    if (!new_jetty) {
+        PLOG(ERROR) << "Failed to create jetty during rebuild";
+        return ERR_ENDPOINT;
+    }
+
+    // 5) Re-import peer and bind locally (no peer protocol).
+    if (peer_eid_.empty()) {
+        LOG(ERROR) << "Missing peer eid during jetty rebuild";
+        urma_delete_jetty(new_jetty);
+        return ERR_ENDPOINT;
+    }
+    urma_eid_t eid;
+    if (!context_->transEidFromString(peer_eid_, eid)) {
+        LOG(ERROR) << "Invalid peer eid during jetty rebuild: " << peer_eid_;
+        urma_delete_jetty(new_jetty);
+        return ERR_ENDPOINT;
+    }
+    urma_rjetty_t rjetty = {};
+    rjetty.jetty_id.id = peer_id;
+    rjetty.jetty_id.eid = eid;
+    rjetty.trans_mode = URMA_TM_RC;
+    rjetty.type = URMA_JETTY;
+    rjetty.tp_type = URMA_CTP;
+    rjetty.flag.value = 0;
+    urma_target_jetty_t* imported =
+        urma_import_jetty(context_->urma_context_, &rjetty, &urma_token);
+    if (!imported) {
+        PLOG(ERROR) << "Failed to import peer jetty during rebuild";
+        urma_delete_jetty(new_jetty);
+        return ERR_ENDPOINT;
+    }
+    urma_status_t bind_ret = urma_bind_jetty(new_jetty, imported);
+    if (bind_ret != URMA_SUCCESS && bind_ret != URMA_EEXIST) {
+        PLOG(ERROR) << "Failed to bind rebuilt jetty";
+        urma_unimport_jetty(imported);
+        urma_delete_jetty(new_jetty);
+        return ERR_ENDPOINT;
+    }
+
+    jetty_list_[slot] = new_jetty;
+    imported_jetty_map_[new_jetty] = imported;
+    const uint32_t new_id = new_jetty->jetty_id.id;
+    jetty_id_map_[new_id] = slot;
+    context_->registerJettyOwner(new_id, this, slot);
+    jetty_state_[slot] = ACTIVE;
+    draining_slot_ = -1;
+    drain_start_ns_ = 0;
+    context_->removeDrainingEndpoint(this);
+
+    LOG(WARNING) << "Jetty rebuilt successfully slot=" << slot
+                 << " old_id=" << old_id << " new_id=" << new_id
+                 << " peer_id=" << peer_id << " elapsed_ms="
+                 << ((getCurrentTimeInNano() - started_ns) / 1000000ull)
+                 << " on " << toString();
     return 0;
 }
 
