@@ -157,6 +157,7 @@ class Transport {
             struct {
                 uint64_t dest_addr;
                 volatile int *jetty_depth;
+                uint64_t jetty_epoch;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 void *r_seg;

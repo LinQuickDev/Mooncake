@@ -60,16 +60,21 @@ kunpeng 数据面是单边 `URMA_OPC_READ/WRITE`，DMA 目标是对端 **segment
 每个 jetty 槽位有独立状态：
 
 ```
-ACTIVE ──(status=9)──► DRAINING ──(FLUSH_ERR_DONE)──► REBUILDING
-                                                          │
-                     ◄── create + 本端 rebind + 更新槽位 ──┘
-                     │
-                     └── 失败 / 超时 ──► 回退：deleteEndpointByPtr
+ACTIVE ──(status=9，无其它槽在重建)──► DRAINING ──(FLUSH_ERR_DONE)──► REBUILDING
+  │                                                                    │
+  │                 ◄── create + 本端 rebind + 更新槽位 ───────────────┘
+  │
+  └──(status=9，已有槽在重建)──► PENDING_DRAIN ──(前槽重建完成后触发)──► DRAINING
+
+                  任一环节失败 / 超时 ──► 回退：deleteEndpointByPtr
 ```
 
 - `ACTIVE`：正常收发
 - `DRAINING`：已 `modify(ERROR)`，禁止 post，等待 `FLUSH_ERR_DONE`
 - `REBUILDING`：排空完成，正在 flush / 删建 / rebind
+- `PENDING_DRAIN`：本槽也收到 status=9，但同 EP 已有 jetty 在重建；禁止 post
+  （选槽跳过，避免故障槽继续吃流量），等前一个重建完成后由其尾部串行触发
+  `modify(ERROR)` 进入 DRAINING
 - 同 EP 任意时刻最多一个 jetty 处于 DRAINING/REBUILDING（串行）
 
 ---
@@ -79,10 +84,11 @@ ACTIVE ──(status=9)──► DRAINING ──(FLUSH_ERR_DONE)──► REBUIL
 ### 4.1 per-jetty 状态
 
 ```cpp
-enum JettyState { ACTIVE, DRAINING, REBUILDING };
+enum JettyState { ACTIVE, DRAINING, REBUILDING, PENDING_DRAIN };
 std::vector<JettyState> jetty_state_;             // 与 jetty_list_ 平行
 std::unordered_map<uint32_t, int> jetty_id_map_;  // jetty_id → slot index
 std::vector<uint32_t> peer_jetty_id_;             // 每槽对端 id，delete 前保留
+std::vector<uint64_t> jetty_epoch_;               // 每槽重建代次，丢弃旧代次的迟到 CR
 ```
 
 `peer_jetty_id_` 在握手 `doSetupConnection` 时写入；段 C 在 delete 本地 jetty
@@ -119,7 +125,9 @@ if cr.status == FLUSH_ERR_DONE:
 ### 4.5 status=9 分流与触发时机
 
 **首次** poll 到 `ACK_TIMEOUT_ERR (9)` 即触发排空（不等重试耗尽）；`onJettyError`
-必须幂等（已在 DRAINING/REBUILDING 则不再 `modify`）。
+必须幂等（已在 DRAINING/REBUILDING/PENDING_DRAIN 则不再 `modify`）。
+若同 EP 已有 jetty 在重建，则把本槽标记为 `PENDING_DRAIN` 排队：选槽立即跳过
+它，等前一个重建完成后由其尾部调用 `startDrainUnlocked` 串行启动排空。
 
 ```
 if cr.status == ACK_TIMEOUT_ERR (9):
@@ -136,19 +144,29 @@ if cr.status == ACK_TIMEOUT_ERR (9):
 - 带有效 `user_ctx` 的失败 CQE：仍走现有 `jetty_depth_set` / retry 路径扣
   `wr_depth_list_` 与 JFC outstanding
 - `FLUSH_ERR_DONE`：不当作 slice；不得 `markSuccess` / 不得当失败 slice 入队
-- 段 C 替换前若 depth 仍非 0：打日志并在持锁下归零该槽与对应 JFC 计数（与今日
-  `deconstruct` 对 outstanding 的处理同思路），避免泄漏
+- **每个 WR 恰好完成一次**：`modify(ERROR)` 后 inflight WR 要么以
+  `WR_FLUSH_ERR` 经 JFC poll 回来，要么被段 C 的 `urma_flush_jetty` 回收；两者
+  统一经 `processWrCompletion` 记账（`jetty_depth_set` 延迟扣减 + poll 返回值
+  累计 JFC outstanding）。因此段 C 删除旧 jetty 后**不做**额外的
+  `wr_depth_list_[slot]` / JFC 清零——延迟扣减要等 poll 返回后才 apply，在段 C
+  里提前清零会双扣（实现后已删除原方案中的"归零兜底"）
+- 旧 jetty 删除后 `++jetty_epoch_[slot]`；slice 在 post 时记录
+  `slice->ub.jetty_epoch`，旧代次的迟到/重复 CR 在 `processWrCompletion` 里按
+  epoch 不匹配直接丢弃，不参与记账、不再入 retry 队列
 
 ### 4.7 段 C 完整顺序（持锁）
 
 ```
-1. urma_flush_jetty（回收残余 WR；注意与 poll 可能重复，见 §7）
+1. urma_flush_jetty（回收残余 WR，逐条经 processWrCompletion 交付；
+   注意与 poll 可能重复，见 §7）
 2. unbind → unimport（旧本地 jetty 上的对端视图）
-3. delete_jetty；从 jetty_id_map_ 删旧 id
+3. delete_jetty；从 jetty_id_map_ 删旧 id；++jetty_epoch_[slot]
 4. create_jetty（同 JFC/JFR 配置）
 5. import(peer_jetty_id_[slot]) → bind(新 jetty, imported)
 6. 更新 jetty_list_[slot]、imported_jetty_map_、jetty_id_map_
 7. jetty_state_[slot] = ACTIVE
+8. 扫描 PENDING_DRAIN 槽：有则立即 startDrainUnlocked（modify(ERROR)），
+   仍保持同 EP 串行
 ```
 
 任一步失败 → 回退 `deleteEndpointByPtr`。
@@ -200,7 +218,7 @@ if cr.status == ACK_TIMEOUT_ERR (9):
 
 | 文件 | 改动 |
 |---|---|
-| `urma_endpoint.h` | `JettyState`、`jetty_state_`、`jetty_id_map_`、`peer_jetty_id_`、`onJettyError()` / `onFlushDone()` |
+| `urma_endpoint.h` | `JettyState`（含 `PENDING_DRAIN`）、`jetty_state_`、`jetty_id_map_`、`peer_jetty_id_`、`jetty_epoch_`、`onJettyError()` / `onFlushDone()` / `startDrainUnlocked()` |
 | `urma_endpoint.cpp` | 状态机、选槽跳过、段 A/C、握手写入 `peer_jetty_id_` |
 | `ub_context.cpp` | poll / worker 侧配合 status=9 与 `FLUSH_ERR_DONE`（若分流落在 context poll 则改 `urma_endpoint.cpp` 中 `UrmaContext::poll`） |
 
@@ -208,7 +226,11 @@ if cr.status == ACK_TIMEOUT_ERR (9):
 
 ## 7. 风险与开放问题
 
-1. **urma_flush_jetty 与 poll 重复**：flush 返回的 WR 级 CR 是否已在 JFC poll 中出现过，需实测确认，避免 double-complete。
+1. **urma_flush_jetty 与 poll 重复**：flush 返回的 WR 级 CR 是否已在 JFC poll
+   中出现过，需实测确认，避免 double-complete。实现按「每个 WR 恰好完成一次」
+   记账，并用 `jetty_epoch_` 把旧代次的迟到 CR 整体丢弃兜底；若实测发现 flush
+   与 poll 会重复交付同一 WR，需重新评估 slice 指针解引用的安全性（届时 CR 里
+   的 `user_ctx` 可能指向已回收的 slice）。
 2. **共享 JFC 假 CQE 过滤**：多 jetty 共享 JFC 时，严格按 `local_id` 匹配，不能假设顺序。
 3. **超时阈值**：flush-done 等待 3s 是否合适，需结合 `err_timeout` 和现场标定。
 4. **硬件 hang 场景**：本方案解决软件放大故障；若根因是设备/驱动 hang，重建仍可能失败，保留删 EP 降级路径。

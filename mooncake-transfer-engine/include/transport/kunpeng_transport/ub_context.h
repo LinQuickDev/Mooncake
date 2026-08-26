@@ -188,13 +188,19 @@ class UbContext {
     //   * Successful slices have markSuccess() called in place and are NOT
     //     returned (they may be recycled by the submitting thread the
     //     moment markSuccess() runs).
-    //   * Failed slices are returned in failed_slices[0..num_failed-1] for
-    //     the caller to apply retry / markFailed.
-    // Returns the total number of completions polled (>= 0), or a negative
-    // error code.
-    virtual int poll(int num_entries, Transport::Slice** failed_slices,
-                     int& num_failed,
+    //   * Failed slices are appended to failed_slices for the caller to apply
+    //     retry / markFailed. Implementations may also append completions
+    //     recovered while draining a jetty, so the vector is unbounded.
+    //   * Stale completions from a previous jetty generation are dropped and
+    //     are not counted in the return value.
+    //   * Endpoints scheduled for deletion are appended to deferred_deletes;
+    //     the caller must delete them only after jetty_depth_set accounting.
+    // Returns the number of resolved WR completions (>= 0), or a negative
+    // error code. Fence markers and dropped stale completions are excluded.
+    virtual int poll(int num_entries,
+                     std::vector<Transport::Slice*>& failed_slices,
                      std::unordered_map<volatile int*, int>& jetty_depth_set,
+                     std::vector<UbEndPoint*>& deferred_deletes,
                      int jfc_index = 0) = 0;
 
     virtual volatile int* outstandingCount(int jfc_index) = 0;
@@ -258,6 +264,10 @@ class UbContext {
     }
 
     UbTransport& engine() const { return engine_; }
+
+    bool traceWorkRequestFlushedErrors() const {
+        return show_work_request_flushed_error_;
+    }
 
     uint8_t portNum() const { return port_; }
 
