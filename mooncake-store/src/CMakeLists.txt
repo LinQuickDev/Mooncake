@@ -88,6 +88,8 @@ set(MOONCAKE_STORE_SOURCES
     vchunk_master_manager.cpp
     vchunk_client.cpp
     vchunk_transfer_engine.cpp
+    vchunk_metadata_store.cpp
+    vchunk_metrics.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
 

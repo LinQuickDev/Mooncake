@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <memory>
 #include <string>
+#include <thread>
 
 #include "master_config.h"
 #include "types.h"
@@ -24,11 +27,44 @@ TEST(VChunkMasterServiceTest, BuilderPropagatesVChunkConfiguration) {
     VChunkConfig vchunk_config;
     vchunk_config.enabled = true;
     vchunk_config.max_slice_count = 128;
+    auto metadata_store = std::make_shared<InMemoryVChunkMetadataStore>();
     const auto config = MasterServiceConfig::builder()
                             .set_vchunk_config(vchunk_config)
+                            .set_vchunk_metadata_store(metadata_store)
                             .build();
     EXPECT_TRUE(config.vchunk_config.enabled);
     EXPECT_EQ(config.vchunk_config.max_slice_count, 128U);
+    EXPECT_EQ(config.vchunk_metadata_store, metadata_store);
+}
+
+TEST(VChunkMasterServiceTest, BackgroundReaperStopsAndCleansExpiredCreating) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.vchunk_config.enabled = true;
+    config.vchunk_config.creating_timeout_ms = 1;
+    config.vchunk_config.reaper_interval_ms = 5;
+    config.vchunk_config.reaper_max_scan = 4;
+    MasterService service(config);
+    ASSERT_TRUE(service
+                    .MountSegment(
+                        MakeVChunkSegment("reaper-segment", 0xE00000000ULL),
+                        generate_uuid())
+                    .has_value());
+    const TenantId tenant("tenant");
+    ASSERT_TRUE(
+        service.VChunkPutStart(tenant, "expired", 4096, false, 0).has_value());
+    for (int i = 0; i < 100; ++i) {
+        if (service.GetVChunk(tenant, "expired").error() ==
+            ErrorCode::OBJECT_NOT_FOUND) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(service.GetVChunk(tenant, "expired").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+    const auto metrics = service.GetVChunkMetrics();
+    EXPECT_EQ(metrics.states[static_cast<size_t>(VChunkStatus::CREATING)], 0U);
+    EXPECT_GE(metrics.rollbacks, 1U);
 }
 
 TEST(VChunkMasterServiceTest, ExposesIsolatedVChunkControlPlane) {

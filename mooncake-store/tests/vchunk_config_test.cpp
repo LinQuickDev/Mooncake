@@ -11,6 +11,9 @@ TEST(VChunkConfigTest, DefaultsAreSafeForProductionOptIn) {
     EXPECT_EQ(config.Validate(), ErrorCode::OK);
     EXPECT_EQ(config.max_slice_count, 4096U);
     EXPECT_EQ(config.max_metadata_bytes, 1024U * 1024U);
+    EXPECT_EQ(config.max_creating_objects, 1024U);
+    EXPECT_EQ(config.reaper_interval_ms, 1000U);
+    EXPECT_EQ(config.reaper_max_scan, 128U);
 }
 
 TEST(VChunkConfigTest, RejectsInvalidLimits) {
@@ -24,6 +27,14 @@ TEST(VChunkConfigTest, RejectsInvalidLimits) {
 
     config = VChunkConfig{};
     config.creating_timeout_ms = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.max_creating_objects = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.reaper_interval_ms = 0;
     EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
 }
 

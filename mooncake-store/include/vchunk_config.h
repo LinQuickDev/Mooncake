@@ -27,12 +27,16 @@ struct VChunkConfig {
     uint32_t max_slice_retry{3};
     uint32_t max_slice_count{4096};
     uint64_t max_metadata_bytes{1024U * 1024U};
+    uint32_t max_creating_objects{1024};
+    uint64_t reaper_interval_ms{1000};
+    uint32_t reaper_max_scan{128};
 
     ErrorCode Validate() const;
 
     YLT_REFL(VChunkConfig, enabled, creating_timeout_ms,
              releasing_timeout_ms, max_slice_retry, max_slice_count,
-             max_metadata_bytes);
+             max_metadata_bytes, max_creating_objects, reaper_interval_ms,
+             reaper_max_scan);
 };
 
 }  // namespace mooncake

@@ -213,7 +213,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
-      vchunk_manager_(config.vchunk_config),
+      vchunk_manager_(config.vchunk_config, config.vchunk_metadata_store),
+      vchunk_enabled_(config.vchunk_config.enabled),
+      vchunk_reaper_interval_ms_(config.vchunk_config.reaper_interval_ms),
+      vchunk_reaper_max_scan_(config.vchunk_config.reaper_max_scan),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
@@ -236,6 +239,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
+    if (config.vchunk_config.enabled && config.enable_ha &&
+        (!config.vchunk_metadata_store ||
+         !config.vchunk_metadata_store->IsPersistent())) {
+        throw std::invalid_argument(
+            "vchunk requires an explicit persistent metadata store in HA mode");
+    }
+    if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
+        const auto error = vchunk_manager_.Recover(getCurrentTimeInMilli());
+        if (error != ErrorCode::OK) {
+            throw std::runtime_error("failed to recover vchunk metadata");
+        }
+    }
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -543,6 +558,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+    if (vchunk_enabled_) {
+        vchunk_reaper_running_ = true;
+        vchunk_reaper_thread_ =
+            std::thread(&MasterService::VChunkReaperThreadFunc, this);
+    }
 }
 
 tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
@@ -586,6 +606,35 @@ ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
                                       int64_t now_ms) {
     auto allocator_access = segment_manager_.getAllocatorAccess();
     return vchunk_manager_.Remove(tenant_id, key, now_ms);
+}
+
+tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
+    int64_t now_ms, size_t max_scan) {
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.ReapExpired(now_ms, max_scan);
+}
+
+VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
+    return vchunk_manager_.MetricsSnapshot();
+}
+
+void MasterService::VChunkReaperThreadFunc() {
+    std::unique_lock<std::mutex> lock(vchunk_reaper_mutex_);
+    while (vchunk_reaper_running_) {
+        if (vchunk_reaper_cv_.wait_for(
+                lock, std::chrono::milliseconds(vchunk_reaper_interval_ms_),
+                [this] { return !vchunk_reaper_running_.load(); })) {
+            break;
+        }
+        lock.unlock();
+        const auto result = ReapExpiredVChunks(getCurrentTimeInMilli(),
+                                               vchunk_reaper_max_scan_);
+        if (!result) {
+            LOG(ERROR) << "vchunk reaper failed, error="
+                       << static_cast<int>(result.error());
+        }
+        lock.lock();
+    }
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -1412,6 +1461,7 @@ MasterService::~MasterService() {
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
+    vchunk_reaper_running_ = false;
     graceful_unmount_scheduler_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -1420,6 +1470,7 @@ MasterService::~MasterService() {
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
+    vchunk_reaper_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -1440,6 +1491,9 @@ MasterService::~MasterService() {
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
+    }
+    if (vchunk_reaper_thread_.joinable()) {
+        vchunk_reaper_thread_.join();
     }
 
     // Reset snapshot manager after all other threads have joined

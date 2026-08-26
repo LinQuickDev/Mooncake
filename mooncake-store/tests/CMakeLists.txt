@@ -47,6 +47,7 @@ add_store_test(vchunk_master_manager_test vchunk_master_manager_test.cpp)
 add_store_test(vchunk_master_service_test vchunk_master_service_test.cpp)
 add_store_test(vchunk_client_test vchunk_client_test.cpp)
 add_store_test(vchunk_transfer_engine_test vchunk_transfer_engine_test.cpp)
+add_store_test(vchunk_metadata_store_test vchunk_metadata_store_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
   NAME replica_selection_env_opt_in_test

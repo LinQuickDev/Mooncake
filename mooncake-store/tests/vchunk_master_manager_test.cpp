@@ -198,5 +198,19 @@ TEST(VChunkMasterManagerTest, PiercingVersionRejectsSsdSegments) {
     EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
 }
 
+TEST(VChunkMasterManagerTest, CreatingBacklogTripsAllocationCircuitBreaker) {
+    ManagerFixture fixture;
+    auto config = EnabledConfig();
+    config.max_creating_objects = 1;
+    VChunkMasterManager manager(config);
+    ASSERT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                 "first", 4096, false, 100)
+                    .has_value());
+    auto blocked = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                    "second", 4096, false, 101);
+    ASSERT_FALSE(blocked.has_value());
+    EXPECT_EQ(blocked.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
 }  // namespace
 }  // namespace mooncake

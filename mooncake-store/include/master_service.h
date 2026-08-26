@@ -259,6 +259,9 @@ class MasterService {
         const TenantId& tenant_id, const std::string& key) const;
     ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
                            int64_t now_ms);
+    tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
+                                                       size_t max_scan);
+    VChunkMetricsSnapshot GetVChunkMetrics() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -2359,6 +2362,14 @@ class MasterService {
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
     VChunkMasterManager vchunk_manager_;
+    bool vchunk_enabled_{false};
+    uint64_t vchunk_reaper_interval_ms_{1000};
+    size_t vchunk_reaper_max_scan_{128};
+    std::atomic<bool> vchunk_reaper_running_{false};
+    std::thread vchunk_reaper_thread_;
+    std::mutex vchunk_reaper_mutex_;
+    std::condition_variable vchunk_reaper_cv_;
+    void VChunkReaperThreadFunc();
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

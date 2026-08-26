@@ -16,6 +16,8 @@
 #include "vchunk_allocation_strategy.h"
 #include "vchunk_config.h"
 #include "vchunk_metadata.h"
+#include "vchunk_metadata_store.h"
+#include "vchunk_metrics.h"
 
 namespace mooncake {
 
@@ -34,7 +36,10 @@ class VChunkMasterManager {
         std::shared_ptr<const void> lifetime_;
     };
 
-    explicit VChunkMasterManager(VChunkConfig config);
+    explicit VChunkMasterManager(
+        VChunkConfig config,
+        std::shared_ptr<VChunkMetadataStore> metadata_store = nullptr,
+        std::shared_ptr<VChunkMetrics> metrics = nullptr);
 
     VChunkMasterManager(const VChunkMasterManager&) = delete;
     VChunkMasterManager& operator=(const VChunkMasterManager&) = delete;
@@ -58,6 +63,11 @@ class VChunkMasterManager {
     ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
                      int64_t now_ms);
 
+    ErrorCode Recover(int64_t now_ms);
+    tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
+                                                size_t max_scan);
+    VChunkMetricsSnapshot MetricsSnapshot() const;
+
     size_t SizeForTesting() const;
 
    private:
@@ -68,8 +78,11 @@ class VChunkMasterManager {
 
     static std::string ScopedKey(const TenantId& tenant_id,
                                  const std::string& key);
+    void RefreshStateMetricsLocked();
 
     const VChunkConfig config_;
+    const std::shared_ptr<VChunkMetadataStore> metadata_store_;
+    const std::shared_ptr<VChunkMetrics> metrics_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
 };

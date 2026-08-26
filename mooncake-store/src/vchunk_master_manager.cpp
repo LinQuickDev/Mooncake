@@ -7,8 +7,15 @@
 
 namespace mooncake {
 
-VChunkMasterManager::VChunkMasterManager(VChunkConfig config)
-    : config_(std::move(config)) {}
+VChunkMasterManager::VChunkMasterManager(
+    VChunkConfig config, std::shared_ptr<VChunkMetadataStore> metadata_store,
+    std::shared_ptr<VChunkMetrics> metrics)
+    : config_(std::move(config)),
+      metadata_store_(metadata_store ? std::move(metadata_store)
+                                     : std::make_shared<
+                                           InMemoryVChunkMetadataStore>()),
+      metrics_(metrics ? std::move(metrics)
+                       : std::make_shared<VChunkMetrics>()) {}
 
 std::string VChunkMasterManager::ScopedKey(const TenantId& tenant_id,
                                            const std::string& key) {
@@ -23,7 +30,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
         !tenant_id.IsValid() || key.empty() || total_size == 0 || now_ms < 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // The piercing version owns buffers from SegmentManager and supports
+    // The current version owns buffers from SegmentManager and supports
     // memory segments only. SSD/NoF routing is introduced in a later stage.
     if (is_ssd_segment) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -33,6 +40,13 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
         std::lock_guard<std::mutex> guard(mutex_);
         if (entries_.contains(scoped_key)) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        size_t creating = 0;
+        for (const auto& [_, entry] : entries_) {
+            creating += entry->record.status == VChunkStatus::CREATING;
+        }
+        if (creating >= config_.max_creating_objects) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
     }
 
@@ -48,6 +62,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     auto allocation = AllocateVChunk(allocator_manager, total_size,
                                      slice_size_level, excluded_segments);
     if (!allocation) {
+        metrics_->AddAllocationFailure();
         return tl::make_unexpected(allocation.error());
     }
 
@@ -77,13 +92,22 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     if (!serialized) {
         return tl::make_unexpected(serialized.error());
     }
+    if (const auto error = metadata_store_->Put(record);
+        error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
 
     std::lock_guard<std::mutex> guard(mutex_);
     if (entries_.contains(scoped_key)) {
+        metadata_store_->Remove(record);
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     const auto snapshot = record;
     entries_.emplace(scoped_key, std::move(entry));
+    metrics_->AddSlices(snapshot.slice_count);
+    metrics_->ObserveLayout(snapshot);
+    metrics_->AddMetadataBytes(serialized->size());
+    RefreshStateMetricsLocked();
     return snapshot;
 }
 
@@ -108,11 +132,18 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
         now_ms < record.last_updated_at_ms) {
         return ErrorCode::INVALID_PARAMS;
     }
-    for (auto& slice : record.slices) {
+    auto durable = record;
+    for (auto& slice : durable.slices) {
         slice.status = VCSliceStatus::COMPLETED;
     }
-    record.status = VChunkStatus::ACTIVE;
-    record.last_updated_at_ms = now_ms;
+    durable.status = VChunkStatus::ACTIVE;
+    durable.last_updated_at_ms = now_ms;
+    if (const auto error = metadata_store_->Put(durable);
+        error != ErrorCode::OK) {
+        return error;
+    }
+    record = std::move(durable);
+    RefreshStateMetricsLocked();
     return ErrorCode::OK;
 }
 
@@ -131,7 +162,13 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
         it->second->record.status != VChunkStatus::FAILED) {
         return ErrorCode::INVALID_PARAMS;
     }
+    if (const auto error = metadata_store_->Remove(it->second->record);
+        error != ErrorCode::OK) {
+        return error;
+    }
     entries_.erase(it);
+    metrics_->AddRollback();
+    RefreshStateMetricsLocked();
     return ErrorCode::OK;
 }
 
@@ -171,15 +208,121 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
         return ErrorCode::OK;
     }
     auto& record = it->second->record;
-    if (record.status != VChunkStatus::ACTIVE ||
+    if ((record.status != VChunkStatus::ACTIVE &&
+         record.status != VChunkStatus::RELEASING) ||
         now_ms < record.last_updated_at_ms) {
         return ErrorCode::INVALID_PARAMS;
     }
-    record.status = VChunkStatus::RELEASING;
-    record.last_updated_at_ms = now_ms;
-    record.status = VChunkStatus::RELEASED;
+    if (record.status == VChunkStatus::ACTIVE) {
+        auto releasing = record;
+        releasing.status = VChunkStatus::RELEASING;
+        releasing.last_updated_at_ms = now_ms;
+        if (const auto error = metadata_store_->Put(releasing);
+            error != ErrorCode::OK) {
+            return error;
+        }
+        record = std::move(releasing);
+    }
+    if (const auto error = metadata_store_->Remove(record);
+        error != ErrorCode::OK) {
+        return error;
+    }
     entries_.erase(it);
+    RefreshStateMetricsLocked();
     return ErrorCode::OK;
+}
+
+ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
+    if (now_ms < 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto records = metadata_store_->List();
+    if (!records) {
+        return records.error();
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (const auto& record : *records) {
+        const auto validation = ValidateVChunkMetadata(record, config_);
+        if (validation != ErrorCode::OK) {
+            return validation;
+        }
+        const bool creating_expired =
+            record.status == VChunkStatus::CREATING &&
+            now_ms >= record.last_updated_at_ms &&
+            static_cast<uint64_t>(now_ms - record.last_updated_at_ms) >=
+                config_.creating_timeout_ms;
+        if (creating_expired || record.status == VChunkStatus::RELEASING ||
+            record.status == VChunkStatus::RELEASED ||
+            record.status == VChunkStatus::FAILED) {
+            const auto error = metadata_store_->Remove(record);
+            if (error != ErrorCode::OK) {
+                return error;
+            }
+            continue;
+        }
+        const auto scoped_key =
+            ScopedKey(TenantId(record.tenant_id), record.key);
+        if (entries_.contains(scoped_key)) {
+            continue;
+        }
+        auto entry = std::make_shared<Entry>();
+        entry->record = record;
+        entries_.emplace(scoped_key, std::move(entry));
+    }
+    RefreshStateMetricsLocked();
+    return ErrorCode::OK;
+}
+
+tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
+    int64_t now_ms, size_t max_scan) {
+    if (now_ms < 0 || max_scan == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    size_t scanned = 0;
+    size_t removed = 0;
+    for (auto it = entries_.begin(); it != entries_.end() && scanned < max_scan;) {
+        ++scanned;
+        const auto& record = it->second->record;
+        const bool time_is_valid = now_ms >= record.last_updated_at_ms;
+        const auto age = time_is_valid
+                             ? static_cast<uint64_t>(now_ms -
+                                                     record.last_updated_at_ms)
+                             : 0;
+        const bool expired =
+            time_is_valid &&
+            ((record.status == VChunkStatus::CREATING &&
+              age >= config_.creating_timeout_ms) ||
+             (record.status == VChunkStatus::RELEASING &&
+              age >= config_.releasing_timeout_ms));
+        if (!expired) {
+            ++it;
+            continue;
+        }
+        if (const auto error = metadata_store_->Remove(record);
+            error != ErrorCode::OK) {
+            return tl::make_unexpected(error);
+        }
+        it = entries_.erase(it);
+        ++removed;
+        metrics_->AddRollback();
+    }
+    RefreshStateMetricsLocked();
+    return removed;
+}
+
+VChunkMetricsSnapshot VChunkMasterManager::MetricsSnapshot() const {
+    return metrics_->Snapshot();
+}
+
+void VChunkMasterManager::RefreshStateMetricsLocked() {
+    std::array<uint64_t, 5> counts{};
+    for (const auto& [_, entry] : entries_) {
+        ++counts[static_cast<size_t>(entry->record.status)];
+    }
+    for (size_t i = 0; i < counts.size(); ++i) {
+        metrics_->SetStateCount(static_cast<VChunkStatus>(i), counts[i]);
+    }
 }
 
 size_t VChunkMasterManager::SizeForTesting() const {

@@ -32,6 +32,11 @@ class MemoryDataPlane final : public VChunkDataPlane {
     ErrorCode Write(const VChunkMetadataRecord& record, const void* source,
                     size_t length,
                     std::chrono::steady_clock::time_point deadline) override {
+        ++write_attempts;
+        if (write_failures_remaining > 0) {
+            --write_failures_remaining;
+            return ErrorCode::TRANSFER_FAIL;
+        }
         if (fail_write || std::chrono::steady_clock::now() >= deadline) {
             return fail_write ? ErrorCode::TRANSFER_FAIL
                               : ErrorCode::RPC_TIMEOUT;
@@ -61,6 +66,11 @@ class MemoryDataPlane final : public VChunkDataPlane {
     ErrorCode Read(const VChunkMetadataRecord& record, void* destination,
                    size_t length,
                    std::chrono::steady_clock::time_point deadline) override {
+        ++read_attempts;
+        if (read_failures_remaining > 0) {
+            --read_failures_remaining;
+            return ErrorCode::TRANSFER_FAIL;
+        }
         if (fail_read || std::chrono::steady_clock::now() >= deadline) {
             return fail_read ? ErrorCode::TRANSFER_FAIL
                              : ErrorCode::RPC_TIMEOUT;
@@ -91,6 +101,10 @@ class MemoryDataPlane final : public VChunkDataPlane {
 
     bool fail_write{false};
     bool fail_read{false};
+    int write_failures_remaining{0};
+    int read_failures_remaining{0};
+    int write_attempts{0};
+    int read_attempts{0};
     bool block_reads{false};
     bool read_entered{false};
     bool release_read{false};
@@ -242,6 +256,75 @@ TEST_F(ClientFixture, InflightGetCompletesWhileRemoveBlocksNewReads) {
     reader.join();
     EXPECT_EQ(read_result, ErrorCode::OK);
     EXPECT_EQ(destination, source);
+}
+
+TEST_F(ClientFixture, BatchKeepsPerKeyFailuresIndependent) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::vector<uint8_t> first(4096, 1);
+    std::vector<uint8_t> third(4096, 3);
+    const std::vector<VChunkClient::PutRequest> puts{
+        {"first", first.data(), first.size()}, {"bad", nullptr, 4096},
+        {"third", third.data(), third.size()}};
+    const auto put_results = client.BatchPut(TenantId("tenant"), puts);
+    ASSERT_EQ(put_results.size(), 3U);
+    EXPECT_EQ(put_results[0], ErrorCode::OK);
+    EXPECT_EQ(put_results[1], ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(put_results[2], ErrorCode::OK);
+
+    std::vector<uint8_t> first_out(first.size());
+    std::vector<uint8_t> missing(first.size());
+    std::vector<uint8_t> third_out(third.size());
+    const std::vector<VChunkClient::GetRequest> gets{
+        {"first", first_out.data(), first_out.size()},
+        {"missing", missing.data(), missing.size()},
+        {"third", third_out.data(), third_out.size()}};
+    const auto get_results = client.BatchGet(TenantId("tenant"), gets);
+    EXPECT_EQ(get_results[0], ErrorCode::OK);
+    EXPECT_EQ(get_results[1], ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(get_results[2], ErrorCode::OK);
+    EXPECT_EQ(first_out, first);
+    EXPECT_EQ(third_out, third);
+}
+
+TEST_F(ClientFixture, RetriesRetryableTransfersWithinConfiguredLimit) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; }, 2);
+    std::vector<uint8_t> source(4096, 5);
+    data.write_failures_remaining = 1;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "key", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    EXPECT_EQ(data.write_attempts, 2);
+    const auto metrics = client.MetricsSnapshot();
+    EXPECT_EQ(metrics.retries, 1U);
+    EXPECT_EQ(metrics.requests[static_cast<size_t>(VChunkOperation::PUT)], 1U);
+    EXPECT_EQ(metrics.successes[static_cast<size_t>(VChunkOperation::PUT)], 1U);
+}
+
+TEST_F(ClientFixture, CircuitBreakerStopsOnlyNewVChunkCreation) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; }, 0,
+                        1);
+    std::vector<uint8_t> source(4096, 5);
+    ASSERT_EQ(client.Put(TenantId("tenant"), "active", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    data.fail_write = true;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "failed", source.data(),
+                         source.size()),
+              ErrorCode::TRANSFER_FAIL);
+    data.fail_write = false;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "blocked", source.data(),
+                         source.size()),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(data.write_attempts, 2);
+    std::vector<uint8_t> output(source.size());
+    EXPECT_EQ(client.Get(TenantId("tenant"), "active", output.data(),
+                         output.size()),
+              ErrorCode::OK);
+    EXPECT_EQ(output, source);
+    EXPECT_EQ(client.Remove(TenantId("tenant"), "active"), ErrorCode::OK);
 }
 
 }  // namespace

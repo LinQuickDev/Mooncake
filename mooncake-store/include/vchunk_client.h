@@ -1,10 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -12,6 +15,7 @@
 #include "tenant_id.h"
 #include "types.h"
 #include "vchunk_metadata.h"
+#include "vchunk_metrics.h"
 
 namespace mooncake {
 
@@ -44,13 +48,35 @@ class VChunkClient {
 
     VChunkClient(bool enabled, MasterService& master, VChunkDataPlane& data_plane,
                  VChunkLegacyPath& legacy, std::chrono::milliseconds timeout,
-                 NowMs now_ms);
+                 NowMs now_ms,
+                 uint32_t max_retries = VChunkConfig{}.max_slice_retry,
+                 uint32_t circuit_breaker_threshold = 0,
+                 std::shared_ptr<VChunkMetrics> metrics = nullptr);
 
     ErrorCode Put(const TenantId& tenant_id, const std::string& key,
                   const void* source, size_t length);
     ErrorCode Get(const TenantId& tenant_id, const std::string& key,
                   void* destination, size_t length);
     ErrorCode Remove(const TenantId& tenant_id, const std::string& key);
+
+    struct PutRequest {
+        std::string key;
+        const void* source{nullptr};
+        size_t length{0};
+    };
+    struct GetRequest {
+        std::string key;
+        void* destination{nullptr};
+        size_t length{0};
+    };
+
+    std::vector<ErrorCode> BatchPut(const TenantId& tenant_id,
+                                    const std::vector<PutRequest>& requests);
+    std::vector<ErrorCode> BatchGet(const TenantId& tenant_id,
+                                    const std::vector<GetRequest>& requests);
+    std::vector<ErrorCode> BatchRemove(
+        const TenantId& tenant_id, const std::vector<std::string>& keys);
+    VChunkMetricsSnapshot MetricsSnapshot() const;
 
    private:
     bool enabled_;
@@ -59,6 +85,10 @@ class VChunkClient {
     VChunkLegacyPath& legacy_;
     std::chrono::milliseconds timeout_;
     NowMs now_ms_;
+    uint32_t max_retries_;
+    uint32_t circuit_breaker_threshold_;
+    std::atomic<uint32_t> consecutive_put_failures_{0};
+    std::shared_ptr<VChunkMetrics> metrics_;
 };
 
 }  // namespace mooncake

@@ -10,6 +10,7 @@
 #include "config_helper.h"
 #include "types.h"
 #include "vchunk_config.h"
+#include "vchunk_metadata_store.h"
 
 namespace mooncake {
 
@@ -879,6 +880,7 @@ class MasterServiceConfigBuilder {
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
     VChunkConfig vchunk_config_{};
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -1025,6 +1027,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_vchunk_config(VChunkConfig config) {
         vchunk_config_ = std::move(config);
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_vchunk_metadata_store(
+        std::shared_ptr<VChunkMetadataStore> store) {
+        vchunk_metadata_store_ = std::move(store);
         return *this;
     }
 
@@ -1283,6 +1291,7 @@ class MasterServiceConfig {
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
     VChunkConfig vchunk_config{};
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -1442,6 +1451,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
     config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
     return config;
 }
 
