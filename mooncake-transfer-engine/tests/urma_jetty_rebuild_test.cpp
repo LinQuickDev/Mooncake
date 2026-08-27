@@ -293,7 +293,9 @@ TEST_F(UrmaJettyRebuildTest, FlushCompletionsDeliveredOnRebuild) {
     depth_set.clear();
     deferred.clear();
     int resolved = pollOnce(failed, depth_set, deferred);
-    EXPECT_EQ(0, resolved);  // fence not counted; flush accounted internally
+    // The fence marker itself is not counted, but s2's flush-driven
+    // completion increments poll's resolved_wr_count via rebuildJettyUnlocked.
+    EXPECT_EQ(1, resolved);
 
     // s2 must have left POSTED via the flush path (delivered to failed_slices).
     bool found_s2 = false;
