@@ -7,6 +7,11 @@ find_path(
   NAMES urma_api.h
   PATHS /usr/include /usr/local/include
   PATH_SUFFIXES urma umdk src/urma/lib/urma/core/include)
+find_path(
+  URMA_BOND_SYSTEM_INCLUDE_DIR
+  NAMES urma_ubagg.h
+  PATHS /usr/include /usr/local/include
+  PATH_SUFFIXES ub/umdk/urma urma umdk src/urma/lib/urma/bond/include)
 find_library(
   URMA_LIBRARY
   NAMES urma
@@ -14,6 +19,7 @@ find_library(
 
 if(URMA_SYSTEM_INCLUDE_DIR)
   set(urma_INCLUDE_DIR "${URMA_SYSTEM_INCLUDE_DIR}")
+  set(urma_bond_INCLUDE_DIR "${URMA_BOND_SYSTEM_INCLUDE_DIR}")
 else()
   # The source fallback supplies headers only. Production TENT UB remains
   # disabled at runtime when no real liburma is present; tests inject their own
@@ -24,12 +30,18 @@ else()
     GIT_TAG v25.12.0.B081)
   FetchContent_MakeAvailable(urma)
   set(urma_INCLUDE_DIR "${urma_SOURCE_DIR}/src/urma/lib/urma/core/include")
+  set(urma_bond_INCLUDE_DIR
+      "${urma_SOURCE_DIR}/src/urma/lib/urma/bond/include")
 endif()
 
 if(NOT TARGET Urma::urma)
   add_library(Urma::urma INTERFACE IMPORTED GLOBAL)
+  set(urma_interface_include_dirs "${urma_INCLUDE_DIR}")
+  if(urma_bond_INCLUDE_DIR)
+    list(APPEND urma_interface_include_dirs "${urma_bond_INCLUDE_DIR}")
+  endif()
   set_property(TARGET Urma::urma PROPERTY INTERFACE_INCLUDE_DIRECTORIES
-                                          "${urma_INCLUDE_DIR}")
+                                          "${urma_interface_include_dirs}")
   if(URMA_LIBRARY)
     set_property(TARGET Urma::urma PROPERTY INTERFACE_LINK_LIBRARIES
                                             "${URMA_LIBRARY}")

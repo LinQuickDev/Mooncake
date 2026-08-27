@@ -54,6 +54,14 @@ urma_status_t urma_init(urma_init_attr_t *init_attr) {
     return URMA_SUCCESS;
 }
 
+urma_status_t urma_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
+                            urma_user_ctl_out_t *out) {
+    (void)ctx;
+    (void)in;
+    (void)out;
+    return URMA_SUCCESS;
+}
+
 urma_status_t urma_uninit(void) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     initialized = false;

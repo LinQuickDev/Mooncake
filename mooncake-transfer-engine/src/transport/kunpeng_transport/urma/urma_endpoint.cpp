@@ -18,6 +18,7 @@
 #include <cstddef>
 #include "config.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
+#include "urma_ubagg.h"
 
 namespace mooncake {
 namespace {
