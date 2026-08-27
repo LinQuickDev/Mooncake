@@ -43,6 +43,9 @@ struct MockScript {
     int flush_err_count = 0;
     // When true, the next urma_create_jetty returns NULL.
     bool fail_next_create_jetty = false;
+    // When true, the next urma_delete_jetty returns an error without freeing,
+    // exercising the rebuild delete-failure path that must keep the handle.
+    bool fail_next_delete_jetty = false;
     // While > 0, the next WRs posted via urma_post_jetty_send_wr are marked
     // withhold (skipped by poll, only flushable). Decremented per WR posted.
     int withhold_next_post_count = 0;
@@ -402,6 +405,13 @@ urma_jetty_t *urma_create_jetty(urma_context_t *ctx, urma_jetty_cfg_t *cfg) {
 }
 
 urma_status_t urma_delete_jetty(urma_jetty_t *jetty) {
+    {
+        std::lock_guard<std::mutex> script_lock(g_script_mutex);
+        if (g_script.fail_next_delete_jetty) {
+            g_script.fail_next_delete_jetty = false;
+            return URMA_FAIL;  // keep the jetty allocated; caller must retry
+        }
+    }
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
         return URMA_EINVAL;
@@ -659,6 +669,11 @@ void mock_urma_set_flush_returns_errors(int count) {
 void mock_urma_withhold_next_post(int count) {
     std::lock_guard<std::mutex> script_lock(g_script_mutex);
     g_script.withhold_next_post_count = count;
+}
+
+void mock_urma_fail_next_delete_jetty(void) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.fail_next_delete_jetty = true;
 }
 
 void mock_urma_fail_next_create_jetty(void) {

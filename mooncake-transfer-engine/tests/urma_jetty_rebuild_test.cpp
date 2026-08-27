@@ -350,9 +350,10 @@ TEST_F(UrmaJettyRebuildTest, StaleEpochCompletionDropped) {
     delete slice;
 }
 
-// TC-4: a failed rebuild keeps the old jetty handle (marked REBUILDING_FAILED)
-// so deconstruct can retry urma_delete_jetty instead of leaking it, and the
-// endpoint is deferred for deletion rather than torn down inside poll.
+// TC-4: when rebuild's urma_delete_jetty fails, the old jetty handle is kept
+// (marked REBUILDING_FAILED) so deconstruct can retry the delete instead of
+// leaking it, and the endpoint is deferred for deletion rather than torn down
+// inside poll.
 TEST_F(UrmaJettyRebuildTest, RebuildFailureKeepsJettyHandle) {
     Transport::TransferTask task = {};
     Transport::Slice *slice = postOneSlice(&task);
@@ -369,17 +370,18 @@ TEST_F(UrmaJettyRebuildTest, RebuildFailureKeepsJettyHandle) {
     ASSERT_EQ(UrmaEndpoint::DRAINING,
               UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
 
-    // Make rebuild's recreate step fail (urma_create_jetty returns NULL), then
-    // inject the fence so onFlushDone runs rebuildJettyUnlocked to failure.
-    mock_urma_fail_next_create_jetty();
+    // Make rebuild's delete step fail (urma_delete_jetty returns an error and
+    // keeps the jetty allocated), then inject the fence so onFlushDone runs
+    // rebuildJettyUnlocked into that delete-failure branch.
+    mock_urma_fail_next_delete_jetty();
     mock_urma_enqueue_flush_done(old_id);
     failed.clear();
     depth_set.clear();
     deferred.clear();
     pollOnce(failed, depth_set, deferred);
 
-    // The rebuild failed: the endpoint is deferred for deletion, and the old
-    // jetty handle is preserved (not nulled) so it can be cleaned up later.
+    // The rebuild failed at delete: the endpoint is deferred for deletion, and
+    // the old jetty handle is preserved (not nulled) so it can be retried.
     ASSERT_FALSE(deferred.empty());
     EXPECT_EQ(static_cast<UbEndPoint *>(endpoint_.get()), deferred.back());
     EXPECT_EQ(UrmaEndpoint::REBUILDING_FAILED,
