@@ -406,11 +406,12 @@ static std::vector<UBDevice> listUBDevices(
         std::string numa_str;
         std::ifstream(path) >> numa_str;
         if (!numa_str.empty()) {
-            int base = (numa_str.rfind("0x", 0) == 0 ||
-                        numa_str.rfind("0X", 0) == 0)
-                           ? 16
-                           : 10;
-            numa_node = static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
+            int base =
+                (numa_str.rfind("0x", 0) == 0 || numa_str.rfind("0X", 0) == 0)
+                    ? 16
+                    : 10;
+            numa_node =
+                static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
         }
         LOG(INFO) << "UBDevices : performation node ----"
                   << device_list[i]->name << " : " << numa_node;

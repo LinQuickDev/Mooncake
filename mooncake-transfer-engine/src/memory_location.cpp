@@ -31,20 +31,25 @@ namespace mooncake {
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }
 
-int parseCpuNumaNode(const std::string& location) {
+int parseCpuNumaNode(const std::string &location) {
     const std::string prefix = "cpu:";
     if (location.rfind(prefix, 0) != 0) return -1;
-    try { return std::stoi(location.substr(prefix.size())); }
-    catch (const std::exception&) { return -1; }
+    try {
+        return std::stoi(location.substr(prefix.size()));
+    } catch (const std::exception &) {
+        return -1;
+    }
 }
 
 // 数 /sys/devices/system/node 下的 NUMA 节点数
 static size_t getNumaNodeCount() {
     int count = 0;
-    DIR* dir = opendir("/sys/devices/system/node");
+    DIR *dir = opendir("/sys/devices/system/node");
     if (!dir) return 0;
-    for (dirent* e = readdir(dir); e; e = readdir(dir))
-        if (strncmp(e->d_name, "node", 4) == 0 && isdigit((unsigned char)e->d_name[4])) count++;
+    for (dirent *e = readdir(dir); e; e = readdir(dir))
+        if (strncmp(e->d_name, "node", 4) == 0 &&
+            isdigit((unsigned char)e->d_name[4]))
+            count++;
     closedir(dir);
     return (size_t)count;
 }
@@ -53,11 +58,12 @@ namespace {
 
 // 读取 NUMA 节点 nodeN 下第一个 CPU 的物理 package(chip) 编号。
 // 路径：/sys/devices/system/node/nodeN/cpulist -> 取首个 cpu ->
-//       /sys/devices/system/cpu/cpuX/topology/physical_package_id。失败返回 -1。
+//       /sys/devices/system/cpu/cpuX/topology/physical_package_id。失败返回
+//       -1。
 int readNodePackageId(int node) {
     char path[256];
-    snprintf(path, sizeof(path),
-             "/sys/devices/system/node/node%d/cpulist", node);
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist",
+             node);
     std::ifstream cpulist(path);
     if (!cpulist) return -1;
     std::string s;
@@ -65,7 +71,7 @@ int readNodePackageId(int node) {
     int cpu = -1;
     try {
         cpu = std::stoi(s);  // 取列表首个 CPU
-    } catch (const std::exception&) {
+    } catch (const std::exception &) {
         return -1;
     }
     if (cpu < 0) return -1;
@@ -79,12 +85,12 @@ int readNodePackageId(int node) {
     return package_id;
 }
 
-// 进程内只构建一次：从服务器拓扑(sysfs)读取 NUMA节点 -> chip(物理package) 映射。
-// chip id 采用「package 排序后 1-based」编号，兼容旧约定（双 chip 即 1/2），
-// 同时正确处理节点与 package 非顺序对应的拓扑。
+// 进程内只构建一次：从服务器拓扑(sysfs)读取 NUMA节点 -> chip(物理package)
+// 映射。 chip id 采用「package 排序后 1-based」编号，兼容旧约定（双 chip 即
+// 1/2）， 同时正确处理节点与 package 非顺序对应的拓扑。
 class NumaChipMap {
    public:
-    static const NumaChipMap& Instance() {
+    static const NumaChipMap &Instance() {
         static const NumaChipMap inst;
         return inst;
     }
@@ -104,9 +110,9 @@ class NumaChipMap {
         std::map<int, int> node_to_pkg;  // numa node -> physical package id
         std::set<int> packages;
 
-        DIR* dir = opendir("/sys/devices/system/node");
+        DIR *dir = opendir("/sys/devices/system/node");
         if (!dir) return;
-        for (dirent* e = readdir(dir); e; e = readdir(dir)) {
+        for (dirent *e = readdir(dir); e; e = readdir(dir)) {
             if (strncmp(e->d_name, "node", 4) != 0 ||
                 !isdigit((unsigned char)e->d_name[4]))
                 continue;
@@ -123,11 +129,11 @@ class NumaChipMap {
         uint8_t chip = 1;
         for (int p : packages) pkg_to_chip[p] = chip++;
 
-        for (const auto& [node, pkg] : node_to_pkg)
+        for (const auto &[node, pkg] : node_to_pkg)
             node_to_chip_[node] = pkg_to_chip[pkg];
 
         std::string mapping;
-        for (const auto& [node, pkg] : node_to_pkg) {
+        for (const auto &[node, pkg] : node_to_pkg) {
             if (!mapping.empty()) mapping += ", ";
             mapping += "numa:" + std::to_string(node) +
                        " package:" + std::to_string(pkg) +
@@ -148,12 +154,13 @@ class NumaChipMap {
 uint8_t numaNodeToChipId(int numa_node, size_t numa_count) {
     if (numa_node < 0) return INVALID_CHIP_ID;  // 对应 INVALID_NUMA_ID
 
-    const auto& chip_map = NumaChipMap::Instance();
+    const auto &chip_map = NumaChipMap::Instance();
     if (!chip_map.Empty()) {
         return chip_map.ChipId(numa_node);
     }
 
-    // Fallback：sysfs 读取失败（如受限容器），退回原启发式，保证不破坏既有行为。
+    // Fallback：sysfs
+    // 读取失败（如受限容器），退回原启发式，保证不破坏既有行为。
     constexpr uint8_t chipId1 = 1, chipId2 = 2;
     if (numa_count == 0) {
         numa_count = getNumaNodeCount();

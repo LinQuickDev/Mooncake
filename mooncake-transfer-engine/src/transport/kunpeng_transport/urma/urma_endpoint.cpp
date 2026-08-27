@@ -25,17 +25,23 @@ constexpr uint64_t kNumaAffinitySampleInterval = 10000;
 
 static const char* bondingModeToString(int mode) {
     switch (mode) {
-        case BONDP_BONDING_MODE_STANDALONE: return "STANDALONE";
-        case BONDP_BONDING_MODE_BALANCE:    return "BALANCE";
-        default:                            return "UNKNOWN";
+        case BONDP_BONDING_MODE_STANDALONE:
+            return "STANDALONE";
+        case BONDP_BONDING_MODE_BALANCE:
+            return "BALANCE";
+        default:
+            return "UNKNOWN";
     }
 }
 
 static const char* bondingLevelToString(int level) {
     switch (level) {
-        case BONDP_BONDING_LEVEL_PORT:  return "PORT";
-        case BONDP_BONDING_LEVEL_IODIE: return "IODIE";
-        default:                        return "UNKNOWN";
+        case BONDP_BONDING_LEVEL_PORT:
+            return "PORT";
+        case BONDP_BONDING_LEVEL_IODIE:
+            return "IODIE";
+        default:
+            return "UNKNOWN";
     }
 }
 }  // namespace
@@ -448,7 +454,8 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
                 return ERR_CONTEXT;
             }
             LOG(INFO) << "[multipath ON] bonding mode set on " << device_name
-                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
+                      << " bonding_mode="
+                      << bondingModeToString(mode.bonding_mode)
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);
         } else {
@@ -464,12 +471,14 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             memset(&out, 0, sizeof(out));
             auto ret = urma_user_ctl(context, &in, &out);
             if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding STANDALONE/PORT mode, ret = "
-                           << ret;
+                LOG(ERROR)
+                    << "Failed to set bonding STANDALONE/PORT mode, ret = "
+                    << ret;
                 return ERR_CONTEXT;
             }
             LOG(INFO) << "[multipath OFF] bonding mode set on " << device_name
-                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
+                      << " bonding_mode="
+                      << bondingModeToString(mode.bonding_mode)
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);
         }
@@ -949,19 +958,25 @@ int UrmaEndpoint::submitPostSend(
     urma_sge_t l_sge_list[wr_count];
     urma_sge_t r_sge_list[wr_count];
 
-    // 两分支共用：填一个 WR 的公共字段（SGE 方向、opcode、flag、tjetty、user_ctx + slice 记账）
+    // 两分支共用：填一个 WR 的公共字段（SGE
+    // 方向、opcode、flag、tjetty、user_ctx + slice 记账）
     auto fill_common = [&](urma_jfs_wr_t& wr, Transport::Slice* slice,
                            urma_sge_t& l_sge, urma_sge_t& r_sge) {
         const bool is_read = slice->opcode == Transport::TransferRequest::READ;
-        l_sge.addr = (uint64_t)slice->source_addr; l_sge.len = slice->length;
+        l_sge.addr = (uint64_t)slice->source_addr;
+        l_sge.len = slice->length;
         l_sge.tseg = static_cast<urma_target_seg_t*>(slice->ub.l_seg);
-        r_sge.addr = slice->ub.dest_addr;          r_sge.len = slice->length;
+        r_sge.addr = slice->ub.dest_addr;
+        r_sge.len = slice->length;
         r_sge.tseg = static_cast<urma_target_seg_t*>(slice->ub.r_seg);
         wr.user_ctx = (uint64_t)slice;
         wr.opcode = is_read ? URMA_OPC_READ : URMA_OPC_WRITE;
-        wr.rw.src.sge = is_read ? &r_sge : &l_sge; wr.rw.src.num_sge = 1;  // 按数据流向定 src/dst
-        wr.rw.dst.sge = is_read ? &l_sge : &r_sge; wr.rw.dst.num_sge = 1;
-        wr.flag.bs.complete_enable = 1; wr.flag.bs.inline_flag = 0;
+        wr.rw.src.sge = is_read ? &r_sge : &l_sge;
+        wr.rw.src.num_sge = 1;  // 按数据流向定 src/dst
+        wr.rw.dst.sge = is_read ? &l_sge : &r_sge;
+        wr.rw.dst.num_sge = 1;
+        wr.flag.bs.complete_enable = 1;
+        wr.flag.bs.inline_flag = 0;
         auto it = imported_jetty_map_.find(jetty_list_[jetty_index]);
         wr.tjetty = (it != imported_jetty_map_.end()) ? it->second : nullptr;
         slice->ts = getCurrentTimeInNano();
@@ -984,8 +999,7 @@ int UrmaEndpoint::submitPostSend(
                 0) {
             VLOG(2) << "[numa_affinity] wr_sample nic=" << peer_nic_path_
                     << " trace_id=" << slice_list[0]->trace_id
-                    << " target_id=" << slice_list[0]->target_id
-                    << " opcode="
+                    << " target_id=" << slice_list[0]->target_id << " opcode="
                     << (slice_list[0]->opcode ==
                                 Transport::TransferRequest::READ
                             ? "READ"
@@ -997,19 +1011,23 @@ int UrmaEndpoint::submitPostSend(
         bondp_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(bondp_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {
-            fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
-            wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
+            fill_common(wr_list[i].base, slice_list[i], l_sge_list[i],
+                        r_sge_list[i]);
+            wr_list[i].base.next =
+                (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
             // src/dst 均使用远端 segment 所在 chip，避免跨 chip 传输。
             const uint8_t remote_chip_id = slice_list[i]->ub.dst_chip_id;
             wr_list[i].src_chip_id = remote_chip_id;
             wr_list[i].dst_chip_id = remote_chip_id;
         }
-        rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
+        rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base,
+                                     &bad_wr);
         if (rc) {
             PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
             while (bad_wr) {
                 // 用 user_ctx 直接还原失败 slice —— 不依赖 base 是不是首成员
-                failed_slice_list.push_back((Transport::Slice*)bad_wr->user_ctx);
+                failed_slice_list.push_back(
+                    (Transport::Slice*)bad_wr->user_ctx);
                 __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
                 __sync_fetch_and_sub(jfc_outstanding_, 1);
                 bad_wr = bad_wr->next;
@@ -1019,19 +1037,20 @@ int UrmaEndpoint::submitPostSend(
         // —— 分支二：非亲和，保持 Mooncake 现状（urma_jfs_wr_t 链）——
         static std::atomic<bool> disabled_logged{false};
         bool expected = false;
-        if (VLOG_IS_ON(2) &&
-            disabled_logged.compare_exchange_strong(
-                expected, true, std::memory_order_relaxed)) {
+        if (VLOG_IS_ON(2) && disabled_logged.compare_exchange_strong(
+                                 expected, true, std::memory_order_relaxed)) {
             VLOG(2) << "[numa_affinity] disabled, plain urma_jfs_wr_t "
                        "will be used";
         }
         urma_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(urma_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {
-            fill_common(wr_list[i], slice_list[i], l_sge_list[i], r_sge_list[i]);
+            fill_common(wr_list[i], slice_list[i], l_sge_list[i],
+                        r_sge_list[i]);
             wr_list[i].next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
         }
-        rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0], &bad_wr);
+        rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0],
+                                     &bad_wr);
         if (rc) {
             PLOG(ERROR) << "Failed to urma_post_jetty_send_wr";
             while (bad_wr) {
@@ -1040,7 +1059,7 @@ int UrmaEndpoint::submitPostSend(
                 __sync_fetch_and_sub(&wr_depth_list_[jetty_index], 1);
                 __sync_fetch_and_sub(jfc_outstanding_, 1);
                 bad_wr = bad_wr->next;
-        }
+            }
         }
     }
     slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);

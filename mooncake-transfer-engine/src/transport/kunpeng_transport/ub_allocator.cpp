@@ -46,9 +46,9 @@ void* ub_allocate_memory_onnode(size_t alignment, size_t total_size,
                    << ", node=" << numa_node << ", alignment : " << alignment;
         return nullptr;
     }
-    LOG(INFO) << "UB:  allocated total size : " << total_size << ", node : "
-              << numa_node << ", alignment : " << alignment << " addr at "
-              << ptr;
+    LOG(INFO) << "UB:  allocated total size : " << total_size
+              << ", node : " << numa_node << ", alignment : " << alignment
+              << " addr at " << ptr;
 
     std::lock_guard<std::mutex> store_lock(g_ub_store_mem_mutex);
     g_ub_store_mem_ranges.push_back({ptr, total_size});
