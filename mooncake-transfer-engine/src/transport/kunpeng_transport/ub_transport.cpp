@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
 #include <future>
 #include "config.h"
 #include "memory_location.h"
@@ -22,6 +23,10 @@
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
 
 namespace mooncake {
+namespace {
+constexpr uint64_t kNumaAffinitySampleInterval = 10000;
+}  // namespace
+
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
     : endpoint_type_(endpoint_type) {}
 
@@ -109,12 +114,18 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         buffer_desc.name = entries[0].location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
+        // Precompute chip_id for single-NUMA ("cpu:N") buffers so peers read it
+        // directly instead of resolving per-slice. -1 stays for non-cpu names.
+        int node = parseCpuNumaNode(buffer_desc.name);
+        if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
         if (rc) return rc;
     } else {
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
+        int node = parseCpuNumaNode(buffer_desc.name);
+        if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
         if (rc) return rc;
     }
@@ -257,6 +268,8 @@ Status UbTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->ts = 0;
             slice->status = Slice::PENDING;
+            slice->ub.src_chip_id = INVALID_CHIP_ID;
+            slice->ub.dst_chip_id = INVALID_CHIP_ID;
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
@@ -312,6 +325,34 @@ Status UbTransport::submitTransferTask(
             auto local_tseg_index =
                 local_segment_desc->buffers[buffer_id].l_seg_index[device_id];
             slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
+            if (context->numa_affinity()) {
+                const auto& local_buf = local_segment_desc->buffers[buffer_id];
+                int data_numa = parseCpuNumaNode(local_buf.name);
+                if (local_buf.chip_id >= 0) {
+                    // Prefer the chip id published at registration.
+                    slice->ub.src_chip_id = (uint8_t)local_buf.chip_id;
+                } else {
+                    // Each UB buffer belongs to one NUMA node and is named
+                    // "cpu:N"; no offset-based segment lookup is required.
+                    slice->ub.src_chip_id = numaNodeToChipId(data_numa);
+                }
+                static std::atomic<uint64_t> numa_log_counter{0};
+                if (VLOG_IS_ON(2) &&
+                    numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
+                            kNumaAffinitySampleInterval ==
+                        0) {
+                    VLOG(2)
+                        << "[numa_affinity] local_sample trace_id="
+                        << slice->trace_id << " target_id=" << slice->target_id
+                        << " opcode="
+                        << (slice->opcode == Transport::TransferRequest::READ
+                                ? "READ"
+                                : "WRITE")
+                        << " local_data_numa=" << data_numa
+                        << " src_chip=" << (int)slice->ub.src_chip_id
+                        << " local_name=" << local_buf.name;
+                }
+            }
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;
             __sync_fetch_and_add(&task.slice_count, 1);
@@ -434,10 +475,14 @@ int UbTransport::selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
             continue;
         }
 
+        // UB memory is allocated and mounted as one independent segment per
+        // NUMA node. Its BufferDesc name is already the resolved location
+        // ("cpu:N"), so no offset-based segments-location lookup is needed.
+        const std::string& location = buffer.name;
         device_id =
             hint.empty()
-                ? desc->topology.selectDevice(buffer.name, retry_cnt)
-                : desc->topology.selectDevice(buffer.name, hint, retry_cnt);
+                ? desc->topology.selectDevice(location, retry_cnt)
+                : desc->topology.selectDevice(location, hint, retry_cnt);
         if (device_id >= 0) return 0;
         device_id = hint.empty() ? desc->topology.selectDevice(
                                        kWildcardLocation, retry_cnt)

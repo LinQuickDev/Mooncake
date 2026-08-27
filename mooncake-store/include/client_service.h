@@ -662,6 +662,15 @@ class Client {
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
     [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
 
+    // Return the total number of NUMA nodes (counted from the local topology,
+    // which has one cpu:N entry per node regardless of NIC presence).
+    [[nodiscard]] int GetNumaNodeCount() const;
+
+    // Pre-establish transfer-engine connections to the currently registered
+    // segments using a small buffer from the client allocator.
+    [[nodiscard]] tl::expected<void, ErrorCode> warmup(
+        const std::shared_ptr<ClientBufferAllocator>& allocator);
+
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
 

@@ -129,3 +129,11 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
 
     numa_free(addr, size);
 }
+
+TEST(MemoryLocationTest, ParseCpuNumaNode) {
+    EXPECT_EQ(mooncake::parseCpuNumaNode("cpu:3"), 3);
+    EXPECT_EQ(mooncake::parseCpuNumaNode("cpu:0"), 0);
+    EXPECT_EQ(mooncake::parseCpuNumaNode("*"), -1);
+    EXPECT_EQ(mooncake::parseCpuNumaNode("gpu:0"), -1);
+    EXPECT_EQ(mooncake::parseCpuNumaNode("cpu:not-a-node"), -1);
+}

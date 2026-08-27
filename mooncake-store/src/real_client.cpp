@@ -40,6 +40,9 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+#ifdef USE_UB
+#include "ub_allocator.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -951,7 +954,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #endif
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
-        // global_segment across them for full NIC utilization.
+        // global_segment across them for full NIC utilization. RDMA keeps the
+        // legacy single-segment-with-multi-region ("segments:...") behavior.
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
@@ -968,6 +972,32 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        // For UB, mount ONE segment per NUMA node (each bound to its node,
+        // location="cpu:N"). Memory is spread across ALL NUMA nodes by count,
+        // not just NIC-bearing ones: this works even with a single bonded
+        // device (e.g. bonding_dev_0, NUMA=-1) where NIC-NUMA discovery would
+        // be empty, and it relies only on the (decimal) NUMA count, so it is
+        // unaffected by the hex "numa" attribute. Each segment then drives
+        // selectDevice (cpu:N -> local NIC, else any) and chip affinity
+        // (cpu:N -> chip via numaNodeToChipId). Automatic whenever UB has more
+        // than one NUMA node; independent of both MC_UB_NUMA_AFFINITY_ENABLE
+        // and MC_URMA_BONDING_MULTIPATH_ENABLE.
+#ifdef USE_UB
+        std::vector<int> ub_numa_nodes;
+        if (protocol == "ub") {
+            int numa_count = client_->GetNumaNodeCount();
+            if (numa_count > 1) {
+                std::string nodes_str;
+                for (int i = 0; i < numa_count; ++i) {
+                    ub_numa_nodes.push_back(i);
+                    if (i) nodes_str += ",";
+                    nodes_str += std::to_string(i);
+                }
+                MC_LOG(INFO) << "UB per-NUMA mode: NUMA node count=" << numa_count
+                          << ", nodes=[" << nodes_str << "]";
+            }
+        }
+#endif  // USE_UB
         const bool parallel_hugetlb_population =
             protocol == "rdma" && should_use_hugepage;
 
@@ -980,6 +1010,54 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             global_segment_size -= segment_size;
+
+            // UB NUMA affinity: split this chunk into one segment per NIC-NUMA
+            // node, each physically bound to its node and registered with
+            // location "cpu:N" (so selectDevice picks the NUMA-local NIC).
+#ifdef USE_UB
+            if (!ub_numa_nodes.empty()) {
+                size_t page_sz = should_use_hugepage
+                                     ? get_hugepage_size_from_env()
+                                     : static_cast<size_t>(getpagesize());
+                size_t n = ub_numa_nodes.size();
+                size_t per_node_size = align_up(segment_size / n, page_sz);
+                if (per_node_size == 0) {
+                    MC_LOG(ERROR) << "UB per-NUMA: per_node_size is 0, segment "
+                                     "too small for " << n << " NUMA nodes";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                for (int node : ub_numa_nodes) {
+                    // Use UB's own allocator bound to this node: numa_alloc_onnode
+                    // via libnuma, registered in the store-memory table, so URMA
+                    // can register it. (A raw mmap+mbind buffer cannot be
+                    // registered by urma_register_seg -- it fails with error
+                    // 2048 because the VMA has no backing pages at reg time.)
+                    void *ptr = mooncake::ub_allocate_memory_onnode(
+                        /*alignment=*/page_sz, per_node_size, node);
+                    if (!ptr) {
+                        MC_LOG(ERROR) << "UB per-NUMA: failed to allocate "
+                                         "segment for node " << node;
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    // numa_alloc-backed => free via ub_free_memory/numa_free,
+                    // NOT munmap. Track with UbSegmentDeleter accordingly.
+                    ub_segment_ptrs_.emplace_back(
+                        ptr, UbSegmentDeleter{per_node_size});
+
+                    std::string loc = genCpuNodeName(node);  // "cpu:<node>"
+                    MC_LOG(INFO) << "Mounting UB per-NUMA segment: node=" << node
+                              << ", size=" << per_node_size << ", loc=" << loc;
+                    auto mr = client_->MountSegment(ptr, per_node_size, protocol,
+                                                    loc);
+                    if (!mr.has_value()) {
+                        MC_LOG(ERROR) << "Failed to mount UB per-NUMA segment: "
+                                   << toString(mr.error());
+                        return tl::unexpected(mr.error());
+                    }
+                }
+                continue;  // this chunk fully mounted across NUMA nodes
+            }
+#endif  // USE_UB
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
