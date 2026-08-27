@@ -885,7 +885,13 @@ void UrmaEndpoint::disconnectUnlocked() {
         if (!jetty_list_[i]) continue;
         // Only jettys that entered ERROR (modify already called) are
         // flushable; PENDING_DRAIN ones have not been modified yet and go
-        // through the normal RESET path below.
+        // through the normal RESET path below. Here the flush only drains the
+        // hardware queue: this endpoint is being torn down (or re-handshaken),
+        // so the returned CRs are deliberately NOT delivered via
+        // processWrCompletion — the slices they reference are owned/reclaimed
+        // by the upper-layer task once the endpoint goes away, and the depth
+        // is reconciled below. Contrast with checkDrainTimeout, where the
+        // endpoint stays alive and residual WRs ARE delivered as failed.
         if (jetty_state_[i] == DRAINING || jetty_state_[i] == REBUILDING) {
             urma_cr_t flush_crs[64];
             while (true) {
@@ -1229,10 +1235,11 @@ void UrmaEndpoint::onFlushDone(
 }
 
 void UrmaEndpoint::checkDrainTimeout(
-    std::unordered_map<volatile int*, int>& /*jetty_depth_set*/,
-    std::vector<Transport::Slice*>& /*failed_slices*/,
+    std::unordered_map<volatile int*, int>& jetty_depth_set,
+    std::vector<Transport::Slice*>& failed_slices,
     std::vector<UbEndPoint*>& deferred_deletes) {
     bool delete_ep = false;
+    int resolved_wr_count = 0;
     {
         RWSpinlock::WriteGuard guard(lock_);
         if (draining_slot_ < 0) return;
@@ -1246,10 +1253,43 @@ void UrmaEndpoint::checkDrainTimeout(
         LOG(ERROR) << "Jetty drain timed out after "
                    << ((now - drain_start_ns_) / 1000000ull)
                    << "ms, slot=" << slot << " on " << toString();
+
+        // The flush-done fence never arrived, so outstanding WRs on this
+        // jetty are stuck. The endpoint is still alive here (unlike
+        // disconnect/deconstruct), so flush the jetty and deliver each
+        // residual WR through processWrCompletion to fail/retry it and bring
+        // the depth accounting back to zero before the endpoint is deleted.
+        if (jetty_list_[slot]) {
+            urma_cr_t flush_crs[64];
+            while (true) {
+                int flushed =
+                    urma_flush_jetty(jetty_list_[slot], 64, flush_crs);
+                if (flushed < 0) {
+                    PLOG(ERROR) << "urma_flush_jetty failed on drain timeout, "
+                                   "slot="
+                                << slot;
+                    break;
+                }
+                if (flushed == 0) break;
+                for (int j = 0; j < flushed; ++j) {
+                    if (flush_crs[j].status == URMA_CR_WR_FLUSH_ERR_DONE)
+                        continue;
+                    if (processWrCompletion(flush_crs[j], jetty_depth_set,
+                                            failed_slices, deferred_deletes, -1,
+                                            /*allow_error_trigger=*/false)) {
+                        ++resolved_wr_count;
+                    }
+                }
+            }
+        }
+
         context_->removeDrainingEndpoint(this);
         draining_slot_ = -1;
         drain_start_ns_ = 0;
         delete_ep = true;
+    }
+    if (resolved_wr_count > 0 && jfc_outstanding_) {
+        __sync_fetch_and_sub(jfc_outstanding_, resolved_wr_count);
     }
     if (delete_ep) {
         LOG(ERROR) << "Jetty rebuild fallback to deleteEndpoint: "
@@ -1368,7 +1408,10 @@ int UrmaEndpoint::rebuildJettyUnlocked(
     ret = urma_delete_jetty(old_jetty);
     if (ret) {
         PLOG(ERROR) << "Failed to delete jetty during rebuild";
-        jetty_list_[slot] = nullptr;
+        // Keep the old handle so deconstruct can retry urma_delete_jetty
+        // rather than leaking it; mark the slot failed so it is never
+        // selected for posting and the rebuild can be retried/cleaned up.
+        jetty_state_[slot] = REBUILDING_FAILED;
         return ERR_ENDPOINT;
     }
     jetty_list_[slot] = nullptr;

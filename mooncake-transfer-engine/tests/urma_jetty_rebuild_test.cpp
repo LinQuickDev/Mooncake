@@ -93,6 +93,14 @@ class UrmaEndpointTestPeer {
     }
     static bool isDraining(UrmaEndpoint &ep) { return ep.draining_slot_ >= 0; }
 
+    // Forces the next checkDrainTimeout to consider the drain already timed
+    // out, without waiting the real 3s kJettyDrainTimeoutNs.
+    static void forceDrainTimeout(UrmaEndpoint &ep) { ep.drain_start_ns_ = 1; }
+
+    static urma_jetty_t *jettyHandle(UrmaEndpoint &ep, int slot) {
+        return ep.jetty_list_[slot];
+    }
+
     // Establishes a connected endpoint without the handshake protocol: marks
     // every jetty ACTIVE with a bound peer so submitPostSend can proceed.
     static void markConnected(UrmaEndpoint &ep, const std::string &peer_eid) {
@@ -340,6 +348,88 @@ TEST_F(UrmaJettyRebuildTest, StaleEpochCompletionDropped) {
               UrmaEndpointTestPeer::jettyEpoch(*endpoint_, slot));
 
     delete slice;
+}
+
+// TC-4: a failed rebuild keeps the old jetty handle (marked REBUILDING_FAILED)
+// so deconstruct can retry urma_delete_jetty instead of leaking it, and the
+// endpoint is deferred for deletion rather than torn down inside poll.
+TEST_F(UrmaJettyRebuildTest, RebuildFailureKeepsJettyHandle) {
+    Transport::TransferTask task = {};
+    Transport::Slice *slice = postOneSlice(&task);
+    const uint32_t old_id = UrmaEndpointTestPeer::jettyId(*endpoint_, 0);
+    urma_jetty_t *old_handle = UrmaEndpointTestPeer::jettyHandle(*endpoint_, 0);
+    ASSERT_NE(nullptr, old_handle);
+
+    // Drive into DRAINING.
+    mock_urma_set_next_poll_status(URMA_CR_ACK_TIMEOUT_ERR, 1);
+    std::vector<Transport::Slice *> failed;
+    std::unordered_map<volatile int *, int> depth_set;
+    std::vector<UbEndPoint *> deferred;
+    pollOnce(failed, depth_set, deferred);
+    ASSERT_EQ(UrmaEndpoint::DRAINING,
+              UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
+
+    // Make rebuild's recreate step fail (urma_create_jetty returns NULL), then
+    // inject the fence so onFlushDone runs rebuildJettyUnlocked to failure.
+    mock_urma_fail_next_create_jetty();
+    mock_urma_enqueue_flush_done(old_id);
+    failed.clear();
+    depth_set.clear();
+    deferred.clear();
+    pollOnce(failed, depth_set, deferred);
+
+    // The rebuild failed: the endpoint is deferred for deletion, and the old
+    // jetty handle is preserved (not nulled) so it can be cleaned up later.
+    ASSERT_FALSE(deferred.empty());
+    EXPECT_EQ(static_cast<UbEndPoint *>(endpoint_.get()), deferred.back());
+    EXPECT_EQ(UrmaEndpoint::REBUILDING_FAILED,
+              UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
+    EXPECT_EQ(old_handle, UrmaEndpointTestPeer::jettyHandle(*endpoint_, 0));
+
+    delete slice;
+}
+
+// TC-5: a drain timeout flushes the jetty and delivers each residual WR as
+// failed (failed_slices), bringing the slot depth accounting back to zero,
+// instead of leaving slices stuck when the flush-done fence never arrives.
+TEST_F(UrmaJettyRebuildTest, DrainTimeoutDeliversResidualWriters) {
+    Transport::TransferTask task = {};
+    // Residual WR withheld from poll so it stays outstanding into the timeout.
+    mock_urma_withhold_next_post(1);
+    Transport::Slice *stuck = postOneSlice(&task);
+    EXPECT_EQ(1, UrmaEndpointTestPeer::wrDepth(*endpoint_, 0));
+
+    // A second WR that polls out with status 9 drives the jetty into DRAINING.
+    // `stuck` is withheld so this poll consumes only the trigger completion.
+    Transport::Slice *trigger = postOneSlice(&task);
+    mock_urma_set_next_poll_status(URMA_CR_ACK_TIMEOUT_ERR, 1);
+    std::vector<Transport::Slice *> failed;
+    std::unordered_map<volatile int *, int> depth_set;
+    std::vector<UbEndPoint *> deferred;
+    pollOnce(failed, depth_set, deferred);
+    ASSERT_EQ(UrmaEndpoint::DRAINING,
+              UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
+
+    // No flush-done fence arrives; force the drain timeout. The timeout path
+    // must flush the jetty and deliver `stuck` as a failed completion.
+    UrmaEndpointTestPeer::forceDrainTimeout(*endpoint_);
+    mock_urma_set_flush_returns_errors(1);
+    failed.clear();
+    depth_set.clear();
+    deferred.clear();
+    context_->checkJettyDrainTimeouts(depth_set, failed, deferred);
+
+    // `stuck` was delivered to failed_slices, depth accounted, and the endpoint
+    // is deferred for deletion (no flush-done fence to rebuild from).
+    bool found_stuck = false;
+    for (auto *s : failed) {
+        if (s == stuck) found_stuck = true;
+    }
+    EXPECT_TRUE(found_stuck);
+    EXPECT_FALSE(deferred.empty());
+
+    delete stuck;
+    delete trigger;
 }
 
 }  // namespace

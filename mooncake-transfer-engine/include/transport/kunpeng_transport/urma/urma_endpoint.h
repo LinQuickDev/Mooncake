@@ -196,7 +196,12 @@ class UrmaEndpoint : public UbEndPoint {
         ACTIVE = 0,
         DRAINING = 1,
         REBUILDING = 2,
-        PENDING_DRAIN = 3
+        PENDING_DRAIN = 3,
+        // Rebuild failed after the old jetty was already torn down
+        // (unbind/unimport) but could not be fully deleted or replaced. The
+        // old handle is kept in jetty_list_[slot] so deconstruct can retry
+        // urma_delete_jetty instead of leaking it. Never selected for post.
+        REBUILDING_FAILED = 4
     };
 
     UrmaEndpoint(UrmaContext* context)
