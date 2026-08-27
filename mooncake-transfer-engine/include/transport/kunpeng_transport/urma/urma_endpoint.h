@@ -51,9 +51,13 @@ static urma_import_seg_flag_t import_flag = {
 
 // define the UrmaContext class
 class UrmaEndpoint;
+// Test hook: lets gtest fixtures seed a minimal UrmaContext (jfc/jfr/urma
+// context) without spinning up the worker pool that full construct() starts.
+class UrmaContextTestPeer;
 
 class UrmaContext : public UbContext {
     friend class UrmaEndpoint;
+    friend class UrmaContextTestPeer;
 
    public:
     UrmaContext(UbTransport& engine, std::string device_name,
@@ -173,10 +177,15 @@ class UrmaContext : public UbContext {
     std::unordered_set<UrmaEndpoint*> draining_endpoints_;
 };
 
+// Test hook for asserting the jetty state machine without touching private
+// members directly from the test body.
+class UrmaEndpointTestPeer;
+
 // define the UrmaEndpoint class
 class UrmaEndpoint : public UbEndPoint {
     // UrmaContext::poll drives the jetty state machine via processWrCompletion.
     friend class UrmaContext;
+    friend class UrmaEndpointTestPeer;
 
    public:
     // PENDING_DRAIN: the slot hit ACK timeout while another jetty of this

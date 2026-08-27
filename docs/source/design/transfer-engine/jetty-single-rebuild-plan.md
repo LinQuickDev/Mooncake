@@ -211,6 +211,8 @@ if cr.status == ACK_TIMEOUT_ERR (9):
 - 单测：状态机、选槽跳过、假 CQE 路由、幂等 `onJettyError`
 - 集成 / 故障注入：status=9 后该槽恢复 ACTIVE，同 EP 其它槽可继续；超时路径删 EP
 - 无 UMDK 硬件时，flush 与真实 ACK timeout 行为标为硬件验证项
+- **Mock 注入 CI 测试草案**：`jetty-rebuild-mock-test-plan.md`（`mock_urma` 脚本化
+  status=9 / FLUSH_ERR_DONE / flush CR，挂 `tent-ci (ub-mock)`）
 
 ---
 
