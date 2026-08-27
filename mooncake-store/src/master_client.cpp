@@ -93,6 +93,31 @@ struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::VChunkPutStart> {
+    static constexpr const char* value = "VChunkPutStart";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::VChunkPutEnd> {
+    static constexpr const char* value = "VChunkPutEnd";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::VChunkPutRevoke> {
+    static constexpr const char* value = "VChunkPutRevoke";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetVChunk> {
+    static constexpr const char* value = "GetVChunk";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveVChunk> {
+    static constexpr const char* value = "RemoveVChunk";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetVChunkRuntimeInfo> {
+    static constexpr const char* value = "GetVChunkRuntimeInfo";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
     static constexpr const char* value = "BatchPutRevoke";
 };
@@ -1052,6 +1077,44 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
         client_id_, key, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
+    const std::string& tenant_id, const std::string& key, uint64_t total_size,
+    int64_t now_ms) {
+    return invoke_rpc<&WrappedMasterService::VChunkPutStart,
+                      VChunkMetadataRecord>(tenant_id, key, total_size, now_ms);
+}
+
+tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& vchunk_id, int64_t now_ms) {
+    return invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
+        tenant_id, key, vchunk_id, now_ms);
+}
+
+tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& vchunk_id) {
+    return invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
+        tenant_id, key, vchunk_id);
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::GetVChunk(
+    const std::string& tenant_id, const std::string& key) {
+    return invoke_rpc<&WrappedMasterService::GetVChunk, VChunkMetadataRecord>(
+        tenant_id, key);
+}
+
+tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
+    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
+    return invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(tenant_id, key,
+                                                                 now_ms);
+}
+
+tl::expected<VChunkRuntimeInfo, ErrorCode> MasterClient::GetVChunkRuntimeInfo() {
+    return invoke_rpc<&WrappedMasterService::GetVChunkRuntimeInfo,
+                      VChunkRuntimeInfo>();
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(

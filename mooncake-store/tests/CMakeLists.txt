@@ -39,8 +39,6 @@ add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(vchunk_config_test vchunk_config_test.cpp)
 add_store_test(vchunk_metadata_test vchunk_metadata_test.cpp)
-add_store_test(vchunk_transfer_engine_probe_test
-               vchunk_transfer_engine_probe_test.cpp)
 add_store_test(vchunk_allocation_strategy_test
                vchunk_allocation_strategy_test.cpp)
 add_store_test(vchunk_master_manager_test vchunk_master_manager_test.cpp)
@@ -48,11 +46,6 @@ add_store_test(vchunk_master_service_test vchunk_master_service_test.cpp)
 add_store_test(vchunk_client_test vchunk_client_test.cpp)
 add_store_test(vchunk_transfer_engine_test vchunk_transfer_engine_test.cpp)
 add_store_test(vchunk_metadata_store_test vchunk_metadata_store_test.cpp)
-add_store_test(vchunk_benchmark_report_test vchunk_benchmark_report_test.cpp
-               ../benchmarks/vchunk_benchmark_report.cpp)
-target_include_directories(vchunk_benchmark_report_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks)
-target_link_libraries(vchunk_benchmark_report_test PRIVATE JsonCpp::JsonCpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
   NAME replica_selection_env_opt_in_test

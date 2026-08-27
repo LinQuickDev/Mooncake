@@ -259,6 +259,7 @@ class MasterService {
         const TenantId& tenant_id, const std::string& key) const;
     ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
                            int64_t now_ms);
+    VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
     tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
                                                        size_t max_scan);
     VChunkMetricsSnapshot GetVChunkMetrics() const;

@@ -70,6 +70,7 @@ class VChunkMasterManager {
     VChunkMetricsSnapshot MetricsSnapshot() const;
 
     size_t SizeForTesting() const;
+    bool HasPersistentMetadata() const { return metadata_store_->IsPersistent(); }
 
    private:
     struct Entry {

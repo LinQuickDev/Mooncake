@@ -155,7 +155,9 @@ ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
 }
 
 ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
-                                       const std::vector<TxnPut>& puts) {
+                                       const std::vector<TxnPut>& puts,
+                                       const std::vector<std::string>&
+                                           delete_keys) {
     std::vector<char*> compare_keys;
     std::vector<int> compare_key_sizes;
     std::vector<int> compare_kinds;
@@ -190,6 +192,14 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
         put_values.push_back(const_cast<char*>(put.value.data()));
         put_value_sizes.push_back(static_cast<int>(put.value.size()));
     }
+    std::vector<char*> deletes;
+    std::vector<int> delete_sizes;
+    deletes.reserve(delete_keys.size());
+    delete_sizes.reserve(delete_keys.size());
+    for (const auto& key : delete_keys) {
+        deletes.push_back(const_cast<char*>(key.data()));
+        delete_sizes.push_back(static_cast<int>(key.size()));
+    }
 
     char* err_msg = nullptr;
     int ret = EtcdStoreTxnCompareAndPutWrapper(
@@ -197,7 +207,8 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
         compare_values.data(), compare_value_sizes.data(),
         static_cast<int>(compares.size()), put_keys.data(),
         put_key_sizes.data(), put_values.data(), put_value_sizes.data(),
-        static_cast<int>(puts.size()), &err_msg);
+        static_cast<int>(puts.size()), deletes.data(), delete_sizes.data(),
+        static_cast<int>(delete_keys.size()), &err_msg);
     if (ret == -2) {
         if (err_msg != nullptr) {
             free(err_msg);
@@ -620,9 +631,12 @@ ErrorCode EtcdHelper::Create(const char* key, const size_t key_size,
 }
 
 ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
-                                       const std::vector<TxnPut>& puts) {
+                                       const std::vector<TxnPut>& puts,
+                                       const std::vector<std::string>&
+                                           delete_keys) {
     (void)compares;
     (void)puts;
+    (void)delete_keys;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }

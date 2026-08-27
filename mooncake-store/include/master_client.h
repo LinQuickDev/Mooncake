@@ -25,6 +25,7 @@
 #include "task_manager.h"
 #include "metadata_store.h"
 #include "partition/partition_router.h"
+#include "vchunk_metadata.h"
 
 namespace mooncake {
 
@@ -285,6 +286,22 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type);
+
+    [[nodiscard]] tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
+        const std::string& tenant_id, const std::string& key,
+        uint64_t total_size, int64_t now_ms);
+    [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutEnd(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& vchunk_id, int64_t now_ms);
+    [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutRevoke(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& vchunk_id);
+    [[nodiscard]] tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
+        const std::string& tenant_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> RemoveVChunk(
+        const std::string& tenant_id, const std::string& key, int64_t now_ms);
+    [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
+    GetVChunkRuntimeInfo();
 
     /**
      * @brief Revokes a put operation for a batch of objects

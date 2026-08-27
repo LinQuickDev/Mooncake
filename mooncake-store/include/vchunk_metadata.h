@@ -63,6 +63,13 @@ struct VChunkMetadataRecord {
              status, created_at_ms, last_updated_at_ms);
 };
 
+struct VChunkRuntimeInfo {
+    bool enabled{false};
+    bool persistent_metadata{false};
+
+    YLT_REFL(VChunkRuntimeInfo, enabled, persistent_metadata);
+};
+
 ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
                                  const VChunkConfig& config);
 ErrorCode ValidateVChunkTransition(VChunkStatus from, VChunkStatus to);

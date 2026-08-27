@@ -11,9 +11,9 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "master_service.h"
 #include "tenant_id.h"
 #include "types.h"
+#include "vchunk_control_plane.h"
 #include "vchunk_metadata.h"
 #include "vchunk_metrics.h"
 
@@ -39,8 +39,6 @@ class VChunkLegacyPath {
     virtual ErrorCode Remove(const TenantId&, const std::string&) = 0;
 };
 
-// In-process control-plane adapter used until the isolated vchunk RPC is added.
-// It preserves the wire compatibility of the community client path.
 class VChunkClient {
    public:
     using Clock = std::chrono::steady_clock;
@@ -49,6 +47,12 @@ class VChunkClient {
     VChunkClient(bool enabled, MasterService& master, VChunkDataPlane& data_plane,
                  VChunkLegacyPath& legacy, std::chrono::milliseconds timeout,
                  NowMs now_ms,
+                 uint32_t max_retries = VChunkConfig{}.max_slice_retry,
+                 uint32_t circuit_breaker_threshold = 0,
+                 std::shared_ptr<VChunkMetrics> metrics = nullptr);
+    VChunkClient(bool enabled, VChunkControlPlane& control_plane,
+                 VChunkDataPlane& data_plane, VChunkLegacyPath& legacy,
+                 std::chrono::milliseconds timeout, NowMs now_ms,
                  uint32_t max_retries = VChunkConfig{}.max_slice_retry,
                  uint32_t circuit_breaker_threshold = 0,
                  std::shared_ptr<VChunkMetrics> metrics = nullptr);
@@ -80,7 +84,8 @@ class VChunkClient {
 
    private:
     bool enabled_;
-    MasterService& master_;
+    std::unique_ptr<VChunkControlPlane> owned_control_plane_;
+    VChunkControlPlane* control_plane_;
     VChunkDataPlane& data_plane_;
     VChunkLegacyPath& legacy_;
     std::chrono::milliseconds timeout_;

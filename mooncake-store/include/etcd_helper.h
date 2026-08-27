@@ -94,7 +94,9 @@ class EtcdHelper {
      * fail.
      */
     static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
-                                      const std::vector<TxnPut>& puts);
+                                      const std::vector<TxnPut>& puts,
+                                      const std::vector<std::string>&
+                                          delete_keys = {});
 
     /*
      * @brief Grant a lease from the etcd.

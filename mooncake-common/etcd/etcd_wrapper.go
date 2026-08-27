@@ -812,7 +812,7 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 }
 
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, deleteKeys **C.char, deleteKeySizes *C.int, deleteCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -821,6 +821,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 
 	cmpN := int(compareCount)
 	putN := int(putCount)
+	deleteN := int(deleteCount)
 
 	cmps := make([]clientv3.Cmp, 0, cmpN)
 	if cmpN > 0 {
@@ -844,7 +845,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		}
 	}
 
-	ops := make([]clientv3.Op, 0, putN)
+	ops := make([]clientv3.Op, 0, putN+deleteN)
 	if putN > 0 {
 		putKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putKeys))[:putN:putN]
 		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
@@ -854,6 +855,14 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
 			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
 			ops = append(ops, clientv3.OpPut(k, v))
+		}
+	}
+	if deleteN > 0 {
+		deleteKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(deleteKeys))[:deleteN:deleteN]
+		deleteKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(deleteKeySizes))[:deleteN:deleteN]
+		for i := 0; i < deleteN; i++ {
+			k := C.GoStringN(deleteKeyPtrs[i], deleteKeySizeList[i])
+			ops = append(ops, clientv3.OpDelete(k))
 		}
 	}
 

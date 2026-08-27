@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include "master_service.h"
+
 namespace mooncake {
 namespace {
 
@@ -26,7 +28,26 @@ VChunkClient::VChunkClient(bool enabled, MasterService& master,
                            uint32_t circuit_breaker_threshold,
                            std::shared_ptr<VChunkMetrics> metrics)
     : enabled_(enabled),
-      master_(master),
+      owned_control_plane_(std::make_unique<LocalVChunkControlPlane>(master)),
+      control_plane_(owned_control_plane_.get()),
+      data_plane_(data_plane),
+      legacy_(legacy),
+      timeout_(timeout),
+      now_ms_(std::move(now_ms)),
+      max_retries_(max_retries),
+      circuit_breaker_threshold_(circuit_breaker_threshold),
+      metrics_(metrics ? std::move(metrics)
+                       : std::make_shared<VChunkMetrics>()) {}
+
+VChunkClient::VChunkClient(bool enabled, VChunkControlPlane& control_plane,
+                           VChunkDataPlane& data_plane,
+                           VChunkLegacyPath& legacy,
+                           std::chrono::milliseconds timeout, NowMs now_ms,
+                           uint32_t max_retries,
+                           uint32_t circuit_breaker_threshold,
+                           std::shared_ptr<VChunkMetrics> metrics)
+    : enabled_(enabled),
+      control_plane_(&control_plane),
       data_plane_(data_plane),
       legacy_(legacy),
       timeout_(timeout),
@@ -51,8 +72,7 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
         metrics_->Observe(VChunkOperation::PUT, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
-    auto created = master_.VChunkPutStart(tenant_id, key, length, false,
-                                           now_ms_());
+    auto created = control_plane_->PutStart(tenant_id, key, length, now_ms_());
     if (!created) {
         if (CountsForCircuitBreaker(created.error())) {
             consecutive_put_failures_.fetch_add(1);
@@ -95,8 +115,8 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                        << " slice_count=" << created->slice_count
                        << " error=" << static_cast<int>(transfer);
         }
-        const auto revoke = master_.VChunkPutRevoke(
-            tenant_id, key, created->vchunk_id);
+        const auto revoke =
+            control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
         metrics_->AddRollback();
         if (transfer == ErrorCode::RPC_TIMEOUT) {
             metrics_->AddTimeout();
@@ -112,10 +132,21 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                 .count());
         return result;
     }
-    const auto end = master_.VChunkPutEnd(tenant_id, key, created->vchunk_id,
-                                          now_ms_());
+    auto end =
+        control_plane_->PutEnd(tenant_id, key, created->vchunk_id, now_ms_());
+    // PutEnd may have committed durably while its RPC response was lost. Read
+    // back before revoking so an ambiguous timeout cannot leave a successful
+    // object reported as failed (or turn it into an orphan).
     if (end != ErrorCode::OK) {
-        master_.VChunkPutRevoke(tenant_id, key, created->vchunk_id);
+        auto committed = control_plane_->Get(tenant_id, key);
+        if (committed &&
+            committed->record.vchunk_id == created->vchunk_id &&
+            committed->record.status == VChunkStatus::ACTIVE) {
+            end = ErrorCode::OK;
+        }
+    }
+    if (end != ErrorCode::OK) {
+        control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
     }
     if (end == ErrorCode::OK) {
         consecutive_put_failures_.store(0);
@@ -140,12 +171,12 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         metrics_->Observe(VChunkOperation::GET, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
-    auto read = master_.AcquireVChunkRead(tenant_id, key);
+    auto read = control_plane_->Get(tenant_id, key);
     if (!read) {
         metrics_->Observe(VChunkOperation::GET, false, 0);
         return read.error();
     }
-    if (read->record().total_size != length) {
+    if (read->record.total_size != length) {
         metrics_->Observe(VChunkOperation::GET, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
@@ -156,7 +187,7 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
             result = ErrorCode::RPC_TIMEOUT;
             break;
         }
-        result = data_plane_.Read(read->record(), destination, length, deadline);
+        result = data_plane_.Read(read->record, destination, length, deadline);
         if (result == ErrorCode::OK ||
             (result != ErrorCode::TRANSFER_FAIL &&
              result != ErrorCode::RPC_TIMEOUT)) {
@@ -172,16 +203,15 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         metrics_->AddTransferFailure();
     }
     if (result != ErrorCode::OK) {
-        if (!read->record().slices.empty()) {
-            const auto& slice = read->record().slices.front();
+        if (!read->record.slices.empty()) {
+            const auto& slice = read->record.slices.front();
             LOG(ERROR) << "vchunk read failed tenant=" << tenant_id.value()
                        << " key_id=" << SafeKeyId(tenant_id, key)
-                       << " vchunk_id=" << read->record().vchunk_id
-                       << " status="
-                       << static_cast<int>(read->record().status)
+                       << " vchunk_id=" << read->record.vchunk_id
+                       << " status=" << static_cast<int>(read->record.status)
                        << " slice_index=" << slice.slice_index
                        << " segment=" << slice.target_segment_name
-                       << " slice_count=" << read->record().slice_count
+                       << " slice_count=" << read->record.slice_count
                        << " error=" << static_cast<int>(result);
         }
     }
@@ -203,7 +233,11 @@ ErrorCode VChunkClient::Remove(const TenantId& tenant_id,
         metrics_->Observe(VChunkOperation::REMOVE, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
-    const auto result = master_.RemoveVChunk(tenant_id, key, now_ms_());
+    auto result = control_plane_->Remove(tenant_id, key, now_ms_());
+    if (result == ErrorCode::RPC_TIMEOUT || result == ErrorCode::RPC_FAIL) {
+        metrics_->AddRetry();
+        result = control_plane_->Remove(tenant_id, key, now_ms_());
+    }
     metrics_->Observe(
         VChunkOperation::REMOVE, result == ErrorCode::OK,
         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -

@@ -606,6 +606,10 @@ ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
     return vchunk_manager_.Remove(tenant_id, key, now_ms);
 }
 
+VChunkRuntimeInfo MasterService::GetVChunkRuntimeInfo() const {
+    return {vchunk_enabled_, vchunk_manager_.HasPersistentMetadata()};
+}
+
 tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
     int64_t now_ms, size_t max_scan) {
     auto allocator_access = segment_manager_.getAllocatorAccess();

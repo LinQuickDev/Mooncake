@@ -87,6 +87,7 @@ set(MOONCAKE_STORE_SOURCES
     vchunk_allocation_strategy.cpp
     vchunk_master_manager.cpp
     vchunk_client.cpp
+    vchunk_control_plane.cpp
     vchunk_transfer_engine.cpp
     vchunk_metadata_store.cpp
     vchunk_metrics.cpp

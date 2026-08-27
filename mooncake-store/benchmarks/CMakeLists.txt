@@ -66,7 +66,9 @@ if(STORE_USE_ETCD)
                               JsonCpp::JsonCpp)
 endif()
 
-add_executable(vchunk_bench vchunk_bench.cpp vchunk_benchmark_report.cpp)
-target_link_libraries(
-  vchunk_bench PRIVATE mooncake_store cachelib_memory_allocator
-                       JsonCpp::JsonCpp gflags::gflags glog::glog pthread)
+if(STORE_USE_ETCD)
+  add_executable(vchunk_distributed_bench vchunk_distributed_bench.cpp)
+  target_link_libraries(
+    vchunk_distributed_bench PRIVATE mooncake_store transfer_engine asio_shared
+                                     gflags::gflags glog::glog pthread)
+endif()
