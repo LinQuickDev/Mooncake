@@ -993,7 +993,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     if (i) nodes_str += ",";
                     nodes_str += std::to_string(i);
                 }
-                MC_LOG(INFO)
+                LOG(INFO)
                     << "UB per-NUMA mode: NUMA node count=" << numa_count
                     << ", nodes=[" << nodes_str << "]";
             }
@@ -1023,7 +1023,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 size_t n = ub_numa_nodes.size();
                 size_t per_node_size = align_up(segment_size / n, page_sz);
                 if (per_node_size == 0) {
-                    MC_LOG(ERROR) << "UB per-NUMA: per_node_size is 0, segment "
+                    LOG(ERROR) << "UB per-NUMA: per_node_size is 0, segment "
                                      "too small for "
                                   << n << " NUMA nodes";
                     return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1038,7 +1038,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     void *ptr = mooncake::ub_allocate_memory_onnode(
                         /*alignment=*/page_sz, per_node_size, node);
                     if (!ptr) {
-                        MC_LOG(ERROR) << "UB per-NUMA: failed to allocate "
+                        LOG(ERROR) << "UB per-NUMA: failed to allocate "
                                          "segment for node "
                                       << node;
                         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1049,13 +1049,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                         ptr, UbSegmentDeleter{per_node_size});
 
                     std::string loc = genCpuNodeName(node);  // "cpu:<node>"
-                    MC_LOG(INFO)
+                    LOG(INFO)
                         << "Mounting UB per-NUMA segment: node=" << node
                         << ", size=" << per_node_size << ", loc=" << loc;
                     auto mr = client_->MountSegment(ptr, per_node_size,
                                                     protocol, loc);
                     if (!mr.has_value()) {
-                        MC_LOG(ERROR) << "Failed to mount UB per-NUMA segment: "
+                        LOG(ERROR) << "Failed to mount UB per-NUMA segment: "
                                       << toString(mr.error());
                         return tl::unexpected(mr.error());
                     }
