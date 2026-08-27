@@ -187,18 +187,22 @@ TEST(VChunkMetadataStoreTest, RemoveFailureLeavesReleasingObjectRetryable) {
     EXPECT_EQ(manager.SizeForTesting(), 0U);
 }
 
-TEST(VChunkMetadataStoreTest, StartupRejectsUnavailableStoreAndUnsupportedHa) {
+TEST(VChunkMetadataStoreTest, StartupRejectsUnavailableStore) {
     auto store = std::make_shared<FaultStore>();
     store->fail_list = true;
     MasterServiceConfig unavailable;
     unavailable.vchunk_config.enabled = true;
     unavailable.vchunk_metadata_store = store;
     EXPECT_THROW(MasterService service(unavailable), std::runtime_error);
+}
 
-    MasterServiceConfig unsupported_ha;
-    unsupported_ha.vchunk_config.enabled = true;
-    unsupported_ha.enable_ha = true;
-    EXPECT_THROW(MasterService service(unsupported_ha), std::invalid_argument);
+TEST(VChunkMetadataStoreTest, StartupAllowsVChunkWithHaEnabled) {
+    MasterServiceConfig coexistence;
+    coexistence.vchunk_config.enabled = true;
+    coexistence.enable_ha = true;
+
+    MasterService service(coexistence);
+    EXPECT_TRUE(service.GetVChunkRuntimeInfo().enabled);
 }
 
 TEST(VChunkMetadataStoreTest, RecoveryRejectsUnknownSchemaVersion) {

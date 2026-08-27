@@ -239,10 +239,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
-    if (config.vchunk_config.enabled && config.enable_ha) {
-        throw std::invalid_argument(
-            "vchunk HA is not supported until allocator ranges can be restored");
-    }
     if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
         const auto error = vchunk_manager_.Recover(getCurrentTimeInMilli());
         if (error != ErrorCode::OK) {
