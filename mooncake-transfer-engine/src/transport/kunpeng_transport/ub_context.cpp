@@ -286,9 +286,9 @@ int UbWorkerPool::submitPostSend(
                 numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
                         kNumaAffinitySampleInterval ==
                     0) {
-                VLOG(2) << "[numa_affinity] remote_sample trace_id="
-                        << slice->trace_id << " target_id=" << slice->target_id
-                        << " opcode="
+                VLOG(2) << "[numa_affinity] remote_sample batch_id="
+                        << slice->task->batch_id
+                        << " target_id=" << slice->target_id << " opcode="
                         << (slice->opcode == Transport::TransferRequest::READ
                                 ? "READ"
                                 : "WRITE")
@@ -534,9 +534,9 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                             kNumaAffinitySampleInterval ==
                         0) {
                     VLOG(2)
-                        << "[numa_affinity] remote_redispatch_sample trace_id="
-                        << slice->trace_id << " target_id=" << slice->target_id
-                        << " opcode="
+                        << "[numa_affinity] remote_redispatch_sample batch_id="
+                        << slice->task->batch_id
+                        << " target_id=" << slice->target_id << " opcode="
                         << (slice->opcode == Transport::TransferRequest::READ
                                 ? "READ"
                                 : "WRITE")

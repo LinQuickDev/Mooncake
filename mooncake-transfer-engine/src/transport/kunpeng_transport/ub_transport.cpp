@@ -342,9 +342,9 @@ Status UbTransport::submitTransferTask(
                             kNumaAffinitySampleInterval ==
                         0) {
                     VLOG(2)
-                        << "[numa_affinity] local_sample trace_id="
-                        << slice->trace_id << " target_id=" << slice->target_id
-                        << " opcode="
+                        << "[numa_affinity] local_sample batch_id="
+                        << slice->task->batch_id
+                        << " target_id=" << slice->target_id << " opcode="
                         << (slice->opcode == Transport::TransferRequest::READ
                                 ? "READ"
                                 : "WRITE")

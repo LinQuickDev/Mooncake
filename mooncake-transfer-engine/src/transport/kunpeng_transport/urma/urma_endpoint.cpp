@@ -998,7 +998,7 @@ int UrmaEndpoint::submitPostSend(
                     kNumaAffinitySampleInterval ==
                 0) {
             VLOG(2) << "[numa_affinity] wr_sample nic=" << peer_nic_path_
-                    << " trace_id=" << slice_list[0]->trace_id
+                    << " batch_id=" << slice_list[0]->task->batch_id
                     << " target_id=" << slice_list[0]->target_id << " opcode="
                     << (slice_list[0]->opcode ==
                                 Transport::TransferRequest::READ

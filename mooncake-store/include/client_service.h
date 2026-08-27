@@ -33,6 +33,7 @@ namespace mooncake {
 class PutOperation;
 class DistributedStorageBackend;
 class RealClient;
+class ClientBufferAllocator;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
