@@ -269,19 +269,18 @@ TEST_F(UrmaJettyRebuildTest, AckTimeoutTriggersRebuildHappyPath) {
 TEST_F(UrmaJettyRebuildTest, FlushCompletionsDeliveredOnRebuild) {
     Transport::TransferTask task = {};
     Transport::Slice *s1 = postOneSlice(&task);
+    // Withhold s2 from poll so it stays outstanding on the jetty and can only
+    // be completed by the rebuild flush path below.
+    mock_urma_withhold_next_post(1);
     Transport::Slice *s2 = postOneSlice(&task);
     const uint32_t old_id = UrmaEndpointTestPeer::jettyId(*endpoint_, 0);
     EXPECT_EQ(2, UrmaEndpointTestPeer::wrDepth(*endpoint_, 0));
 
-    // Drive into DRAINING without consuming the two WRs.
+    // Drive into DRAINING: only s1 is polled (status 9); s2 stays outstanding.
     mock_urma_set_next_poll_status(URMA_CR_ACK_TIMEOUT_ERR, 1);
-    // Move the two real WRs aside so the ACK-timeout completion can refer to
-    // the first one; the remaining one stays outstanding for the flush loop.
     std::vector<Transport::Slice *> failed;
     std::unordered_map<volatile int *, int> depth_set;
     std::vector<UbEndPoint *> deferred;
-    // Re-post nothing; mark both WRs with ACK timeout would fail both. Instead
-    // fail only the first (count=1), leaving s2 outstanding.
     pollOnce(failed, depth_set, deferred);
     ASSERT_EQ(UrmaEndpoint::DRAINING,
               UrmaEndpointTestPeer::jettyState(*endpoint_, 0));

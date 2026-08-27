@@ -18,6 +18,10 @@ namespace {
 struct PendingWr {
     uint64_t user_ctx;
     uint32_t jetty_local_id;
+    // When true, urma_poll_jfc skips this WR (it stays outstanding) so only
+    // urma_flush_jetty can complete it. Lets a test leave a residual WR on the
+    // jetty to exercise the rebuild flush-delivery path.
+    bool withhold = false;
 };
 
 struct JfcState {
@@ -39,6 +43,9 @@ struct MockScript {
     int flush_err_count = 0;
     // When true, the next urma_create_jetty returns NULL.
     bool fail_next_create_jetty = false;
+    // While > 0, the next WRs posted via urma_post_jetty_send_wr are marked
+    // withhold (skipped by poll, only flushable). Decremented per WR posted.
+    int withhold_next_post_count = 0;
 };
 
 std::mutex g_script_mutex;
@@ -535,8 +542,16 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
         std::lock_guard<std::mutex> jfc_lock(state->mutex);
         urma_jfs_wr_t *current_wr = wr;
         while (current_wr) {
+            bool withhold = false;
+            {
+                std::lock_guard<std::mutex> script_lock(g_script_mutex);
+                if (g_script.withhold_next_post_count > 0) {
+                    withhold = true;
+                    --g_script.withhold_next_post_count;
+                }
+            }
             state->pending.push_back(
-                PendingWr{current_wr->user_ctx, jetty->jetty_id.id});
+                PendingWr{current_wr->user_ctx, jetty->jetty_id.id, withhold});
             current_wr = current_wr->next;
         }
     }
@@ -590,9 +605,14 @@ int urma_poll_jfc(urma_jfc_t *jfc, int num_entries, urma_cr_t *cr_list) {
         }
     }
 
-    int available = static_cast<int>(state->pending.size());
-    int wr_completed = std::min(num_entries - num_completed, available);
-    for (int i = 0; i < wr_completed; ++i) {
+    int capacity = num_entries - num_completed;
+    int wr_completed = 0;
+    for (auto it = state->pending.begin();
+         it != state->pending.end() && wr_completed < capacity;) {
+        if (it->withhold) {
+            ++it;  // leave outstanding for the flush path
+            continue;
+        }
         urma_cr_status_t status = URMA_CR_SUCCESS;
         {
             std::lock_guard<std::mutex> script_lock(g_script_mutex);
@@ -602,12 +622,12 @@ int urma_poll_jfc(urma_jfc_t *jfc, int num_entries, urma_cr_t *cr_list) {
             }
         }
         cr_list[num_completed].status = status;
-        cr_list[num_completed].user_ctx = state->pending[i].user_ctx;
-        cr_list[num_completed].local_id = state->pending[i].jetty_local_id;
+        cr_list[num_completed].user_ctx = it->user_ctx;
+        cr_list[num_completed].local_id = it->jetty_local_id;
         ++num_completed;
+        ++wr_completed;
+        it = state->pending.erase(it);
     }
-    state->pending.erase(state->pending.begin(),
-                         state->pending.begin() + wr_completed);
     return num_completed;
 }
 
@@ -634,6 +654,11 @@ void mock_urma_enqueue_flush_done(uint32_t jetty_local_id) {
 void mock_urma_set_flush_returns_errors(int count) {
     std::lock_guard<std::mutex> script_lock(g_script_mutex);
     g_script.flush_err_count = count;
+}
+
+void mock_urma_withhold_next_post(int count) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.withhold_next_post_count = count;
 }
 
 void mock_urma_fail_next_create_jetty(void) {

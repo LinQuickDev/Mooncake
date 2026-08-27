@@ -48,6 +48,12 @@ void mock_urma_set_flush_returns_errors(int count);
 // rebuild-failure -> deferred-delete fallback.
 void mock_urma_fail_next_create_jetty(void);
 
+// Marks the next `count` WRs posted via urma_post_jetty_send_wr as withheld:
+// urma_poll_jfc skips them (they stay outstanding) so only urma_flush_jetty
+// can complete them. Use to leave a residual WR on a jetty and exercise the
+// rebuild flush-delivery path.
+void mock_urma_withhold_next_post(int count);
+
 #ifdef __cplusplus
 }
 #endif
