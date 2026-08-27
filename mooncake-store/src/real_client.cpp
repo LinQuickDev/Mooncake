@@ -1208,14 +1208,18 @@ int RealClient::setup_real(
     SpDiag::PerfPoint pt(PerfKey::RC_SETUP_REAL,
                          SpDiag::PerfLevel::KEY_MODULE);
     pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
     auto ret = to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
         tenant_id, Environ::Get().GetOffloadRpcThreadNum(8), enable_client_http_server, client_http_port));
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count();
     pt.End(ret == 0 ? 0 : -1);
     // S2 setup 下沉层 MC_LOG 汇总（Q1b：入口层只 PerfPoint）
-    MC_LOG(INFO) << "[setup] elapsed_us=" << pt.ElapsedMicros()
+    MC_LOG(INFO) << "[setup] elapsed_us=" << elapsed_us
                  << " success=" << (ret == 0 ? 1 : 0)
                  << " hostname=" << local_hostname
                  << " metadata_server=" << metadata_server
@@ -2490,7 +2494,11 @@ std::vector<int> RealClient::batchIsExist(
     SpDiag::PerfPoint pt(PerfKey::RC_BATCH_IS_EXIST,
                          SpDiag::PerfLevel::KEY_MODULE);
     pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
     auto internal_results = batchIsExist_internal(keys);
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count();
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -2505,7 +2513,7 @@ std::vector<int> RealClient::batchIsExist(
     // S6 batch_is_exist 下沉层 MC_LOG 汇总+per-key（Q1b：入口层只 PerfPoint）
     // 字段：success+key（无 size/replica/endpoint，缺失不输出）
     std::ostringstream oss;
-    oss << "[batch_is_exist] elapsed_us=" << pt.ElapsedMicros()
+    oss << "[batch_is_exist] elapsed_us=" << elapsed_us
         << " num_keys=" << keys.size();
     for (size_t i = 0; i < keys.size(); ++i) {
         int success = (i < results.size()) ? results[i] : 0;
@@ -3795,10 +3803,14 @@ int RealClient::register_buffer(void *buffer, size_t size) {
     SpDiag::PerfPoint pt(PerfKey::RC_REGISTER_BUFFER,
                          SpDiag::PerfLevel::KEY_MODULE);
     pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
     auto ret = to_py_ret(register_buffer_internal(buffer, size));
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count();
     pt.End(ret == 0 ? 0 : -1);
     // S3 register_buffer 下沉层 MC_LOG 汇总（Q1b：入口层只 PerfPoint）
-    MC_LOG(INFO) << "[register_buffer] elapsed_us=" << pt.ElapsedMicros()
+    MC_LOG(INFO) << "[register_buffer] elapsed_us=" << elapsed_us
                  << " success=" << (ret == 0 ? 1 : 0)
                  << " base_addr=" << buffer << " size=" << size;
     return ret;

@@ -2246,11 +2246,15 @@ PYBIND11_MODULE(store, m) {
                 SpDiag::PerfPoint pt(PerfKey::STORE_PY_REMOVE_ALL,
                                      SpDiag::PerfLevel::KEY_MODULE);
                 pt.Start();
+                auto t0 = std::chrono::steady_clock::now();
                 py::gil_scoped_release release;
                 auto ret = self.store_->removeAll(force);
+                auto t1 = std::chrono::steady_clock::now();
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      t1 - t0).count();
                 pt.End(ret == 0 ? 0 : -1);
                 // 下沉 removeAll 不加 MC_LOG，入口层输出汇总（Q1b）
-                MC_LOG(INFO) << "[remove_all] elapsed_us=" << pt.ElapsedMicros()
+                MC_LOG(INFO) << "[remove_all] elapsed_us=" << elapsed_us
                              << " success=" << (ret == 0 ? 1 : 0);
                 return ret;
             },
@@ -2293,18 +2297,25 @@ PYBIND11_MODULE(store, m) {
                  SpDiag::PerfPoint pt(PerfKey::STORE_PY_CLOSE,
                                       SpDiag::PerfLevel::KEY_MODULE);
                  pt.Start();
+                 auto t0 = std::chrono::steady_clock::now();
                  if (!self.store_) {
+                     auto t1 = std::chrono::steady_clock::now();
+                     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                           t1 - t0).count();
                      pt.End(0);
                      // 无下沉 MC_LOG，入口层输出汇总（Q1b）
-                     MC_LOG(INFO) << "[close] elapsed_us=" << pt.ElapsedMicros()
+                     MC_LOG(INFO) << "[close] elapsed_us=" << elapsed_us
                                   << " success=1";
                      return 0;
                  }
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
+                 auto t1 = std::chrono::steady_clock::now();
+                 auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                       t1 - t0).count();
                  pt.End(rc == 0 ? 0 : -1);
                  // 下沉 tearDownAll 不加 MC_LOG，入口层输出汇总（Q1b）
-                 MC_LOG(INFO) << "[close] elapsed_us=" << pt.ElapsedMicros()
+                 MC_LOG(INFO) << "[close] elapsed_us=" << elapsed_us
                               << " success=" << (rc == 0 ? 1 : 0);
                  return rc;
              })
