@@ -339,7 +339,7 @@ urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
         context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
-    urma_target_seg_t *tseg = new urma_target_seg_t;
+    auto *tseg = new urma_target_seg_t;
     tseg->seg = *seg;
     *token_value = {.token = seg->token_id};
     seg_map[tseg] = 1;

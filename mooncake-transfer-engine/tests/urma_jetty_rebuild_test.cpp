@@ -162,6 +162,15 @@ class UrmaJettyRebuildTest : public ::testing::Test {
         config.max_wr = 64;
         ASSERT_EQ(0, endpoint_->construct(config));
         UrmaEndpointTestPeer::markConnected(*endpoint_, context_->getEid());
+
+        // Import a real (mock) target segment so slices can carry a non-null
+        // r_seg; processWrCompletion's failure log dereferences r_seg, so a
+        // null pointer would segfault the test on any non-SUCCESS completion.
+        urma_seg_t seg = {};
+        seg.token_id = 1;
+        urma_token_t seg_token = {};
+        imported_seg_ = urma_import_seg(uctx, &seg, &seg_token, 0, import_flag);
+        ASSERT_NE(nullptr, imported_seg_);
     }
 
     void TearDown() override {
@@ -185,7 +194,7 @@ class UrmaJettyRebuildTest : public ::testing::Test {
         slice->task = task;
         slice->from_cache = false;
         slice->ub.dest_addr = 0x2000;
-        slice->ub.r_seg = nullptr;
+        slice->ub.r_seg = imported_seg_;
         slice->ub.l_seg = nullptr;
         slice->ub.retry_cnt = 0;
         slice->ub.max_retry_cnt = 0;
@@ -209,6 +218,7 @@ class UrmaJettyRebuildTest : public ::testing::Test {
     TestUbTransport *transport_ = nullptr;
     std::unique_ptr<UrmaContext> context_;
     std::unique_ptr<UrmaEndpoint> endpoint_;
+    urma_target_seg_t *imported_seg_ = nullptr;
 };
 
 // TC-1: status=9 -> DRAINING -> FLUSH_ERR_DONE -> rebuild -> slice resolved.
