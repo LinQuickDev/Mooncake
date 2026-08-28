@@ -7,6 +7,7 @@ orphan: true
 状态：已实现（P0：TC-1～TC-3 + scoped ctest 挂 `tent-ci (ub-mock)`）
 范围：kunpeng / UB（`UrmaEndpoint` + `mock_urma.cpp` + `UbWorkerPool`）
 关联方案：`jetty-single-rebuild-plan.md`（见其"验证"章节的回链）
+Review 说明：`jetty-rebuild-mock-test-verification.md`（设计思路与验证原理）
 目标：在 **无真实 URMA 硬件** 的 CI 中，覆盖 status=9 触发的单 Jetty 重建与安全修复路径。
 
 ---

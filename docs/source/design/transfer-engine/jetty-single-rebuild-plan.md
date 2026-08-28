@@ -213,6 +213,8 @@ if cr.status == ACK_TIMEOUT_ERR (9):
 - 无 UMDK 硬件时，flush 与真实 ACK timeout 行为标为硬件验证项
 - **Mock 注入 CI 测试草案**：`jetty-rebuild-mock-test-plan.md`（`mock_urma` 脚本化
   status=9 / FLUSH_ERR_DONE / flush CR，挂 `tent-ci (ub-mock)`）
+- **Mock 注入 CI 验证说明（review 用）**：`jetty-rebuild-mock-test-verification.md`
+  （设计思路、error9 触发时序、用例-修复对应关系、验证边界）
 
 ---
 
