@@ -631,6 +631,41 @@ MasterService::AcquireVChunkRead(const TenantId& tenant_id,
     return vchunk_manager_.AcquireRead(tenant_id, key);
 }
 
+tl::expected<VChunkReadLease, ErrorCode>
+MasterService::AcquireVChunkReadLease(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      int64_t now_ms) {
+    constexpr int64_t kRemoteReadLeaseTtlMs = 5 * 60 * 1000;
+    if (now_ms < 0 ||
+        now_ms > std::numeric_limits<int64_t>::max() -
+                     kRemoteReadLeaseTtlMs) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto handle = AcquireVChunkRead(tenant_id, key);
+    if (!handle) {
+        return tl::make_unexpected(handle.error());
+    }
+    VChunkReadLease lease{handle->record(), UuidToString(generate_uuid())};
+    {
+        std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+        vchunk_read_leases_.emplace(
+            lease.lease_id,
+            VChunkRemoteReadLease{std::move(*handle),
+                                  now_ms + kRemoteReadLeaseTtlMs});
+    }
+    return lease;
+}
+
+ErrorCode MasterService::ReleaseVChunkReadLease(
+    const std::string& lease_id) {
+    if (lease_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+    vchunk_read_leases_.erase(lease_id);
+    return ErrorCode::OK;
+}
+
 ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
                                       const std::string& key,
                                       int64_t now_ms) {
@@ -652,6 +687,12 @@ tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
     int64_t now_ms, size_t max_scan) {
     if (!vchunk_enabled_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    {
+        std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+        std::erase_if(vchunk_read_leases_, [now_ms](const auto& item) {
+            return item.second.expires_at_ms <= now_ms;
+        });
     }
     auto allocator_access = segment_manager_.getAllocatorAccess();
     return vchunk_manager_.ReapExpired(

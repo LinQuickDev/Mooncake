@@ -133,7 +133,16 @@ TEST(VChunkMasterServiceTest, ExposesIsolatedVChunkControlPlane) {
     auto active = service.GetVChunk(tenant, "key");
     ASSERT_TRUE(active.has_value());
     EXPECT_EQ(active->status, VChunkStatus::ACTIVE);
+    auto remote_read = service.AcquireVChunkReadLease(tenant, "key", 250);
+    ASSERT_TRUE(remote_read.has_value());
+    EXPECT_FALSE(remote_read->lease_id.empty());
+    EXPECT_EQ(remote_read->record.vchunk_id, created->vchunk_id);
     EXPECT_EQ(service.RemoveVChunk(tenant, "key", 300), ErrorCode::OK);
+    EXPECT_EQ(service.ReleaseVChunkReadLease(remote_read->lease_id),
+              ErrorCode::OK);
+    EXPECT_EQ(service.ReleaseVChunkReadLease(remote_read->lease_id),
+              ErrorCode::OK);
+    EXPECT_EQ(service.ReleaseVChunkReadLease(""), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(service.GetVChunk(tenant, "key").error(),
               ErrorCode::OBJECT_NOT_FOUND);
 }

@@ -70,6 +70,13 @@ struct VChunkRuntimeInfo {
     YLT_REFL(VChunkRuntimeInfo, enabled, persistent_metadata);
 };
 
+struct VChunkReadLease {
+    VChunkMetadataRecord record;
+    std::string lease_id;
+
+    YLT_REFL(VChunkReadLease, record, lease_id);
+};
+
 ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
                                  const VChunkConfig& config);
 ErrorCode ValidateVChunkTransition(VChunkStatus from, VChunkStatus to);

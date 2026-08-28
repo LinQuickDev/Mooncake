@@ -297,8 +297,11 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutRevoke(
         const std::string& tenant_id, const std::string& key,
         const std::string& vchunk_id);
-    [[nodiscard]] tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
+    [[nodiscard]] tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
         const std::string& tenant_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& lease_id);
     [[nodiscard]] tl::expected<void, ErrorCode> RemoveVChunk(
         const std::string& tenant_id, const std::string& key, int64_t now_ms);
     [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
@@ -821,6 +824,9 @@ class MasterClient {
     partition::PartitionRouter partition_router_;
     mutable std::mutex routing_config_mutex_;
     std::string routing_cluster_namespace_;
+    // Protects the target switch and the following vchunk RPC as one unit.
+    // RpcClientPool itself is thread-safe, but its selected target is shared.
+    mutable std::mutex vchunk_routed_rpc_mutex_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;

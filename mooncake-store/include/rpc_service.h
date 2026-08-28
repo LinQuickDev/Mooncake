@@ -102,8 +102,10 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> VChunkPutRevoke(
         const std::string& tenant_id, const std::string& key,
         const std::string& vchunk_id);
-    tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
+    tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
         const std::string& tenant_id, const std::string& key);
+    tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
+        const std::string& lease_id);
     tl::expected<void, ErrorCode> RemoveVChunk(const std::string& tenant_id,
                                                const std::string& key,
                                                int64_t now_ms);

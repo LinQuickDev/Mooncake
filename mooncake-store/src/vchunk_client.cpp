@@ -60,6 +60,7 @@ VChunkClient::VChunkClient(bool enabled, VChunkControlPlane& control_plane,
 ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                             const void* source, size_t length) {
     const auto started = Clock::now();
+    const auto deadline = started + timeout_;
     if (!enabled_) {
         return legacy_.Put(tenant_id, key, source, length);
     }
@@ -84,9 +85,19 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                 .count());
         return created.error();
     }
+    if (Clock::now() >= deadline) {
+        (void)control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
+        metrics_->AddRollback();
+        metrics_->AddTimeout();
+        metrics_->Observe(
+            VChunkOperation::PUT, false,
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                  started)
+                .count());
+        return ErrorCode::RPC_TIMEOUT;
+    }
     metrics_->AddSlices(created->slice_count);
     metrics_->ObserveLayout(*created);
-    const auto deadline = Clock::now() + timeout_;
     ErrorCode transfer = ErrorCode::TRANSFER_FAIL;
     for (uint32_t attempt = 0; attempt <= max_retries_; ++attempt) {
         if (Clock::now() >= deadline) {
@@ -132,6 +143,17 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                 .count());
         return result;
     }
+    if (Clock::now() >= deadline) {
+        (void)control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
+        metrics_->AddRollback();
+        metrics_->AddTimeout();
+        metrics_->Observe(
+            VChunkOperation::PUT, false,
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                  started)
+                .count());
+        return ErrorCode::RPC_TIMEOUT;
+    }
     auto end =
         control_plane_->PutEnd(tenant_id, key, created->vchunk_id, now_ms_());
     // PutEnd may have committed durably while its RPC response was lost. Read
@@ -164,6 +186,7 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
 ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
                             void* destination, size_t length) {
     const auto started = Clock::now();
+    const auto deadline = started + timeout_;
     if (!enabled_) {
         return legacy_.Get(tenant_id, key, destination, length);
     }
@@ -180,7 +203,15 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         metrics_->Observe(VChunkOperation::GET, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
-    const auto deadline = Clock::now() + timeout_;
+    if (Clock::now() >= deadline) {
+        metrics_->AddTimeout();
+        metrics_->Observe(
+            VChunkOperation::GET, false,
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                  started)
+                .count());
+        return ErrorCode::RPC_TIMEOUT;
+    }
     ErrorCode result = ErrorCode::TRANSFER_FAIL;
     for (uint32_t attempt = 0; attempt <= max_retries_; ++attempt) {
         if (Clock::now() >= deadline) {

@@ -17,7 +17,8 @@ void PartitionRouter::LoadSlotOwners(
     std::unordered_map<uint16_t, std::string> next;
     next.reserve(owners.size());
     for (const auto& owner : owners) {
-        if (!owner.primary_master_id.empty()) {
+        if (!owner.primary_master_id.empty() &&
+            owner.state == static_cast<int32_t>(cvm::SlotState::kStable)) {
             next[owner.slot] = owner.primary_master_id;
         }
     }

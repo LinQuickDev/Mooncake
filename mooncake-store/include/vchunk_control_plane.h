@@ -17,9 +17,8 @@ class MasterService;
 
 struct VChunkControlPlaneRead {
     VChunkMetadataRecord record;
-    // Local control planes retain the allocator-backed read handle here.
-    // RPC control planes leave it empty; remote lifetime is governed by the
-    // master's object lifecycle.
+    // Retains either the local allocator-backed read handle or the guard for a
+    // remote read lease until the data-plane transfer has finished.
     std::shared_ptr<void> lifetime;
 };
 

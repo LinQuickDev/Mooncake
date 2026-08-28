@@ -257,6 +257,9 @@ class MasterService {
         const TenantId& tenant_id, const std::string& key) const;
     tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
         const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<VChunkReadLease, ErrorCode> AcquireVChunkReadLease(
+        const TenantId& tenant_id, const std::string& key, int64_t now_ms);
+    ErrorCode ReleaseVChunkReadLease(const std::string& lease_id);
     ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
                            int64_t now_ms);
     VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
@@ -2369,6 +2372,13 @@ class MasterService {
     size_t vchunk_reaper_max_scan_{128};
     std::atomic<bool> vchunk_reaper_running_{false};
     bool vchunk_recovery_pending_{false};
+    struct VChunkRemoteReadLease {
+        VChunkMasterManager::ReadHandle handle;
+        int64_t expires_at_ms{0};
+    };
+    std::mutex vchunk_read_leases_mutex_;
+    std::unordered_map<std::string, VChunkRemoteReadLease>
+        vchunk_read_leases_;
     std::thread vchunk_reaper_thread_;
     std::mutex vchunk_reaper_mutex_;
     std::condition_variable vchunk_reaper_cv_;

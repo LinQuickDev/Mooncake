@@ -137,6 +137,45 @@ class LegacySpy final : public VChunkLegacyPath {
     int removes{0};
 };
 
+class DelayingControlPlane final : public VChunkControlPlane {
+   public:
+    DelayingControlPlane(VChunkControlPlane& delegate,
+                         std::chrono::milliseconds delay)
+        : delegate_(delegate), delay_(delay) {}
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
+        const TenantId& tenant_id, const std::string& key, uint64_t total_size,
+        int64_t now_ms) override {
+        std::this_thread::sleep_for(delay_);
+        return delegate_.PutStart(tenant_id, key, total_size, now_ms);
+    }
+
+    ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
+                     const std::string& vchunk_id, int64_t now_ms) override {
+        return delegate_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+    }
+
+    ErrorCode PutRevoke(const TenantId& tenant_id, const std::string& key,
+                        const std::string& vchunk_id) override {
+        return delegate_.PutRevoke(tenant_id, key, vchunk_id);
+    }
+
+    tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
+        const TenantId& tenant_id, const std::string& key) override {
+        std::this_thread::sleep_for(delay_);
+        return delegate_.Get(tenant_id, key);
+    }
+
+    ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
+                     int64_t now_ms) override {
+        return delegate_.Remove(tenant_id, key, now_ms);
+    }
+
+   private:
+    VChunkControlPlane& delegate_;
+    std::chrono::milliseconds delay_;
+};
+
 struct ClientFixture : testing::Test {
     ClientFixture() : service(MakeConfig()) {
         const auto client_id = generate_uuid();
@@ -328,6 +367,32 @@ TEST_F(ClientFixture, CircuitBreakerStopsOnlyNewVChunkCreation) {
               ErrorCode::OK);
     EXPECT_EQ(output, source);
     EXPECT_EQ(client.Remove(TenantId("tenant"), "active"), ErrorCode::OK);
+}
+
+TEST_F(ClientFixture, ControlPlaneLatencyConsumesOperationTimeout) {
+    LocalVChunkControlPlane local(service);
+    DelayingControlPlane delayed(local, std::chrono::milliseconds(20));
+    VChunkClient timed_client(true, delayed, data, legacy,
+                              std::chrono::milliseconds(1),
+                              [this] { return ++now; });
+    std::vector<uint8_t> source(4096, 7);
+    EXPECT_EQ(timed_client.Put(TenantId("tenant"), "slow-put", source.data(),
+                               source.size()),
+              ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "slow-put").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+
+    VChunkClient setup_client(true, service, data, legacy,
+                              std::chrono::seconds(1),
+                              [this] { return ++now; });
+    ASSERT_EQ(setup_client.Put(TenantId("tenant"), "slow-get", source.data(),
+                               source.size()),
+              ErrorCode::OK);
+    std::vector<uint8_t> destination(source.size());
+    EXPECT_EQ(timed_client.Get(TenantId("tenant"), "slow-get",
+                               destination.data(), destination.size()),
+              ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(data.read_attempts, 0);
 }
 
 }  // namespace

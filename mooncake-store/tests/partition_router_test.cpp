@@ -45,6 +45,18 @@ TEST(PartitionRouterTest, SkipsEmptyPrimary) {
     EXPECT_TRUE(router.ResolveSubmaster(11).has_value());
 }
 
+TEST(PartitionRouterTest, SkipsMigratingSlotUntilOwnerIsStable) {
+    auto migrating = MakeOwner(10, "m-a");
+    migrating.state = static_cast<int32_t>(cvm::SlotState::kMigrating);
+    migrating.migrating_to_master_id = "m-b";
+
+    partition::PartitionRouter router;
+    router.LoadSlotOwners({migrating, MakeOwner(11, "m-b")});
+
+    EXPECT_FALSE(router.ResolveSubmaster(10).has_value());
+    EXPECT_EQ(router.ResolveSubmaster(11), "m-b");
+}
+
 TEST(PartitionRouterTest, OverwritesOnReload) {
     partition::PartitionRouter router;
     router.LoadSlotOwners({MakeOwner(10, "m-a")});

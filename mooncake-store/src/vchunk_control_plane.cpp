@@ -5,6 +5,30 @@
 
 namespace mooncake {
 
+namespace {
+
+class RpcReadLeaseGuard {
+   public:
+    RpcReadLeaseGuard(MasterClient& master, std::string tenant_id,
+                      std::string key, std::string lease_id)
+        : master_(master),
+          tenant_id_(std::move(tenant_id)),
+          key_(std::move(key)),
+          lease_id_(std::move(lease_id)) {}
+
+    ~RpcReadLeaseGuard() {
+        (void)master_.ReleaseVChunkReadLease(tenant_id_, key_, lease_id_);
+    }
+
+   private:
+    MasterClient& master_;
+    std::string tenant_id_;
+    std::string key_;
+    std::string lease_id_;
+};
+
+}  // namespace
+
 tl::expected<VChunkMetadataRecord, ErrorCode>
 LocalVChunkControlPlane::PutStart(const TenantId& tenant_id,
                                   const std::string& key, uint64_t total_size,
@@ -67,7 +91,10 @@ tl::expected<VChunkControlPlaneRead, ErrorCode> RpcVChunkControlPlane::Get(
     const TenantId& tenant_id, const std::string& key) {
     auto record = master_.GetVChunk(tenant_id.value(), key);
     if (!record) return tl::unexpected(record.error());
-    return VChunkControlPlaneRead{std::move(*record), {}};
+    auto lifetime = std::make_shared<RpcReadLeaseGuard>(
+        master_, tenant_id.value(), key, record->lease_id);
+    return VChunkControlPlaneRead{std::move(record->record),
+                                  std::move(lifetime)};
 }
 
 ErrorCode RpcVChunkControlPlane::Remove(const TenantId& tenant_id,
