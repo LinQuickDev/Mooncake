@@ -69,6 +69,11 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
             last_err = err;
         }
     }
+    // 释放成功的聚合记录：仅在 owned 集合变化时打印一条，便于确认交接完成。
+    if (!released.empty()) {
+        LOG(INFO) << "SlotMigrator released " << released.size()
+                  << " slot(s), master_id=" << config_.master_id;
+    }
 
     // 获得：kMigrating -> on_acquire -> kStable 两段式交接。
     for (uint16_t slot : gained) {
@@ -88,6 +93,12 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
                          << " failed: " << err;
             last_err = err;
         }
+    }
+    // 获得成功的聚合记录：确认 kMigrating -> kStable 交接已全部落盘。
+    if (!gained.empty()) {
+        LOG(INFO) << "SlotMigrator acquired " << gained.size()
+                  << " slot(s) via kMigrating->kStable, master_id="
+                  << config_.master_id;
     }
 
     // 不变 slot：幂等 reaffirm kStable。

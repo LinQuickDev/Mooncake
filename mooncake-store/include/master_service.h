@@ -2142,6 +2142,9 @@ class MasterService {
     mutable std::shared_mutex owned_slots_mutex_;
     std::vector<bool> owned_slot_lookup_;
     bool owned_slots_ready_{false};
+    // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
+    bool owned_slot_count_logged_{false};
+    std::size_t last_logged_owned_count_{0};
     // Segment view (CVM) 数据源：在 segment 挂载/卸载时把 segment owner 原始
     // 记录同步到 etcd（segment_view/<id>），供 CvmController 聚合生成 segment
     // view 快照。仅在 etcd HA backend 下生效，其余场景为空操作。

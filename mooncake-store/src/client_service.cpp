@@ -1203,8 +1203,14 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     // （分区已重平衡）。刷新一次路由快照后重试，submaster 经 etcd 收敛视图。
     if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
         !etcd_connstring_.empty()) {
+        LOG(WARNING) << "Query: SLOT_NOT_OWNED for key=" << object_key
+                     << ", refreshing slot routing and retrying once";
         TryLoadRoutingOnce();
         result = master_client_.GetReplicaList(object_key);
+        if (result) {
+            LOG(INFO) << "Query: re-route retry succeeded for key="
+                      << object_key;
+        }
     }
     if (!result) {
         return tl::unexpected(result.error());
@@ -1237,6 +1243,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             }
         }
         if (has_slot_not_owned) {
+            LOG(WARNING) << "BatchQuery: SLOT_NOT_OWNED in batch of "
+                         << object_keys.size()
+                         << " keys, refreshing slot routing and retrying once";
             TryLoadRoutingOnce();
             response =
                 master_client_.BatchGetReplicaList(object_keys, tenant_id);

@@ -72,7 +72,15 @@ ErrorCode SlotOwnerHeartbeat::PublishOnce() {
     // Delegate the per-slot writes to the SlotMigrator state machine: it
     // publishes kMigrating -> kStable for newly-acquired slots, deletes
     // released slots, and re-affirms unchanged slots.
-    return migrator_.Reconcile(slots);
+    ErrorCode err = migrator_.Reconcile(slots);
+    if (err != ErrorCode::OK) {
+        // Reconcile 内部已有逐 slot 失败 WARNING；这里补一条周期级汇总，
+        // 便于从心跳线程视角确认本轮发布未完全成功。
+        LOG(WARNING) << "SlotOwnerHeartbeat publish incomplete: master_id="
+                     << config_.master_id << " owned_slots=" << slots.size()
+                     << " err=" << err;
+    }
+    return err;
 }
 
 void SlotOwnerHeartbeat::RunLoop() {

@@ -994,6 +994,16 @@ void MasterService::UpdateOwnedSlots(const std::vector<uint16_t>& slots) {
         }
     }
     owned_slots_ready_ = true;
+    // 一致性哈希环分配结果（3.1）：仅在数量变化（含首次解析）时打印，
+    // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
+    if (!owned_slot_count_logged_ || slots.size() != last_logged_owned_count_) {
+        LOG(INFO) << "Owned slots updated (consistent-hash ring): count="
+                  << slots.size() << "/" << cvm::kSlotCount
+                  << (owned_slot_count_logged_ ? " (changed)" : "");
+        owned_slot_count_logged_ = true;
+        last_logged_owned_count_ = slots.size();
+    }
+    VLOG(1) << "UpdateOwnedSlots: " << slots.size() << " slots";
 }
 
 bool MasterService::OwnsSlot(uint16_t slot) const {
@@ -3683,7 +3693,9 @@ auto MasterService::GetReplicaList(const std::string& key,
     // 让客户端根据最新 slot→master 视图重新路由。
     const uint16_t slot = cvm::KeySlot(object_id.tenant_id, object_id.user_key);
     if (!OwnsSlot(slot)) {
-        VLOG(1) << "key=" << key << ", info=slot_not_owned";
+        LOG(WARNING) << "GetReplicaList: key=" << key << " slot=" << slot
+                     << " not owned by this master, rejecting with "
+                        "SLOT_NOT_OWNED (client should re-route)";
         return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
     }
 
@@ -3861,7 +3873,10 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 // SLOT_NOT_OWNED，避免访问已迁移的过期元数据。
                 const uint16_t slot = cvm::KeySlot(normalized_tenant, key);
                 if (!OwnsSlot(slot)) {
-                    VLOG(1) << "key=" << key << ", info=slot_not_owned";
+                    LOG(WARNING) << "BatchGetReplicaList: key=" << key
+                                 << " slot=" << slot
+                                 << " not owned by this master, rejecting "
+                                    "with SLOT_NOT_OWNED";
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
                     continue;
