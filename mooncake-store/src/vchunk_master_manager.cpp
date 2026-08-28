@@ -236,7 +236,8 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
     return ErrorCode::OK;
 }
 
-ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
+ErrorCode VChunkMasterManager::Recover(int64_t now_ms,
+                                       OwnershipPredicate owns) {
     if (now_ms < 0) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -248,6 +249,9 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
     // Validate the complete snapshot before mutating the store so recovery is
     // deterministic even when List() returns records in a different order.
     for (const auto& record : *records) {
+        if (owns && !owns(record)) {
+            continue;
+        }
         const auto validation = ValidateVChunkMetadata(record, config_);
         if (validation != ErrorCode::OK) {
             return validation;
@@ -260,6 +264,9 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
         }
     }
     for (const auto& record : *records) {
+        if (owns && !owns(record)) {
+            continue;
+        }
         // CREATING records cannot be resumed safely either: their buffers were
         // owned by the previous process. Treat all incomplete writes as stale.
         if (record.status == VChunkStatus::CREATING ||
@@ -278,7 +285,7 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms) {
 }
 
 tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
-    int64_t now_ms, size_t max_scan) {
+    int64_t now_ms, size_t max_scan, OwnershipPredicate owns) {
     if (now_ms < 0 || max_scan == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -298,6 +305,10 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
         auto next = std::next(it);
         if (next == entries_.end()) next = entries_.begin();
         const auto& record = it->second->record;
+        if (owns && !owns(record)) {
+            it = next;
+            continue;
+        }
         const bool time_is_valid = now_ms >= record.last_updated_at_ms;
         const auto age = time_is_valid
                              ? static_cast<uint64_t>(now_ms -

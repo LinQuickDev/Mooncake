@@ -2316,6 +2316,7 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                              const TenantId& tenant_id);
+    bool OwnsVChunkSlot(uint16_t slot) const;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
@@ -2367,9 +2368,11 @@ class MasterService {
     uint64_t vchunk_reaper_interval_ms_{1000};
     size_t vchunk_reaper_max_scan_{128};
     std::atomic<bool> vchunk_reaper_running_{false};
+    bool vchunk_recovery_pending_{false};
     std::thread vchunk_reaper_thread_;
     std::mutex vchunk_reaper_mutex_;
     std::condition_variable vchunk_reaper_cv_;
+    void StartVChunkReaper();
     void VChunkReaperThreadFunc();
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;

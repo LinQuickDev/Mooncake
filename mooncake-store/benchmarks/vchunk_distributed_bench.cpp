@@ -16,6 +16,10 @@
 #include "vchunk_transfer_engine.h"
 
 DEFINE_string(master, "127.0.0.1:50051", "Master RPC address");
+DEFINE_string(routing_etcd, "",
+              "ETCD endpoints used to load the CVM SubMaster route snapshot");
+DEFINE_string(cluster_namespace, "",
+              "CVM cluster namespace; required with --routing_etcd");
 DEFINE_string(metadata, "http://127.0.0.1:8080/metadata",
               "TransferEngine metadata connection string");
 DEFINE_string(local_server, "vchunk-bench-client:12345",
@@ -55,6 +59,17 @@ double Percentile(std::vector<double> values, double percentile) {
         percentile * static_cast<double>(values.size() - 1));
     return values[index];
 }
+
+ErrorCode ConfigureRouting(MasterClient& master) {
+    if (FLAGS_routing_etcd.empty() && FLAGS_cluster_namespace.empty()) {
+        return ErrorCode::OK;
+    }
+    if (FLAGS_routing_etcd.empty() || FLAGS_cluster_namespace.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return master.LoadRoutingFromEtcd(FLAGS_routing_etcd,
+                                      FLAGS_cluster_namespace);
+}
 }  // namespace
 }  // namespace mooncake
 
@@ -74,13 +89,15 @@ int main(int argc, char** argv) {
         LOG(ERROR) << "failed to connect master: " << toString(error);
         return 2;
     }
+    if (const auto error = ConfigureRouting(master); error != ErrorCode::OK) {
+        LOG(ERROR) << "failed to load SubMaster routing: " << toString(error);
+        return 2;
+    }
     auto runtime = master.GetVChunkRuntimeInfo();
     if (!runtime || !runtime->enabled || !runtime->persistent_metadata) {
         LOG(ERROR) << "master must enable vchunk with persistent ETCD metadata";
         return 2;
     }
-    RpcVChunkControlPlane control_plane(master);
-
     TransferEngine engine(FLAGS_auto_discovery);
     if (engine.init(FLAGS_metadata, FLAGS_local_server) != 0 ||
         engine.installTransport(FLAGS_protocol, nullptr) == nullptr) {
@@ -102,6 +119,13 @@ int main(int argc, char** argv) {
     std::barrier finish_barrier(FLAGS_concurrency + 1);
     for (uint32_t worker_id = 0; worker_id < FLAGS_concurrency; ++worker_id) {
         workers.emplace_back([&, worker_id] {
+            MasterClient worker_master(generate_uuid(), nullptr, FLAGS_tenant);
+            const auto connect_error = worker_master.Connect(FLAGS_master);
+            const auto routing_error =
+                connect_error == ErrorCode::OK
+                    ? ConfigureRouting(worker_master)
+                    : connect_error;
+            RpcVChunkControlPlane control_plane(worker_master);
             std::vector<uint8_t> source(FLAGS_object_size);
             std::vector<uint8_t> destination(FLAGS_object_size);
             const bool source_registered =
@@ -110,7 +134,8 @@ int main(int argc, char** argv) {
             const bool destination_registered =
                 engine.registerLocalMemory(destination.data(),
                                            destination.size(), "cpu:0") == 0;
-            if (!source_registered || !destination_registered) {
+            if (!source_registered || !destination_registered ||
+                routing_error != ErrorCode::OK) {
                 setup_failed.store(true);
             }
             start_barrier.arrive_and_wait();
@@ -180,6 +205,10 @@ int main(int argc, char** argv) {
     std::cout << "{\n"
               << "  \"production_equivalent_data_plane\": true,\n"
               << "  \"master_rpc\": \"" << FLAGS_master << "\",\n"
+              << "  \"submaster_routing\": "
+              << (!FLAGS_routing_etcd.empty() ? "true" : "false") << ",\n"
+              << "  \"cluster_namespace\": \"" << FLAGS_cluster_namespace
+              << "\",\n"
               << "  \"transfer_protocol\": \"" << FLAGS_protocol << "\",\n"
               << "  \"auto_discovery\": "
               << (FLAGS_auto_discovery ? "true" : "false") << ",\n"

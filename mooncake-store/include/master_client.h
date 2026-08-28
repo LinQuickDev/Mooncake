@@ -3,6 +3,7 @@
 #include <csignal>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -763,6 +764,10 @@ class MasterClient {
     [[nodiscard]] ErrorCode SwitchToSubmaster(const std::string& tenant_id,
                                               const std::string& key);
 
+    // Refreshes the previously configured CVM snapshot after a server reports
+    // SLOT_NOT_OWNED. The caller remains responsible for a bounded retry.
+    [[nodiscard]] ErrorCode RefreshSubmasterRouting();
+
     /**
      * @brief Switches the underlying RPC pool to the given submaster address.
      * @param address Submaster address (primary_master_id).
@@ -814,6 +819,8 @@ class MasterClient {
 
     // KV partition routing table (slot -> submaster). Loaded from etcd.
     partition::PartitionRouter partition_router_;
+    mutable std::mutex routing_config_mutex_;
+    std::string routing_cluster_namespace_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;

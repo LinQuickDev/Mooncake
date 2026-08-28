@@ -59,6 +59,22 @@ TEST(VChunkMasterServiceTest, DisabledModeRejectsAllControlPlaneOperations) {
               ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 }
 
+TEST(VChunkMasterServiceTest, PartitionedModeRejectsBeforeSlotViewIsReady) {
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.ha_backend_type = "etcd";
+    config.submaster_count = 2;
+    config.vchunk_config.enabled = true;
+    MasterService service(config);
+
+    EXPECT_EQ(service
+                  .VChunkPutStart(TenantId("tenant"), "key", 4096, false, 1)
+                  .error(),
+              ErrorCode::SLOT_NOT_OWNED);
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "key").error(),
+              ErrorCode::SLOT_NOT_OWNED);
+}
+
 TEST(VChunkMasterServiceTest, BackgroundReaperStopsAndCleansExpiredCreating) {
     MasterServiceConfig config;
     config.memory_allocator = BufferAllocatorType::OFFSET;

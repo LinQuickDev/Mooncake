@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -26,6 +27,9 @@ namespace mooncake {
 // SegmentManager allocator access guard while PutStart uses AllocatorManager.
 class VChunkMasterManager {
    public:
+    using OwnershipPredicate =
+        std::function<bool(const VChunkMetadataRecord&)>;
+
     class ReadHandle {
        public:
         ReadHandle() = default;
@@ -64,9 +68,10 @@ class VChunkMasterManager {
     ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
                      int64_t now_ms);
 
-    ErrorCode Recover(int64_t now_ms);
+    ErrorCode Recover(int64_t now_ms, OwnershipPredicate owns = {});
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
-                                                size_t max_scan);
+                                                size_t max_scan,
+                                                OwnershipPredicate owns = {});
     VChunkMetricsSnapshot MetricsSnapshot() const;
 
     size_t SizeForTesting() const;

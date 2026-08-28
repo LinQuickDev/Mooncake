@@ -146,6 +146,42 @@ TEST(VChunkMetadataStoreTest, RecoveryCleansIncompleteWrites) {
     EXPECT_TRUE(fixture.store->List()->empty());
 }
 
+TEST(VChunkMetadataStoreTest, RecoveryOnlyProcessesOwnedSubmasterRecords) {
+    StoreFixture fixture;
+    VChunkMetadataRecord foreign_active;
+    {
+        VChunkMasterManager writer(fixture.config, fixture.store);
+        auto foreign = writer.PutStart(fixture.allocators, TenantId("tenant"),
+                                       "foreign", 4096, false, 10);
+        ASSERT_TRUE(foreign.has_value());
+        ASSERT_EQ(writer.PutEnd(TenantId("tenant"), "foreign",
+                                foreign->vchunk_id, 20),
+                  ErrorCode::OK);
+        foreign_active = *writer.Get(TenantId("tenant"), "foreign");
+    }
+
+    auto owned_incomplete = foreign_active;
+    owned_incomplete.vchunk_id = "owned-incomplete";
+    owned_incomplete.key = "owned";
+    owned_incomplete.status = VChunkStatus::CREATING;
+    owned_incomplete.last_updated_at_ms = 10;
+    for (auto& slice : owned_incomplete.slices) {
+        slice.status = VCSliceStatus::PENDING;
+    }
+    ASSERT_EQ(fixture.store->Put(owned_incomplete), ErrorCode::OK);
+
+    VChunkMasterManager recovered(fixture.config, fixture.store);
+    EXPECT_EQ(recovered.Recover(
+                  100, [](const VChunkMetadataRecord& record) {
+                      return record.key == "owned";
+                  }),
+              ErrorCode::OK);
+    auto records = fixture.store->List();
+    ASSERT_TRUE(records.has_value());
+    ASSERT_EQ(records->size(), 1U);
+    EXPECT_EQ(records->front().vchunk_id, foreign_active.vchunk_id);
+}
+
 TEST(VChunkMetadataStoreTest, ReaperIsBoundedAndRetryable) {
     StoreFixture fixture;
     VChunkMasterManager manager(fixture.config, fixture.store);
@@ -166,6 +202,26 @@ TEST(VChunkMetadataStoreTest, ReaperIsBoundedAndRetryable) {
     fixture.store->fail_remove = false;
     EXPECT_EQ(*manager.ReapExpired(200, 2), 1U);
     EXPECT_EQ(manager.SizeForTesting(), 0U);
+}
+
+TEST(VChunkMetadataStoreTest, ReaperSkipsRecordsOwnedByAnotherSubmaster) {
+    StoreFixture fixture;
+    VChunkMasterManager manager(fixture.config, fixture.store);
+    ASSERT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                 "owned", 4096, false, 10)
+                    .has_value());
+    ASSERT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                 "foreign", 4096, false, 10)
+                    .has_value());
+
+    auto result = manager.ReapExpired(
+        200, 2, [](const VChunkMetadataRecord& record) {
+            return record.key == "owned";
+        });
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1U);
+    EXPECT_EQ(manager.SizeForTesting(), 1U);
+    EXPECT_EQ(manager.Get(TenantId("tenant"), "foreign")->key, "foreign");
 }
 
 TEST(VChunkMetadataStoreTest, RemoveFailureLeavesReleasingObjectRetryable) {
