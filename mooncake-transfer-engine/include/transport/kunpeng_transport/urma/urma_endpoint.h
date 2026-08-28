@@ -100,7 +100,7 @@ class UrmaContext : public UbContext {
     void checkJettyDrainTimeouts(
         std::unordered_map<volatile int*, int>& jetty_depth_set,
         std::vector<Transport::Slice*>& failed_slices,
-        std::vector<UbEndPoint*>& deferred_deletes);
+        std::vector<UbEndPoint*>& deferred_deletes) override;
 
    private:
     int construct(GlobalConfig& config) override;

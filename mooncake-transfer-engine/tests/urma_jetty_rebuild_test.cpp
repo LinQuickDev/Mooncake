@@ -434,4 +434,49 @@ TEST_F(UrmaJettyRebuildTest, DrainTimeoutDeliversResidualWriters) {
     delete trigger;
 }
 
+// TC-6: drain-timeout recovery must NOT be part of poll(). If poll() delivered
+// recovered WRs in its failed vector without counting them in its return
+// value, the worker pool's num_success = resolved - failed would go negative
+// and permanently disable the RNIC-dead protection. The contract is: poll()
+// resolves only completions it polled; recovery happens in the separate
+// checkJettyDrainTimeouts() pass afterwards.
+TEST_F(UrmaJettyRebuildTest, DrainTimeoutRecoveryExcludedFromPoll) {
+    Transport::TransferTask task = {};
+    mock_urma_withhold_next_post(1);
+    Transport::Slice *stuck = postOneSlice(&task);
+
+    Transport::Slice *trigger = postOneSlice(&task);
+    mock_urma_set_next_poll_status(URMA_CR_ACK_TIMEOUT_ERR, 1);
+    std::vector<Transport::Slice *> failed;
+    std::unordered_map<volatile int *, int> depth_set;
+    std::vector<UbEndPoint *> deferred;
+    pollOnce(failed, depth_set, deferred);
+    ASSERT_EQ(UrmaEndpoint::DRAINING,
+              UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
+
+    // Force the timeout, then poll again WITHOUT the separate recovery pass:
+    // poll() must resolve nothing and deliver no failures for the residual
+    // (withheld) WR, even though its jetty has already timed out.
+    UrmaEndpointTestPeer::forceDrainTimeout(*endpoint_);
+    mock_urma_set_flush_returns_errors(1);
+    failed.clear();
+    depth_set.clear();
+    deferred.clear();
+    int resolved = pollOnce(failed, depth_set, deferred);
+    EXPECT_EQ(0, resolved);
+    EXPECT_TRUE(failed.empty());
+    EXPECT_TRUE(deferred.empty());
+
+    // The recovery pass is what delivers the residual WR.
+    context_->checkJettyDrainTimeouts(depth_set, failed, deferred);
+    bool found_stuck = false;
+    for (auto *s : failed) {
+        if (s == stuck) found_stuck = true;
+    }
+    EXPECT_TRUE(found_stuck);
+
+    delete stuck;
+    delete trigger;
+}
+
 }  // namespace

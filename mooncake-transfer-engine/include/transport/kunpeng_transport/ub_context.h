@@ -189,12 +189,17 @@ class UbContext {
     //     returned (they may be recycled by the submitting thread the
     //     moment markSuccess() runs).
     //   * Failed slices are appended to failed_slices for the caller to apply
-    //     retry / markFailed. Implementations may also append completions
-    //     recovered while draining a jetty, so the vector is unbounded.
+    //     retry / markFailed. The vector holds at most num_entries entries:
+    //     every failed slice comes from one polled CQE.
     //   * Stale completions from a previous jetty generation are dropped and
     //     are not counted in the return value.
     //   * Endpoints scheduled for deletion are appended to deferred_deletes;
     //     the caller must delete them only after jetty_depth_set accounting.
+    // Recoveries from jetty drain timeouts are NOT part of poll(): the
+    // worker pool runs checkJettyDrainTimeouts() once after all poll() calls
+    // and must account their failures separately from this return value.
+    // Mixing them in would make resolved - failed go negative and disable
+    // the RNIC-dead protection.
     // Returns the number of resolved WR completions (>= 0), or a negative
     // error code. Fence markers and dropped stale completions are excluded.
     virtual int poll(int num_entries,
@@ -202,6 +207,17 @@ class UbContext {
                      std::unordered_map<volatile int*, int>& jetty_depth_set,
                      std::vector<UbEndPoint*>& deferred_deletes,
                      int jfc_index = 0) = 0;
+
+    // Post-poll recovery pass, run once per worker round after every poll()
+    // call: flushes jetties whose drain never completed and delivers their
+    // residual WRs as failed slices. These failures were never part of any
+    // poll() return value, so the caller must not subtract them from
+    // poll()'s resolved count. jetty_depth_set / deferred_deletes follow the
+    // same contract as poll(). Default: nothing to check.
+    virtual void checkJettyDrainTimeouts(
+        std::unordered_map<volatile int*, int>& jetty_depth_set,
+        std::vector<Transport::Slice*>& failed_slices,
+        std::vector<UbEndPoint*>& deferred_deletes) {}
 
     virtual volatile int* outstandingCount(int jfc_index) = 0;
 

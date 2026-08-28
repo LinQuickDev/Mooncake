@@ -621,7 +621,12 @@ int UrmaContext::poll(int num_entries,
             ++wr_completions;
         }
     }
-    checkJettyDrainTimeouts(jetty_depth_set, failed_slices, deferred_deletes);
+    // Drain-timeout recovery is deliberately NOT run here: the worker pool
+    // invokes checkJettyDrainTimeouts() after all poll() calls and accounts
+    // the failures it recovers separately. Running it inside poll() would
+    // append failed slices that the return value does not count, making the
+    // caller's resolved - failed subtraction go negative and disabling its
+    // RNIC-dead protection.
     // Exclude FLUSH_ERR_DONE and dropped stale completions from outstanding
     // accounting; the rebuild path already accounted for the stale ones.
     return wr_completions;
