@@ -563,6 +563,9 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
     const TenantId& tenant_id, const std::string& key, uint64_t total_size,
     bool is_ssd_segment, int64_t now_ms,
     const std::set<std::string>& excluded_segments) {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     auto allocator_access = segment_manager_.getAllocatorAccess();
     return vchunk_manager_.PutStart(allocator_access.getAllocatorManager(),
                                     tenant_id, key, total_size,
@@ -574,30 +577,45 @@ ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
                                       const std::string& key,
                                       const std::string& vchunk_id,
                                       int64_t now_ms) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
     return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms);
 }
 
 ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,
                                          const std::string& key,
                                          const std::string& vchunk_id) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
     auto allocator_access = segment_manager_.getAllocatorAccess();
     return vchunk_manager_.PutRevoke(tenant_id, key, vchunk_id);
 }
 
 tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::GetVChunk(
     const TenantId& tenant_id, const std::string& key) const {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     return vchunk_manager_.Get(tenant_id, key);
 }
 
 tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
 MasterService::AcquireVChunkRead(const TenantId& tenant_id,
                                  const std::string& key) const {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     return vchunk_manager_.AcquireRead(tenant_id, key);
 }
 
 ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
                                       const std::string& key,
                                       int64_t now_ms) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
     auto allocator_access = segment_manager_.getAllocatorAccess();
     return vchunk_manager_.Remove(tenant_id, key, now_ms);
 }
@@ -608,6 +626,9 @@ VChunkRuntimeInfo MasterService::GetVChunkRuntimeInfo() const {
 
 tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
     int64_t now_ms, size_t max_scan) {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     auto allocator_access = segment_manager_.getAllocatorAccess();
     return vchunk_manager_.ReapExpired(now_ms, max_scan);
 }

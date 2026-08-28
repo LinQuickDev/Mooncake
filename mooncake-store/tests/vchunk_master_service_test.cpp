@@ -37,6 +37,28 @@ TEST(VChunkMasterServiceTest, BuilderPropagatesVChunkConfiguration) {
     EXPECT_EQ(config.vchunk_metadata_store, metadata_store);
 }
 
+TEST(VChunkMasterServiceTest, DisabledModeRejectsAllControlPlaneOperations) {
+    MasterServiceConfig config;
+    config.vchunk_config.enabled = false;
+    MasterService service(config);
+    const TenantId tenant("tenant");
+
+    EXPECT_EQ(service.VChunkPutStart(tenant, "key", 4096, false, 1).error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    EXPECT_EQ(service.VChunkPutEnd(tenant, "key", "id", 2),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    EXPECT_EQ(service.VChunkPutRevoke(tenant, "key", "id"),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    EXPECT_EQ(service.GetVChunk(tenant, "key").error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    EXPECT_EQ(service.AcquireVChunkRead(tenant, "key").error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    EXPECT_EQ(service.RemoveVChunk(tenant, "key", 3),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    EXPECT_EQ(service.ReapExpiredVChunks(4, 1).error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+}
+
 TEST(VChunkMasterServiceTest, BackgroundReaperStopsAndCleansExpiredCreating) {
     MasterServiceConfig config;
     config.memory_allocator = BufferAllocatorType::OFFSET;

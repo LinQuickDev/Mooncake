@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "master_config.h"
+#include "master_service.h"
+
 namespace mooncake {
 namespace {
 
