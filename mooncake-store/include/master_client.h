@@ -1,7 +1,9 @@
 #pragma once
 
 #include <csignal>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -22,6 +24,7 @@
 #include "store_rpc_client_io_context.h"
 #include "task_manager.h"
 #include "metadata_store.h"
+#include "partition/partition_router.h"
 
 namespace mooncake {
 
@@ -121,6 +124,27 @@ class MasterClient {
      */
     [[nodiscard]] ErrorCode Connect(
         const std::string& master_addr = kDefaultMasterAddress);
+
+    /**
+     * @brief Loads the slot -> submaster mapping from the etcd KV view
+     * snapshot into the partition router. Must be called after etcd is
+     * reachable and the cluster namespace (cluster_id) is known.
+     * @param etcd_endpoints Etcd endpoints, semicolon separated.
+     * @param cluster_namespace Cluster namespace used to locate the snapshot.
+     * @return ErrorCode indicating success/failure.
+     */
+    [[nodiscard]] ErrorCode LoadRoutingFromEtcd(
+        const std::string& etcd_endpoints,
+        const std::string& cluster_namespace);
+
+    /**
+     * @brief Resolves the submaster (primary_master_id) that owns the slot of
+     * the given key, using the currently loaded partition routing table.
+     * @param key Object key.
+     * @return submaster id on success, std::nullopt if no mapping is loaded.
+     */
+    [[nodiscard]] std::optional<std::string> ResolveSubmaster(
+        const std::string& key) const;
 
     /**
      * @brief Checks if an object exists
@@ -714,6 +738,30 @@ class MasterClient {
     void WarmupRpcPool();
 
     /**
+     * @brief Switches the underlying RPC pool to the submaster that owns the
+     * slot of the given key (single-target switching). Keeps the current
+     * connection when the routing table is not loaded (single-master mode).
+     * @return ErrorCode::OK on switch (or no-op), otherwise an error.
+     */
+    [[nodiscard]] ErrorCode SwitchToSubmaster(const std::string& tenant_id,
+                                              const std::string& key);
+
+    /**
+     * @brief Switches the underlying RPC pool to the given submaster address.
+     * @param address Submaster address (primary_master_id).
+     */
+    void SwitchToSubmasterByAddress(const std::string& address);
+
+    /**
+     * @brief Groups key indices by their owning submaster. Keys without a
+     * resolved submaster are grouped under an empty string ("").
+     * @return Map from submaster address to original key indices.
+     */
+    [[nodiscard]] std::map<std::string, std::vector<size_t>>
+    GroupKeysBySubmaster(const std::vector<std::string>& keys,
+                         const std::string& tenant_id);
+
+    /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
      * cannot reconnect to a different address, a new coro_rpc_client pool is
      * created if the address is different from the current one.
@@ -746,6 +794,9 @@ class MasterClient {
 
     // Tenant identity for this client instance.
     const TenantId tenant_id_;
+
+    // KV partition routing table (slot -> submaster). Loaded from etcd.
+    partition::PartitionRouter partition_router_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;

@@ -25,8 +25,22 @@ std::string PrefixEnd(std::string prefix) {
     return std::string(1, '\0');
 }
 
-std::string BatchPrefix(const std::string& cluster_id) {
-    return "/oplog/" + cluster_id + "/batches/";
+std::string BatchPrefix(const std::string& cluster_id,
+                        const std::string& source_id) {
+    std::string path = "/oplog/" + cluster_id + "/";
+    if (!source_id.empty()) {
+        path += source_id + "/";
+    }
+    return path + "batches/";
+}
+
+std::string DurablePrefixPath(const std::string& cluster_id,
+                              const std::string& source_id) {
+    std::string path = "/oplog/" + cluster_id + "/";
+    if (!source_id.empty()) {
+        path += source_id + "/";
+    }
+    return path + "durable_prefix";
 }
 
 }  // namespace
@@ -114,29 +128,32 @@ std::string FormatOpLogBatchId(uint64_t batch_id) {
 }
 
 std::string BuildBatchRecordKey(const std::string& cluster_id,
-                                uint64_t batch_id) {
+                                uint64_t batch_id,
+                                const std::string& source_id) {
     std::string normalized = cluster_id;
     if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
         return {};
     }
-    return BatchPrefix(normalized) + FormatOpLogBatchId(batch_id);
+    return BatchPrefix(normalized, source_id) + FormatOpLogBatchId(batch_id);
 }
 
-std::string BuildDurablePrefixKey(const std::string& cluster_id) {
+std::string BuildDurablePrefixKey(const std::string& cluster_id,
+                                  const std::string& source_id) {
     std::string normalized = cluster_id;
     if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
         return {};
     }
-    return "/oplog/" + normalized + "/durable_prefix";
+    return DurablePrefixPath(normalized, source_id);
 }
 
 BatchRecordRange BuildBatchRecordRange(const std::string& cluster_id,
-                                       uint64_t after_batch_id) {
+                                       uint64_t after_batch_id,
+                                       const std::string& source_id) {
     std::string normalized = cluster_id;
     if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
         return {};
     }
-    const std::string prefix = BatchPrefix(normalized);
+    const std::string prefix = BatchPrefix(normalized, source_id);
     if (after_batch_id == UINT64_MAX) {
         return {.begin_key = PrefixEnd(prefix), .end_key = PrefixEnd(prefix)};
     }

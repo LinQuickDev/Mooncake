@@ -41,18 +41,19 @@ TEST(RpcClientIoContextPoolTest, UsesConfiguredSizeAndReusesPool) {
     EXPECT_NE(&first_pool, &second_pool);
 }
 
-TEST(RpcClientIoContextPoolTest, ReplacesPoolWhenTargetChanges) {
+TEST(RpcClientIoContextPoolTest, CachesPoolsPerAddress) {
     RpcClientPool pools(GetFirstTestRpcClientIoContextPool());
 
     auto first = pools.GetOrCreateClientPool("127.0.0.1:10001");
-    std::weak_ptr<RpcClientPool::ClientPool> old_pool = first;
     EXPECT_EQ(pools.GetOrCreateClientPool("127.0.0.1:10001"), first);
 
     auto second = pools.GetOrCreateClientPool("127.0.0.1:10002");
     EXPECT_NE(first, second);
-    first.reset();
-    EXPECT_TRUE(old_pool.expired());
     EXPECT_EQ(pools.GetClientPool(), second);
+
+    // Switching back reuses the cached pool instead of recreating it.
+    EXPECT_EQ(pools.GetOrCreateClientPool("127.0.0.1:10001"), first);
+    EXPECT_EQ(pools.GetClientPool(), first);
 }
 
 TEST(RpcClientIoContextPoolTest, SendsToNewAddressAfterSwitch) {

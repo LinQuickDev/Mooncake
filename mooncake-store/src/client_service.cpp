@@ -347,6 +347,11 @@ Client::~Client() {
         leader_monitor_thread_.join();
     }
 
+    routing_refresh_running_ = false;
+    if (routing_refresh_thread_.joinable()) {
+        routing_refresh_thread_.join();
+    }
+
     {
         std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
         graceful_unmount_timer_stopping_ = true;
@@ -570,6 +575,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
+        etcd_connstring_ = ha_backend_spec.value()->connstring;
 
         leader_monitor_running_ = true;
         leader_monitor_thread_ =
@@ -588,6 +594,95 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         last_ping_success_.store(true);
         return ErrorCode::OK;
+    }
+}
+
+void Client::LoadPartitionRouting() {
+    // Routing is only meaningful in HA mode where etcd is available.
+    if (etcd_connstring_.empty()) {
+        LOG(INFO) << "LoadPartitionRouting skipped: non-HA mode (no etcd "
+                     "endpoints)";
+        return;
+    }
+    LOG(INFO) << "LoadPartitionRouting: etcd_endpoints=[" << etcd_connstring_
+              << "]";
+
+    // First attempt (best effort). A failure here must not fail client
+    // startup; the refresh loop started below keeps retrying until it
+    // succeeds.
+    TryLoadRoutingOnce();
+
+    // Start the periodic refresh/retry loop unconditionally in HA mode, so a
+    // first-attempt failure (etcd temporarily unavailable, GetFsdir hiccup) is
+    // retried on the next cycle instead of leaving the client permanently in
+    // single-master fallback.
+    if (!routing_refresh_running_.exchange(true)) {
+        routing_refresh_thread_ =
+            std::thread([this]() { this->RoutingRefreshThreadMain(); });
+    }
+}
+
+void Client::TryLoadRoutingOnce() {
+    // 串行化 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新，
+    // 避免并发读写 cluster_id_ 与路由表。
+    std::lock_guard<std::mutex> lock(routing_load_mutex_);
+    // Resolve the cluster namespace (cluster_id) from the fsdir returned by
+    // master, which is formatted as "<root_fs_dir>/<cluster_id>". The result is
+    // stable, so it is cached in cluster_id_ and reused across retries.
+    std::string cluster_id = cluster_id_;
+    if (cluster_id.empty()) {
+        auto fsdir_response = master_client_.GetFsdir();
+        if (!fsdir_response) {
+            LOG(WARNING) << "TryLoadRoutingOnce: GetFsdir failed, err="
+                         << toString(fsdir_response.error()) << " (will retry)";
+            return;
+        }
+        const std::string& fsdir = fsdir_response.value();
+        if (fsdir.empty()) {
+            LOG(WARNING) << "TryLoadRoutingOnce: GetFsdir returned empty fsdir";
+            return;
+        }
+        LOG(INFO) << "TryLoadRoutingOnce: fsdir=" << fsdir;
+
+        const size_t pos = fsdir.find_last_of('/');
+        if (pos == std::string::npos) {
+            LOG(WARNING) << "TryLoadRoutingOnce: invalid fsdir format (no '/'), "
+                            "fsdir="
+                         << fsdir;
+            return;
+        }
+        cluster_id = fsdir.substr(pos + 1);
+        if (cluster_id.empty()) {
+            LOG(WARNING) << "TryLoadRoutingOnce: empty cluster_id parsed from "
+                            "fsdir="
+                         << fsdir;
+            return;
+        }
+        cluster_id_ = cluster_id;
+        LOG(INFO) << "TryLoadRoutingOnce: resolved cluster_id=" << cluster_id;
+    }
+
+    ErrorCode err =
+        master_client_.LoadRoutingFromEtcd(etcd_connstring_, cluster_id);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "TryLoadRoutingOnce: failed to load routing, "
+                        "cluster_id="
+                     << cluster_id << " err=" << err;
+        return;
+    }
+    LOG(INFO) << "TryLoadRoutingOnce: routing loaded, cluster_id=" << cluster_id;
+}
+
+void Client::RoutingRefreshThreadMain() {
+    // Refresh cadence aligned with SlotOwnerHeartbeat (5s) and
+    // CvmController::SyncLoop (5s). Slot migration is a low-frequency event,
+    // so a fixed sleep (rather than a fast poll) keeps steady-state etcd load
+    // low while still picking up changes promptly.
+    constexpr auto kRefreshInterval = std::chrono::milliseconds(5000);
+
+    while (routing_refresh_running_.load()) {
+        std::this_thread::sleep_for(kRefreshInterval);
+        TryLoadRoutingOnce();
     }
 }
 
@@ -923,6 +1018,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         return std::nullopt;
     }
 
+    // Load the KV partition routing table from etcd (HA mode only). Best
+    // effort: a routing load failure must not fail client startup.
+    client->LoadPartitionRouting();
+
     // Initialize storage backend if storage_root_dir is valid
     auto config_response = client->master_client_.GetStorageConfig();
     if (!config_response) {
@@ -1100,6 +1199,13 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
+    // 松耦合重路由：SLOT_NOT_OWNED 表示本地 slot→submaster 视图过期
+    // （分区已重平衡）。刷新一次路由快照后重试，submaster 经 etcd 收敛视图。
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        !etcd_connstring_.empty()) {
+        TryLoadRoutingOnce();
+        result = master_client_.GetReplicaList(object_key);
+    }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -1119,6 +1225,23 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+
+    // 松耦合重路由：任一项返回 SLOT_NOT_OWNED 说明视图过期，刷新一次后
+    // 整体重试；读操作幂等，重复查询已成功项无害。
+    if (!etcd_connstring_.empty()) {
+        bool has_slot_not_owned = false;
+        for (const auto& r : response) {
+            if (!r && r.error() == ErrorCode::SLOT_NOT_OWNED) {
+                has_slot_not_owned = true;
+                break;
+            }
+        }
+        if (has_slot_not_owned) {
+            TryLoadRoutingOnce();
+            response =
+                master_client_.BatchGetReplicaList(object_keys, tenant_id);
+        }
+    }
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {

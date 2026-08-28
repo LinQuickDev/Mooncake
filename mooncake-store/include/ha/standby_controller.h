@@ -31,8 +31,7 @@ class StandbyController {
 
     virtual ~StandbyController() = default;
 
-    virtual ErrorCode StartStandby(
-        const std::optional<MasterView>& observed_leader) = 0;
+    virtual ErrorCode StartStandby(const MasterSources& sources) = 0;
 
     virtual void StopStandby() = 0;
 
@@ -47,8 +46,7 @@ class StandbyController {
     virtual tl::expected<PromotionContext, ErrorCode>
     PromoteStandbyAndExport() = 0;
 
-    virtual void UpdateObservedLeader(
-        const std::optional<MasterView>& observed_leader) = 0;
+    virtual void UpdateObservedLeader(const MasterSources& sources) = 0;
 
     virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
 

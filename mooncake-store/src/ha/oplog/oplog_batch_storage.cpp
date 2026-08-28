@@ -53,8 +53,11 @@ bool TryParseBatchIdFromKey(const std::string& key, uint64_t& batch_id) {
 }  // namespace
 
 OpLogBatchStorage::OpLogBatchStorage(std::string cluster_id,
-                                     HaKvBackend& backend)
-    : cluster_id_(std::move(cluster_id)), backend_(backend) {
+                                     HaKvBackend& backend,
+                                     std::string source_id)
+    : cluster_id_(std::move(cluster_id)),
+      source_id_(std::move(source_id)),
+      backend_(backend) {
     cluster_id_valid_ =
         NormalizeAndValidateClusterId(cluster_id_) && !cluster_id_.empty();
 }
@@ -78,7 +81,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto batch_range = BuildBatchRecordRange(cluster_id_, 0);
+    auto batch_range = BuildBatchRecordRange(cluster_id_, 0, source_id_);
     std::vector<KvPair> existing_batches;
     err = backend_.Range(batch_range.begin_key, batch_range.end_key,
                          /*limit=*/1, existing_batches);
@@ -90,7 +93,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+    const std::string durable_key = BuildDurablePrefixKey(cluster_id_, source_id_);
     DurablePrefix initial{.batch_id = 0, .last_seq = 0};
     KvTxn txn;
     txn.compares.push_back({.key = durable_key,
@@ -114,7 +117,7 @@ ErrorCode OpLogBatchStorage::ReadDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INVALID_PARAMS;
     }
     std::string value;
-    const std::string key = BuildDurablePrefixKey(cluster_id_);
+    const std::string key = BuildDurablePrefixKey(cluster_id_, source_id_);
     ErrorCode err = backend_.Get(key, value);
     if (err != ErrorCode::OK) {
         return err;
@@ -157,7 +160,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+    const std::string durable_key = BuildDurablePrefixKey(cluster_id_, source_id_);
     const std::string encoded_batch = EncodeOpLogBatchRecord(batch);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     HAMetricManager::instance().observe_batch_record_batch_bytes(
@@ -168,8 +171,9 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
         {.key = durable_key,
          .kind = KvCompareKind::kValueEquals,
          .expected_value = EncodeDurablePrefix(expected_prefix)});
-    txn.puts.push_back({.key = BuildBatchRecordKey(cluster_id_, batch.batch_id),
-                        .value = encoded_batch});
+    txn.puts.push_back(
+        {.key = BuildBatchRecordKey(cluster_id_, batch.batch_id, source_id_),
+         .value = encoded_batch});
     txn.puts.push_back(
         {.key = durable_key,
          .value = EncodeDurablePrefix(
@@ -200,7 +204,8 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
     }
     std::string value;
     ErrorCode err =
-        backend_.Get(BuildBatchRecordKey(cluster_id_, batch_id), value);
+        backend_.Get(BuildBatchRecordKey(cluster_id_, batch_id, source_id_),
+                     value);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -219,7 +224,7 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    auto range = BuildBatchRecordRange(cluster_id_, after_batch_id);
+    auto range = BuildBatchRecordRange(cluster_id_, after_batch_id, source_id_);
     std::string begin_key = range.begin_key;
     do {
         std::vector<KvPair> kvs;

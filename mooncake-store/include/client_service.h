@@ -908,8 +908,19 @@ class Client {
     std::mutex leader_switch_mutex_;
     std::optional<ha::MasterView> current_master_view_;
     std::string direct_master_address_;
+    // Etcd endpoints parsed from the HA backend entry, used to load the KV
+    // partition routing snapshot. Empty in non-HA mode.
+    std::string etcd_connstring_;
+    // Resolved cluster namespace (cluster_id) cached after the first routing
+    // load; reused by the periodic routing refresh loop.
+    std::string cluster_id_;
+    // 串行化 TryLoadRoutingOnce（及其内部对 cluster_id_ 的读写），
+    // 用于 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新之间。
+    std::mutex routing_load_mutex_;
     std::thread leader_monitor_thread_;
     std::atomic<bool> leader_monitor_running_{false};
+    std::thread routing_refresh_thread_;
+    std::atomic<bool> routing_refresh_running_{false};
     std::thread storage_heartbeat_thread_;
     std::atomic<bool> storage_heartbeat_running_{false};
     std::thread task_poll_thread_;
@@ -918,6 +929,9 @@ class Client {
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LoadPartitionRouting();
+    void TryLoadRoutingOnce();
+    void RoutingRefreshThreadMain();
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
     void TaskPollThreadMain();

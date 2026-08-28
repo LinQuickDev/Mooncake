@@ -74,6 +74,13 @@ struct MasterConfig {
     int metrics_report_lease_ttl_sec = DEFAULT_METRICS_REPORT_LEASE_TTL_SEC;
 
     std::string cluster_id;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
+    uint32_t submaster_count = 1;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
@@ -213,6 +220,12 @@ class MasterServiceSupervisorConfig {
     uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    uint32_t submaster_count = 1;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
@@ -350,6 +363,9 @@ class MasterServiceSupervisorConfig {
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
 
         enable_metrics_report_to_backend =
             config.enable_metrics_report_to_backend;
@@ -533,6 +549,18 @@ class WrappedMasterServiceConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // Stable identifier of this master instance, used as the SlotOwner
+    // primary_master_id for the KV partition view. Empty disables the
+    // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
+    std::string master_id;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled; set a non-zero port to expose /kv_view,
+    // /segment_view and /health for inspection.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
+    uint32_t submaster_count = 1;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -624,6 +652,9 @@ class WrappedMasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -741,6 +772,10 @@ class WrappedMasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        master_id = config.local_hostname;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
@@ -1192,6 +1227,18 @@ class MasterServiceConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // Stable identifier of this master instance, used as the SlotOwner
+    // primary_master_id for the KV partition view. Empty disables the
+    // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
+    std::string master_id;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled; set a non-zero port to expose /kv_view,
+    // /segment_view and /health for inspection.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
+    uint32_t submaster_count = 1;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -1277,6 +1324,10 @@ class MasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        master_id = config.master_id;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
+        submaster_count = config.submaster_count;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =

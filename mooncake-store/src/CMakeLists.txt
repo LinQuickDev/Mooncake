@@ -16,6 +16,12 @@ set(MOONCAKE_STORE_SOURCES
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp
+    cvm/etcd_view_store.cpp
+    cvm/cvm_controller.cpp
+    cvm/slot_owner_heartbeat.cpp
+    cvm/slot_migrator.cpp
+    cvm/cvm_http_server.cpp
+    partition/partition_router.cpp
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp

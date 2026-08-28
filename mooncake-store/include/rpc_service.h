@@ -267,6 +267,12 @@ class WrappedMasterService {
                             uint64_t initial_oplog_sequence_id,
                             const std::vector<StandbySegmentInfo>& segments);
 
+    // CVM slot ownership publishing, driven by the HA supervisor. These
+    // forward to the wrapped MasterService (NOT RPC endpoints).
+    void SetCvmLeaseId(EtcdLeaseId lease_id);
+    ErrorCode StartSlotOwnerHeartbeat();
+    void StopSlotOwnerHeartbeat();
+
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);

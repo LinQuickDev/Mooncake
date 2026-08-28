@@ -42,6 +42,8 @@ struct StandbyObjectMetadata {
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
 };
+YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, last_sequence_id,
+         group_id, data_type);
 
 /**
  * Segment info stored in standby's segment registry.
@@ -70,6 +72,25 @@ struct StandbyObjectEntry {
     StandbyObjectMetadata metadata;
 
     YLT_REFL(StandbyObjectEntry, tenant_id, key, metadata);
+};
+
+/**
+ * @brief Object-metadata export for a single KV slot (live primary -> live
+ * primary handoff).
+ *
+ * When a live primary gracefully releases a slot it no longer owns (scale-out /
+ * scale-in rebalance), it exports the object metadata of every key in that
+ * slot to etcd. The new owner then imports it to materialize the same
+ * key -> Replica::Descriptor[] mapping without moving any data bytes (which
+ * stay in their segments). Serialized with struct_pack (msgpack binary) and
+ * stored as a binary etcd value.
+ */
+struct SlotMetadataExport {
+    uint16_t slot{0};
+    std::string source_master_id;
+    std::vector<StandbyObjectEntry> objects;
+
+    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects);
 };
 
 /**

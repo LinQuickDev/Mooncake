@@ -25,6 +25,9 @@
 
 #include "allocation_strategy.h"
 #include "count_min_sketch.h"
+#include "cvm/cvm_controller.h"
+#include "cvm/slot_hash.h"
+#include "cvm/slot_owner_heartbeat.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -141,6 +144,14 @@ class MasterService {
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
+
+    // CVM slot ownership publishing. The CvmController now lives in the HA
+    // supervisor so membership keeps running even while this node is a
+    // standby; the supervisor injects the lease id it granted and drives the
+    // heartbeat around serve start/stop.
+    void SetCvmLeaseId(EtcdLeaseId lease_id);
+    ErrorCode StartSlotOwnerHeartbeat();
+    void StopSlotOwnerHeartbeat();
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
@@ -1471,20 +1482,23 @@ class MasterService {
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     bool TenantHasObjects(const TenantId& tenant_id) const;
 
-    // Helper to get shard index from tenant-scoped object identity.
+    // Helper to get the logical slot (Redis Cluster style, 16384 slots) for
+    // a tenant-scoped key. Slots are the unit of cross-master ownership.
+    uint16_t getSlot(const TenantId& tenant_id,
+                     const std::string& user_key) const {
+        return cvm::KeySlot(tenant_id, user_key);
+    }
+
+    // Helper to get shard index from tenant-scoped object identity. The
+    // physical shard is derived from the logical slot.
     size_t getShardIndex(const TenantId& tenant_id,
                          const std::string& user_key) const {
-        if (tenant_id.IsDefault()) {
-            return std::hash<std::string>{}(user_key) % kNumShards;
-        }
-        size_t seed = std::hash<std::string>{}(tenant_id.value());
-        boost::hash_combine(seed, user_key);
-        return seed % kNumShards;
+        return getSlot(tenant_id, user_key) % kNumShards;
     }
 
     // Legacy helper routes plain keys to the default tenant.
     size_t getShardIndex(const std::string& key) const {
-        return std::hash<std::string>{}(key) % kNumShards;
+        return getSlot(TenantId::Default(), key) % kNumShards;
     }
 
     size_t getMetadataShardIndex(const TenantId& tenant_id,
@@ -1507,6 +1521,9 @@ class MasterService {
         kFull,
         kPreserveOld,
         kAbortOnly,
+        // slot 交接：与 kFull 相同，但跳过 ReleaseLocalDiskUsage，因为数据字节
+        // 仍留在共享 segment（不应错误扣减 ssd_used_bytes）。
+        kHandoff,
     };
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
@@ -2103,6 +2120,50 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // Stable master id used by the SlotOwnerHeartbeat (empty = disabled).
+    const std::string master_id_;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    const uint16_t cvm_http_port_;
+    const std::string cvm_http_host_;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调）。
+    const uint32_t submaster_count_;
+    // Publishes this submaster's slot ownership to etcd for the KV partition
+    // view. Only started in HA mode when a stable master_id is configured.
+    std::unique_ptr<cvm::SlotOwnerHeartbeat> slot_owner_heartbeat_;
+    // Lease id granted by the supervisor-owned CvmController. Reused by the
+    // SlotOwnerHeartbeat and segment owner records so they share the master
+    // registration lifecycle (auto-removed on lease expiry). 0 until the
+    // supervisor injects it via SetCvmLeaseId().
+    EtcdLeaseId cvm_lease_id_{0};
+    // 读路径 slot 所有权校验位图（A1）。由心跳 resolver 与晋升路径更新，
+    // GetReplicaList / BatchGetReplicaList 读路径校验，非 owner 拒绝服务。
+    // owned_slots_ready_ 为 false 表示 partition 未启用或尚未解析过，放行。
+    mutable std::shared_mutex owned_slots_mutex_;
+    std::vector<bool> owned_slot_lookup_;
+    bool owned_slots_ready_{false};
+    // Segment view (CVM) 数据源：在 segment 挂载/卸载时把 segment owner 原始
+    // 记录同步到 etcd（segment_view/<id>），供 CvmController 聚合生成 segment
+    // view 快照。仅在 etcd HA backend 下生效，其余场景为空操作。
+    void PublishSegmentOwnerForCvm(const Segment& segment);
+    void RemoveSegmentOwnerForCvm(const UUID& segment_id);
+    // 动态 KV slot 划分：读取 etcd 中已注册的 master 列表，按 master_id 字典序
+    // 排序后取本机 index，把 16384 个 slot 均分到各 master，返回本机应拥有的
+    // slot 区间。读失败时退化为全量接管（单主）。供 SlotOwnerHeartbeat 动态
+    // 解析器回调调用（运行在心跳线程）。
+    std::vector<uint16_t> ResolveOwnedSlotsForCvm();
+    // live primary → live primary 的 slot 元数据交接（P4 技术债 1）。
+    // ExportSlotMetadata 把 `slot` 下所有对象的元数据序列化后写入 etcd，再
+    // 从本地 metadata_shards_ 擦除；ImportSlotMetadata 从 etcd 读回并物化到
+    // 本地 metadata_shards_。数据字节始终留在 segment，不搬移。两者均由
+    // SlotOwnerHeartbeat 的 on_slot_released / on_slot_acquired 钩子在心跳
+    // 线程调用。
+    ErrorCode ExportSlotMetadata(uint16_t slot);
+    ErrorCode ImportSlotMetadata(uint16_t slot);
+    // A1：读路径 slot 所有权校验。UpdateOwnedSlots 由心跳 resolver 与晋升路径
+    // 调用，把最新 owned slot 集合写入位图；OwnsSlot 供读路径查询（未就绪放行）。
+    void UpdateOwnedSlots(const std::vector<uint16_t>& slots);
+    bool OwnsSlot(uint16_t slot) const;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size

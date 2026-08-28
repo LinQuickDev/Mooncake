@@ -1832,6 +1832,18 @@ void WrappedMasterService::RestoreFromStandby(
         objects, initial_oplog_sequence_id, segments);
 }
 
+void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
+    master_service_.SetCvmLeaseId(lease_id);
+}
+
+ErrorCode WrappedMasterService::StartSlotOwnerHeartbeat() {
+    return master_service_.StartSlotOwnerHeartbeat();
+}
+
+void WrappedMasterService::StopSlotOwnerHeartbeat() {
+    master_service_.StopSlotOwnerHeartbeat();
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {

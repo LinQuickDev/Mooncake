@@ -297,6 +297,15 @@ DEFINE_int64(global_file_segment_size,
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
+DEFINE_uint32(submaster_count, 1,
+              "Maximum number of simultaneously serving submaster in the "
+              "cluster (CVM quota coordination, first-come-first-served). "
+              "Masters ranked beyond this limit are demoted to standby.");
+DEFINE_uint32(cvm_http_port, 0,
+              "Port for the CVM external HTTP API (CvmHttpServer). 0 keeps it "
+              "disabled.");
+DEFINE_string(cvm_http_host, "0.0.0.0",
+              "Bind host for the CVM external HTTP API (CvmHttpServer).");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
@@ -1054,6 +1063,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
+    }
+    if ((google::GetCommandLineFlagInfo("submaster_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.submaster_count = FLAGS_submaster_count;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_http_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_http_port = static_cast<uint16_t>(FLAGS_cvm_http_port);
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_http_host", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_http_host = FLAGS_cvm_http_host;
     }
     if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
          !info.is_default) ||
