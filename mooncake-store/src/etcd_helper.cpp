@@ -71,8 +71,11 @@ ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
         EtcdStoreGetWrapper(const_cast<char*>(key), (int)key_size, &value_ptr,
                             &value_size, &revision_id, &err_msg);
     if (ret == -2) {
-        LOG(ERROR) << "key=" << std::string(key, key_size)
-                   << ", error=" << err_msg;
+        // Key-not-found is an expected outcome for existence probes (e.g.
+        // ImportSlotMetadata checking for a graceful export). Downgrade to
+        // VLOG to avoid ERROR-level spam for benign misses.
+        VLOG(1) << "key=" << std::string(key, key_size)
+                << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_KEY_NOT_EXIST;
     }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <string_view>
 
 #include <glog/logging.h>
 
@@ -278,27 +279,60 @@ ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
         return err;
     }
 
-    std::vector<KvPair> entries;
-    err = backend_.Range(root + "00000000000000000000", root + ":",
-                         /*limit=*/1, entries);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    if (!entries.empty()) {
-        LOG(ERROR) << "Legacy per-entry OpLog key exists for cluster="
-                   << cluster_id_
-                   << "; clear the legacy OpLog namespace before enabling "
-                      "batch-record OpLog";
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-    }
+    // Legacy per-entry keys have the exact shape root + <20 digits> with no
+    // trailing '/'. Batch-layout keys (root + <source_id>/batches/... and
+    // root + <source_id>/durable_prefix) can sort lexically inside the legacy
+    // numeric range when the source id starts with a digit (e.g. an
+    // "ip:port" master id such as "141.61.84.245:50052"), so a bare range
+    // probe would false-positive on this node's own batch keys after a
+    // restart. Scan the range with pagination and reject only keys matching
+    // the legacy per-entry shape.
+    std::string begin_key = root + "00000000000000000000";
+    const std::string end_key = root + ":";
+    constexpr size_t kLegacyScanPageLimit = 100;
+    do {
+        std::vector<KvPair> entries;
+        err = backend_.Range(begin_key, end_key, kLegacyScanPageLimit, entries);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        for (const auto& kv : entries) {
+            const std::string_view suffix(kv.key.data() + root.size(),
+                                          kv.key.size() - root.size());
+            bool is_legacy_entry = suffix.size() ==
+                                       static_cast<size_t>(
+                                           kOpLogBatchIdWidth) &&
+                                   suffix.find('/') ==
+                                       std::string_view::npos;
+            if (is_legacy_entry) {
+                for (char c : suffix) {
+                    if (c < '0' || c > '9') {
+                        is_legacy_entry = false;
+                        break;
+                    }
+                }
+            }
+            if (is_legacy_entry) {
+                LOG(ERROR) << "Legacy per-entry OpLog key exists for cluster="
+                           << cluster_id_ << ": key=" << kv.key
+                           << "; clear the legacy OpLog namespace before "
+                              "enabling batch-record OpLog";
+                return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            }
+        }
+        if (entries.size() < kLegacyScanPageLimit) {
+            break;
+        }
+        begin_key = entries.back().key + '\0';
+    } while (begin_key < end_key);
 
-    entries.clear();
+    std::vector<KvPair> snapshot_entries;
     err = backend_.Range(root + "snapshot/", root + "snapshot0",
-                         /*limit=*/1, entries);
+                         /*limit=*/1, snapshot_entries);
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!entries.empty()) {
+    if (!snapshot_entries.empty()) {
         LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
                    << cluster_id_
                    << "; clear the legacy OpLog namespace before enabling "
