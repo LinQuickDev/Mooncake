@@ -671,6 +671,16 @@ void mock_urma_withhold_next_post(int count) {
     g_script.withhold_next_post_count = count;
 }
 
+void mock_urma_unwithhold_all(void) {
+    std::shared_lock<std::shared_mutex> rw_lock(g_rw_mutex);
+    for (auto &entry : jfc_state_map) {
+        std::lock_guard<std::mutex> jfc_lock(entry.second->mutex);
+        for (auto &wr : entry.second->pending) {
+            wr.withhold = false;
+        }
+    }
+}
+
 void mock_urma_fail_next_delete_jetty(void) {
     std::lock_guard<std::mutex> script_lock(g_script_mutex);
     g_script.fail_next_delete_jetty = true;

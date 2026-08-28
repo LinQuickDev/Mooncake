@@ -59,6 +59,12 @@ void mock_urma_fail_next_delete_jetty(void);
 // rebuild flush-delivery path.
 void mock_urma_withhold_next_post(int count);
 
+// Clears the withhold flag on every outstanding WR across all JFCs, so
+// urma_poll_jfc delivers them again. Use to release a WR that was withheld
+// before a rebuild and survived it, letting poll deliver its (now stale)
+// completion through the normal path.
+void mock_urma_unwithhold_all(void);
+
 #ifdef __cplusplus
 }
 #endif

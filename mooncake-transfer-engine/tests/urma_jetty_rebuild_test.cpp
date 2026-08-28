@@ -318,18 +318,34 @@ TEST_F(UrmaJettyRebuildTest, FlushCompletionsDeliveredOnRebuild) {
     delete s2;
 }
 
-// TC-3: a completion from the old jetty generation is dropped, not completed.
+// TC-3: a completion from the old jetty generation is dropped by poll, not
+// completed. A WR withheld from poll survives a rebuild untouched (the
+// flush loop produces nothing when no flush-error script is armed), so its
+// CQE is still sitting in the JFC queue afterwards, carrying the old slice
+// as user_ctx and stamped with the pre-rebuild epoch. When poll delivers
+// that CQE after the epoch bump, processWrCompletion must drop it: not
+// counted as resolved, not re-delivered as failed, no depth accounting —
+// otherwise the slice would complete a second time.
 TEST_F(UrmaJettyRebuildTest, StaleEpochCompletionDropped) {
     Transport::TransferTask task = {};
-    Transport::Slice *slice = postOneSlice(&task);
+    mock_urma_withhold_next_post(1);
+    Transport::Slice *stale = postOneSlice(&task);
+    const uint64_t old_epoch = UrmaEndpointTestPeer::jettyEpoch(*endpoint_, 0);
     const uint32_t old_id = UrmaEndpointTestPeer::jettyId(*endpoint_, 0);
 
-    // Rebuild once so the jetty epoch advances past this slice's epoch.
+    // A second WR whose completion carries status=9 drives the jetty into
+    // DRAINING; the withheld `stale` stays outstanding on the old jetty.
+    Transport::Slice *trigger = postOneSlice(&task);
     mock_urma_set_next_poll_status(URMA_CR_ACK_TIMEOUT_ERR, 1);
     std::vector<Transport::Slice *> failed;
     std::unordered_map<volatile int *, int> depth_set;
     std::vector<UbEndPoint *> deferred;
     pollOnce(failed, depth_set, deferred);
+    ASSERT_EQ(UrmaEndpoint::DRAINING,
+              UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
+
+    // Fence arrives; rebuild completes without consuming `stale` (no
+    // flush-error script armed). The epoch advances past `stale`'s stamp.
     mock_urma_enqueue_flush_done(old_id);
     failed.clear();
     depth_set.clear();
@@ -337,17 +353,25 @@ TEST_F(UrmaJettyRebuildTest, StaleEpochCompletionDropped) {
     pollOnce(failed, depth_set, deferred);
     ASSERT_EQ(UrmaEndpoint::ACTIVE,
               UrmaEndpointTestPeer::jettyState(*endpoint_, 0));
+    ASSERT_NE(old_epoch, UrmaEndpointTestPeer::jettyEpoch(*endpoint_, 0));
 
-    // Inject a SUCCESS completion carrying the OLD epoch's slice pointer. The
-    // slice still references the old jetty_depth slot, whose epoch has moved.
-    // processWrCompletion must drop it (return false -> not counted).
-    // We emulate by polling a WR we manually re-queue is not possible; instead
-    // assert the guard directly via the epoch mismatch path.
-    const int slot = 0;
-    EXPECT_NE(slice->ub.jetty_epoch,
-              UrmaEndpointTestPeer::jettyEpoch(*endpoint_, slot));
+    // Release the withheld WR so urma_poll_jfc delivers its completion, then
+    // poll for real: SUCCESS, user_ctx=`stale`, stamped with the pre-rebuild
+    // epoch. processWrCompletion must drop it.
+    mock_urma_unwithhold_all();
+    failed.clear();
+    depth_set.clear();
+    deferred.clear();
+    const int resolved = pollOnce(failed, depth_set, deferred);
+    EXPECT_EQ(0, resolved);
+    EXPECT_TRUE(failed.empty());
+    EXPECT_TRUE(depth_set.empty());
+    EXPECT_EQ(Transport::Slice::POSTED, stale->status);
 
-    delete slice;
+    // Ownership was retained (the drop path never calls markSuccess, which
+    // would self-delete the slice), so deleting it here is safe.
+    delete stale;
+    delete trigger;
 }
 
 // TC-4: when rebuild's urma_delete_jetty fails, the old jetty handle is kept
