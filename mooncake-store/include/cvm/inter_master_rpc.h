@@ -127,6 +127,24 @@ class InterMasterRpcClient {
                         const std::vector<std::string>& keys,
                         const std::string& tenant_id);
 
+    // ----- Write forwarding (model B) -----
+
+    // Relays a FULL PutStart to the slot-owning submaster. The owner executes
+    // the complete local PutStart (alloc + metadata + keepalive) and returns
+    // the descriptors, which the caller relays to the client. The owner's
+    // OwnsSlot==true so it does not re-forward (chain stops at the first hop).
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+        const std::string& master_id, const UUID& client_id,
+        const std::string& key, const std::string& tenant_id,
+        uint64_t slice_length, const ReplicateConfig& config);
+
+    // Upsert variant: relays a FULL UpsertStart to the slot owner so it
+    // overwrites-if-exists (preemption) locally rather than via PutStart.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+        const std::string& master_id, const UUID& client_id,
+        const std::string& key, const std::string& tenant_id,
+        uint64_t slice_length, const ReplicateConfig& config);
+
    private:
     // Generic sync RPC invocation against the pool of the target address.
     // Defined in the .cpp (needs the complete WrappedMasterService type).

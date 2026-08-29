@@ -813,6 +813,28 @@ MasterService::InterMasterBatchGetReplicaList(
     return BatchGetReplicaListLocal(keys, tenant);
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::InterMasterPutStart(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    const TenantId tenant(tenant_id);
+    // peer 互信：调用方已按 slot 归属解析本机为 owner，直接执行完整本地
+    // PutStart（分配 + 写元数据 + keepalive）。本机 OwnsSlot==true，不会再
+    // 二次转发（转发链止于第一跳，避免视图不一致时的循环转发）。
+    return PutStart(client_id, key, tenant, slice_length, config);
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::InterMasterUpsertStart(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    const TenantId tenant(tenant_id);
+    // Upsert 转发：本机为 slot owner，执行完整本地 UpsertStart 以保留
+    // "已存在则覆盖（preemption）"语义；由 PutStart 转发走 PutStart 会丢失
+    // 该覆盖语义。peer 互信，不二次转发。
+    return UpsertStart(client_id, key, tenant, slice_length, config);
+}
+
 tl::expected<std::vector<Replica>, ErrorCode>
 MasterService::TryAllocateReplicasRemotely(
     const std::string& key, const TenantId& tenant_id, uint64_t value_length,
@@ -1203,27 +1225,23 @@ void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
 }
 
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
-    const auto all_slots = []() {
-        std::vector<uint16_t> slots;
-        slots.reserve(cvm::kSlotCount);
-        for (uint16_t s = 0; s < cvm::kSlotCount; ++s) {
-            slots.push_back(s);
-        }
-        return slots;
-    };
-
+    // etcd 读取失败：sticky 策略——沿用上一轮成功解析的结果（可能为空）。
+    // 绝不回退为全量接管：瞬时抖动引发的全量认领会与对端产生覆盖战
+    // （双方反复重写对方 slot 记录，导致 slot 分布持续震荡不收敛）。
     std::vector<cvm::MasterRegistration> masters;
     ViewVersionId version;
     ErrorCode err =
         cvm::EtcdViewStore::LoadAllMasters(cluster_id_, masters, version);
     if (err != ErrorCode::OK) {
+        std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
         LOG(WARNING) << "ResolveOwnedSlotsForCvm: LoadAllMasters failed: " << err
-                     << ", falling back to full ownership";
-        return all_slots();
+                     << ", keeping previous owned set (sticky), count="
+                     << cvm_last_resolved_owned_slots_.size();
+        return cvm_last_resolved_owned_slots_;
     }
 
     std::vector<std::string> ids;
-    ids.reserve(masters.size() + 1);
+    ids.reserve(masters.size());
     for (const auto& m : masters) {
         // Only serving primaries own slots. Standbys do not publish slot
         // ownership, so including them would strand part of the slot space.
@@ -1234,15 +1252,30 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
             ids.push_back(m.master_id);
         }
     }
-    // Always include this master so ownership is non-empty even before its
-    // registration has been persisted (avoids a transient zero-slot window).
-    ids.push_back(master_id_);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
-    // 技术债 3.1：一致性哈希环分配已提取到 cvm::ResolveOwnedSlotsOnRing
-    // 纯函数（可单元测试），本机 owned slots 由 (ids, master_id_) 决定。
-    return cvm::ResolveOwnedSlotsOnRing(ids, master_id_);
+    // etcd 注册表是唯一事实源：本机必须已注册为 primary 才参与分配。
+    // 不再无条件注入本机 master_id——否则任一节点视图缺失对端时都会以
+    // n==1 身份全量接管，是 slot 覆盖战的直接根源。
+    const bool self_registered =
+        std::binary_search(ids.begin(), ids.end(), master_id_);
+    std::vector<uint16_t> slots;
+    if (self_registered) {
+        // 技术债 3.1：一致性哈希环分配已提取到 cvm::ResolveOwnedSlotsOnRing
+        // 纯函数（可单元测试），本机 owned slots 由 (ids, master_id_) 决定。
+        slots = cvm::ResolveOwnedSlotsOnRing(ids, master_id_);
+    } else {
+        LOG(WARNING) << "ResolveOwnedSlotsForCvm: self not registered as "
+                        "primary in etcd (masters="
+                     << ids.size() << "), owning no slots this cycle";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+        cvm_last_resolved_owned_slots_ = slots;
+    }
+    return slots;
 }
 
 std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
@@ -1258,7 +1291,7 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
     }
 
     std::vector<std::string> ids;
-    ids.reserve(masters.size() + 1);
+    ids.reserve(masters.size());
     for (const auto& m : masters) {
         if (static_cast<cvm::MasterRole>(m.role) != cvm::MasterRole::kPrimary) {
             continue;
@@ -1267,10 +1300,12 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
             ids.push_back(m.master_id);
         }
     }
-    ids.push_back(master_id_);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
+    // 与 ResolveOwnedSlotsForCvm 保持一致：纯粹以 etcd 注册表计算环，
+    // 不注入本机 master_id，保证所有权判定与认领发布使用同一个环。
+    // 解析结果为空（注册表无 primary）时由调用方跳过转发。
     return cvm::ResolveSlotOwnerOnRing(ids, slot);
 }
 #else
@@ -3448,7 +3483,8 @@ void MasterService::RestoreFromStandbySnapshot(
 
     // P4：晋升时只物化「本机负责 slot」的对象元数据（数据字节留在 segment）。
     // 仅在 etcd HA 动态分区下过滤；非 HA / 单机 / 测试路径 lookup 为空，退化
-    // 为恢复全部。ResolveOwnedSlotsForCvm 失败时退化为全量，同样等价于不过滤。
+    // 为恢复全部。ResolveOwnedSlotsForCvm 失败时 sticky 沿用上一轮结果
+    // （standby 晋升前为空 → 全量恢复），同样等价于不过滤。
     std::vector<bool> owned_slot_lookup;
     {
         const bool kv_partition_enabled =
@@ -4763,6 +4799,32 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     UpdateClientHostId(client_id, config.host_id);
 
+#ifdef STORE_USE_ETCD
+    // 写路径 slot 归属校验 + 完整转发（模型 B）：本机若非该 key 的 slot
+    // owner，不得在本地写入元数据（否则元数据落在"非环 owner"上，而读路径
+    // 按环归属，会造成"写后读不到/写到错误位置"的不一致）。此处把整个
+    // PutStart 转发给 slot owner，由其本地分配 + 写元数据并返回 Descriptor。
+    // owner 侧 peer 互信（OwnsSlot==true）不再二次转发，转发链止于第一跳。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        if (!OwnsSlot(slot)) {
+            auto owner = ResolveSlotOwnerMasterId(slot);
+            if (owner && !owner->empty() && *owner != master_id_ &&
+                inter_master_rpc_) {
+                LOG(INFO) << "PutStart forwarded: key=" << object_id.user_key
+                          << " slot=" << slot << " -> owner=" << *owner;
+                return inter_master_rpc_->PutStart(
+                    *owner, client_id, object_id.user_key,
+                    object_id.tenant_id.value(), slice_length, config);
+            }
+            LOG(INFO) << "PutStart rejected with SLOT_NOT_OWNED: key="
+                      << object_id.user_key << " slot=" << slot;
+            return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+        }
+    }
+#endif
+
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
         LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
@@ -5362,6 +5424,31 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 #endif
 
     UpdateClientHostId(client_id, config.host_id);
+
+#ifdef STORE_USE_ETCD
+    // 写路径 slot 归属校验 + 完整转发（模型 B）：Upsert 为覆盖式写，一旦
+    // client 路由过期把请求发到非 slot owner，错位覆盖比 PutStart 危害更大。
+    // 此处与 PutStart 对称：把整个 UpsertStart 转发给 slot owner 执行。
+    // owner 侧 peer 互信（OwnsSlot==true）不再二次转发，转发链止于第一跳。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        if (!OwnsSlot(slot)) {
+            auto owner = ResolveSlotOwnerMasterId(slot);
+            if (owner && !owner->empty() && *owner != master_id_ &&
+                inter_master_rpc_) {
+                LOG(INFO) << "UpsertStart forwarded: key=" << object_id.user_key
+                          << " slot=" << slot << " -> owner=" << *owner;
+                return inter_master_rpc_->UpsertStart(
+                    *owner, client_id, object_id.user_key,
+                    object_id.tenant_id.value(), slice_length, config);
+            }
+            LOG(INFO) << "UpsertStart rejected with SLOT_NOT_OWNED: key="
+                      << object_id.user_key << " slot=" << slot;
+            return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+        }
+    }
+#endif
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {

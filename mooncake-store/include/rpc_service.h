@@ -311,6 +311,19 @@ class WrappedMasterService {
     InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
                                    const std::string& tenant_id);
 
+    // Inter-master write forwarding (model B): relays a FULL PutStart to the
+    // slot-owning submaster so it allocates + writes metadata locally.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> InterMasterPutStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t slice_length,
+        const ReplicateConfig& config);
+
+    // Upsert variant of InterMasterPutStart (owner overwrites-if-exists).
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterUpsertStart(const UUID& client_id, const std::string& key,
+                           const std::string& tenant_id, uint64_t slice_length,
+                           const ReplicateConfig& config);
+
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);

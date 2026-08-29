@@ -199,6 +199,27 @@ class MasterService {
     InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
                                    const std::string& tenant_id);
 
+    // Inter-master write forwarding (model B). Called by WrappedMasterService
+    // when a peer submaster received a PutStart for a slot it does not own: it
+    // relays the FULL PutStart to this submaster (the slot owner), which
+    // executes the complete local alloc + metadata + keepalive and returns the
+    // descriptors for the caller to relay to the client. Because this is the
+    // slot owner, its OwnsSlot==true so the forward chain terminates here
+    // (peer trust, symmetric with InterMasterGetReplicaList).
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> InterMasterPutStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t slice_length,
+        const ReplicateConfig& config);
+
+    // Upsert variant of InterMasterPutStart: the slot owner executes the FULL
+    // UpsertStart (preserving the "overwrite if exists" preemption semantics
+    // that PutStart lacks), and returns the descriptors for the caller to
+    // relay to the client.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterUpsertStart(const UUID& client_id, const std::string& key,
+                           const std::string& tenant_id, uint64_t slice_length,
+                           const ReplicateConfig& config);
+
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
      *        unit tests can drive a single eviction cycle synchronously
@@ -2238,11 +2259,15 @@ class MasterService {
     // view 快照。仅在 etcd HA backend 下生效，其余场景为空操作。
     void PublishSegmentOwnerForCvm(const Segment& segment);
     void RemoveSegmentOwnerForCvm(const UUID& segment_id);
-    // 动态 KV slot 划分：读取 etcd 中已注册的 master 列表，按 master_id 字典序
-    // 排序后取本机 index，把 16384 个 slot 均分到各 master，返回本机应拥有的
-    // slot 区间。读失败时退化为全量接管（单主）。供 SlotOwnerHeartbeat 动态
-    // 解析器回调调用（运行在心跳线程）。
+    // 动态 KV slot 划分：以 etcd 注册表为唯一事实源，读取已注册的 primary
+    // master 列表，按一致性哈希环（cvm::ResolveOwnedSlotsOnRing）计算本机
+    // 应拥有的 slot 集合。etcd 读取失败时沿用上一轮结果（sticky），避免
+    // 瞬时抖动引发全量抢夺；本机不在 primary 列表时返回空集合（不认领）。
+    // 供 SlotOwnerHeartbeat 动态解析器回调调用（运行在心跳线程）。
     std::vector<uint16_t> ResolveOwnedSlotsForCvm();
+    // sticky 缓存：最近一次成功解析的 owned slot 集合（etcd 抖动时沿用）。
+    std::vector<uint16_t> cvm_last_resolved_owned_slots_;
+    mutable std::mutex cvm_resolver_mutex_;
     // live primary → live primary 的 slot 元数据交接（P4 技术债 1）。
     // ExportSlotMetadata 把 `slot` 下所有对象的元数据序列化后写入 etcd，再
     // 从本地 metadata_shards_ 擦除；ImportSlotMetadata 从 etcd 读回并物化到

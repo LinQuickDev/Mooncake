@@ -228,6 +228,36 @@ InterMasterRpcClient::BatchGetReplicaList(
     return std::move(result.value());
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+InterMasterRpcClient::PutStart(const std::string& master_id,
+                               const UUID& client_id, const std::string& key,
+                               const std::string& tenant_id,
+                               uint64_t slice_length,
+                               const ReplicateConfig& config) {
+    auto address = ResolveAddress(master_id);
+    if (!address) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return invoke_rpc<&WrappedMasterService::InterMasterPutStart,
+                      std::vector<Replica::Descriptor>>(
+        *address, client_id, key, tenant_id, slice_length, config);
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+InterMasterRpcClient::UpsertStart(const std::string& master_id,
+                                  const UUID& client_id, const std::string& key,
+                                  const std::string& tenant_id,
+                                  uint64_t slice_length,
+                                  const ReplicateConfig& config) {
+    auto address = ResolveAddress(master_id);
+    if (!address) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return invoke_rpc<&WrappedMasterService::InterMasterUpsertStart,
+                      std::vector<Replica::Descriptor>>(
+        *address, client_id, key, tenant_id, slice_length, config);
+}
+
 void InterMasterRpcClient::EnqueueBroadcastFree(const std::string& tenant_id,
                                                  const std::string& key) {
     if (!running_.load()) {

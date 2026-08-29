@@ -1915,6 +1915,40 @@ WrappedMasterService::InterMasterBatchGetReplicaList(
     return master_service_.InterMasterBatchGetReplicaList(keys, tenant_id);
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::InterMasterPutStart(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    return execute_rpc(
+        "InterMasterPutStart", PerfKey::MASTER_RPC_PUT_START,
+        [&] {
+            return master_service_.InterMasterPutStart(
+                client_id, key, tenant_id, slice_length, config);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", slice_length=", slice_length);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::InterMasterUpsertStart(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    return execute_rpc(
+        "InterMasterUpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
+        [&] {
+            return master_service_.InterMasterUpsertStart(
+                client_id, key, tenant_id, slice_length, config);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", slice_length=", slice_length);
+        },
+        [] {}, [] {});
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -1937,6 +1971,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::InterMasterBatchGetReplicaList>(
+        &wrapped_master_service);
+    // Inter-master write forwarding (model B).
+    server.register_handler<&mooncake::WrappedMasterService::InterMasterPutStart>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterUpsertStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);
