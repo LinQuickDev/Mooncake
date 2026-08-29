@@ -17,6 +17,9 @@
 #include <thread>
 #include <vector>
 
+#include <numa.h>
+#include <sched.h>
+
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "mooncake_logging.h"
@@ -210,7 +213,7 @@ class StoreConnectorBench {
                     LOG(WARNING)
                         << "Failed to unregister thread buffer, ignoring";
                 }
-                free(tb.ptr);
+                numa_free(tb.ptr, tb.size);
             }
         }
         if (main_buffer_) {
@@ -219,7 +222,7 @@ class StoreConnectorBench {
             } catch (...) {
                 LOG(WARNING) << "Failed to unregister main buffer, ignoring";
             }
-            free(main_buffer_);
+            numa_free(main_buffer_, main_buffer_size_);
         }
     }
 
@@ -237,7 +240,8 @@ class StoreConnectorBench {
 
         // 主 buffer 用于 PrepareData 阶段
         main_buffer_size_ = FLAGS_num_layers * FLAGS_layer_size;
-        main_buffer_ = static_cast<char*>(malloc(main_buffer_size_));
+        main_buffer_ = reinterpret_cast<char*>(
+            numa_alloc_local(main_buffer_size_));
         if (!main_buffer_) {
             LOG(ERROR) << "Failed to allocate main buffer";
             return -1;
@@ -420,7 +424,8 @@ class StoreConnectorBench {
         size_t per_buf = FLAGS_num_layers * FLAGS_layer_size;
         for (size_t t = 0; t < num_threads; ++t) {
             thread_buffers_[t].size = per_buf;
-            thread_buffers_[t].ptr = static_cast<char*>(malloc(per_buf));
+            thread_buffers_[t].ptr =
+                reinterpret_cast<char*>(numa_alloc_local(per_buf));
             if (!thread_buffers_[t].ptr) {
                 LOG(ERROR) << "Failed to allocate buffer for thread " << t;
                 return -1;
