@@ -82,6 +82,8 @@ class MasterClient {
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(), 
                            detail::MakeMasterRpcClientPoolConfig()),
+          targeted_accessor_(GetStoreRpcClientIoContextPool(),
+                             detail::MakeMasterRpcClientPoolConfig()),
           client_id_(client_id),
           tenant_id_(NormalizeTenantId(std::move(tenant_id))),
           metrics_(metrics) {
@@ -456,6 +458,14 @@ class MasterClient {
     [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
 
+    /**
+     * @brief 定向 QuerySegmentStatusById：向指定 submaster 查询 segment 状态
+     * （不切换当前连接）。用于多 submaster 优雅卸载时确认所有 primary
+     * submaster 均已移除该 segment。
+     */
+    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusByIdTo(
+        const std::string& address, const UUID& segment_id);
+
     [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
     GetStorageConfig();
 
@@ -465,6 +475,46 @@ class MasterClient {
      * containing view version and client status
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+
+    /**
+     * @brief 返回 client_accessor_ 当前连接的 submaster 地址（IP:Port）。
+     * 供后台心跳去重使用——HeartbeatAllSubmasters 跳过当前 active 地址，
+     * 避免与主循环的 Ping() 对同一 submaster 重复 ping。
+     */
+    std::string GetCurrentAddress() const;
+
+    /**
+     * @brief 定向 Ping：向指定 submaster 发送 Ping（不切换当前连接）。
+     * 用于 client 侧多 submaster 心跳，防止各 submaster 因收不到 ping 而
+     * 误判 client 过期并卸载其 segment。返回 NEED_REMOUNT 时调用方应对该
+     * submaster 重新 mount。
+     */
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> PingTo(
+        const std::string& address);
+
+    /**
+     * @brief 定向 MountSegment：向指定 submaster 注册 segment（不切换当前
+     * 连接）。用于 client 侧全量 mount——同一 segment 挂载到所有 primary
+     * submaster，使任何 slot owner 都能本地分配副本。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSegmentTo(
+        const std::string& address, const Segment& segment);
+
+    /**
+     * @brief 定向 UnmountSegment：向指定 submaster 注销 segment（不切换当前
+     * 连接）。与全量 mount 对称，保证 segment 生命周期在所有 submaster 闭合。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegmentTo(
+        const std::string& address, const UUID& segment_id);
+
+    /**
+     * @brief 定向 GracefulUnmountSegment：向指定 submaster 发起优雅卸载（不
+     * 切换当前连接）。与全量 unmount 对称，保证优雅卸载在所有 submaster 生效。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> GracefulUnmountSegmentTo(
+        const std::string& address, const UUID& segment_id,
+        uint64_t grace_period_ms);
+
 
     /**
      * @brief Mounts a local disk segment into the master.
@@ -723,6 +773,16 @@ class MasterClient {
         Args&&... args);
 
     /**
+     * @brief 定向 RPC：向指定 submaster 发请求，使用独立的 targeted_accessor_
+     * 缓存 per-address pool，不切换 client_accessor_ 的"当前地址"。供后台心跳
+     * /全量 mount/unmount 使用，避免与业务请求（SwitchToSubmaster + invoke_rpc）
+     * 的当前地址切换竞态。
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_to(
+        const std::string& address, Args&&... args);
+
+    /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
      * @tparam ResultType The expected return type of the RPC call
@@ -788,6 +848,12 @@ class MasterClient {
     };
 
     RpcClientPool client_accessor_;
+
+    // 定向 RPC 用独立 pool 访问器：后台心跳/全量 mount/unmount 用它直发指定
+    // submaster，与业务请求的 client_accessor_（SwitchToSubmaster 切"当前地址"）
+    // 完全隔离，避免"当前地址"竞态。invoke_rpc_to 用 GetOrCreateClientPool 的
+    // 返回值发请求，不依赖该访问器的"当前地址"，因此可被多线程并发调用。
+    RpcClientPool targeted_accessor_;
 
     // The client identification.
     const UUID client_id_;

@@ -456,6 +456,45 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     return rpc_result;
 }
 
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_to(
+    const std::string& address, Args&&... args) {
+    // 定向 RPC：用独立 targeted_accessor_ 按地址取 pool，不切换
+    // client_accessor_ 的"当前地址"，避免与业务请求竞态。pool 取自返回值，
+    // 不依赖 targeted_accessor_ 的当前状态，因此可被多线程并发调用。
+    auto pool = targeted_accessor_.GetOrCreateClientPool(address);
+
+    if (metrics_) {
+        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    }
+
+    return async_simple::coro::syncAwait(
+        [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            auto ret = co_await pool->send_request(
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client& client) {
+                    return client.send_request<ServiceMethod>(
+                        std::forward<Args>(args)...);
+                });
+            if (!ret.has_value()) {
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            auto result = co_await std::move(ret.value());
+            if (!result) {
+                if (result.error().code == coro_rpc::errc::timed_out) {
+                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            if constexpr (std::is_void_v<ReturnType>) {
+                result->result();
+                co_return tl::expected<void, ErrorCode>{};
+            } else {
+                co_return std::move(result->result());
+            }
+        }());
+}
+
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
@@ -1414,6 +1453,18 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::MountSegmentTo(
+    const std::string& address, const Segment& segment) {
+    ScopedVLogTimer timer(1, "MasterClient::MountSegmentTo");
+    timer.LogRequest("address=", address, ", id=", segment.id,
+                     ", client_id=", client_id_);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::MountSegment, void>(
+        address, segment, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
     const NoFSegment& segment) {
     ScopedVLogTimer timer(1, "MasterClient::MountNofSegment");
@@ -1462,6 +1513,18 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::UnmountSegmentTo(
+    const std::string& address, const UUID& segment_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountSegmentTo");
+    timer.LogRequest("address=", address, ", segment_id=", segment_id,
+                     ", client_id=", client_id_);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::UnmountSegment, void>(
+        address, segment_id, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegment(
     const UUID& segment_id, uint64_t grace_period_ms) {
     ScopedVLogTimer timer(1, "MasterClient::GracefulUnmountSegment");
@@ -1471,6 +1534,21 @@ tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::GracefulUnmountSegment, void>(
             segment_id, client_id_, grace_period_ms);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegmentTo(
+    const std::string& address, const UUID& segment_id,
+    uint64_t grace_period_ms) {
+    ScopedVLogTimer timer(1, "MasterClient::GracefulUnmountSegmentTo");
+    timer.LogRequest("address=", address, ", segment_id=", segment_id,
+                     ", client_id=", client_id_,
+                     ", grace_period_ms=", grace_period_ms);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::GracefulUnmountSegment, void>(
+            address, segment_id, client_id_, grace_period_ms);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1530,6 +1608,21 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     return result;
 }
 
+std::string MasterClient::GetCurrentAddress() const {
+    return client_accessor_.GetAddress();
+}
+
+tl::expected<PingResponse, ErrorCode> MasterClient::PingTo(
+    const std::string& address) {
+    ScopedVLogTimer timer(1, "MasterClient::PingTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id_);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::Ping, PingResponse>(
+        address, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -1546,6 +1639,18 @@ tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatusById(
 
     auto result = invoke_rpc<&WrappedMasterService::QuerySegmentStatusById,
                              SegmentStatus>(segment_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<SegmentStatus, ErrorCode>
+MasterClient::QuerySegmentStatusByIdTo(const std::string& address,
+                                       const UUID& segment_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatusByIdTo");
+    timer.LogRequest("address=", address, ", segment_id=", segment_id);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::QuerySegmentStatusById,
+                                SegmentStatus>(address, segment_id);
     timer.LogResponseExpected(result);
     return result;
 }

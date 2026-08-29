@@ -919,6 +919,12 @@ class Client {
     // Empty in single-leader HA mode and direct mode. Also drives the
     // ping-failure re-discovery path.
     std::string cvm_cluster_namespace_;
+    // CVM 多 submaster：已发现的全部 primary submaster 地址（含当前连接的
+    // 那个）。用于 client 侧全量 mount（同一 segment 挂到所有 submaster）与
+    // 多 submaster 心跳（防止各 submaster 因收不到 ping 而误卸载 segment）。
+    // 由 ConnectToCvmSubmasters 填充。
+    std::mutex cvm_submaster_addresses_mutex_;
+    std::vector<std::string> cvm_submaster_addresses_;
     // 串行化 TryLoadRoutingOnce（及其内部对 cluster_id_ 的读写），
     // 用于 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新之间。
     std::mutex routing_load_mutex_;
@@ -944,6 +950,15 @@ class Client {
     void RoutingRefreshThreadMain();
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
+    // CVM 多 submaster：向所有 primary submaster 定向 Ping（不切换当前连接），
+    // 各 submaster 收到 ping 后会保活该 client；返回 NEED_REMOUNT 的 submaster
+    // 会被重新 mount（重新注册 segment）。单 submaster 失败不影响其他。
+    void HeartbeatAllSubmasters();
+    // CVM 多 submaster：重新扫描 /cvm/<ns>/masters/ 注册表，更新已发现的
+    // primary 地址列表；对新增的 submaster 全量 mount 所有本地 segment，使
+    // 新加入的 submaster 也具备给本 client 分配副本的能力。由路由刷新线程
+    // 周期调用。
+    void RefreshSubmasterAddresses();
     void TaskPollThreadMain();
     void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
