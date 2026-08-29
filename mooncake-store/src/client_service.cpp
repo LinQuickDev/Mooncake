@@ -737,11 +737,16 @@ ErrorCode Client::ConnectToCvmSubmasters(const std::string& etcd_endpoints) {
                     std::lock_guard<std::mutex> lock(
                         cvm_submaster_addresses_mutex_);
                     cvm_submaster_addresses_.clear();
+                    // 去重：etcd 中可能存在指向同一 address 的重复 primary
+                    // 注册（如重启残留 lease），不去重会导致全量 mount 对同一
+                    // submaster 重复调用、master 日志刷屏。
+                    std::set<std::string> seen;
                     for (const auto& reg2 : masters) {
                         if (reg2.role ==
                                 static_cast<int32_t>(
                                     cvm::MasterRole::kPrimary) &&
-                            !reg2.address.empty()) {
+                            !reg2.address.empty() &&
+                            seen.insert(reg2.address).second) {
                             cvm_submaster_addresses_.push_back(reg2.address);
                         }
                     }
@@ -4620,6 +4625,11 @@ void Client::RefreshSubmasterAddresses() {
         }
     }
     std::sort(new_addresses.begin(), new_addresses.end());
+    // 去重：与 ConnectToCvmSubmasters 保持一致，避免重复 primary 注册导致
+    // 全量 mount 对同一 submaster 重复调用。
+    new_addresses.erase(
+        std::unique(new_addresses.begin(), new_addresses.end()),
+        new_addresses.end());
 
     // 若本轮扫描为空（etcd 抖动或所有 primary 异常），保持现有地址列表不变
     //（sticky），避免短暂异常清空地址列表导致心跳与全量 mount 退化。
