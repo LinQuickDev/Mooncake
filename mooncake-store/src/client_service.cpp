@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 #ifdef USE_NOF
 #include <numa.h>
 #endif
@@ -34,6 +35,10 @@
 #include "transport/transport.h"
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
+#include "cvm/cvm_keys.h"
+#include "cvm/cvm_types.h"
+#include "cvm/etcd_view_store.h"
+#include "etcd_helper.h"
 #include "types.h"
 #include "client_buffer.h"
 #include "utils.h"
@@ -43,6 +48,12 @@
 #include "crc_checksum.h"
 #include "environ.h"
 #include "mooncake_logging.h"
+
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
 
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
@@ -562,8 +573,24 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return current_view.error();
         }
         if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            // No single-leader master_view is published. In the CVM
+            // multi-submaster architecture masters never write master_view;
+            // they register under /cvm/<ns>/masters/ instead. Fall back to
+            // the CVM registry to bootstrap the connection. Per-key routing
+            // is loaded afterwards via LoadPartitionRouting() from the
+            // kv_view snapshot in etcd.
+            LOG(INFO) << "No master_view in HA backend; trying CVM "
+                         "multi-submaster bootstrap from /cvm/ registry";
+            auto err =
+                ConnectToCvmSubmasters(ha_backend_spec.value()->connstring);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "No master is available in HA backend (nor a "
+                              "CVM submaster registry)";
+                return err;
+            }
+            direct_master_address_.clear();
+            etcd_connstring_ = ha_backend_spec.value()->connstring;
+            return ErrorCode::OK;
         }
 
         const auto& master_view = current_view.value().value();
@@ -595,6 +622,152 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         last_ping_success_.store(true);
         return ErrorCode::OK;
     }
+}
+
+ErrorCode Client::ConnectToCvmSubmasters(const std::string& etcd_endpoints) {
+    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "ConnectToCvmSubmasters: failed to connect etcd: " << err;
+        return err;
+    }
+
+    // Discover cluster namespaces that have registered masters by scanning
+    // the /cvm/ key space for /cvm/<ns>/masters/<master_id> keys.
+    const std::string cvm_root(std::string(mooncake::cvm::kCvmRootPrefix));
+    const std::string cvm_root_end = mooncake::cvm::PrefixEnd(cvm_root);
+    const std::string masters_suffix("/masters/");
+    std::string json;
+    EtcdRevisionId revision = 0;
+    err = EtcdHelper::GetRangeAsJson(cvm_root.data(), cvm_root.size(),
+                                     cvm_root_end.data(), cvm_root_end.size(),
+                                     0 /* no limit */, json, revision);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "ConnectToCvmSubmasters: failed to scan /cvm/ prefix: "
+                   << err;
+        return err;
+    }
+
+    std::set<std::string> namespaces;
+    {
+        Json::Value root;
+        Json::CharReaderBuilder reader;
+        std::string errors;
+        std::istringstream stream(json);
+        if (!Json::parseFromStream(reader, stream, &root, &errors) ||
+            !root.isArray()) {
+            LOG(ERROR) << "ConnectToCvmSubmasters: failed to parse /cvm/ "
+                          "range JSON: "
+                       << errors;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        for (const auto& item : root) {
+            if (!item.isObject() || !item["key"].isString()) {
+                continue;
+            }
+            const std::string key = item["key"].asString();
+            if (!key.starts_with(cvm_root)) {
+                continue;
+            }
+            const size_t ns_begin = cvm_root.size();
+            const size_t masters_pos = key.find(masters_suffix, ns_begin);
+            // Key layout: /cvm/<ns>/masters/<master_id>. Reject namespaces
+            // containing '/' (not a valid masters key).
+            if (masters_pos == std::string::npos ||
+                key.find('/', ns_begin) != masters_pos) {
+                continue;
+            }
+            namespaces.insert(key.substr(ns_begin, masters_pos - ns_begin));
+        }
+    }
+    if (namespaces.empty()) {
+        LOG(ERROR) << "ConnectToCvmSubmasters: no /cvm/<ns>/masters/ "
+                      "registry found in etcd";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (namespaces.size() > 1) {
+        std::ostringstream oss;
+        for (const auto& ns : namespaces) {
+            oss << " " << ns;
+        }
+        LOG(WARNING) << "ConnectToCvmSubmasters: multiple CVM namespaces "
+                        "found ("
+                     << oss.str() << "); using the first one";
+    }
+
+    // Try each namespace; within a namespace, prefer primaries ordered by
+    // registration time (first-registered first), matching the
+    // CvmController first-come-first-served ranking. Fall back to standbys
+    // only if no primary is reachable, so the client can still bootstrap.
+    for (const auto& ns : namespaces) {
+        std::vector<cvm::MasterRegistration> masters;
+        ViewVersionId version = 0;
+        err = cvm::EtcdViewStore::LoadAllMasters(ns, masters, version);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "ConnectToCvmSubmasters: LoadAllMasters failed "
+                            "for namespace "
+                         << ns << ": " << err;
+            continue;
+        }
+        std::sort(masters.begin(), masters.end(),
+                  [](const cvm::MasterRegistration& a,
+                     const cvm::MasterRegistration& b) {
+                      if (a.registered_at_ms != b.registered_at_ms) {
+                          return a.registered_at_ms < b.registered_at_ms;
+                      }
+                      return a.master_id < b.master_id;
+                  });
+
+        auto try_connect_group = [&](bool primaries_only) {
+            for (const auto& reg : masters) {
+                if (primaries_only &&
+                    reg.role != static_cast<int32_t>(cvm::MasterRole::kPrimary)) {
+                    continue;
+                }
+                auto connect_err = master_client_.Connect(reg.address);
+                if (connect_err != ErrorCode::OK) {
+                    LOG(WARNING) << "ConnectToCvmSubmasters: connect to "
+                                 << reg.master_id << " (" << reg.address
+                                 << ") failed: " << toString(connect_err);
+                    continue;
+                }
+                cvm_cluster_namespace_ = ns;
+                {
+                    std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                    current_master_view_.reset();
+                }
+                // Seed cluster_id_ with the CVM namespace so
+                // TryLoadRoutingOnce skips fsdir-based discovery: GetFsdir
+                // returns an empty string when the submaster has no storage
+                // root configured, which would otherwise leave the partition
+                // routing permanently unloaded.
+                {
+                    std::lock_guard<std::mutex> lock(routing_load_mutex_);
+                    cluster_id_ = ns;
+                }
+                last_ping_success_.store(true);
+                LOG(INFO) << "ConnectToCvmSubmasters: connected to submaster "
+                         << reg.master_id << " (" << reg.address
+                         << ", role=" << reg.role
+                         << ", namespace=" << ns << ")";
+                return ErrorCode::OK;
+            }
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        };
+
+        if (try_connect_group(true) == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+        if (try_connect_group(false) == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+        LOG(WARNING) << "ConnectToCvmSubmasters: no reachable master in "
+                       "namespace "
+                    << ns;
+    }
+
+    LOG(ERROR) << "ConnectToCvmSubmasters: no reachable submaster in any "
+                  "CVM namespace";
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
 }
 
 void Client::LoadPartitionRouting() {
@@ -4435,6 +4608,20 @@ void Client::StorageHeartbeatThreadMain() {
             }
 
             LOG(INFO) << "Reconnected to master " << next_view.leader_address;
+            ping_fail_count = 0;
+        } else if (!cvm_cluster_namespace_.empty()) {
+            // CVM multi-submaster mode: the connected submaster died or
+            // became unreachable. Re-discover live submasters from the
+            // /cvm/ registry and reconnect to another one.
+            LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                       << " times (CVM submaster mode); re-discovering "
+                          "submasters from etcd";
+            auto err = ConnectToCvmSubmasters(etcd_connstring_);
+            if (err != ErrorCode::OK) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
             ping_fail_count = 0;
         } else {
             const std::string current_master_address = direct_master_address_;

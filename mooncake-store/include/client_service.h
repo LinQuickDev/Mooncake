@@ -914,6 +914,11 @@ class Client {
     // Resolved cluster namespace (cluster_id) cached after the first routing
     // load; reused by the periodic routing refresh loop.
     std::string cluster_id_;
+    // CVM multi-submaster mode: set when the client bootstraps from the
+    // /cvm/<ns>/masters/ registry (no single-leader master_view in etcd).
+    // Empty in single-leader HA mode and direct mode. Also drives the
+    // ping-failure re-discovery path.
+    std::string cvm_cluster_namespace_;
     // 串行化 TryLoadRoutingOnce（及其内部对 cluster_id_ 的读写），
     // 用于 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新之间。
     std::mutex routing_load_mutex_;
@@ -929,6 +934,11 @@ class Client {
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    // CVM multi-submaster bootstrap/failover: connect the etcd store client,
+    // discover the cluster namespace from /cvm/<ns>/masters/, and connect to
+    // the first live primary submaster (first-registered first, matching the
+    // CvmController ranking). On success sets cvm_cluster_namespace_.
+    ErrorCode ConnectToCvmSubmasters(const std::string& etcd_endpoints);
     void LoadPartitionRouting();
     void TryLoadRoutingOnce();
     void RoutingRefreshThreadMain();
