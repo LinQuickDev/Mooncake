@@ -404,8 +404,18 @@ class StoreConnectorBench {
             result.latencies_ns.push_back(ElapsedNanos(t0, t1));
 
             bool ok = true;
-            for (int v : ret)
-                if (v != 0) ok = false;
+            for (int v : ret) {
+                if (phase == Phase::IS_EXIST) {
+                    // batchIsExist: 1=存在(成功), 0=不存在(失败)
+                    if (v != 1) ok = false;
+                } else if (phase == Phase::GET) {
+                    // batch_get: >0=字节数(成功), <0=错误码(失败)
+                    if (v <= 0) ok = false;
+                } else {
+                    // WRITE: 0=成功, 非0=失败
+                    if (v != 0) ok = false;
+                }
+            }
             if (ok) {
                 result.total_keys += FLAGS_num_layers;
                 if (phase != Phase::IS_EXIST)
