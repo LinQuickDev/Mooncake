@@ -117,5 +117,47 @@ inline std::vector<uint16_t> ResolveOwnedSlotsOnRing(
     return slots;
 }
 
+// 一致性哈希环反查：给定去重排序后的 primary master_id 列表 ids 与单个
+// slot，返回该 slot 的 owner master_id。规则与 ResolveOwnedSlotsOnRing 一致
+// （slot 归属顺时针最近的虚拟节点）。ids 为空返回空串，n == 1 直接返回
+// 唯一成员（单主全量接管）。供读路径转发（非 owner → slot owner）使用。
+inline std::string ResolveSlotOwnerOnRing(const std::vector<std::string>& ids,
+                                          uint16_t slot) {
+    const size_t n = ids.size();
+    if (n == 0) {
+        return {};
+    }
+    if (n == 1) {
+        return ids[0];
+    }
+
+    struct VNode {
+        uint16_t position;
+        size_t owner_index;  // 指向 ids
+    };
+    std::vector<VNode> ring;
+    ring.reserve(n * kVnodeCount);
+    for (size_t i = 0; i < n; ++i) {
+        for (uint16_t v = 0; v < kVnodeCount; ++v) {
+            ring.push_back({VNodePosition(ids[i], v), i});
+        }
+    }
+    // 稳定排序（position 相同按 owner_index）保证跨进程结果一致。
+    std::sort(ring.begin(), ring.end(), [](const VNode& a, const VNode& b) {
+        if (a.position != b.position) {
+            return a.position < b.position;
+        }
+        return a.owner_index < b.owner_index;
+    });
+
+    auto it = std::lower_bound(
+        ring.begin(), ring.end(), slot,
+        [](const VNode& vn, uint16_t value) { return vn.position < value; });
+    if (it == ring.end()) {
+        it = ring.begin();
+    }
+    return ids[it->owner_index];
+}
+
 }  // namespace cvm
 }  // namespace mooncake

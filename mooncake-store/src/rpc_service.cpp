@@ -1844,10 +1844,99 @@ void WrappedMasterService::StopSlotOwnerHeartbeat() {
     master_service_.StopSlotOwnerHeartbeat();
 }
 
+ErrorCode WrappedMasterService::StartInterMasterRpc() {
+    return master_service_.StartInterMasterRpc();
+}
+
+void WrappedMasterService::StopInterMasterRpc() {
+    master_service_.StopInterMasterRpc();
+}
+
+tl::expected<InterMasterHandshakeResponse, ErrorCode>
+WrappedMasterService::InterMasterHandshake() {
+    return execute_rpc(
+        "InterMasterHandshake",
+        [&]() -> tl::expected<InterMasterHandshakeResponse, ErrorCode> {
+            InterMasterHandshakeResponse resp;
+            resp.master_id = master_service_.master_id();
+            resp.lease_id = master_service_.cvm_lease_id();
+            resp.owned_slot_count = master_service_.GetOwnedSlotCount();
+            resp.version = GetMooncakeStoreVersion();
+            return resp;
+        },
+        [&](auto& timer) {
+            timer.LogRequest("self=", master_service_.master_id());
+        },
+        [] {}, [] {});
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::InterMasterAllocateReplicas(
+    const std::string& tenant_id, const std::string& key,
+    uint64_t slice_length, uint64_t replica_num,
+    const std::vector<std::string>& preferred_segments) {
+    return execute_rpc(
+        "InterMasterAllocateReplicas",
+        [&] {
+            return master_service_.InterMasterAllocateReplicas(
+                tenant_id, key, slice_length, replica_num, preferred_segments);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", slice_length=", slice_length,
+                             ", replica_num=", replica_num);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<bool, ErrorCode> WrappedMasterService::InterMasterFreeReplicas(
+    const std::string& tenant_id, const std::string& key) {
+    return execute_rpc(
+        "InterMasterFreeReplicas",
+        [&] { return master_service_.InterMasterFreeReplicas(tenant_id, key); },
+        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::InterMasterGetReplicaList(const std::string& key,
+                                                const std::string& tenant_id) {
+    return execute_rpc(
+        "InterMasterGetReplicaList",
+        [&] {
+            return master_service_.InterMasterGetReplicaList(key, tenant_id);
+        },
+        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::InterMasterBatchGetReplicaList(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "InterMasterBatchGetReplicaList");
+    timer.LogRequest("keys_count=", keys.size());
+    return master_service_.InterMasterBatchGetReplicaList(keys, tenant_id);
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    // Inter-master handshake (CVM multi-submaster coordination).
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterHandshake>(
+        &wrapped_master_service);
+    // Inter-master allocation forwarding (CVM plan B phase 2).
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterAllocateReplicas>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterFreeReplicas>(
+        &wrapped_master_service);
+    // Inter-master read forwarding (CVM plan B phase 2).
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterGetReplicaList>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterBatchGetReplicaList>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);

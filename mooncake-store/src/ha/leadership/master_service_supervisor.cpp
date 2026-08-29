@@ -490,6 +490,14 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     LOG(WARNING) << "Failed to start SlotOwnerHeartbeat during "
                                     "serve phase";
                 }
+                // Inter-master RPC channel: etcd-driven peer discovery +
+                // cached peer connections for the CVM multi-submaster
+                // coordination (handshake now, allocation forwarding later).
+                if (wrapped_master_service->StartInterMasterRpc() !=
+                    ErrorCode::OK) {
+                    LOG(WARNING) << "Failed to start InterMasterRpcClient "
+                                    "during serve phase";
+                }
             } else {
                 LOG(INFO) << "Demoted during serve startup; stopping server";
                 server.stop();
@@ -502,6 +510,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             metrics_reporter.Stop();
             metrics_reporter.SetRole("standby");
             wrapped_master_service->StopSlotOwnerHeartbeat();
+            wrapped_master_service->StopInterMasterRpc();
             cvm_membership_coordinator.SetServeStopSignal(nullptr);
             DeactivateServingState(admin_server, label_reconciler);
             EnterStandbyMode(admin_server, *standby_controller,

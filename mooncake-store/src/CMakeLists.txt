@@ -21,6 +21,7 @@ set(MOONCAKE_STORE_SOURCES
     cvm/slot_owner_heartbeat.cpp
     cvm/slot_migrator.cpp
     cvm/cvm_http_server.cpp
+    cvm/inter_master_rpc.cpp
     partition/partition_router.cpp
     segment.cpp
     transfer_task.cpp

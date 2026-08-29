@@ -273,6 +273,44 @@ class WrappedMasterService {
     ErrorCode StartSlotOwnerHeartbeat();
     void StopSlotOwnerHeartbeat();
 
+    // CVM inter-master RPC lifecycle, driven by the HA supervisor (NOT an
+    // RPC endpoint). Starts/stops the peer discovery + connection pools.
+    ErrorCode StartInterMasterRpc();
+    void StopInterMasterRpc();
+
+    // Inter-master handshake RPC: returns this submaster's identity and
+    // ownership summary so peers can verify the inter-master channel.
+    tl::expected<InterMasterHandshakeResponse, ErrorCode>
+    InterMasterHandshake();
+
+    // Inter-master allocation forwarding (CVM plan B): allocate memory
+    // replicas in this submaster's locally mounted segments on behalf of a
+    // slot-owning peer. Strictly within `preferred_segments` when given.
+    // This submaster keeps the real handles alive (keepalive registry);
+    // the slot owner materializes dummy-allocator replicas from the
+    // returned descriptors and owns the metadata.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterAllocateReplicas(
+        const std::string& tenant_id, const std::string& key,
+        uint64_t slice_length, uint64_t replica_num,
+        const std::vector<std::string>& preferred_segments);
+
+    // Frees the keepalive entry (and thus the handles) previously created
+    // by InterMasterAllocateReplicas. Returns true when an entry existed.
+    tl::expected<bool, ErrorCode> InterMasterFreeReplicas(
+        const std::string& tenant_id, const std::string& key);
+
+    // Inter-master read forwarding (CVM plan B): local GetReplicaList /
+    // BatchGetReplicaList query for a forwarding peer. These do NOT
+    // re-forward, so an inconsistent view terminates the chain at the first
+    // hop instead of looping.
+    tl::expected<GetReplicaListResponse, ErrorCode> InterMasterGetReplicaList(
+        const std::string& key, const std::string& tenant_id);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const std::string& tenant_id);
+
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
