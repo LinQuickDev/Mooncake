@@ -62,6 +62,10 @@ class SlotMigrator {
     SlotCallback on_acquire_;
     SlotCallback on_release_;
     std::vector<uint16_t> last_owned_slots_;
+    // Reconcile 调用计数，用于把不变 slot 的 reaffirm 降频为低频安全网：
+    // slot key 附着在 lease 上（keepalive 保活即不过期），逐周期重写只是
+    // 徒增 etcd MVCC revision，曾导致 backend 配额被写满。
+    uint64_t reconcile_cycles_{0};
 };
 
 }  // namespace cvm

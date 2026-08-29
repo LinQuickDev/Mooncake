@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -445,12 +446,42 @@ ErrorCode EtcdViewStore::SaveSegmentViewSnapshot(
     return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
+namespace {
+// Content-dedup cache for snapshot writes. `generated_at_ms` changes on every
+// build, so a naive "write every sync cycle" put a ~MB value per cycle per
+// master and exhausted the etcd backend quota with MVCC revisions. Skip the
+// write when the owners content is unchanged since this process last wrote it.
+// Process-local: after a content change each master writes once, which is
+// acceptable (two puts per change instead of one).
+std::mutex g_snapshot_dedup_mutex;
+std::unordered_map<std::string, std::string> g_last_snapshot_content;
+}  // namespace
+
 ErrorCode EtcdViewStore::BuildAndSaveKvViewSnapshot(
     const std::string& cluster_namespace, ViewVersionId& version) {
     std::vector<SlotOwner> owners;
     ErrorCode err = LoadAllSlotOwners(cluster_namespace, owners, version);
     if (err != ErrorCode::OK) {
         return err;
+    }
+
+    // Fingerprint over the owners only (exclude version/generated_at so the
+    // steady state produces a stable string).
+    std::string content;
+    try {
+        struct_json::to_json(owners, content);
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "BuildAndSaveKvViewSnapshot: fingerprint failed: "
+                     << e.what();
+        content.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
+        auto& last = g_last_snapshot_content["kv:" + cluster_namespace];
+        if (!content.empty() && last == content) {
+            return ErrorCode::OK;  // unchanged, skip the etcd write
+        }
+        last = content;
     }
 
     KvViewSnapshot snapshot;
@@ -460,7 +491,13 @@ ErrorCode EtcdViewStore::BuildAndSaveKvViewSnapshot(
             std::chrono::system_clock::now().time_since_epoch())
             .count();
     snapshot.slot_owners = std::move(owners);
-    return SaveKvViewSnapshot(cluster_namespace, snapshot);
+    err = SaveKvViewSnapshot(cluster_namespace, snapshot);
+    if (err != ErrorCode::OK) {
+        // 写失败时回滚缓存，下轮重试完整写入。
+        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
+        g_last_snapshot_content.erase("kv:" + cluster_namespace);
+    }
+    return err;
 }
 
 ErrorCode EtcdViewStore::BuildAndSaveSegmentViewSnapshot(
@@ -471,6 +508,23 @@ ErrorCode EtcdViewStore::BuildAndSaveSegmentViewSnapshot(
         return err;
     }
 
+    std::string content;
+    try {
+        struct_json::to_json(owners, content);
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "BuildAndSaveSegmentViewSnapshot: fingerprint failed: "
+                     << e.what();
+        content.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
+        auto& last = g_last_snapshot_content["segment:" + cluster_namespace];
+        if (!content.empty() && last == content) {
+            return ErrorCode::OK;  // unchanged, skip the etcd write
+        }
+        last = content;
+    }
+
     SegmentViewSnapshot snapshot;
     snapshot.version = version;
     snapshot.generated_at_ms =
@@ -478,7 +532,12 @@ ErrorCode EtcdViewStore::BuildAndSaveSegmentViewSnapshot(
             std::chrono::system_clock::now().time_since_epoch())
             .count();
     snapshot.segment_owners = std::move(owners);
-    return SaveSegmentViewSnapshot(cluster_namespace, snapshot);
+    err = SaveSegmentViewSnapshot(cluster_namespace, snapshot);
+    if (err != ErrorCode::OK) {
+        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
+        g_last_snapshot_content.erase("segment:" + cluster_namespace);
+    }
+    return err;
 }
 
 // ---- Watch ----

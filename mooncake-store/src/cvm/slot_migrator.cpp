@@ -101,16 +101,24 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
                   << config_.master_id;
     }
 
-    // 不变 slot：幂等 reaffirm kStable。
-    for (uint16_t slot : cur) {
-        if (std::binary_search(gained.begin(), gained.end(), slot)) {
-            continue;
-        }
-        ErrorCode err = PublishStable(slot);
-        if (err != ErrorCode::OK) {
-            LOG(WARNING) << "SlotMigrator reaffirm slot " << slot
-                         << " failed: " << err;
-            last_err = err;
+    // 不变 slot：幂等 reaffirm kStable，但仅作为低频安全网（每
+    // kReaffirmIntervalCycles 个周期一次）。slot key 附着在 lease 上，
+    // keepalive 持续保活即不过期；逐周期重写等值 value 只会线性堆积 etcd
+    // MVCC revision（曾以 ~3k put/s 的速率写满 backend 配额）。正常稳态
+    // 下 lease 存活即代表所有权持续有效，无需重写。
+    constexpr uint64_t kReaffirmIntervalCycles = 12;  // ~60s @ 5s heartbeat
+    const bool do_reaffirm = (++reconcile_cycles_ % kReaffirmIntervalCycles) == 0;
+    if (do_reaffirm) {
+        for (uint16_t slot : cur) {
+            if (std::binary_search(gained.begin(), gained.end(), slot)) {
+                continue;
+            }
+            ErrorCode err = PublishStable(slot);
+            if (err != ErrorCode::OK) {
+                LOG(WARNING) << "SlotMigrator reaffirm slot " << slot
+                             << " failed: " << err;
+                last_err = err;
+            }
         }
     }
 
