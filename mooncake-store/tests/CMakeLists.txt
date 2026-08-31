@@ -37,6 +37,15 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
+add_store_test(vchunk_config_test vchunk_config_test.cpp)
+add_store_test(vchunk_metadata_test vchunk_metadata_test.cpp)
+add_store_test(vchunk_allocation_strategy_test
+               vchunk_allocation_strategy_test.cpp)
+add_store_test(vchunk_master_manager_test vchunk_master_manager_test.cpp)
+add_store_test(vchunk_master_service_test vchunk_master_service_test.cpp)
+add_store_test(vchunk_client_test vchunk_client_test.cpp)
+add_store_test(vchunk_transfer_engine_test vchunk_transfer_engine_test.cpp)
+add_store_test(vchunk_metadata_store_test vchunk_metadata_store_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
   NAME replica_selection_env_opt_in_test

@@ -1,0 +1,99 @@
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <ylt/util/tl/expected.hpp>
+
+#include "tenant_id.h"
+#include "types.h"
+#include "vchunk_control_plane.h"
+#include "vchunk_metadata.h"
+#include "vchunk_metrics.h"
+
+namespace mooncake {
+
+class VChunkDataPlane {
+   public:
+    virtual ~VChunkDataPlane() = default;
+    virtual ErrorCode Write(const VChunkMetadataRecord& record,
+                            const void* source, size_t length,
+                            std::chrono::steady_clock::time_point deadline) = 0;
+    virtual ErrorCode Read(const VChunkMetadataRecord& record, void* destination,
+                           size_t length,
+                           std::chrono::steady_clock::time_point deadline) = 0;
+};
+
+class VChunkLegacyPath {
+   public:
+    virtual ~VChunkLegacyPath() = default;
+    virtual ErrorCode Put(const TenantId&, const std::string&, const void*,
+                          size_t) = 0;
+    virtual ErrorCode Get(const TenantId&, const std::string&, void*, size_t) = 0;
+    virtual ErrorCode Remove(const TenantId&, const std::string&) = 0;
+};
+
+class VChunkClient {
+   public:
+    using Clock = std::chrono::steady_clock;
+    using NowMs = std::function<int64_t()>;
+
+    VChunkClient(bool enabled, MasterService& master, VChunkDataPlane& data_plane,
+                 VChunkLegacyPath& legacy, std::chrono::milliseconds timeout,
+                 NowMs now_ms,
+                 uint32_t max_retries = VChunkConfig{}.max_slice_retry,
+                 uint32_t circuit_breaker_threshold = 0,
+                 std::shared_ptr<VChunkMetrics> metrics = nullptr);
+    VChunkClient(bool enabled, VChunkControlPlane& control_plane,
+                 VChunkDataPlane& data_plane, VChunkLegacyPath& legacy,
+                 std::chrono::milliseconds timeout, NowMs now_ms,
+                 uint32_t max_retries = VChunkConfig{}.max_slice_retry,
+                 uint32_t circuit_breaker_threshold = 0,
+                 std::shared_ptr<VChunkMetrics> metrics = nullptr);
+
+    ErrorCode Put(const TenantId& tenant_id, const std::string& key,
+                  const void* source, size_t length);
+    ErrorCode Get(const TenantId& tenant_id, const std::string& key,
+                  void* destination, size_t length);
+    ErrorCode Remove(const TenantId& tenant_id, const std::string& key);
+
+    struct PutRequest {
+        std::string key;
+        const void* source{nullptr};
+        size_t length{0};
+    };
+    struct GetRequest {
+        std::string key;
+        void* destination{nullptr};
+        size_t length{0};
+    };
+
+    std::vector<ErrorCode> BatchPut(const TenantId& tenant_id,
+                                    const std::vector<PutRequest>& requests);
+    std::vector<ErrorCode> BatchGet(const TenantId& tenant_id,
+                                    const std::vector<GetRequest>& requests);
+    std::vector<ErrorCode> BatchRemove(
+        const TenantId& tenant_id, const std::vector<std::string>& keys);
+    VChunkMetricsSnapshot MetricsSnapshot() const;
+
+   private:
+    bool enabled_;
+    std::unique_ptr<VChunkControlPlane> owned_control_plane_;
+    VChunkControlPlane* control_plane_;
+    VChunkDataPlane& data_plane_;
+    VChunkLegacyPath& legacy_;
+    std::chrono::milliseconds timeout_;
+    NowMs now_ms_;
+    uint32_t max_retries_;
+    uint32_t circuit_breaker_threshold_;
+    std::atomic<uint32_t> consecutive_put_failures_{0};
+    std::shared_ptr<VChunkMetrics> metrics_;
+};
+
+}  // namespace mooncake

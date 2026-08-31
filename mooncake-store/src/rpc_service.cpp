@@ -8,6 +8,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "common.h"
 #include "ha_metric_manager.h"
 #include "master_admin_service.h"
 #include "master_metric_manager.h"
@@ -544,6 +545,81 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                      << (result.has_value() ? "ok" : toString(result.error()));
     }
     return result;
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode>
+WrappedMasterService::VChunkPutStart(const std::string& tenant_id,
+                                     const std::string& key,
+                                     uint64_t total_size, int64_t now_ms) {
+    return WithRequestTenant(
+        tenant_id,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.VChunkPutStart(resolved_tenant_id, key,
+                                                  total_size, false, now_ms);
+        });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutEnd(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& vchunk_id, int64_t now_ms) {
+    return WithRequestTenant(
+        tenant_id,
+        [&](const TenantId& resolved_tenant_id) {
+            const auto error = master_service_.VChunkPutEnd(
+                resolved_tenant_id, key, vchunk_id, now_ms);
+            return error == ErrorCode::OK
+                       ? tl::expected<void, ErrorCode>{}
+                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
+        });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutRevoke(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& vchunk_id) {
+    return WithRequestTenant(
+        tenant_id,
+        [&](const TenantId& resolved_tenant_id) {
+            const auto error = master_service_.VChunkPutRevoke(
+                resolved_tenant_id, key, vchunk_id);
+            return error == ErrorCode::OK
+                       ? tl::expected<void, ErrorCode>{}
+                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
+        });
+}
+
+tl::expected<VChunkReadLease, ErrorCode> WrappedMasterService::GetVChunk(
+    const std::string& tenant_id, const std::string& key) {
+    return WithRequestTenant(
+        tenant_id,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.AcquireVChunkReadLease(
+                resolved_tenant_id, key, getCurrentTimeInMilli());
+        });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ReleaseVChunkReadLease(
+    const std::string& lease_id) {
+    const auto error = master_service_.ReleaseVChunkReadLease(lease_id);
+    return error == ErrorCode::OK
+               ? tl::expected<void, ErrorCode>{}
+               : tl::expected<void, ErrorCode>{tl::unexpected(error)};
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::RemoveVChunk(
+    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
+    return WithRequestTenant(
+        tenant_id,
+        [&](const TenantId& resolved_tenant_id) {
+            const auto error = master_service_.RemoveVChunk(
+                resolved_tenant_id, key, now_ms);
+            return error == ErrorCode::OK
+                       ? tl::expected<void, ErrorCode>{}
+                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
+        });
+}
+
+VChunkRuntimeInfo WrappedMasterService::GetVChunkRuntimeInfo() {
+    return master_service_.GetVChunkRuntimeInfo();
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
@@ -1995,6 +2071,22 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VChunkPutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VChunkPutEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VChunkPutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetVChunk>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReleaseVChunkReadLease>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveVChunk>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetVChunkRuntimeInfo>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);

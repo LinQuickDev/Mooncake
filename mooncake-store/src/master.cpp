@@ -469,6 +469,27 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     // Initialize the master service configuration from the default config
     default_config.GetBool("enable_cxl", &master_config.enable_cxl,
                            FLAGS_enable_cxl);
+    default_config.GetBool("enable_vchunk",
+                           &master_config.vchunk_config.enabled, false);
+    default_config.GetString("vchunk_etcd_endpoints",
+                             &master_config.vchunk_etcd_endpoints, "");
+    default_config.GetUInt64(
+        "vchunk_creating_timeout_ms",
+        &master_config.vchunk_config.creating_timeout_ms, 30'000);
+    default_config.GetUInt64(
+        "vchunk_releasing_timeout_ms",
+        &master_config.vchunk_config.releasing_timeout_ms, 60'000);
+    default_config.GetUInt32("vchunk_max_slice_retry",
+                             &master_config.vchunk_config.max_slice_retry, 3);
+    default_config.GetUInt32("vchunk_max_slice_count",
+                             &master_config.vchunk_config.max_slice_count,
+                             4096);
+    default_config.GetUInt64("vchunk_max_metadata_bytes",
+                             &master_config.vchunk_config.max_metadata_bytes,
+                             1024U * 1024U);
+    default_config.GetUInt32(
+        "vchunk_max_creating_objects",
+        &master_config.vchunk_config.max_creating_objects, 1024);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,

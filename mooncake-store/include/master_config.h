@@ -3,11 +3,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
 #include "config_helper.h"
 #include "types.h"
+#include "vchunk_config.h"
+#include "vchunk_metadata_store.h"
 
 namespace mooncake {
 
@@ -139,6 +142,8 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
@@ -268,6 +273,8 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     bool strict_replica_allocation = false;
@@ -431,6 +438,10 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
+                                     ? config.etcd_endpoints
+                                     : config.vchunk_etcd_endpoints;
 
         pod_name = config.pod_name;
         pod_namespace = config.pod_namespace;
@@ -596,6 +607,8 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -714,6 +727,10 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
+                                     ? config.etcd_endpoints
+                                     : config.vchunk_etcd_endpoints;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -808,6 +825,8 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
     }
 };
 
@@ -876,6 +895,8 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+    VChunkConfig vchunk_config_{};
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -1017,6 +1038,17 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
         enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_vchunk_config(VChunkConfig config) {
+        vchunk_config_ = std::move(config);
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_vchunk_metadata_store(
+        std::shared_ptr<VChunkMetadataStore> store) {
+        vchunk_metadata_store_ = std::move(store);
         return *this;
     }
 
@@ -1274,6 +1306,9 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -1366,6 +1401,12 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
+        if (vchunk_config.enabled && !vchunk_etcd_endpoints.empty()) {
+            vchunk_metadata_store = std::make_shared<EtcdVChunkMetadataStore>(
+                vchunk_etcd_endpoints, vchunk_config, cluster_id);
+        }
     }
 
     // Static factory method to create a builder
@@ -1432,6 +1473,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
     return config;
 }
 

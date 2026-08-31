@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -36,6 +37,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "vchunk_master_manager.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -241,6 +243,29 @@ class MasterService {
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
+        const TenantId& tenant_id, const std::string& key,
+        uint64_t total_size, bool is_ssd_segment, int64_t now_ms,
+        const std::set<std::string>& excluded_segments = {});
+    ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
+                           const std::string& vchunk_id, int64_t now_ms);
+    ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
+                              const std::string& key,
+                              const std::string& vchunk_id);
+    tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
+        const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
+        const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<VChunkReadLease, ErrorCode> AcquireVChunkReadLease(
+        const TenantId& tenant_id, const std::string& key, int64_t now_ms);
+    ErrorCode ReleaseVChunkReadLease(const std::string& lease_id);
+    ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
+                           int64_t now_ms);
+    VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
+    tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
+                                                       size_t max_scan);
+    VChunkMetricsSnapshot GetVChunkMetrics() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -2294,6 +2319,7 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                              const TenantId& tenant_id);
+    bool OwnsVChunkSlot(uint16_t slot) const;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
@@ -2340,6 +2366,24 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
+    VChunkMasterManager vchunk_manager_;
+    bool vchunk_enabled_{false};
+    uint64_t vchunk_reaper_interval_ms_{1000};
+    size_t vchunk_reaper_max_scan_{128};
+    std::atomic<bool> vchunk_reaper_running_{false};
+    bool vchunk_recovery_pending_{false};
+    struct VChunkRemoteReadLease {
+        VChunkMasterManager::ReadHandle handle;
+        int64_t expires_at_ms{0};
+    };
+    std::mutex vchunk_read_leases_mutex_;
+    std::unordered_map<std::string, VChunkRemoteReadLease>
+        vchunk_read_leases_;
+    std::thread vchunk_reaper_thread_;
+    std::mutex vchunk_reaper_mutex_;
+    std::condition_variable vchunk_reaper_cv_;
+    void StartVChunkReaper();
+    void VChunkReaperThreadFunc();
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

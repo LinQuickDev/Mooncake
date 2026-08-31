@@ -65,3 +65,10 @@ if(STORE_USE_ETCD)
     oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
                               JsonCpp::JsonCpp)
 endif()
+
+if(STORE_USE_ETCD)
+  add_executable(vchunk_distributed_bench vchunk_distributed_bench.cpp)
+  target_link_libraries(
+    vchunk_distributed_bench PRIVATE mooncake_store transfer_engine asio_shared
+                                     gflags::gflags glog::glog pthread)
+endif()

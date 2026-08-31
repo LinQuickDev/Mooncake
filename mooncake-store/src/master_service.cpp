@@ -213,6 +213,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
+      vchunk_manager_(config.vchunk_config, config.vchunk_metadata_store),
+      vchunk_enabled_(config.vchunk_config.enabled),
+      vchunk_reaper_interval_ms_(config.vchunk_config.reaper_interval_ms),
+      vchunk_reaper_max_scan_(config.vchunk_config.reaper_max_scan),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
@@ -235,6 +239,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
+    const bool partitioned_vchunk =
+        config.vchunk_config.enabled && config.enable_ha &&
+        config.ha_backend_type == "etcd" && config.submaster_count > 1;
+    if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
+        if (partitioned_vchunk) {
+            vchunk_recovery_pending_ = true;
+        } else {
+            const auto error =
+                vchunk_manager_.Recover(getCurrentTimeInMilli());
+            if (error != ErrorCode::OK) {
+                throw std::runtime_error("failed to recover vchunk metadata");
+            }
+        }
+    }
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -542,6 +560,178 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+    if (vchunk_enabled_ && !vchunk_recovery_pending_) {
+        StartVChunkReaper();
+    }
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
+    const TenantId& tenant_id, const std::string& key, uint64_t total_size,
+    bool is_ssd_segment, int64_t now_ms,
+    const std::set<std::string>& excluded_segments) {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.PutStart(allocator_access.getAllocatorManager(),
+                                    tenant_id, key, total_size,
+                                    is_ssd_segment, now_ms,
+                                    excluded_segments);
+}
+
+ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      const std::string& vchunk_id,
+                                      int64_t now_ms) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return ErrorCode::SLOT_NOT_OWNED;
+    }
+    return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+}
+
+ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,
+                                         const std::string& key,
+                                         const std::string& vchunk_id) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return ErrorCode::SLOT_NOT_OWNED;
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.PutRevoke(tenant_id, key, vchunk_id);
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::GetVChunk(
+    const TenantId& tenant_id, const std::string& key) const {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+    return vchunk_manager_.Get(tenant_id, key);
+}
+
+tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
+MasterService::AcquireVChunkRead(const TenantId& tenant_id,
+                                 const std::string& key) const {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+    return vchunk_manager_.AcquireRead(tenant_id, key);
+}
+
+tl::expected<VChunkReadLease, ErrorCode>
+MasterService::AcquireVChunkReadLease(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      int64_t now_ms) {
+    constexpr int64_t kRemoteReadLeaseTtlMs = 5 * 60 * 1000;
+    if (now_ms < 0 ||
+        now_ms > std::numeric_limits<int64_t>::max() -
+                     kRemoteReadLeaseTtlMs) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto handle = AcquireVChunkRead(tenant_id, key);
+    if (!handle) {
+        return tl::make_unexpected(handle.error());
+    }
+    VChunkReadLease lease{handle->record(), UuidToString(generate_uuid())};
+    {
+        std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+        vchunk_read_leases_.emplace(
+            lease.lease_id,
+            VChunkRemoteReadLease{std::move(*handle),
+                                  now_ms + kRemoteReadLeaseTtlMs});
+    }
+    return lease;
+}
+
+ErrorCode MasterService::ReleaseVChunkReadLease(
+    const std::string& lease_id) {
+    if (lease_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+    vchunk_read_leases_.erase(lease_id);
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      int64_t now_ms) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return ErrorCode::SLOT_NOT_OWNED;
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.Remove(tenant_id, key, now_ms);
+}
+
+VChunkRuntimeInfo MasterService::GetVChunkRuntimeInfo() const {
+    return {vchunk_enabled_, vchunk_manager_.HasPersistentMetadata()};
+}
+
+tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
+    int64_t now_ms, size_t max_scan) {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    {
+        std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+        std::erase_if(vchunk_read_leases_, [now_ms](const auto& item) {
+            return item.second.expires_at_ms <= now_ms;
+        });
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.ReapExpired(
+        now_ms, max_scan, [this](const VChunkMetadataRecord& record) {
+            return OwnsVChunkSlot(
+                cvm::KeySlot(TenantId(record.tenant_id), record.key));
+        });
+}
+
+VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
+    return vchunk_manager_.MetricsSnapshot();
+}
+
+void MasterService::VChunkReaperThreadFunc() {
+    std::unique_lock<std::mutex> lock(vchunk_reaper_mutex_);
+    while (vchunk_reaper_running_) {
+        if (vchunk_reaper_cv_.wait_for(
+                lock, std::chrono::milliseconds(vchunk_reaper_interval_ms_),
+                [this] { return !vchunk_reaper_running_.load(); })) {
+            break;
+        }
+        lock.unlock();
+        const auto result = ReapExpiredVChunks(getCurrentTimeInMilli(),
+                                               vchunk_reaper_max_scan_);
+        if (!result) {
+            LOG(ERROR) << "vchunk reaper failed, error="
+                       << static_cast<int>(result.error());
+        }
+        lock.lock();
+    }
+}
+
+void MasterService::StartVChunkReaper() {
+    bool expected = false;
+    if (!vchunk_reaper_running_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    vchunk_reaper_thread_ =
+        std::thread(&MasterService::VChunkReaperThreadFunc, this);
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -614,6 +804,23 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
 
     if (slot_owner_heartbeat_) {
         return ErrorCode::OK;  // already running
+    }
+
+    const auto initial_slots = ResolveOwnedSlotsForCvm();
+    UpdateOwnedSlots(initial_slots);
+    if (vchunk_recovery_pending_) {
+        const auto error = vchunk_manager_.Recover(
+            getCurrentTimeInMilli(), [this](const VChunkMetadataRecord& record) {
+                return OwnsVChunkSlot(
+                    cvm::KeySlot(TenantId(record.tenant_id), record.key));
+            });
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to recover owned vchunk metadata: "
+                       << static_cast<int>(error);
+            return error;
+        }
+        vchunk_recovery_pending_ = false;
+        StartVChunkReaper();
     }
 
     cvm::SlotOwnerHeartbeat::Config hb_config;
@@ -1347,6 +1554,16 @@ bool MasterService::OwnsSlot(uint16_t slot) const {
     return slot < owned_slot_lookup_.size() && owned_slot_lookup_[slot];
 }
 
+bool MasterService::OwnsVChunkSlot(uint16_t slot) const {
+    std::shared_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    if (!owned_slots_ready_) {
+        const bool partitioned = enable_ha_ && ha_backend_type_ == "etcd" &&
+                                 submaster_count_ > 1;
+        return !partitioned;
+    }
+    return slot < owned_slot_lookup_.size() && owned_slot_lookup_[slot];
+}
+
 MasterService::~MasterService() {
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
@@ -1368,6 +1585,7 @@ MasterService::~MasterService() {
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
+    vchunk_reaper_running_ = false;
     graceful_unmount_scheduler_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -1376,6 +1594,7 @@ MasterService::~MasterService() {
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
+    vchunk_reaper_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -1396,6 +1615,9 @@ MasterService::~MasterService() {
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
+    }
+    if (vchunk_reaper_thread_.joinable()) {
+        vchunk_reaper_thread_.join();
     }
 
     // Reset snapshot manager after all other threads have joined
