@@ -38,6 +38,16 @@ target_link_libraries(
   stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
                                gflags::gflags glog::glog pthread)
 
+# Benchmark for vLLM Store Connector path
+# Triggers: batch_put_from_multi_buffers / batchIsExist /
+# batch_get_into_multi_buffers (and setup/register_buffer/tearDownAll).
+# Used to verify SpDiag perf points and MC_LOG logging.
+add_executable(store_connector_bench store_connector_bench.cpp)
+target_link_libraries(
+  store_connector_bench PRIVATE mooncake_store transfer_engine asio_shared
+                                 gflags::gflags glog::glog pthread)
+
+
 # Benchmark for RealClient::get_into_ranges with configurable value size,
 # fragments per key and keys per query.
 add_executable(stress_cluster_ranges_bench stress_cluster_ranges_bench.cpp)

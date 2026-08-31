@@ -179,3 +179,38 @@ PERF_KEY_DEF(MASTER_BG_DISCARD_EXPIRED,   "master_service.cpp::EvictionThreadFun
 PERF_KEY_DEF(MASTER_BG_SNAPSHOT_PERSIST,  "master_service.cpp::SnapshotThreadFunc",  "SnapshotPersist")
 PERF_KEY_DEF(MASTER_BG_CLIENT_MONITOR,    "master_service.cpp::ClientMonitorFunc",   "ClientMonitorScan")
 PERF_KEY_DEF(MASTER_BG_CLIENT_UNMOUNT,    "master_service.cpp::ClientMonitorFunc",   "ExpiredClientUnmount")
+
+// ============================================================
+// === vLLM MooncakeStoreConnector 路径打点（vllm 0.26.1rc0）===
+// === 覆盖 S2-S9 入口 + T1-T8 下沉 + Client 服务层          ===
+// ============================================================
+
+// === store_py.cpp Python 绑定层（vllm 直接调用入口，S2-S9）===
+PERF_KEY_DEF(STORE_PY_SETUP,                    "store_py.cpp::setup",                        "Setup")
+PERF_KEY_DEF(STORE_PY_REGISTER_BUFFER,          "store_py.cpp::register_buffer",             "RegisterBuffer")
+PERF_KEY_DEF(STORE_PY_BATCH_PUT_MULTI,          "store_py.cpp::batch_put_from_multi_buffers","BatchPutMultiBuf")
+PERF_KEY_DEF(STORE_PY_BATCH_GET_INTO_MULTI,     "store_py.cpp::batch_get_into_multi_buffers","BatchGetIntoMultiBuf")
+PERF_KEY_DEF(STORE_PY_BATCH_IS_EXIST,           "store_py.cpp::batch_is_exist",              "BatchIsExist")
+PERF_KEY_DEF(STORE_PY_BATCH_GET_REPLICA_DESC,   "store_py.cpp::batch_get_replica_desc",      "BatchGetReplicaDesc")
+PERF_KEY_DEF(STORE_PY_REMOVE_ALL,               "store_py.cpp::remove_all",                  "RemoveAll")
+PERF_KEY_DEF(STORE_PY_CLOSE,                    "store_py.cpp::close",                       "Close")
+
+// === RealClient 核心逻辑层（下沉路径，T1-T8）===
+PERF_KEY_DEF(RC_SETUP_REAL,                     "real_client.cpp::setup_real",               "SetupReal")
+PERF_KEY_DEF(RC_SETUP_INTERNAL,                 "real_client.cpp::setup_internal",            "SetupInternal")
+PERF_KEY_DEF(RC_TEARDOWN_ALL,                   "real_client.cpp::tearDownAll",              "TeardownAll")
+PERF_KEY_DEF(RC_TEARDOWN_ALL_INTERNAL,          "real_client.cpp::tearDownAll_internal",    "TeardownAllInternal")
+PERF_KEY_DEF(RC_REMOVE_ALL,                     "real_client.cpp::removeAll",                "RemoveAll")
+PERF_KEY_DEF(RC_REMOVE_ALL_INTERNAL,            "real_client.cpp::removeAll_internal",       "RemoveAllInternal")
+PERF_KEY_DEF(RC_BATCH_IS_EXIST,                 "real_client.cpp::batchIsExist",             "BatchIsExist")
+PERF_KEY_DEF(RC_BATCH_IS_EXIST_INTERNAL,        "real_client.cpp::batchIsExist_internal",    "BatchIsExistInternal")
+PERF_KEY_DEF(RC_REGISTER_BUFFER,                "real_client.cpp::register_buffer",          "RegisterBuffer")
+PERF_KEY_DEF(RC_REGISTER_BUFFER_INTERNAL,       "real_client.cpp::register_buffer_internal","RegisterBufferInternal")
+PERF_KEY_DEF(RC_BATCH_PUT_MULTI,                "real_client.cpp::batch_put_from_multi_buffers",        "BatchPutMultiBuf")
+PERF_KEY_DEF(RC_BATCH_PUT_MULTI_INTERNAL,       "real_client.cpp::batch_put_from_multi_buffers_internal","BatchPutMultiBufInternal")
+PERF_KEY_DEF(RC_BATCH_GET_INTO_MULTI,           "real_client.cpp::batch_get_into_multi_buffers",        "BatchGetIntoMultiBuf")
+PERF_KEY_DEF(RC_BATCH_GET_INTO_MULTI_INTERNAL,  "real_client.cpp::batch_get_into_multi_buffers_internal","BatchGetIntoMultiBufInternal")
+PERF_KEY_DEF(RC_BATCH_GET_REPLICA_DESC,         "real_client.cpp::batch_get_replica_desc",   "BatchGetReplicaDesc")
+
+// === Client 服务层（vllm 路径下沉，部分已有打点）===
+PERF_KEY_DEF(CLIENT_BATCH_QUERY,                "client_service.cpp::BatchQuery",            "BatchQuery")
