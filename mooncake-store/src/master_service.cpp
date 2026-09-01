@@ -1840,7 +1840,27 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    // 幂等重挂载（segment 已存在）同样要把 client 标记为 OK：Ping 仅凭
+    // ok_client_ 判定 client_status，若此处不标记，HeartbeatAllSubmasters
+    // 收到 NEED_REMOUNT 后用普通 mount 重挂永远无法消除该状态，形成
+    // 每秒一次的 remount 死循环（并持续写 OpLog/segment_view）。
+    // 注意：必须在 segment 访问释放之后再加 client_mutex_，避免与
+    // ClientMonitorFunc 的 client_mutex_ -> segment access 加锁顺序倒挂。
+    if (mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        if (ok_client_.find(client_id) == ok_client_.end()) {
+            ok_client_.insert(client_id);
+            MasterMetricManager::instance().inc_active_clients();
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=mount_segment_idempotent_ok"
+                      << ", segment_name=" << segment.name;
+        }
+    }
+
+    // 幂等重挂载不产生新的元数据变更，segment 首次挂载时已记录
+    // SEGMENT_MOUNT OpLog，重复追加只会让 OpLog 无谓增长。
+    if (enable_oplog_ && ordered_oplog_writer_ &&
+        mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
         SegmentMountOp op;
         op.segment_name = segment.name;
         op.transport_endpoint = segment.te_endpoint;
