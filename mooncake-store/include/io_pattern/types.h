@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "tenant_id.h"
@@ -66,7 +67,7 @@ struct InferenceMetrics {
     uint32_t layout_group{0};
     uint32_t prefix_depth{0};
     uint32_t prefix_fanout{0};
-    uint32_t match_length{0};
+    uint32_t match_length{0};  // tokens/blocks, as defined by the connector
     uint32_t continuous_prefix_length{0};
     uint32_t token_count{0};
     float recompute_cost{0.0F};
@@ -75,7 +76,7 @@ struct InferenceMetrics {
 
 struct AccessRecord {
     ObjectRef object;
-    uint64_t observed_at_ns{0};
+    uint64_t observed_at_ns{0};  // monotonic nanoseconds
     uint64_t block_size{0};
     uint64_t latency_us{0};
     CacheTier tier{CacheTier::kL2Segment};
@@ -212,5 +213,35 @@ struct AdmissionResult {
     AdmissionDecision decision{AdmissionDecision::kDefer};
     float confidence{0.0F};
 };
+
+struct CacheViewEntry {
+    ObjectRef object;
+    CacheTier tier{CacheTier::kL2Segment};
+    uint64_t bytes{0};
+};
+
+struct CacheView {
+    uint64_t version{0};
+    std::vector<CacheViewEntry> entries;
+};
+
+using KVMappingTable = std::vector<CacheViewEntry>;
+
+enum class CacheEventType : uint8_t {
+    kUnknown,
+    kInserted,
+    kRemoved,
+    kTierChanged,
+};
+
+struct CacheEvent {
+    CacheEventType type{CacheEventType::kUnknown};
+    ObjectRef object;
+    CacheTier source_tier{CacheTier::kL2Segment};
+    CacheTier target_tier{CacheTier::kL2Segment};
+};
+
+using PolicyCommand =
+    std::variant<EvictionPlan, PrefetchPlan, AdmissionResult>;
 
 }  // namespace mooncake::io_pattern

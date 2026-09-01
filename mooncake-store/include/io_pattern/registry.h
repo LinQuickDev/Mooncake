@@ -20,6 +20,7 @@ class OpsRegistry {
    public:
     using Factory = std::function<std::shared_ptr<Ops>()>;
 
+    // Registration is thread-safe; duplicate names are rejected.
     bool Register(std::string name, Factory factory) {
         if (name.empty() || !factory) {
             return false;
