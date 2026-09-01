@@ -51,6 +51,14 @@ class EtcdViewStore {
     static ErrorCode SaveSlotOwnerWithLease(const std::string& cluster_namespace,
                                             const SlotOwner& owner,
                                             EtcdLeaseId lease_id);
+    // Batch variant: writes many slot owners in chunks (each chunk a single
+    // etcd txn, all bound to lease_id). Speeds up bulk acquisition (e.g. cold
+    // start / node add) that would otherwise issue one RPC per slot. Falls back
+    // to per-slot puts within a chunk if the txn fails; returns an error only
+    // if a final per-slot put fails.
+    static ErrorCode SaveSlotOwnersWithLease(
+        const std::string& cluster_namespace,
+        const std::vector<SlotOwner>& owners, EtcdLeaseId lease_id);
     static ErrorCode DeleteSlotOwner(const std::string& cluster_namespace,
                                      uint16_t slot);
     static ErrorCode DeleteSlotOwnerIfOwnedBy(

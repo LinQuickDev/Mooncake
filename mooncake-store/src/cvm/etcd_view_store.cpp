@@ -1,5 +1,6 @@
 #include "cvm/etcd_view_store.h"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <sstream>
@@ -201,6 +202,52 @@ ErrorCode EtcdViewStore::SaveSlotOwnerWithLease(
     }
     return EtcdHelper::PutWithLease(key.data(), key.size(), value.data(),
                                     value.size(), lease_id);
+}
+
+ErrorCode EtcdViewStore::SaveSlotOwnersWithLease(
+    const std::string& cluster_namespace,
+    const std::vector<SlotOwner>& owners, EtcdLeaseId lease_id) {
+    // etcd 默认单事务操作数上限为 128，因此按 128 个/批分块，每批一次事务写。
+    constexpr size_t kTxnOpLimit = 128;
+    for (size_t i = 0; i < owners.size(); i += kTxnOpLimit) {
+        const size_t n = std::min(kTxnOpLimit, owners.size() - i);
+        std::vector<std::string> keys;
+        std::vector<std::string> values;
+        keys.reserve(n);
+        values.reserve(n);
+        bool serialize_ok = true;
+        for (size_t j = 0; j < n; ++j) {
+            const SlotOwner& owner = owners[i + j];
+            keys.push_back(SlotOwnerKey(cluster_namespace, owner.slot));
+            std::string value;
+            if (SerializeSlotOwner(owner, value) != ErrorCode::OK) {
+                serialize_ok = false;
+                break;
+            }
+            values.push_back(std::move(value));
+        }
+        if (!serialize_ok) {
+            return ErrorCode::SERIALIZE_FAIL;
+        }
+        ErrorCode err = EtcdHelper::BatchPutWithLease(keys, values, lease_id);
+        if (err == ErrorCode::OK) {
+            continue;
+        }
+        // 某批事务失败：退化为逐条写，避免整批丢弃。仍失败则上抛。
+        LOG(WARNING) << "SaveSlotOwnersWithLease batch of " << n
+                     << " failed: " << err << ", falling back per-slot";
+        for (size_t j = 0; j < n; ++j) {
+            err = EtcdHelper::PutWithLease(keys[j].data(), keys[j].size(),
+                                           values[j].data(), values[j].size(),
+                                           lease_id);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "SaveSlotOwnersWithLease per-slot put failed for "
+                           << keys[j] << ": " << err;
+                return err;
+            }
+        }
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode EtcdViewStore::DeleteSlotOwner(const std::string& cluster_namespace,

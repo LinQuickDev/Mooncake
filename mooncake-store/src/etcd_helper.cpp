@@ -154,6 +154,50 @@ ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdHelper::BatchPutWithLease(const std::vector<std::string>& keys,
+                                        const std::vector<std::string>& values,
+                                        EtcdLeaseId lease_id) {
+    if (keys.size() != values.size()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (keys.empty()) {
+        return ErrorCode::OK;
+    }
+
+    std::vector<char*> c_keys;
+    std::vector<int> c_key_sizes;
+    std::vector<char*> c_values;
+    std::vector<int> c_value_sizes;
+    c_keys.reserve(keys.size());
+    c_key_sizes.reserve(keys.size());
+    c_values.reserve(values.size());
+    c_value_sizes.reserve(values.size());
+
+    for (const auto& key : keys) {
+        c_keys.push_back(const_cast<char*>(key.data()));
+        c_key_sizes.push_back(static_cast<int>(key.size()));
+    }
+    for (const auto& val : values) {
+        c_values.push_back(const_cast<char*>(val.data()));
+        c_value_sizes.push_back(static_cast<int>(val.size()));
+    }
+
+    char* err_msg = nullptr;
+    int ret = EtcdStoreBatchPutWithLeaseWrapper(
+        c_keys.data(), c_key_sizes.data(), c_values.data(), c_value_sizes.data(),
+        static_cast<int>(keys.size()), lease_id, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "BatchPutWithLease failed (count=" << keys.size()
+                   << ", lease=" << lease_id
+                   << "): " << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
                                        const std::vector<TxnPut>& puts,
                                        const std::vector<std::string>&
@@ -547,6 +591,16 @@ ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
                                   const std::vector<std::string>& values) {
     (void)keys;
     (void)values;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::BatchPutWithLease(const std::vector<std::string>& keys,
+                                        const std::vector<std::string>& values,
+                                        EtcdLeaseId lease_id) {
+    (void)keys;
+    (void)values;
+    (void)lease_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
