@@ -3,10 +3,11 @@
 #include <cstdint>
 
 #include "io_pattern/types.h"
-#include "types.h"
+#include "../types.h"
 
 namespace mooncake::io_pattern {
 
+// Produces an eviction plan; it does not move or delete data.
 class EvictionOps {
    public:
     virtual ~EvictionOps() = default;
@@ -15,6 +16,7 @@ class EvictionOps {
                                   uint64_t target_bytes) const = 0;
 };
 
+// Produces a prefetch plan; execution belongs to PrefetchExecutor.
 class PrefetchOps {
    public:
     virtual ~PrefetchOps() = default;
@@ -23,6 +25,7 @@ class PrefetchOps {
                                   const TraceHistory& trace) const = 0;
 };
 
+// Decides whether an object may enter a target tier.
 class AdmissionOps {
    public:
     virtual ~AdmissionOps() = default;
