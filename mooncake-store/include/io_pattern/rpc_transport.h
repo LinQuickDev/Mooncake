@@ -9,12 +9,30 @@
 #include <string>
 #include <string_view>
 #include <functional>
+#include <utility>
 #include <vector>
 
 #include "cfm_channel.h"
 #include "reporter.h"
 
 namespace mooncake::io_pattern {
+
+struct CfmReceiveResult {
+    enum class Status { kPayload, kEmpty, kError };
+
+    static CfmReceiveResult Payload(std::string payload,
+                                    uint64_t delivery_id = 0) {
+        return {.status = Status::kPayload,
+                .payload = std::move(payload),
+                .delivery_id = delivery_id};
+    }
+    static CfmReceiveResult Empty() { return {.status = Status::kEmpty}; }
+    static CfmReceiveResult Error() { return {.status = Status::kError}; }
+
+    Status status{Status::kEmpty};
+    std::string payload;
+    uint64_t delivery_id{0};
+};
 
 class CfmRpcCodec {
    public:
@@ -35,8 +53,34 @@ class CfmRpcTransport {
     virtual bool Authenticate(std::string_view token) { return token.empty(); }
     virtual bool Send(std::string_view method, std::string_view payload,
                       std::chrono::milliseconds timeout) = 0;
-    virtual std::optional<std::string> Receive(
+    virtual CfmReceiveResult Receive(
         std::string_view method, std::chrono::milliseconds timeout) = 0;
+    virtual bool Acknowledge(uint64_t delivery_id, bool success,
+                             std::chrono::milliseconds timeout) = 0;
+};
+
+// Production CFM transport over Mooncake's existing coro_rpc connection pool.
+// It targets the CFM handlers registered on the Master RPC service.
+class CoroRpcCfmTransport final : public CfmRpcTransport {
+   public:
+    CoroRpcCfmTransport(std::string endpoint, std::string node_id,
+                        std::chrono::milliseconds default_timeout =
+                            std::chrono::milliseconds(500));
+    ~CoroRpcCfmTransport() override;
+
+    bool Authenticate(std::string_view token) override;
+    bool Send(std::string_view method, std::string_view payload,
+              std::chrono::milliseconds timeout) override;
+    CfmReceiveResult Receive(
+        std::string_view method, std::chrono::milliseconds timeout) override;
+    bool Acknowledge(uint64_t delivery_id, bool success,
+                     std::chrono::milliseconds timeout) override;
+    bool EnqueuePolicy(std::string_view node_id, std::string_view payload,
+                       std::chrono::milliseconds timeout);
+
+   private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 struct CfmRpcConfig {
@@ -58,8 +102,12 @@ class InProcessCfmRpcTransport final : public CfmRpcTransport {
     bool Authenticate(std::string_view token) override;
     bool Send(std::string_view method, std::string_view payload,
               std::chrono::milliseconds timeout) override;
-    std::optional<std::string> Receive(
+    CfmReceiveResult Receive(
         std::string_view method, std::chrono::milliseconds timeout) override;
+    bool Acknowledge(uint64_t, bool,
+                     std::chrono::milliseconds) override {
+        return true;
+    }
 
     void EnqueuePolicy(std::string payload);
     void SetSendHandler(SendHandler handler);
@@ -82,7 +130,8 @@ class CfmRpcChannel final : public CfmChannel {
           config_(config) {}
 
     bool SendSnapshot(const IoPatternSnapshot& snapshot) override;
-    std::optional<PolicyCommand> PollPolicy() override;
+    CfmPollResult PollPolicyResult() override;
+    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override;
     ErrorCode ExecutePrefetch(const PrefetchPlan& plan) override;
     bool SendMetricBatch(const MetricBatch& batch);
 
@@ -105,7 +154,8 @@ class CfmChannelPool final : public CfmChannel {
         : channels_(std::move(channels)) {}
 
     bool SendSnapshot(const IoPatternSnapshot& snapshot) override;
-    std::optional<PolicyCommand> PollPolicy() override;
+    CfmPollResult PollPolicyResult() override;
+    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override;
     ErrorCode ExecutePrefetch(const PrefetchPlan& plan) override;
 
    private:

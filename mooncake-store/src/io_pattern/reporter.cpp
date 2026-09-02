@@ -19,13 +19,7 @@ void IoPatternReporter::Start() {
     worker_ = std::thread([this] {
         std::unique_lock lock(mutex_);
         while (running_) {
-            const size_t size = batch_.inference.size() + batch_.accesses.size() +
-                                batch_.storage.size();
-            const auto interval =
-                (capacity_ == 0 || size * 2 >= capacity_)
-                    ? std::chrono::milliseconds(100)
-                    : (size == 0 ? std::chrono::milliseconds(1000)
-                                 : std::chrono::milliseconds(500));
+            const auto interval = RecommendedFlushIntervalLocked();
             condition_.wait_for(lock, interval, [this] { return !running_; });
             if (!running_) break;
             lock.unlock();
@@ -131,13 +125,25 @@ uint64_t IoPatternReporter::reported() const {
 
 std::chrono::milliseconds IoPatternReporter::RecommendedFlushInterval() const {
     std::lock_guard lock(mutex_);
-    const size_t size = batch_.inference.size() + batch_.accesses.size() +
-                        batch_.storage.size();
-    if (capacity_ == 0 || size * 2 >= capacity_) {
-        return std::chrono::milliseconds(100);
+    return RecommendedFlushIntervalLocked();
+}
+
+void IoPatternReporter::UpdateLoad(float memory_used_ratio,
+                                   uint64_t rpc_latency_us) {
+    std::lock_guard lock(mutex_);
+    memory_used_ratio_ = memory_used_ratio;
+    rpc_latency_us_ = rpc_latency_us;
+    condition_.notify_one();
+}
+
+std::chrono::milliseconds
+IoPatternReporter::RecommendedFlushIntervalLocked() const {
+    if (memory_used_ratio_ >= 0.95F || rpc_latency_us_ > 100'000) {
+        return std::chrono::milliseconds(1000);
     }
-    if (size == 0) return std::chrono::milliseconds(1000);
-    return std::chrono::milliseconds(500);
+    if (memory_used_ratio_ >= 0.80F) return std::chrono::milliseconds(500);
+    if (memory_used_ratio_ >= 0.50F) return std::chrono::milliseconds(200);
+    return std::chrono::milliseconds(100);
 }
 
 }  // namespace mooncake::io_pattern

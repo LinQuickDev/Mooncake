@@ -46,4 +46,26 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     EXPECT_EQ(17u, config.oplog_batch_max_entries);
 }
 
+TEST(MasterServiceConfigTest, IoPatternCfmPropagatesToServingConfig) {
+    MasterConfig master_config{};
+    master_config.io_pattern_cfm = {.endpoint = "cfm.example:50051",
+                                    .node_id = "master-a",
+                                    .auth_token = "secret",
+                                    .producer_auth_token = "producer-secret",
+                                    .timeout_ms = 750,
+                                    .policy_queue_capacity = 32};
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+
+    EXPECT_EQ(service_config.io_pattern_cfm.endpoint, "cfm.example:50051");
+    EXPECT_EQ(service_config.io_pattern_cfm.node_id, "master-a");
+    EXPECT_EQ(service_config.io_pattern_cfm.auth_token, "secret");
+    EXPECT_EQ(service_config.io_pattern_cfm.producer_auth_token,
+              "producer-secret");
+    EXPECT_EQ(service_config.io_pattern_cfm.timeout_ms, 750);
+    EXPECT_EQ(service_config.io_pattern_cfm.policy_queue_capacity, 32);
+}
+
 }  // namespace mooncake::test

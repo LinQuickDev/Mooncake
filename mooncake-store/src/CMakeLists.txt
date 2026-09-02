@@ -72,6 +72,7 @@ set(MOONCAKE_STORE_SOURCES
     io_pattern/reporter.cpp
     io_pattern/cfm_client_impl.cpp
     io_pattern/cfm_ingress.cpp
+    io_pattern/cfm_service.cpp
     io_pattern/cfm_protocol.cpp
     io_pattern/resilient_cfm_channel.cpp
     io_pattern/feedback.cpp

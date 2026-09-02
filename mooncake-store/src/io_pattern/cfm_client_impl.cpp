@@ -24,8 +24,18 @@ std::optional<PolicyCommand> CfmClientImpl::PollPolicy() {
 }
 
 ErrorCode CfmClientImpl::PollAndDispatchPolicy() {
-    const auto command = PollPolicy();
-    return command ? ReceivePolicy(*command) : ErrorCode::RPC_TIMEOUT;
+    if (!channel_) return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    auto result = channel_->PollPolicyResult();
+    if (result.status == CfmPollResult::Status::kEmpty) return ErrorCode::OK;
+    if (result.status == CfmPollResult::Status::kError || !result.command) {
+        return ErrorCode::RPC_TIMEOUT;
+    }
+    const auto execution = ReceivePolicy(*result.command);
+    if (!channel_->AcknowledgePolicy(result.delivery_id,
+                                     execution == ErrorCode::OK)) {
+        return ErrorCode::RPC_FAIL;
+    }
+    return execution;
 }
 
 }  // namespace mooncake::io_pattern

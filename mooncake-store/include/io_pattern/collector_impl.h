@@ -1,8 +1,10 @@
 #pragma once
 
+#include <deque>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <memory>
 #include <utility>
 
 #include "collector.h"
@@ -17,6 +19,10 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
     struct Config {
         size_t max_keys_per_tenant{0};
         size_t max_total_keys{0};
+        uint64_t access_window_ns{60'000'000'000ULL};
+        uint64_t access_bucket_ns{1'000'000'000ULL};
+        size_t max_access_buckets_per_key{64};
+        std::function<uint64_t()> now_ns;
     };
 
     explicit IoPatternCollectorImpl(Config config = {},
@@ -47,6 +53,16 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
                    (static_cast<size_t>(key.tier) << 1);
         }
     };
+    struct AccessWindowBucket {
+        uint64_t observed_at_ns{0};
+        uint64_t access_count{0};
+        uint64_t write_count{0};
+        uint64_t overwrite_count{0};
+        uint32_t max_write_batch_size{0};
+    };
+
+    void ApplyAccessWindow(const ObjectRef& object, uint64_t now_ns,
+                           KeyMetrics& metrics) const;
 
     mutable std::mutex mutex_;
     Config config_;
@@ -54,8 +70,8 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
     uint64_t dropped_{0};
     bool degraded_{false};
     std::unordered_map<ObjectRef, KeyMetrics, ObjectRefHash> key_metrics_;
-    std::unordered_map<ObjectRef, uint64_t, ObjectRefHash> write_counts_;
-    std::unordered_map<ObjectRef, uint64_t, ObjectRefHash> overwrite_counts_;
+    std::unordered_map<ObjectRef, std::deque<AccessWindowBucket>, ObjectRefHash>
+        access_windows_;
     std::unordered_map<TenantId, size_t, TenantIdHash> tenant_key_counts_;
     std::unordered_map<StorageMetricKey, StorageMetric, StorageMetricKeyHash>
         storage_metrics_;

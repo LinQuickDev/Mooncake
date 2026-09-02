@@ -13,6 +13,7 @@
 #include "rpc_types.h"
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
+#include "io_pattern/cfm_service.h"
 #include "segment.h"
 
 namespace mooncake {
@@ -397,8 +398,11 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    io_pattern::CfmRpcService& CfmRpcEndpoint() { return cfm_rpc_service_; }
+
    private:
     MasterService master_service_;
+    io_pattern::CfmRpcService cfm_rpc_service_;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

@@ -982,7 +982,7 @@ by the Store master.
 - `IoPatternReporter` provides bounded, non-blocking batches with explicit
   report/drop counters and a transport-agnostic sink.
 - `MetricBatchTransport` defines the transport seam, and the reporter exposes
-  load-sensitive 100/500/1000 ms flush recommendations.
+  load-sensitive 100/200/500/1000 ms flush recommendations.
 - `IoPatternRuntime` wires collection, bounded analysis, policy execution,
   feedback tuning and storage handlers; `MasterService` feeds it from actual
   Get/Put/watermark paths.
@@ -1034,6 +1034,24 @@ by the Store master.
 - Analyzer execution has a single in-flight worker, timeout fallback to the
   last safe result, and an explicit key-count budget; collector key quotas and
   reporter bounds provide the associated overload/OOM protection.
+- Access and write frequencies use timestamped buckets pruned against a true
+  rolling 60-second cutoff. Sliding analysis deduplicates objects across
+  snapshots and enforces a hard total retained-key budget (including a single
+  oversized snapshot), so repeated high-watermark evaluations cannot multiply
+  complete snapshots without bound. CFM ingress rebases process-local monotonic
+  timestamps to receiver time, and each object also has a hard bucket-count cap.
+- Store-side eviction executes only the tenant-qualified objects selected by
+  the policy. The legacy `BatchEvict` path runs only when policy execution
+  fails, avoiding a second unplanned eviction pass.
+- Non-memory PUT completions enqueue bounded, asynchronous L1 retention/
+  promotion evaluation. This is a post-write cache-admission hook, not initial
+  replica placement: the existing `PutStart` contract selects and allocates
+  replicas before write metrics such as batch and overwrite are known.
+- CFM polling distinguishes a command, a healthy empty queue and a transport
+  error. Only transport errors contribute to consecutive-failure degradation.
+- Reporter intervals follow the documented memory/RPC load thresholds
+  (100/200/500/1000 ms), and in-process transport callbacks execute outside the
+  transport mutex.
 
 ## Interface decision: complete plans versus document shorthand
 
@@ -1088,10 +1106,47 @@ Registry ownership is external and thread-safe. Factories return independent
 Ops instances; callers own the returned smart pointers. Concrete storage and
 RPC resources are injected through execution handlers and CFM channels.
 
-## Known gaps
+## Production CFM wiring
 
-There are no remaining implementation gaps in the Mooncake IO Pattern scope.
-Production deployments select their network-specific `CfmRpcTransport` through
-the documented transport seam; the authenticated embedded transport is the
-reference implementation and the SGLang adapter is intentionally kept
-framework-neutral because SGLang source is not vendored in this repository.
+Master registers authenticated CFM handlers on its existing `coro_rpc` port.
+`CoroRpcCfmTransport` is the production client: metric batches are delivered to
+`CfmIngress`, while policy commands use a bounded per-node queue and are polled
+by stable `node_id`. Received commands execute through
+`IoPatternRuntime::ExecuteCommand`, preserving the same storage-safe handlers as
+local policy decisions. Every report RPC also carries that `node_id`; ingress
+uses it as the authoritative storage-metric source so central aggregation does
+not merge watermarks from different Masters.
+
+Configure a central CFM receiver with `io_pattern_cfm_auth_token`. Configure each
+reporting/policy-consuming Master with:
+
+- `io_pattern_cfm_endpoint=host:port`
+- `io_pattern_cfm_node_id=<stable unique node id>` (defaults to `cluster_id`)
+- the same `io_pattern_cfm_auth_token`
+- on the central receiver only, a distinct
+  `io_pattern_cfm_producer_auth_token` for policy producers
+- optional `io_pattern_cfm_timeout_ms` and
+  `io_pattern_cfm_policy_queue_capacity`
+
+An outbound Master authenticates during construction and fails startup if the
+configured CFM endpoint cannot be reached or rejects the token. At runtime the
+Reporter sends metric batches over the channel and a resilient poll loop
+dispatches queued policies. On the receiver, each accepted metric batch is put
+onto a bounded policy-production queue; the central runtime runs
+Collector -> Analyzer -> PolicyEngine asynchronously and automatically queues
+high-watermark eviction and trace-derived prefetch commands for the reporting
+`node_id`. An external policy producer may also call the registered
+`CfmRpcService::EnqueuePolicy` RPC with a target node id and an encoded
+`PolicyCommand`.
+
+Node credentials cannot use that explicit enqueue RPC; an external producer
+must authenticate with the separately configured producer credential. The
+server validates commands before enqueueing them, assigns a delivery id, and
+retains each command until the target node acknowledges successful execution.
+Its poll response distinguishes an authenticated empty queue from a rejected
+or invalid request, so authorization failures enter the normal degradation
+path. The configured capacity is enforced for both pending production work and
+policy delivery, with policy delivery bounded both per node and globally.
+
+The SGLang adapter remains framework-neutral because SGLang source is not
+vendored in this repository.

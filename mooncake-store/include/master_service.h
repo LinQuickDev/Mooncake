@@ -53,6 +53,9 @@
 namespace mooncake {
 
 namespace io_pattern {
+class CfmChannel;
+class CfmClientImpl;
+class CfmService;
 class IoPatternRuntime;
 }
 
@@ -436,6 +439,10 @@ class MasterService {
 
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
+
+    std::shared_ptr<io_pattern::CfmService> GetCfmService() const {
+        return io_pattern_cfm_service_;
+    }
 
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
@@ -1016,7 +1023,8 @@ class MasterService {
         uint64_t evicted_objects{0};
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes);
+        const TenantId& tenant_id, uint64_t target_bytes,
+        const std::unordered_set<std::string>* candidate_keys = nullptr);
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
@@ -1698,6 +1706,11 @@ class MasterService {
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    auto PutEndInternal(const UUID& client_id, const ObjectMeta& object_meta,
+                        const TenantId& tenant_id, ReplicaType replica_type,
+                        uint32_t write_batch_size, bool overwrite)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Helper to discard expired processing keys.
      */
@@ -2211,7 +2224,14 @@ class MasterService {
     // The IO-pattern pipeline is deliberately owned by MasterService: the
     // master has the authoritative replica map and is the only component that
     // can safely translate a policy plan into promotion/eviction operations.
-    std::unique_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
+    std::shared_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
+    std::shared_ptr<io_pattern::CfmService> io_pattern_cfm_service_;
+    std::shared_ptr<io_pattern::CfmChannel> io_pattern_cfm_channel_;
+    std::unique_ptr<io_pattern::CfmClientImpl> io_pattern_cfm_client_;
+    std::atomic<bool> io_pattern_cfm_polling_{false};
+    std::mutex io_pattern_cfm_poll_mutex_;
+    std::condition_variable io_pattern_cfm_poll_cv_;
+    std::thread io_pattern_cfm_poll_thread_;
 
     const std::string ha_backend_type_;
 

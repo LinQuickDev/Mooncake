@@ -46,11 +46,13 @@ class IoPatternReporter final {
     size_t pending() const;
     uint64_t dropped() const;
     uint64_t reported() const;
+    void UpdateLoad(float memory_used_ratio, uint64_t rpc_latency_us);
     std::chrono::milliseconds RecommendedFlushInterval() const;
 
    private:
     bool EnqueueImpl(std::function<void(MetricBatch&)> append,
                      const TenantId& tenant);
+    std::chrono::milliseconds RecommendedFlushIntervalLocked() const;
 
     const size_t capacity_;
     const MetricBatchSink sink_;
@@ -62,6 +64,8 @@ class IoPatternReporter final {
     std::condition_variable condition_;
     std::thread worker_;
     bool running_{false};
+    float memory_used_ratio_{0.0F};
+    uint64_t rpc_latency_us_{0};
     std::unordered_map<TenantId, size_t, TenantIdHash> tenant_pending_;
 };
 

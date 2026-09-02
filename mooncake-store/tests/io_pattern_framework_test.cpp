@@ -3,12 +3,16 @@
 #include "io_pattern/policy_strategies.h"
 
 #include <memory>
+#include <chrono>
+#include <future>
+#include <thread>
 #include <type_traits>
 #include <variant>
 #include <vector>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake::io_pattern {
 namespace {
@@ -109,12 +113,23 @@ class TestCfmChannel final : public CfmChannel {
         snapshot = value;
         return send_ok;
     }
-    std::optional<PolicyCommand> PollPolicy() override { return policy; }
+    CfmPollResult PollPolicyResult() override {
+        return policy ? CfmPollResult::Command(*policy, 42)
+                      : CfmPollResult::Empty();
+    }
+    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override {
+        acknowledged_delivery_id = delivery_id;
+        acknowledged_success = success;
+        return acknowledge_ok;
+    }
     ErrorCode ExecutePrefetch(const PrefetchPlan& value) override {
         plan = value;
         return execute_code;
     }
     bool send_ok{true};
+    bool acknowledge_ok{true};
+    bool acknowledged_success{false};
+    uint64_t acknowledged_delivery_id{0};
     ErrorCode execute_code{ErrorCode::OK};
     IoPatternSnapshot snapshot;
     std::optional<PolicyCommand> policy;
@@ -126,7 +141,9 @@ class FlakyCfmChannel final : public CfmChannel {
     bool SendSnapshot(const IoPatternSnapshot&) override {
         return send_failures-- <= 0;
     }
-    std::optional<PolicyCommand> PollPolicy() override { return PrefetchPlan{}; }
+    CfmPollResult PollPolicyResult() override {
+        return CfmPollResult::Command(PrefetchPlan{});
+    }
     ErrorCode ExecutePrefetch(const PrefetchPlan&) override {
         return ErrorCode::RPC_FAIL;
     }
@@ -142,13 +159,24 @@ class TestRpcTransport final : public CfmRpcTransport {
         last_timeout = timeout;
         return send_ok;
     }
-    std::optional<std::string> Receive(std::string_view method,
-                                       std::chrono::milliseconds timeout) override {
+    CfmReceiveResult Receive(std::string_view method,
+                             std::chrono::milliseconds timeout) override {
         last_method = std::string(method);
         last_timeout = timeout;
-        return response;
+        return response ? CfmReceiveResult::Payload(*response)
+                        : CfmReceiveResult::Empty();
+    }
+    bool Acknowledge(uint64_t delivery_id, bool success,
+                     std::chrono::milliseconds timeout) override {
+        acknowledged_delivery_id = delivery_id;
+        acknowledged_success = success;
+        last_timeout = timeout;
+        return acknowledge_ok;
     }
     bool send_ok{true};
+    bool acknowledge_ok{true};
+    bool acknowledged_success{false};
+    uint64_t acknowledged_delivery_id{0};
     std::optional<std::string> response;
     std::string last_method;
     std::string last_payload;
@@ -339,6 +367,65 @@ TEST(IoPatternFrameworkTest, CollectorImplDerivesWritePathMetrics) {
     EXPECT_TRUE(key.write_burst);
 }
 
+TEST(IoPatternFrameworkTest, CollectorImplBoundsAccessCountByTimeWindow) {
+    uint64_t now_ns = 10;
+    IoPatternCollectorImpl collector(IoPatternCollectorImpl::Config{
+        .access_window_ns = 100,
+        .access_bucket_ns = 1,
+        .now_ns = [&] { return now_ns; }});
+    AccessRecord access{.object = {TenantId("tenant-a"), "key"},
+                        .observed_at_ns = 10};
+    collector.RecordAccess(access.object.key, access);
+    access.observed_at_ns = 50;
+    collector.RecordAccess(access.object.key, access);
+    EXPECT_EQ(collector.GetSnapshot().keys.front().access_count_window, 2);
+
+    access.observed_at_ns = 111;
+    now_ns = 111;
+    collector.RecordAccess(access.object.key, access);
+    // A true sliding window retains the event at 50 even though the first
+    // event's fixed 10..110 bucket has ended.
+    EXPECT_EQ(collector.GetSnapshot().keys.front().access_count_window, 2);
+
+    now_ns = 212;
+    EXPECT_EQ(collector.GetSnapshot().keys.front().access_count_window, 0);
+}
+
+TEST(IoPatternFrameworkTest, CollectorExpiresMergedAccessWindowsLocally) {
+    uint64_t now_ns = 10;
+    IoPatternCollectorImpl collector(IoPatternCollectorImpl::Config{
+        .access_window_ns = 100,
+        .access_bucket_ns = 1,
+        .now_ns = [&] { return now_ns; }});
+    IoPatternSnapshot remote;
+    remote.keys.push_back(
+        KeyMetrics{.object = {TenantId("tenant-a"), "remote"},
+                   .access_count_window = 7,
+                   .write_frequency = 3});
+
+    collector.MergeSnapshot(remote);
+    EXPECT_EQ(collector.GetSnapshot().keys.front().access_count_window, 7);
+    now_ns = 111;
+    const auto expired = collector.GetSnapshot().keys.front();
+    EXPECT_EQ(expired.access_count_window, 0);
+    EXPECT_EQ(expired.write_frequency, 0);
+}
+
+TEST(IoPatternFrameworkTest, CollectorHardCapsBucketsForOutOfOrderInput) {
+    uint64_t now_ns = 3;
+    IoPatternCollectorImpl collector(IoPatternCollectorImpl::Config{
+        .access_window_ns = 1'000,
+        .access_bucket_ns = 1,
+        .max_access_buckets_per_key = 2,
+        .now_ns = [&] { return now_ns; }});
+    AccessRecord access{.object = {TenantId("tenant-a"), "key"}};
+    for (uint64_t timestamp : {1ULL, 2ULL, 3ULL}) {
+        access.observed_at_ns = timestamp;
+        collector.RecordAccess(access.object.key, access);
+    }
+    EXPECT_EQ(collector.GetSnapshot().keys.front().access_count_window, 2);
+}
+
 TEST(IoPatternFrameworkTest, ThresholdAnalyzerClassifiesDocumentedWorkloads) {
     ThresholdAnalyzer analyzer;
     IoPatternSnapshot code_agent;
@@ -460,6 +547,17 @@ TEST(IoPatternFrameworkTest, PrefixAdmissionUsesTierSpecificSignals) {
     const auto rejected =
         admission.Evaluate(key.object, CacheTier::kL0Hbm, context);
     EXPECT_EQ(rejected.decision, AdmissionDecision::kRejectPrefix);
+
+    context.snapshot.storage = {
+        StorageMetric{.source_id = "ssd",
+                      .tier = CacheTier::kL3NofSsd,
+                      .memory_used_ratio = 0.1F},
+        StorageMetric{.source_id = "host",
+                      .tier = CacheTier::kL1Host,
+                      .memory_used_ratio = 0.95F}};
+    EXPECT_EQ(admission.Evaluate(key.object, CacheTier::kL1Host, context)
+                  .decision,
+              AdmissionDecision::kRejectWatermark);
 }
 
 TEST(IoPatternFrameworkTest, TracePrefetchPlansOnlyLongPrefixMatches) {
@@ -667,14 +765,21 @@ TEST(IoPatternFrameworkTest, ReporterBatchesBoundsAndCountsDrops) {
 
 TEST(IoPatternFrameworkTest, ReporterAdaptsFlushIntervalToLoad) {
     IoPatternReporter reporter(4, [](const MetricBatch&) { return true; });
-    EXPECT_EQ(reporter.RecommendedFlushInterval(),
-              std::chrono::milliseconds(1000));
-    reporter.Enqueue(InferenceMetrics{});
-    EXPECT_EQ(reporter.RecommendedFlushInterval(),
-              std::chrono::milliseconds(500));
-    reporter.Enqueue(InferenceMetrics{});
+    reporter.UpdateLoad(0.25F, 0);
     EXPECT_EQ(reporter.RecommendedFlushInterval(),
               std::chrono::milliseconds(100));
+    reporter.UpdateLoad(0.50F, 0);
+    EXPECT_EQ(reporter.RecommendedFlushInterval(),
+              std::chrono::milliseconds(200));
+    reporter.UpdateLoad(0.80F, 0);
+    EXPECT_EQ(reporter.RecommendedFlushInterval(),
+              std::chrono::milliseconds(500));
+    reporter.UpdateLoad(0.95F, 0);
+    EXPECT_EQ(reporter.RecommendedFlushInterval(),
+              std::chrono::milliseconds(1000));
+    reporter.UpdateLoad(0.25F, 101'000);
+    EXPECT_EQ(reporter.RecommendedFlushInterval(),
+              std::chrono::milliseconds(1000));
 }
 
 TEST(IoPatternFrameworkTest, ReporterEnforcesPerTenantFairness) {
@@ -722,6 +827,11 @@ TEST(IoPatternFrameworkTest, CfmClientDispatchesReceivedPolicyCommands) {
     channel->policy = PolicyCommand{AdmissionResult{}};
     EXPECT_EQ(client.PollAndDispatchPolicy(), ErrorCode::OK);
     EXPECT_EQ(dispatched, 2);
+    EXPECT_EQ(channel->acknowledged_delivery_id, 42);
+    EXPECT_TRUE(channel->acknowledged_success);
+    channel->policy.reset();
+    EXPECT_EQ(client.PollAndDispatchPolicy(), ErrorCode::OK);
+    EXPECT_EQ(dispatched, 2);
 }
 
 TEST(IoPatternFrameworkTest, ResilientChannelRetriesAndTracksDegrade) {
@@ -737,6 +847,17 @@ TEST(IoPatternFrameworkTest, ResilientChannelRetriesAndTracksDegrade) {
     EXPECT_EQ(channel.ExecutePrefetch({}), ErrorCode::RPC_FAIL);
     EXPECT_EQ(channel.consecutive_failures(), 2);
     EXPECT_TRUE(channel.degraded());
+}
+
+TEST(IoPatternFrameworkTest, EmptyPolicyPollKeepsChannelHealthy) {
+    auto idle = std::make_shared<TestCfmChannel>();
+    ResilientCfmChannel channel(
+        idle, CfmRetryConfig{.max_retries = 2, .degrade_after_failures = 2});
+
+    EXPECT_FALSE(channel.PollPolicy().has_value());
+    EXPECT_FALSE(channel.PollPolicy().has_value());
+    EXPECT_EQ(channel.consecutive_failures(), 0);
+    EXPECT_FALSE(channel.degraded());
 }
 
 TEST(IoPatternFrameworkTest, ResilientAnalyzerFallsBackAfterFailure) {
@@ -853,6 +974,39 @@ TEST(IoPatternFrameworkTest, InProcessCfmTransportAuthenticatesAndDispatches) {
     EXPECT_FALSE(unauthorized.SendSnapshot({}));
 }
 
+TEST(IoPatternFrameworkTest, InProcessTransportDoesNotHoldLockAcrossHandler) {
+    std::promise<void> handler_entered;
+    std::promise<void> release_handler;
+    auto release = release_handler.get_future().share();
+    auto transport = std::make_shared<InProcessCfmRpcTransport>(
+        "shared-secret", [&](std::string_view, std::string_view) {
+            handler_entered.set_value();
+            release.wait();
+            return true;
+        });
+    ASSERT_TRUE(transport->Authenticate("shared-secret"));
+
+    std::thread sender([&] {
+        EXPECT_TRUE(transport->Send("report_snapshot", {},
+                                    std::chrono::milliseconds(10)));
+    });
+    if (handler_entered.get_future().wait_for(std::chrono::seconds(1)) !=
+        std::future_status::ready) {
+        release_handler.set_value();
+        sender.join();
+        FAIL() << "send handler did not start";
+        return;
+    }
+    auto enqueue = std::async(std::launch::async, [&] {
+        transport->EnqueuePolicy("policy");
+        return true;
+    });
+    EXPECT_EQ(enqueue.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::ready);
+    release_handler.set_value();
+    sender.join();
+}
+
 TEST(IoPatternFrameworkTest, CfmIngressFeedsRuntimeFromMetricBatches) {
     auto runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{.eviction = [](const EvictionPlan&) {
@@ -879,6 +1033,158 @@ TEST(IoPatternFrameworkTest, CfmIngressFeedsRuntimeFromMetricBatches) {
     ASSERT_EQ(snapshot.keys.size(), 1);
     EXPECT_EQ(snapshot.keys.front().session_id, "session");
     EXPECT_EQ(snapshot.keys.front().access_count_window, 1);
+}
+
+TEST(IoPatternFrameworkTest, CfmServiceAuthenticatesAndBoundsPolicyQueues) {
+    int admissions = 0;
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [&admissions](const AdmissionResult&) {
+                ++admissions;
+                return ErrorCode::OK;
+            }});
+    CfmService service(runtime, "secret", 1, "producer");
+    CfmBinaryCodec codec;
+
+    EXPECT_FALSE(service.Authenticate("wrong"));
+    EXPECT_TRUE(service.Authenticate("secret"));
+    EXPECT_FALSE(service.EnqueuePolicy("node-a", "first", "secret"));
+    const auto admission = codec.EncodePolicy(AdmissionResult{
+        .object = {TenantId("tenant"), "key"},
+        .target_tier = CacheTier::kL1Host,
+        .decision = AdmissionDecision::kAdmit});
+    const auto second = codec.EncodePolicy(PrefetchPlan{});
+    EXPECT_FALSE(service.EnqueuePolicy("node-a", "malformed", "producer"));
+    EXPECT_TRUE(service.EnqueuePolicy("node-a", admission, "producer"));
+    EXPECT_FALSE(service.EnqueuePolicy("node-a", second, "producer"));
+    const auto delivery = service.PollPolicy("node-a", "secret");
+    ASSERT_TRUE(delivery.has_value());
+    EXPECT_EQ(delivery->second, admission);
+    EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, false,
+                                         "secret"));
+    EXPECT_TRUE(service.PollPolicy("node-a", "secret").has_value());
+    EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, true,
+                                         "secret"));
+    EXPECT_FALSE(service.PollPolicy("node-a", "secret").has_value());
+
+    EXPECT_FALSE(service.Send("", "execute_policy", admission, "secret"));
+    EXPECT_FALSE(
+        service.Send("node-a", "execute_policy", admission, "secret"));
+    EXPECT_TRUE(
+        service.Send("node-a", "execute_policy", admission, "producer"));
+    EXPECT_EQ(admissions, 1);
+}
+
+TEST(IoPatternFrameworkTest, CoroRpcCfmTransportRunsTheProductionWirePath) {
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    auto service =
+        std::make_shared<CfmService>(runtime, "secret", 2, "producer");
+    CfmRpcService endpoint(service);
+    coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
+    server.register_handler<&CfmRpcService::Authenticate>(&endpoint);
+    server.register_handler<&CfmRpcService::Send>(&endpoint);
+    server.register_handler<&CfmRpcService::Receive>(&endpoint);
+    server.register_handler<&CfmRpcService::Acknowledge>(&endpoint);
+    server.register_handler<&CfmRpcService::EnqueuePolicy>(&endpoint);
+    ASSERT_FALSE(server.async_start().hasResult());
+
+    const auto rejected_poll =
+        endpoint.Receive("poll_policy", "node-a", "wrong");
+    EXPECT_FALSE(rejected_poll.first);
+    const auto empty_poll = endpoint.Receive("poll_policy", "node-a", "secret");
+    EXPECT_TRUE(empty_poll.first);
+    EXPECT_FALSE(empty_poll.second.has_value());
+
+    CoroRpcCfmTransport transport(
+        "127.0.0.1:" + std::to_string(server.port()), "node-a",
+        std::chrono::milliseconds(500));
+    EXPECT_FALSE(transport.Authenticate("wrong"));
+    ASSERT_TRUE(transport.Authenticate("secret"));
+
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "remote-key"},
+                     .is_hit = true});
+    batch.storage.push_back(StorageMetric{.source_id = "spoofed",
+                                          .tier = CacheTier::kL1Host,
+                                          .memory_used_ratio = 0.75F});
+    EXPECT_TRUE(transport.Send("report_metric_batch",
+                               codec.EncodeMetricBatch(batch),
+                               std::chrono::milliseconds(500)));
+    const auto snapshot = runtime->Snapshot();
+    ASSERT_EQ(snapshot.keys.size(), 1);
+    ASSERT_EQ(snapshot.storage.size(), 1);
+    EXPECT_EQ(snapshot.keys.front().object.key, "remote-key");
+    EXPECT_EQ(snapshot.storage.front().source_id, "node-a");
+
+    const auto policy = codec.EncodePolicy(PrefetchPlan{});
+    CoroRpcCfmTransport producer(
+        "127.0.0.1:" + std::to_string(server.port()), "producer",
+        std::chrono::milliseconds(500));
+    ASSERT_TRUE(producer.Authenticate("producer"));
+    EXPECT_TRUE(producer.EnqueuePolicy("node-a", policy,
+                                       std::chrono::milliseconds(500)));
+    const auto received =
+        transport.Receive("poll_policy", std::chrono::milliseconds(500));
+    EXPECT_EQ(received.status, CfmReceiveResult::Status::kPayload);
+    EXPECT_EQ(received.payload, policy);
+    EXPECT_NE(received.delivery_id, 0);
+    EXPECT_TRUE(transport.Acknowledge(received.delivery_id, false,
+                                      std::chrono::milliseconds(500)));
+    const auto redelivered =
+        transport.Receive("poll_policy", std::chrono::milliseconds(500));
+    EXPECT_EQ(redelivered.delivery_id, received.delivery_id);
+    EXPECT_EQ(redelivered.payload, policy);
+    EXPECT_TRUE(transport.Acknowledge(redelivered.delivery_id, true,
+                                      std::chrono::milliseconds(500)));
+    EXPECT_EQ(transport.Receive("poll_policy", std::chrono::milliseconds(500))
+                  .status,
+              CfmReceiveResult::Status::kEmpty);
+    server.stop();
+}
+
+TEST(IoPatternFrameworkTest, CfmProducesNodePolicyFromHighWatermarkReport) {
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    CfmService service(runtime, "node-secret", 8, "producer-secret");
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "cold-key"},
+                     .block_size = 1024,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = false});
+    batch.storage.push_back(StorageMetric{.tier = CacheTier::kL1Host,
+                                          .used_bytes = 950,
+                                          .capacity_bytes = 1000,
+                                          .memory_used_ratio = 0.95F});
+    ASSERT_TRUE(service.Send("node-a", "report_metric_batch",
+                             codec.EncodeMetricBatch(batch), "node-secret"));
+
+    std::optional<std::pair<uint64_t, std::string>> delivery;
+    for (size_t attempt = 0; attempt < 100 && !delivery; ++attempt) {
+        delivery = service.PollPolicy("node-a", "node-secret");
+        if (!delivery) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(delivery.has_value());
+    const auto command = codec.DecodePolicy(delivery->second);
+    ASSERT_TRUE(command.has_value());
+    const auto* eviction = std::get_if<EvictionPlan>(&*command);
+    ASSERT_NE(eviction, nullptr);
+    ASSERT_EQ(eviction->candidates.size(), 1);
+    EXPECT_EQ(eviction->candidates.front().object.key, "cold-key");
+    EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, true,
+                                         "node-secret"));
 }
 
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {
@@ -972,14 +1278,16 @@ TEST(IoPatternFrameworkTest, SlidingWindowAnalyzerComputesPercentiles) {
     SlidingWindowAnalyzer analyzer(100);
     IoPatternSnapshot first;
     first.generated_at_ns = 10;
-    first.keys.push_back(KeyMetrics{.token_count = 20 * 1024,
+    first.keys.push_back(KeyMetrics{.object = {TenantId("tenant"), "first"},
+                                    .token_count = 20 * 1024,
                                     .prefix_fanout = 20,
                                     .match_length = 512,
                                     .block_size = 100,
                                     .access_count_window = 1});
     IoPatternSnapshot second;
     second.generated_at_ns = 50;
-    second.keys.push_back(KeyMetrics{.token_count = 30,
+    second.keys.push_back(KeyMetrics{.object = {TenantId("tenant"), "second"},
+                                     .token_count = 30,
                                      .prefix_fanout = 20,
                                      .match_length = 300,
                                      .block_size = 300,
@@ -990,6 +1298,39 @@ TEST(IoPatternFrameworkTest, SlidingWindowAnalyzerComputesPercentiles) {
     EXPECT_EQ(stats.token_median, 30);
     EXPECT_EQ(stats.fanout_p90, 20);
     EXPECT_EQ(stats.block_p90, 300);
+}
+
+TEST(IoPatternFrameworkTest, SlidingWindowDeduplicatesObjectsAndBoundsHistory) {
+    SlidingWindowAnalyzer analyzer(1'000, {}, 2);
+    const ObjectRef object{TenantId("tenant-a"), "same-key"};
+    for (uint64_t timestamp = 1; timestamp <= 3; ++timestamp) {
+        IoPatternSnapshot snapshot;
+        snapshot.generated_at_ns = timestamp;
+        snapshot.keys.push_back(KeyMetrics{.object = object,
+                                           .token_count =
+                                               static_cast<uint32_t>(timestamp),
+                                           .access_count_window = timestamp});
+        analyzer.Analyze(snapshot);
+    }
+
+    const auto stats = analyzer.FeatureStats();
+    EXPECT_EQ(stats.samples, 1);
+    EXPECT_EQ(stats.token_median, 3);
+    EXPECT_EQ(stats.frequency_median, 3);
+}
+
+TEST(IoPatternFrameworkTest, SlidingWindowCapsASingleOversizedSnapshot) {
+    SlidingWindowAnalyzer analyzer(1'000, {}, 2);
+    IoPatternSnapshot snapshot;
+    snapshot.generated_at_ns = 1;
+    snapshot.keys = {
+        KeyMetrics{.object = {TenantId("tenant"), "c"}},
+        KeyMetrics{.object = {TenantId("tenant"), "a"}},
+        KeyMetrics{.object = {TenantId("tenant"), "b"}},
+    };
+
+    analyzer.Analyze(snapshot);
+    EXPECT_EQ(analyzer.FeatureStats().samples, 2);
 }
 
 TEST(IoPatternFrameworkTest, KMeansFallbackLabelsIndependentSessions) {
@@ -1057,6 +1398,21 @@ TEST(IoPatternFrameworkTest, LegacyEvictionAdapterUsesLruFallback) {
     const auto plan = fallback.Evaluate(context, CacheTier::kL1Host, 10);
     ASSERT_EQ(plan.candidates.size(), 1);
     EXPECT_EQ(plan.candidates.front().object.key, "first");
+}
+
+TEST(IoPatternFrameworkTest, ScoreBasedEvictionMayCrossTheByteTarget) {
+    PolicyContext context;
+    context.snapshot.keys = {
+        KeyMetrics{.object = {TenantId("tenant-a"), "large"},
+                   .block_size = 64,
+                   .replica_tiers = CacheTierBit(CacheTier::kL1Host)}};
+    context.analysis.keys = {
+        KeyPattern{.object = {TenantId("tenant-a"), "large"}}};
+    ScoreBasedEvictionOps eviction;
+
+    const auto plan = eviction.Evaluate(context, CacheTier::kL1Host, 32);
+    ASSERT_EQ(plan.candidates.size(), 1);
+    EXPECT_EQ(plan.candidates.front().bytes, 64);
 }
 
 TEST(IoPatternFrameworkTest, ScoreBasedEvictionUsesTierSpecificSignals) {
@@ -1191,6 +1547,27 @@ TEST(IoPatternFrameworkTest, RuntimeExecutesCfmCommandsThroughStorageHandlers) {
                                   .decision = AdmissionDecision::kAdmit}),
               ErrorCode::OK);
     EXPECT_EQ(admissions, 1);
+}
+
+TEST(IoPatternFrameworkTest, RuntimeSchedulesAdmissionOffTheProducerPath) {
+    std::promise<AdmissionResult> handled;
+    IoPatternRuntime runtime(
+        {.eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+         .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+         .admission = [&handled](const AdmissionResult& result) {
+             handled.set_value(result);
+             return ErrorCode::OK;
+         }});
+    AccessRecord access{.object = {TenantId("tenant"), "disk-key"},
+                        .tier = CacheTier::kL3NofSsd,
+                        .operation = IoOperation::kPut};
+    runtime.RecordAccess(access.object.key, access);
+
+    EXPECT_TRUE(runtime.ScheduleAdmission(access.object, CacheTier::kL1Host));
+    auto result = handled.get_future();
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_EQ(result.get().object, access.object);
 }
 
 }  // namespace

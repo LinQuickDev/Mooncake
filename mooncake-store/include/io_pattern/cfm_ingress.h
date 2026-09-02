@@ -17,7 +17,8 @@ class CfmIngress final {
                             std::make_shared<CfmBinaryCodec>())
         : runtime_(std::move(runtime)), codec_(std::move(codec)) {}
 
-    bool Handle(std::string_view method, std::string_view payload);
+    bool Handle(std::string_view method, std::string_view payload,
+                std::string_view source_id = {});
 
    private:
     std::shared_ptr<IoPatternRuntime> runtime_;
