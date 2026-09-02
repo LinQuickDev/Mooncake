@@ -4,6 +4,7 @@
 #include "io_pattern/client.h"
 #include "io_pattern/cfm_channel.h"
 #include "io_pattern/cfm_ingress.h"
+#include "io_pattern/cfm_service.h"
 #include "io_pattern/cfm_protocol.h"
 #include "io_pattern/cfm_client_impl.h"
 #include "io_pattern/feedback.h"

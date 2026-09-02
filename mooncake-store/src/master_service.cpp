@@ -58,6 +58,11 @@
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
 #include "io_pattern/runtime.h"
+#include "io_pattern/cfm_client_impl.h"
+#include "io_pattern/cfm_protocol.h"
+#include "io_pattern/cfm_service.h"
+#include "io_pattern/resilient_cfm_channel.h"
+#include "io_pattern/rpc_transport.h"
 
 namespace mooncake {
 
@@ -413,19 +418,74 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
-    io_pattern_runtime_ = std::make_unique<io_pattern::IoPatternRuntime>(
+    io_pattern::IoPatternRuntime::Config io_pattern_config;
+    std::shared_ptr<io_pattern::CfmRpcChannel> cfm_rpc_channel;
+    if (!config.io_pattern_cfm.endpoint.empty()) {
+        if (config.io_pattern_cfm.timeout_ms == 0 ||
+            config.io_pattern_cfm.timeout_ms > 10'000) {
+            throw std::invalid_argument(
+                "io_pattern_cfm_timeout_ms must be in [1, 10000]");
+        }
+        if (config.io_pattern_cfm.auth_token.empty()) {
+            throw std::invalid_argument(
+                "io_pattern_cfm_auth_token is required when "
+                "io_pattern_cfm_endpoint is configured");
+        }
+        const std::string node_id = config.io_pattern_cfm.node_id.empty()
+                                        ? config.cluster_id
+                                        : config.io_pattern_cfm.node_id;
+        auto transport = std::make_shared<io_pattern::CoroRpcCfmTransport>(
+            config.io_pattern_cfm.endpoint, node_id,
+            std::chrono::milliseconds(config.io_pattern_cfm.timeout_ms));
+        if (!transport->Authenticate(config.io_pattern_cfm.auth_token)) {
+            throw std::runtime_error(
+                "failed to authenticate with configured IO-pattern CFM "
+                "endpoint " +
+                config.io_pattern_cfm.endpoint);
+        }
+        cfm_rpc_channel = std::make_shared<io_pattern::CfmRpcChannel>(
+            std::move(transport),
+            std::make_shared<io_pattern::CfmBinaryCodec>(),
+            io_pattern::CfmRpcConfig{
+                .timeout =
+                    std::chrono::milliseconds(config.io_pattern_cfm.timeout_ms),
+                .auth_token = config.io_pattern_cfm.auth_token});
+        io_pattern_config.report_sink =
+            io_pattern::MakeCfmMetricBatchSink(cfm_rpc_channel);
+        io_pattern_cfm_channel_ =
+            std::make_shared<io_pattern::ResilientCfmChannel>(cfm_rpc_channel);
+    }
+
+    io_pattern_runtime_ = std::make_shared<io_pattern::IoPatternRuntime>(
         io_pattern::IoPatternRuntime::Handlers{
             .eviction = [this](const io_pattern::EvictionPlan& plan) {
-                bool evicted = plan.candidates.empty();
-                std::unordered_map<TenantId, uint64_t, TenantIdHash> targets;
+                struct TenantCandidates {
+                    uint64_t bytes{0};
+                    std::unordered_set<std::string> keys;
+                };
+                if (plan.target_bytes == 0) return ErrorCode::OK;
+                if (plan.candidates.empty()) return ErrorCode::OBJECT_NOT_FOUND;
+                uint64_t total_freed = 0;
+                std::unordered_map<TenantId, TenantCandidates, TenantIdHash>
+                    targets;
                 for (const auto& candidate : plan.candidates) {
-                    targets[candidate.object.tenant_id] += candidate.bytes;
+                    auto& target = targets[candidate.object.tenant_id];
+                    target.bytes += candidate.bytes;
+                    target.keys.insert(candidate.object.key);
                 }
-                for (const auto& [tenant, bytes] : targets) {
-                    const auto result = EvictTenantMemoryForQuota(tenant, bytes);
-                    evicted = evicted || result.freed_bytes != 0;
+                for (const auto& [tenant, target] : targets) {
+                    const auto result = EvictTenantMemoryForQuota(
+                        tenant, target.bytes, &target.keys);
+                    total_freed =
+                        result.freed_bytes >
+                                std::numeric_limits<uint64_t>::max() -
+                                    total_freed
+                            ? std::numeric_limits<uint64_t>::max()
+                            : total_freed + result.freed_bytes;
                 }
-                return evicted ? ErrorCode::OK : ErrorCode::OBJECT_NOT_FOUND;
+                return total_freed >= plan.target_bytes
+                           ? ErrorCode::OK
+                           : ErrorCode::OBJECT_NOT_FOUND;
             },
             .prefetch = [this](const io_pattern::PrefetchPlan& plan) {
                 for (const auto& candidate : plan.candidates) {
@@ -456,7 +516,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                PromotionQueueResult::kQueued
                            ? ErrorCode::OK
                            : ErrorCode::OBJECT_NOT_FOUND;
-            }});
+            }},
+        std::move(io_pattern_config));
+    io_pattern_cfm_service_ = std::make_shared<io_pattern::CfmService>(
+        io_pattern_runtime_, config.io_pattern_cfm.auth_token,
+        config.io_pattern_cfm.policy_queue_capacity,
+        config.io_pattern_cfm.producer_auth_token);
 
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
@@ -575,6 +640,34 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+
+    // Start the CFM consumer last. If any preceding initialization throws,
+    // constructor unwinding must not encounter a joinable std::thread.
+    if (io_pattern_cfm_channel_) {
+        io_pattern_cfm_client_ = std::make_unique<io_pattern::CfmClientImpl>(
+            io_pattern_cfm_channel_,
+            [this](const io_pattern::PolicyCommand& command) {
+                return io_pattern_runtime_
+                           ? io_pattern_runtime_->ExecuteCommand(command)
+                           : ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+            });
+        io_pattern_cfm_polling_ = true;
+        io_pattern_cfm_poll_thread_ = std::thread([this] {
+            while (io_pattern_cfm_polling_.load(std::memory_order_acquire)) {
+                const auto result =
+                    io_pattern_cfm_client_->PollAndDispatchPolicy();
+                std::unique_lock lock(io_pattern_cfm_poll_mutex_);
+                io_pattern_cfm_poll_cv_.wait_for(
+                    lock,
+                    result == ErrorCode::OK ? std::chrono::milliseconds(100)
+                                            : std::chrono::seconds(1),
+                    [this] {
+                        return !io_pattern_cfm_polling_.load(
+                            std::memory_order_acquire);
+                    });
+            }
+        });
+    }
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -614,6 +707,14 @@ MasterService::CreateSnapshotCatalogStore() {
 }
 
 MasterService::~MasterService() {
+    io_pattern_cfm_polling_.store(false, std::memory_order_release);
+    io_pattern_cfm_poll_cv_.notify_all();
+    if (io_pattern_cfm_poll_thread_.joinable()) {
+        io_pattern_cfm_poll_thread_.join();
+    }
+    io_pattern_cfm_client_.reset();
+    io_pattern_cfm_channel_.reset();
+
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
@@ -659,6 +760,11 @@ MasterService::~MasterService() {
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
     }
+
+    // Its admission worker executes handlers that capture this service. Stop
+    // and join it while all handler dependencies are still alive.
+    io_pattern_cfm_service_.reset();
+    io_pattern_runtime_.reset();
 
     // Reset snapshot manager after all other threads have joined
     // This triggers the destructor which joins the snapshot thread
@@ -4052,8 +4158,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
-auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+auto MasterService::PutEndInternal(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    const TenantId& tenant_id, ReplicaType replica_type,
+    uint32_t write_batch_size, bool overwrite)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -4170,7 +4278,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                               : io_pattern::CacheTier::kL3NofSsd,
                   .operation = io_pattern::IoOperation::kPut,
                   .is_hit = true,
-                  .write_batch_size = 1});
+                  .write_batch_size = write_batch_size,
+                  .overwrite = overwrite});
+        if (replica_type != ReplicaType::MEMORY) {
+            io_pattern_runtime_->ScheduleAdmission(
+                {object_id.tenant_id, key}, io_pattern::CacheTier::kL1Host);
+        }
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -4430,6 +4543,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     return {};
 }
 
+auto MasterService::PutEnd(const UUID& client_id,
+                           const ObjectMeta& object_meta,
+                           const TenantId& tenant_id, ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEndInternal(client_id, object_meta, tenant_id, replica_type,
+                          /*write_batch_size=*/1, /*overwrite=*/false);
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -4444,8 +4565,11 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
     for (const auto& object_meta : object_metas) {
-        results.emplace_back(
-            PutEnd(client_id, object_meta, tenant_id, replica_type));
+        results.emplace_back(PutEndInternal(
+            client_id, object_meta, tenant_id, replica_type,
+            static_cast<uint32_t>(std::min<size_t>(
+                object_metas.size(), std::numeric_limits<uint32_t>::max())),
+            /*overwrite=*/false));
     }
     return results;
 }
@@ -4823,7 +4947,8 @@ auto MasterService::UpsertEnd(const UUID& client_id,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, object_meta, tenant_id, replica_type);
+    return PutEndInternal(client_id, object_meta, tenant_id, replica_type,
+                          /*write_batch_size=*/1, /*overwrite=*/true);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
@@ -4878,7 +5003,18 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const TenantId& tenant_id) {
-    return BatchPutEnd(client_id, object_metas, tenant_id, ReplicaType::ALL);
+    assert(tenant_id.IsValid());
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(object_metas.size());
+    const auto batch_size = static_cast<uint32_t>(
+        std::min<size_t>(object_metas.size(),
+                         std::numeric_limits<uint32_t>::max()));
+    for (const auto& object_meta : object_metas) {
+        results.emplace_back(PutEndInternal(
+            client_id, object_meta, tenant_id, ReplicaType::ALL, batch_size,
+            /*overwrite=*/true));
+    }
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
@@ -7536,12 +7672,16 @@ void MasterService::EvictionThreadFunc() {
                      .memory_used_ratio = static_cast<float>(used_ratio)});
                 const auto capacity = std::max<int64_t>(
                     0, MasterMetricManager::instance().get_total_mem_capacity());
-                io_pattern_runtime_->Execute(
+                const auto status = io_pattern_runtime_->Execute(
                     io_pattern::CacheTier::kL1Host,
                     static_cast<uint64_t>(evict_ratio_target * capacity), {});
+                if (status.eviction != ErrorCode::OK) {
+                    BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+                }
+            } else {
+                BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             }
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-            LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+            LOG(INFO) << "[EVICT-DONE] eviction execution completed.";
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
@@ -8140,7 +8280,9 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
 MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
-                                         uint64_t target_bytes) {
+                                          uint64_t target_bytes,
+                                          const std::unordered_set<std::string>*
+                                              candidate_keys) {
     TenantQuotaEvictionResult total;
     if (target_bytes == 0) {
         return total;
@@ -8257,6 +8399,17 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     .evicted_objects = freed > 0 ? 1U : 0U};
         }
 
+        // Group eviction is atomic. A policy plan naming only part of a group
+        // must not silently expand into unplanned objects; let the caller take
+        // the legacy fallback path instead.
+        if (candidate_keys &&
+            std::any_of(group_it->second.begin(), group_it->second.end(),
+                        [candidate_keys](const std::string& member_key) {
+                            return !candidate_keys->contains(member_key);
+                        })) {
+            return {};
+        }
+
         for (const auto& member_key : group_it->second) {
             auto member_it = tenant_state.metadata.find(member_key);
             if (member_it != tenant_state.metadata.end() &&
@@ -8311,6 +8464,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 for (auto it = tenant_state.metadata.begin();
                      it != tenant_state.metadata.end() &&
                      total.freed_bytes < target_bytes;) {
+                    if (candidate_keys && !candidate_keys->contains(it->first)) {
+                        ++it;
+                        continue;
+                    }
                     auto& metadata = it->second;
                     if (metadata.IsHardPinned() ||
                         !metadata.IsLeaseExpired(now) ||

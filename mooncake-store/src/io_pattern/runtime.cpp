@@ -38,9 +38,17 @@ IoPatternRuntime::IoPatternRuntime(Handlers handlers, Config config)
         std::make_shared<LegacyEvictionOps>(std::move(legacy_strategy)),
         nullptr, std::make_shared<PrefixMatchAdmissionOps>());
     policy_ = std::make_shared<DegradingPolicyEngine>(workload_policy_, fallback);
+    admission_worker_ = std::thread(&IoPatternRuntime::AdmissionWorker, this);
 }
 
 IoPatternRuntime::~IoPatternRuntime() {
+    {
+        std::lock_guard lock(admission_mutex_);
+        admission_stopping_ = true;
+        pending_admissions_.clear();
+    }
+    admission_condition_.notify_all();
+    if (admission_worker_.joinable()) admission_worker_.join();
     if (reporter_) reporter_->Stop();
 }
 
@@ -160,32 +168,18 @@ PatternResult IoPatternRuntime::AnalyzeWithinBudget(
 PolicyExecutionStatus IoPatternRuntime::Execute(
     CacheTier eviction_tier, uint64_t eviction_bytes, const TraceHistory& trace,
     const std::vector<ObjectRef>& admissions, const std::string& session_id) {
-    const auto snapshot = collector_->GetSnapshot();
-    const auto start = std::chrono::steady_clock::now();
-    bool analysis_degraded = false;
-    const auto analysis = AnalyzeWithinBudget(snapshot, analysis_degraded);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-    observability_.RecordAnalyzeLatency(elapsed);
-
-    workload_policy_->SetWorkloadType(analysis.workload_type);
-    workload_policy_->SetSessionWorkloads(analysis.sessions);
-    workload_policy_->AdvanceTransitionWindow();
-    const PolicyResult result = policy_->ExecutePolicy(
-        PolicyContext{.snapshot = snapshot, .analysis = analysis,
-                      .session_id = session_id}, eviction_tier,
-        eviction_bytes, trace, admissions);
+    auto planned = BuildPolicy(eviction_tier, eviction_bytes, trace, admissions,
+                               session_id);
+    const auto& snapshot = planned.snapshot;
+    const auto& result = planned.result;
     auto status = executor_.Execute(result);
-    status.degraded = status.degraded || result.degraded || collector_->degraded() ||
-                      analysis_degraded ||
-                      elapsed > static_cast<int64_t>(config_.analysis_timeout_us);
-    observability_.RecordPolicyDecision(!result.eviction.candidates.empty() ||
-                                        !result.prefetch.candidates.empty());
+    status.degraded = status.degraded || result.degraded;
     const bool failed = status.eviction != ErrorCode::OK ||
                         status.prefetch != ErrorCode::OK || status.degraded;
-    if (failed) policy_->RecordFailure();
-    else policy_->RecordSuccess();
+    if (failed)
+        policy_->RecordFailure();
+    else
+        policy_->RecordSuccess();
     if (status.degraded || policy_->degraded()) observability_.RecordDegrade();
     status.degraded = status.degraded || policy_->degraded();
 
@@ -199,7 +193,8 @@ PolicyExecutionStatus IoPatternRuntime::Execute(
                 pending_prefetches_.insert(candidate.object);
             }
         }
-        if (!result.prefetch.candidates.empty() && status.prefetch != ErrorCode::OK) {
+        if (!result.prefetch.candidates.empty() &&
+            status.prefetch != ErrorCode::OK) {
             feedback.prefetch_accuracy = 0.0F;
             has_feedback = true;
         }
@@ -212,6 +207,45 @@ PolicyExecutionStatus IoPatternRuntime::Execute(
     }
     if (has_feedback) RecordFeedback(feedback);
     return status;
+}
+
+PolicyResult IoPatternRuntime::Plan(
+    CacheTier eviction_tier, uint64_t eviction_bytes, const TraceHistory& trace,
+    const std::vector<ObjectRef>& admissions, const std::string& session_id) {
+    return BuildPolicy(eviction_tier, eviction_bytes, trace, admissions,
+                       session_id)
+        .result;
+}
+
+IoPatternRuntime::PlannedPolicy IoPatternRuntime::BuildPolicy(
+    CacheTier eviction_tier, uint64_t eviction_bytes, const TraceHistory& trace,
+    const std::vector<ObjectRef>& admissions, const std::string& session_id) {
+    PlannedPolicy planned;
+    planned.snapshot = collector_->GetSnapshot();
+    const auto start = std::chrono::steady_clock::now();
+    const auto analysis =
+        AnalyzeWithinBudget(planned.snapshot, planned.analysis_degraded);
+    planned.analysis_elapsed_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    observability_.RecordAnalyzeLatency(planned.analysis_elapsed_us);
+
+    workload_policy_->SetWorkloadType(analysis.workload_type);
+    workload_policy_->SetSessionWorkloads(analysis.sessions);
+    workload_policy_->AdvanceTransitionWindow();
+    planned.result = policy_->ExecutePolicy(
+        PolicyContext{.snapshot = planned.snapshot, .analysis = analysis,
+                      .session_id = session_id}, eviction_tier,
+        eviction_bytes, trace, admissions);
+    planned.result.degraded =
+        planned.result.degraded || collector_->degraded() ||
+        planned.analysis_degraded ||
+        planned.analysis_elapsed_us > config_.analysis_timeout_us;
+    observability_.RecordPolicyDecision(
+        !planned.result.eviction.candidates.empty() ||
+        !planned.result.prefetch.candidates.empty());
+    return planned;
 }
 
 ErrorCode IoPatternRuntime::ExecuteCommand(const PolicyCommand& command) {
@@ -235,6 +269,70 @@ ErrorCode IoPatternRuntime::ExecuteCommand(const PolicyCommand& command) {
         return status.prefetch;
     }
     return status.admissions.empty() ? ErrorCode::OK : status.admissions.front();
+}
+
+bool IoPatternRuntime::ScheduleAdmission(ObjectRef object, CacheTier target_tier,
+                                         std::string session_id) {
+    {
+        std::lock_guard lock(admission_mutex_);
+        if (admission_stopping_ ||
+            (config_.max_pending_admissions != 0 &&
+             pending_admissions_.size() >= config_.max_pending_admissions)) {
+            return false;
+        }
+        pending_admissions_.push_back(
+            {.object = std::move(object),
+             .target_tier = target_tier,
+             .session_id = std::move(session_id)});
+    }
+    admission_condition_.notify_one();
+    return true;
+}
+
+void IoPatternRuntime::AdmissionWorker() {
+    while (true) {
+        PendingAdmission pending;
+        {
+            std::unique_lock lock(admission_mutex_);
+            admission_condition_.wait(lock, [this] {
+                return admission_stopping_ || !pending_admissions_.empty();
+            });
+            if (admission_stopping_) return;
+            pending = std::move(pending_admissions_.front());
+            pending_admissions_.pop_front();
+        }
+        try {
+            ExecuteAdmission(pending.object, pending.target_tier,
+                             pending.session_id);
+        } catch (...) {
+            policy_->RecordFailure();
+            observability_.RecordDegrade();
+        }
+    }
+}
+
+ErrorCode IoPatternRuntime::ExecuteAdmission(const ObjectRef& object,
+                                             CacheTier target_tier,
+                                             const std::string& session_id) {
+    const auto snapshot = collector_->GetSnapshot();
+    bool analysis_degraded = false;
+    const auto analysis = AnalyzeWithinBudget(snapshot, analysis_degraded);
+    workload_policy_->SetWorkloadType(analysis.workload_type);
+    workload_policy_->SetSessionWorkloads(analysis.sessions);
+    const auto admission = policy_->DecideAdmission(
+        object, target_tier,
+        PolicyContext{.snapshot = snapshot,
+                      .analysis = analysis,
+                      .session_id = session_id});
+    PolicyResult result;
+    result.admissions.push_back(admission);
+    auto status = executor_.Execute(result);
+    if (analysis_degraded) status.degraded = true;
+    const auto code = status.admissions.empty() ? ErrorCode::OK
+                                                 : status.admissions.front();
+    if (code != ErrorCode::OK || status.degraded)
+        observability_.RecordDegrade();
+    return code;
 }
 
 void IoPatternRuntime::RecordFeedback(PolicyFeedbackSample sample) {

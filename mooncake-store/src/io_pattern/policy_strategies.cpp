@@ -1,6 +1,7 @@
 #include "io_pattern/policy_strategies.h"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 
 namespace mooncake::io_pattern {
@@ -122,11 +123,11 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
     }
     uint64_t selected_bytes = 0;
     auto end = plan.candidates.begin();
-    while (end != plan.candidates.end()) {
-        if (end->bytes > target_bytes - selected_bytes) {
-            break;
-        }
-        selected_bytes += end->bytes;
+    while (end != plan.candidates.end() && selected_bytes < target_bytes) {
+        selected_bytes =
+            end->bytes > std::numeric_limits<uint64_t>::max() - selected_bytes
+                ? std::numeric_limits<uint64_t>::max()
+                : selected_bytes + end->bytes;
         ++end;
     }
     plan.candidates.erase(end, plan.candidates.end());
@@ -156,10 +157,14 @@ AdmissionResult PrefixMatchAdmissionOps::Evaluate(
     result.decision = key->access_count_window >= config_.frequency_threshold
                           ? AdmissionDecision::kAdmit
                           : AdmissionDecision::kRejectFrequency;
+    const bool target_over_watermark = std::any_of(
+        context.snapshot.storage.begin(), context.snapshot.storage.end(),
+        [&](const StorageMetric& metric) {
+            return metric.tier == target_tier &&
+                   metric.memory_used_ratio >= config_.max_memory_used_ratio;
+        });
     if (result.decision == AdmissionDecision::kAdmit &&
-        !context.snapshot.storage.empty() &&
-        context.snapshot.storage.front().memory_used_ratio >=
-            config_.max_memory_used_ratio) {
+        target_over_watermark) {
         result.decision = AdmissionDecision::kRejectWatermark;
     }
     result.confidence =

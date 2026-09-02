@@ -24,8 +24,10 @@ struct WorkloadFeatureStats {
 class SlidingWindowAnalyzer final : public IoPatternAnalyzer {
    public:
     explicit SlidingWindowAnalyzer(uint64_t window_ns = 60'000'000'000ULL,
-                                   ThresholdAnalyzerConfig config = {})
+                                    ThresholdAnalyzerConfig config = {},
+                                    size_t max_history_keys = 200'000)
         : window_ns_(window_ns),
+          max_history_keys_(max_history_keys),
           analyzer_(config),
           kmeans_(KMeansWorkloadAnalyzer::Config{.thresholds = config}) {}
 
@@ -41,8 +43,10 @@ class SlidingWindowAnalyzer final : public IoPatternAnalyzer {
     void Append(const IoPatternSnapshot& snapshot) const;
 
     const uint64_t window_ns_;
+    const size_t max_history_keys_;
     mutable std::mutex mutex_;
     mutable std::deque<IoPatternSnapshot> history_;
+    mutable size_t history_key_count_{0};
     ThresholdAnalyzer analyzer_;
     KMeansWorkloadAnalyzer kmeans_;
 };
