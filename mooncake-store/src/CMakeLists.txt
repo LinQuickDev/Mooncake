@@ -68,6 +68,24 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
+    io_pattern/collector_impl.cpp
+    io_pattern/reporter.cpp
+    io_pattern/cfm_client_impl.cpp
+    io_pattern/cfm_ingress.cpp
+    io_pattern/cfm_protocol.cpp
+    io_pattern/resilient_cfm_channel.cpp
+    io_pattern/feedback.cpp
+    io_pattern/degrading_policy_engine.cpp
+    io_pattern/legacy_eviction_ops.cpp
+    io_pattern/kmeans_analyzer.cpp
+    io_pattern/observability.cpp
+    io_pattern/sliding_window_analyzer.cpp
+    io_pattern/tier_executor.cpp
+    io_pattern/resilient_analyzer.cpp
+    io_pattern/rpc_transport.cpp
+    io_pattern/runtime.cpp
+    io_pattern/threshold_analyzer.cpp
+    io_pattern/policy_strategies.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp

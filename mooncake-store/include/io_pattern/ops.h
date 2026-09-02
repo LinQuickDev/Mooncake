@@ -12,8 +12,10 @@ class EvictionOps {
    public:
     virtual ~EvictionOps() = default;
 
+    // Returns a complete plan carrying tenant, score and byte metadata.
     virtual EvictionPlan Evaluate(const PolicyContext& context, CacheTier tier,
                                   uint64_t target_bytes) const = 0;
+
 };
 
 // Produces a prefetch plan; execution belongs to PrefetchExecutor.
@@ -21,6 +23,7 @@ class PrefetchOps {
    public:
     virtual ~PrefetchOps() = default;
 
+    // Returns a complete plan carrying strategy, timeout and confidence.
     virtual PrefetchPlan Evaluate(const PolicyContext& context,
                                   const TraceHistory& trace) const = 0;
 };
@@ -30,6 +33,7 @@ class AdmissionOps {
    public:
     virtual ~AdmissionOps() = default;
 
+    // Returns a complete decision carrying tenant identity and confidence.
     virtual AdmissionResult Evaluate(const ObjectRef& object,
                                      CacheTier target_tier,
                                      const PolicyContext& context) const = 0;
