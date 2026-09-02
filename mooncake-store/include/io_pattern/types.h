@@ -60,6 +60,15 @@ struct ObjectRef {
     bool operator==(const ObjectRef&) const = default;
 };
 
+struct ObjectRefHash {
+    size_t operator()(const ObjectRef& object) const noexcept {
+        const size_t tenant_hash = TenantIdHash{}(object.tenant_id);
+        const size_t key_hash = std::hash<std::string>{}(object.key);
+        return tenant_hash ^ (key_hash + 0x9e3779b9 + (tenant_hash << 6) +
+                              (tenant_hash >> 2));
+    }
+};
+
 struct InferenceMetrics {
     ObjectRef object;
     std::string session_id;
@@ -82,6 +91,8 @@ struct AccessRecord {
     CacheTier tier{CacheTier::kL2Segment};
     IoOperation operation{IoOperation::kGet};
     bool is_hit{false};
+    uint32_t write_batch_size{0};
+    bool overwrite{false};
 };
 
 struct StorageMetric {
@@ -101,6 +112,7 @@ struct StorageMetric {
 
 struct KeyMetrics {
     ObjectRef object;
+    std::string session_id;
     uint64_t last_access_time_ns{0};
     uint64_t access_count_window{0};
     uint64_t idle_time_us{0};
@@ -144,15 +156,23 @@ struct KeyPattern {
     bool migration_safe{false};
 };
 
+struct SessionPattern {
+    std::string session_id;
+    WorkloadType workload_type{WorkloadType::kUnknown};
+    float confidence{0.0F};
+};
+
 struct PatternResult {
     WorkloadType workload_type{WorkloadType::kUnknown};
     float workload_confidence{0.0F};
     std::vector<KeyPattern> keys;
+    std::vector<SessionPattern> sessions;
 };
 
 struct PolicyContext {
     IoPatternSnapshot snapshot;
     PatternResult analysis;
+    std::string session_id;
 };
 
 struct TraceEvent {
@@ -191,6 +211,7 @@ struct EvictionCandidate {
     ObjectRef object;
     uint64_t bytes{0};
     float score{0.0F};
+    CacheTier target_tier{CacheTier::kL3NofSsd};
 };
 
 struct EvictionPlan {
@@ -212,6 +233,13 @@ struct AdmissionResult {
     CacheTier target_tier{CacheTier::kL2Segment};
     AdmissionDecision decision{AdmissionDecision::kDefer};
     float confidence{0.0F};
+};
+
+struct PolicyResult {
+    EvictionPlan eviction;
+    PrefetchPlan prefetch;
+    std::vector<AdmissionResult> admissions;
+    bool degraded{false};
 };
 
 struct CacheViewEntry {

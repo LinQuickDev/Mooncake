@@ -57,6 +57,7 @@
 #include "master_snapshot_repository.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
+#include "io_pattern/runtime.h"
 
 namespace mooncake {
 
@@ -411,6 +412,51 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ", max_per_heartbeat=" << promotion_max_per_heartbeat_
                   << ")";
     }
+
+    io_pattern_runtime_ = std::make_unique<io_pattern::IoPatternRuntime>(
+        io_pattern::IoPatternRuntime::Handlers{
+            .eviction = [this](const io_pattern::EvictionPlan& plan) {
+                bool evicted = plan.candidates.empty();
+                std::unordered_map<TenantId, uint64_t, TenantIdHash> targets;
+                for (const auto& candidate : plan.candidates) {
+                    targets[candidate.object.tenant_id] += candidate.bytes;
+                }
+                for (const auto& [tenant, bytes] : targets) {
+                    const auto result = EvictTenantMemoryForQuota(tenant, bytes);
+                    evicted = evicted || result.freed_bytes != 0;
+                }
+                return evicted ? ErrorCode::OK : ErrorCode::OBJECT_NOT_FOUND;
+            },
+            .prefetch = [this](const io_pattern::PrefetchPlan& plan) {
+                for (const auto& candidate : plan.candidates) {
+                    // Store's safe promotion primitive is LOCAL_DISK -> MEMORY;
+                    // HBM remains inference-runtime-owned and is never promoted
+                    // from the master control plane.
+                    if (candidate.target_tier == io_pattern::CacheTier::kL0Hbm) {
+                        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+                    }
+                    const ObjectIdentity object_id{candidate.object.tenant_id,
+                                                   candidate.object.key};
+                    if (TryPushPromotionQueue(object_id,
+                                               /*record_candidate=*/false) !=
+                        PromotionQueueResult::kQueued) {
+                        return ErrorCode::OBJECT_NOT_FOUND;
+                    }
+                }
+                return ErrorCode::OK;
+            },
+            .admission = [this](const io_pattern::AdmissionResult& result) {
+                if (result.target_tier == io_pattern::CacheTier::kL0Hbm) {
+                    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+                }
+                const ObjectIdentity object_id{result.object.tenant_id,
+                                               result.object.key};
+                return TryPushPromotionQueue(object_id,
+                                              /*record_candidate=*/false) ==
+                               PromotionQueueResult::kQueued
+                           ? ErrorCode::OK
+                           : ErrorCode::OBJECT_NOT_FOUND;
+            }});
 
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
@@ -3185,6 +3231,8 @@ auto MasterService::GetReplicaList(const std::string& key,
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
+    io_pattern::AccessRecord io_access;
+    bool record_io_access = false;
     {
         MetadataAccessorRO accessor(this, object_id);
 
@@ -3262,10 +3310,25 @@ auto MasterService::GetReplicaList(const std::string& key,
         resp = GetReplicaListResponse(std::move(replica_list),
                                       default_kv_lease_ttl_,
                                       metadata.object_checksum);
+        io_access.object = {object_id.tenant_id, key};
+        io_access.observed_at_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        io_access.block_size = metadata.size;
+        io_access.tier = resp.replicas[0].is_memory_replica()
+                             ? io_pattern::CacheTier::kL1Host
+                             : io_pattern::CacheTier::kL3NofSsd;
+        io_access.operation = io_pattern::IoOperation::kGet;
+        io_access.is_hit = true;
+        record_io_access = true;
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
         TryPushPromotionQueue(object_id);
+    }
+    if (record_io_access && io_pattern_runtime_) {
+        io_pattern_runtime_->RecordAccess(key, io_access);
     }
     return resp;
 }
@@ -3344,6 +3407,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
 
         std::vector<ObjectIdentity> promotion_candidates;
+        std::vector<io_pattern::AccessRecord> io_accesses;
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
@@ -3423,11 +3487,28 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
                     metadata.object_checksum);
+                io_accesses.push_back(
+                    {.object = {normalized_tenant, key},
+                     .observed_at_ns = static_cast<uint64_t>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count()),
+                     .block_size = metadata.size,
+                     .tier = results[original_idx]->replicas[0].is_memory_replica()
+                                 ? io_pattern::CacheTier::kL1Host
+                                 : io_pattern::CacheTier::kL3NofSsd,
+                     .operation = io_pattern::IoOperation::kGet,
+                     .is_hit = true});
             }
         }
 
         for (const auto& object_id : promotion_candidates) {
             TryPushPromotionQueue(object_id);
+        }
+        if (io_pattern_runtime_) {
+            for (const auto& access : io_accesses) {
+                io_pattern_runtime_->RecordAccess(access.object.key, access);
+            }
         }
     }
 
@@ -4075,6 +4156,22 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
+
+    if (io_pattern_runtime_) {
+        io_pattern_runtime_->RecordAccess(
+            key, {.object = {object_id.tenant_id, key},
+                  .observed_at_ns = static_cast<uint64_t>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count()),
+                  .block_size = metadata.size,
+                  .tier = replica_type == ReplicaType::MEMORY
+                              ? io_pattern::CacheTier::kL1Host
+                              : io_pattern::CacheTier::kL3NofSsd,
+                  .operation = io_pattern::IoOperation::kPut,
+                  .is_hit = true,
+                  .write_batch_size = 1});
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
@@ -7433,6 +7530,16 @@ void MasterService::EvictionThreadFunc() {
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
+            if (io_pattern_runtime_) {
+                io_pattern_runtime_->RecordStorageMetric(
+                    {.source_id = "master-memory", .tier = io_pattern::CacheTier::kL1Host,
+                     .memory_used_ratio = static_cast<float>(used_ratio)});
+                const auto capacity = std::max<int64_t>(
+                    0, MasterMetricManager::instance().get_total_mem_capacity());
+                io_pattern_runtime_->Execute(
+                    io_pattern::CacheTier::kL1Host,
+                    static_cast<uint64_t>(evict_ratio_target * capacity), {});
+            }
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
@@ -8035,7 +8142,7 @@ MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                          uint64_t target_bytes) {
     TenantQuotaEvictionResult total;
-    if (!enable_multi_tenants_ || target_bytes == 0) {
+    if (target_bytes == 0) {
         return total;
     }
 

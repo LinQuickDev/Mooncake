@@ -46,6 +46,10 @@
 
 namespace mooncake {
 
+namespace io_pattern {
+class IoPatternRuntime;
+}
+
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
 class MasterSnapshotRepository;
@@ -2085,6 +2089,11 @@ class MasterService {
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
+
+    // The IO-pattern pipeline is deliberately owned by MasterService: the
+    // master has the authoritative replica map and is the only component that
+    // can safely translate a policy plan into promotion/eviction operations.
+    std::unique_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
 
     const std::string ha_backend_type_;
 

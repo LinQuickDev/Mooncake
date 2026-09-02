@@ -11,7 +11,8 @@ class IoPatternCollector {
 
     // Implementations must not block the caller on RPC or storage I/O.
     virtual void ReportInferenceMetrics(const InferenceMetrics& metrics) = 0;
-    virtual void RecordAccess(const AccessRecord& record) = 0;
+    virtual void RecordAccess(const std::string& key,
+                              const AccessRecord& record) = 0;
     virtual void RecordStorageMetric(const StorageMetric& metric) = 0;
     virtual IoPatternSnapshot GetSnapshot() const = 0;
 };
