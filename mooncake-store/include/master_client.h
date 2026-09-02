@@ -493,6 +493,12 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    /** Fetch pending remove tasks without removing them from the queue. */
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeat(const UUID& client_id);
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
+
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * promotion. Returns the new replica's descriptor that the caller writes

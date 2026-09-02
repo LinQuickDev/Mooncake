@@ -455,6 +455,18 @@ class Client {
         std::vector<PromotionTaskItem>& promotion_objects);
 
     /**
+     * @brief Drain the removed_keys queue from master. Returns {tenant_id,
+     * key} pairs that were removed via Remove/BatchRemove and had LOCAL_DISK
+     * replicas on this client. The caller should MarkRemoved each key to
+     * trigger SSD tombstone + GC compaction.
+     */
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeat(const UUID& client_id);
+
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * L2->L1 promotion. Returns the new replica's descriptor that the caller
      * writes via Transfer Engine before calling NotifyPromotionSuccess.

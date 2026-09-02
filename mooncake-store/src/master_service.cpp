@@ -1,6 +1,5 @@
 #include "master_service.h"
 
-#include <algorithm>
 #include <array>
 #include <algorithm>
 #include <cassert>
@@ -1764,6 +1763,14 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     const bool erased_local_disk = std::any_of(
         erased_replicas.begin(), erased_replicas.end(),
         [](const Replica& replica) { return replica.is_local_disk_replica(); });
+    std::vector<UUID> local_disk_holders;
+    for (const auto& replica : erased_replicas) {
+        if (!replica.is_local_disk_replica()) continue;
+        auto client_id = replica.get_local_disk_client_id();
+        if (client_id.has_value()) {
+            local_disk_holders.push_back(client_id.value());
+        }
+    }
     ReleaseLocalDiskUsage(erased_replicas);
     if (erased_local_disk) {
         shard.OnDiskReplicaRemoved(erased_local_disk, metadata);
@@ -1773,6 +1780,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
         if (tenant_state.Empty()) {
             shard->tenants.erase(tenant_it);
         }
+    }
+    if (erased_local_disk) {
+        EnqueueRemoveTasks(
+            local_disk_holders,
+            RemoveTaskItem{tenant_id.value(), durable_entry.object_key});
     }
 }
 
@@ -1810,6 +1822,7 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     }
 
     auto& metadata = accessor.Get();
+
     auto replicas = PopReplicasWithCacheTotalAccounting(
         metadata, &Replica::fn_is_processing);
     if (!replicas.empty()) {
@@ -5599,6 +5612,17 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
     }
 
     auto& metadata = accessor.Get();
+    std::vector<UUID> local_disk_holders;
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_local_disk_replica();
+        },
+        [&local_disk_holders](Replica& replica) {
+            auto client_id = replica.get_local_disk_client_id();
+            if (client_id.has_value()) {
+                local_disk_holders.push_back(client_id.value());
+            }
+        });
 
     if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
@@ -5636,10 +5660,15 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
             auto persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::REMOVE,
                 object_id.tenant_id.value(), key, {},
-                [this, removed_ids = std::move(removed_ids)](
+                [this, removed_ids = std::move(removed_ids),
+                 local_disk_holders,
+                 tenant_id_for_task = object_id.tenant_id.value(), key](
                     const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
                         durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    EnqueueRemoveTasks(
+                        local_disk_holders,
+                        RemoveTaskItem{tenant_id_for_task, key});
                 });
             if (!persist_result) {
                 return tl::make_unexpected(persist_result.error());
@@ -5648,7 +5677,14 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         }
     }
     PublishKvRemoved(key, metadata, object_id.tenant_id);
+
+    // Before erasing metadata, collect LOCAL_DISK replica holders so we
+    // can notify them to reclaim SSD space via RemoveObjectHeartbeat.
     accessor.Erase();
+
+    // Push removed key to each LOCAL_DISK holder's removed_keys queue.
+    EnqueueRemoveTasks(local_disk_holders, RemoveTaskItem{tenant_id.value(), key});
+
     return {};
 }
 
@@ -6045,6 +6081,18 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             auto& metadata = it->second;
 
+            std::vector<UUID> batch_local_disk_holders;
+            metadata.VisitReplicas(
+                [](const Replica& replica) {
+                    return replica.is_local_disk_replica();
+                },
+                [&batch_local_disk_holders](Replica& replica) {
+                    auto cid = replica.get_local_disk_client_id();
+                    if (cid.has_value()) {
+                        batch_local_disk_holders.push_back(cid.value());
+                    }
+                });
+
             if (!force && !metadata.IsLeaseExpired(now)) {
                 VLOG(1) << "key=" << key << ", error=object_has_lease";
                 results[original_idx] =
@@ -6087,11 +6135,16 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                         AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::REMOVE,
                             normalized_tenant.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
+                            [this, removed_ids = std::move(removed_ids),
+                             batch_local_disk_holders,
+                             tenant_id = normalized_tenant.value(), key](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
                                     durable_entry, removed_ids,
                                     QuotaEraseMode::kFull);
+                                EnqueueRemoveTasks(
+                                    batch_local_disk_holders,
+                                    RemoveTaskItem{tenant_id, key});
                             });
                     if (!persist_result) {
                         results[original_idx] =
@@ -6102,11 +6155,20 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     continue;
                 }
             }
+
+            // Collect LOCAL_DISK replica holders before erasing, so we
+            // can notify them to reclaim SSD space via RemoveObjectHeartbeat.
             EraseMetadata(tenant_state, it, normalized_tenant,
                           QuotaEraseMode::kFull, &shard);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
+
+            // Push removed key to each LOCAL_DISK holder's removed_keys queue.
+            EnqueueRemoveTasks(
+                batch_local_disk_holders,
+                RemoveTaskItem{normalized_tenant.value(), key});
+
             results[original_idx] = {};  // Success
         }
     }
@@ -6329,6 +6391,64 @@ auto MasterService::PollRemoveAll(const UUID& client_id)
         local_disk_segment_it->second->pending_remove_all = false;
     }
     return result;
+}
+
+auto MasterService::RemoveObjectHeartbeat(const UUID& client_id)
+    -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        return local_disk_segment_it->second->removed_keys;
+    }
+}
+
+void MasterService::EnqueueRemoveTasks(
+    const std::vector<UUID>& holder_ids, const RemoveTaskItem& task) {
+    if (holder_ids.empty()) return;
+    ScopedLocalDiskSegmentAccess access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& segments = access.getClientLocalDiskSegment();
+    for (const auto& holder_id : holder_ids) {
+        auto it = segments.find(holder_id);
+        if (it == segments.end()) continue;
+        MutexLocker locker(&it->second->offloading_mutex_);
+        if (std::find(it->second->removed_keys.begin(),
+                      it->second->removed_keys.end(), task) ==
+            it->second->removed_keys.end()) {
+            it->second->removed_keys.push_back(task);
+        }
+    }
+}
+
+auto MasterService::AckRemoveObjectHeartbeat(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& segments = access.getClientLocalDiskSegment();
+    auto it = segments.find(client_id);
+    if (it == segments.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&it->second->offloading_mutex_);
+    auto& pending = it->second->removed_keys;
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                 [&tasks](const RemoveTaskItem& task) {
+                                     return std::find(tasks.begin(),
+                                                      tasks.end(), task) !=
+                                            tasks.end();
+                                 }),
+                  pending.end());
+    return {};
 }
 
 auto MasterService::ReportSsdCapacity(const UUID& client_id,

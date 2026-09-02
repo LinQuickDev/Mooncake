@@ -1116,6 +1116,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    SpDiag::PerfPoint pt(PerfKey::CLIENT_BATCH_QUERY,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
@@ -1130,6 +1133,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
         }
+        pt.End(-1);
         return results;
     }
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
@@ -1145,6 +1149,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             results.emplace_back(tl::unexpected(response[i].error()));
         }
     }
+    pt.End(0);
     return results;
 }
 
@@ -3503,6 +3508,16 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     }
     promotion_objects = std::move(response.value());
     return {};
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+Client::RemoveObjectHeartbeat(const UUID& client_id) {
+    return master_client_.RemoveObjectHeartbeat(client_id);
+}
+
+tl::expected<void, ErrorCode> Client::AckRemoveObjectHeartbeat(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks) {
+    return master_client_.AckRemoveObjectHeartbeat(client_id, tasks);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>

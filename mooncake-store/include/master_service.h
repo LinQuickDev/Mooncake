@@ -727,6 +727,13 @@ class MasterService {
     auto PromotionObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
 
+    /** Fetch pending remove tasks without removing them from the queue. */
+    auto RemoveObjectHeartbeat(const UUID& client_id)
+        -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode>;
+    auto AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
      * DRAM via the existing AllocationStrategy, optionally biased toward the
@@ -1533,6 +1540,8 @@ class MasterService {
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+    void EnqueueRemoveTasks(const std::vector<UUID>& holder_ids,
+                            const RemoveTaskItem& task);
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(

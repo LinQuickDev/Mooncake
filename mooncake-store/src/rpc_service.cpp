@@ -1728,6 +1728,21 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+WrappedMasterService::RemoveObjectHeartbeat(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "RemoveObjectHeartbeat");
+    timer.LogRequest("action=remove_heartbeat");
+    return master_service_.RemoveObjectHeartbeat(client_id);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::AckRemoveObjectHeartbeat(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks) {
+    ScopedVLogTimer timer(1, "AckRemoveObjectHeartbeat");
+    timer.LogRequest("action=ack_remove_heartbeat");
+    return master_service_.AckRemoveObjectHeartbeat(client_id, tasks);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
@@ -1921,6 +1936,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RemoveObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::AckRemoveObjectHeartbeat>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(

@@ -442,18 +442,19 @@ void UbWorkerPool::performPostSend(int thread_id) {
 void UbWorkerPool::performPoll(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
-    // context_.poll() aggregates each completion's jetty_depth here and
-    // calls markSuccess() on successful slices in place. Successful slices
-    // are NOT returned from poll(), so this worker never dereferences them
-    // after they may have been recycled by the submitting thread.
+    // context_.poll() aggregates each completion's jetty_depth here. Normal
+    // successful slices are published in place; staged READ successes are
+    // returned in deferred_success_slices so H2D can finish before publishing.
     std::unordered_map<volatile int*, int> jetty_depth_set;
     std::vector<UbTransport::Slice*> failed_slices;
+    std::vector<UbTransport::Slice*> deferred_success_slices;
     for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
          jfc_index += kTransferWorkerCount) {
         UbTransport::Slice* failed[kPollCount];
         int num_failed = 0;
         int nr_poll = context_.poll(kPollCount, failed, num_failed,
-                                    jetty_depth_set, jfc_index);
+                                    deferred_success_slices, jetty_depth_set,
+                                    jfc_index);
         if (nr_poll < 0) {
             LOG(ERROR) << "Worker: Failed to poll jetty for complete";
             continue;
@@ -488,6 +489,10 @@ void UbWorkerPool::performPoll(int thread_id) {
     for (auto& entry : jetty_depth_set)
         __sync_fetch_and_sub(entry.first, entry.second);
 
+    for (auto& slice : deferred_success_slices) {
+        context_.engine().onStagedSliceSuccess(slice);
+    }
+
     // Slices that hit max_retry: final markFailed() after all reads (and the
     // jetty depth returns above) are done. Failed slices were never published
     // by poll(), so they remained safe to deref up to this point.
@@ -496,7 +501,11 @@ void UbWorkerPool::performPoll(int thread_id) {
             auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
             context_.deleteEndpointByPtr(ptr);
         }
-        slice->markFailed();
+        if (context_.engine().isStagedSlice(slice)) {
+            context_.engine().onStagedSliceFinalFailure(slice);
+        } else {
+            slice->markFailed();
+        }
         processed_slice_count_++;
     }
 

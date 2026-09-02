@@ -1205,11 +1205,26 @@ int RealClient::setup_real(
     const std::string &ipc_socket_path, bool enable_ssd_offload,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
-    return to_py_ret(setup_internal(
+    SpDiag::PerfPoint pt(PerfKey::RC_SETUP_REAL,
+                         SpDiag::PerfLevel::KEY_MODULE);
+    pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
+    auto ret = to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
         tenant_id, Environ::Get().GetOffloadRpcThreadNum(8), enable_client_http_server, client_http_port));
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count();
+    pt.End(ret == 0 ? 0 : -1);
+    // S2 setup 下沉层 MC_LOG 汇总（Q1b：入口层只 PerfPoint）
+    MC_LOG(INFO) << "[setup] elapsed_us=" << elapsed_us
+                 << " success=" << (ret == 0 ? 1 : 0)
+                 << " hostname=" << local_hostname
+                 << " metadata_server=" << metadata_server
+                 << " protocol=" << protocol;
+    return ret;
 }
 
 namespace {
@@ -2397,6 +2412,7 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
+    // SSD tombstone is handled by the storage node via RemoveObjectHeartbeat.
     return {};
 }
 
@@ -2436,7 +2452,9 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    return client_->BatchRemove(keys, force);
+    auto results = client_->BatchRemove(keys, force);
+    // SSD tombstone is handled by the storage node via RemoveObjectHeartbeat.
+    return results;
 }
 
 std::vector<int> RealClient::batchRemove(const std::vector<std::string> &keys,
@@ -2476,7 +2494,14 @@ int RealClient::isExist(const std::string &key) {
 
 std::vector<int> RealClient::batchIsExist(
     const std::vector<std::string> &keys) {
+    SpDiag::PerfPoint pt(PerfKey::RC_BATCH_IS_EXIST,
+                         SpDiag::PerfLevel::KEY_MODULE);
+    pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
     auto internal_results = batchIsExist_internal(keys);
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count();
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -2487,7 +2512,17 @@ std::vector<int> RealClient::batchIsExist(
             results.push_back(toInt(result.error()));
         }
     }
-
+    pt.End(0);
+    // S6 batch_is_exist 下沉层 MC_LOG 汇总+per-key（Q1b：入口层只 PerfPoint）
+    // 字段：success+key（无 size/replica/endpoint，缺失不输出）
+    std::ostringstream oss;
+    oss << "[batch_is_exist] elapsed_us=" << elapsed_us
+        << " num_keys=" << keys.size();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        int success = (i < results.size()) ? results[i] : 0;
+        oss << "\n  success=" << success << " key=" << keys[i];
+    }
+    MC_LOG(INFO) << oss.str();
     return results;
 }
 
@@ -3768,7 +3803,20 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
 }
 
 int RealClient::register_buffer(void *buffer, size_t size) {
-    return to_py_ret(register_buffer_internal(buffer, size));
+    SpDiag::PerfPoint pt(PerfKey::RC_REGISTER_BUFFER,
+                         SpDiag::PerfLevel::KEY_MODULE);
+    pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
+    auto ret = to_py_ret(register_buffer_internal(buffer, size));
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count();
+    pt.End(ret == 0 ? 0 : -1);
+    // S3 register_buffer 下沉层 MC_LOG 汇总（Q1b：入口层只 PerfPoint）
+    MC_LOG(INFO) << "[register_buffer] elapsed_us=" << elapsed_us
+                 << " success=" << (ret == 0 ? 1 : 0)
+                 << " base_addr=" << buffer << " size=" << size;
+    return ret;
 }
 
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
@@ -5854,19 +5902,26 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     const std::vector<std::string> &keys) {
+    SpDiag::PerfPoint pt(PerfKey::RC_BATCH_IS_EXIST_INTERNAL,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        pt.End(-1);
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
     if (keys.empty()) {
         LOG(WARNING) << "Empty keys vector provided to batchIsExist_internal";
+        pt.End(0);
         return std::vector<tl::expected<bool, ErrorCode>>();
     }
 
     // Call client BatchIsExist and return the vector<expected> directly
-    return client_->BatchIsExist(keys);
+    auto ret = client_->BatchIsExist(keys);
+    pt.End(0);
+    return ret;
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
@@ -5913,6 +5968,9 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
+    SpDiag::PerfPoint pt(PerfKey::RC_BATCH_PUT_MULTI,
+                         SpDiag::PerfLevel::KEY_MODULE);
+    pt.Start();
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
@@ -5938,7 +5996,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     for (const auto &result : internal_results) {
         results.push_back(to_py_ret(result));
     }
-
+    pt.End(results.empty() ? -1 : 0);
+    // MC_LOG 在 *_internal 输出 汇总+per-key（Q1b）
     return results;
 }
 
@@ -5948,8 +6007,13 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config) {
+    SpDiag::PerfPoint pt(PerfKey::RC_BATCH_PUT_MULTI_INTERNAL,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        pt.End(-1);
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -5957,6 +6021,7 @@ RealClient::batch_put_from_multi_buffers_internal(
     if ((keys.size() != all_buffers.size()) ||
         (all_buffers.size() != all_sizes.size())) {
         LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        pt.End(-1);
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -5967,6 +6032,7 @@ RealClient::batch_put_from_multi_buffers_internal(
         const auto &sizes = all_sizes[i];
         if (buffers.size() != sizes.size()) {
             LOG(ERROR) << "Mismatched buffers and sizes of key:" << keys[i];
+            pt.End(-1);
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
@@ -5976,7 +6042,32 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
     }
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    auto result = client_->BatchPut(keys, batched_slices, config);
+    auto t1 = std::chrono::steady_clock::now();
+    auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t1 - t0).count();
+    pt.End(result.empty() ? -1 : 0);
+    // S4 batch_put_from_multi_buffers 下沉层 MC_LOG 汇总+per-key（Q1b）
+    // 字段：success+key+size（无 replica/endpoint，缺失不输出）
+    size_t total_bytes = 0;
+    for (const auto &sizes : all_sizes)
+        for (auto s : sizes) total_bytes += s;
+    std::ostringstream oss;
+    oss << "[batch_put_from_multi_buffers] elapsed_us=" << total_us
+        << " num_keys=" << keys.size()
+        << " total_bytes=" << total_bytes;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        int success = (i < result.size() && result[i].has_value()) ? 1 : 0;
+        oss << "\n  success=" << success << " key=" << keys[i];
+        if (i < all_sizes.size()) {
+            size_t key_size = 0;
+            for (auto s : all_sizes[i]) key_size += s;
+            oss << " size=" << key_size;
+        }
+        // 无 replica/endpoint，不输出
+    }
+    MC_LOG(INFO) << oss.str();
+    return result;
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
@@ -5984,6 +6075,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
+    SpDiag::PerfPoint pt(PerfKey::RC_BATCH_GET_INTO_MULTI,
+                         SpDiag::PerfLevel::KEY_MODULE);
+    pt.Start();
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
@@ -6008,6 +6102,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     for (const auto &result : internal_results) {
         results.push_back(to_py_ret(result));
     }
+    pt.End(results.empty() ? -1 : 0);
+    // MC_LOG 在 *_internal 输出 汇总+per-key（Q1b）
     return results;
 }
 
@@ -6017,9 +6113,14 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
+    SpDiag::PerfPoint pt(PerfKey::RC_BATCH_GET_INTO_MULTI_INTERNAL,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto t0 = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        pt.End(-1);
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -6028,6 +6129,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << all_buffers.size()
                    << ", sizes=" << all_sizes.size();
+        pt.End(-1);
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -6035,7 +6137,11 @@ RealClient::batch_get_into_multi_buffers_internal(
     const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results;
     results.reserve(num_keys);
+    // Per-key replica/endpoint tracking for MC_LOG（Q1b：下沉层 per-key 全字段）
+    std::vector<std::string> per_key_replica_type(num_keys);
+    std::vector<std::string> per_key_endpoint(num_keys);
     if (num_keys == 0) {
+        pt.End(0);
         return results;
     }
     // Query metadata for all keys
@@ -6094,6 +6200,21 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         const auto replica = *best_replica;
+        // Capture replica info for MC_LOG per-key output
+        if (replica.is_memory_replica()) {
+            per_key_replica_type[i] = "memory";
+            per_key_endpoint[i] = std::string(replica.get_memory_descriptor()
+                                                   .buffer_descriptor
+                                                   .transport_endpoint_);
+        } else if (replica.is_local_disk_replica()) {
+            per_key_replica_type[i] = "local_disk";
+            per_key_endpoint[i] =
+                std::string(replica.get_local_disk_descriptor()
+                                .transport_endpoint);
+        } else if (replica.is_disk_replica()) {
+            per_key_replica_type[i] = "disk";
+            // DISK 副本无 transport_endpoint，缺失不输出
+        }
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
@@ -6149,6 +6270,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
+        pt.End(0);
         return results;
     }
 
@@ -6366,6 +6488,32 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    auto t1 = std::chrono::steady_clock::now();
+    auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t1 - t0).count();
+    pt.End(results.empty() ? -1 : 0);
+    // S5 batch_get_into_multi_buffers 下沉层 MC_LOG 汇总+per-key（Q1b）
+    // 字段：success+key+size+replica+endpoint（缺失字段不输出）
+    std::ostringstream oss;
+    oss << "[batch_get_into_multi_buffers] elapsed_us=" << total_us
+        << " num_keys=" << keys.size();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        int success =
+            (i < results.size() && results[i].has_value()) ? 1 : 0;
+        oss << "\n  success=" << success << " key=" << keys[i];
+        if (i < all_sizes.size()) {
+            size_t key_size = 0;
+            for (auto s : all_sizes[i]) key_size += s;
+            oss << " size=" << key_size;
+        }
+        if (i < per_key_replica_type.size() && !per_key_replica_type[i].empty()) {
+            oss << " replica=" << per_key_replica_type[i];
+        }
+        if (i < per_key_endpoint.size() && !per_key_endpoint[i].empty()) {
+            oss << " endpoint=" << per_key_endpoint[i];
+        }
+    }
+    MC_LOG(INFO) << oss.str();
     return results;
 }
 
