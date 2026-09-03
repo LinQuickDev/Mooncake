@@ -914,6 +914,9 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+    IoPatternCfmConfig io_pattern_cfm_;
+    VChunkConfig vchunk_config_{};
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -1274,6 +1277,8 @@ class MasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    // CFM transport and authentication settings used by this MasterService.
+    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -1329,6 +1334,9 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -1373,6 +1381,7 @@ class MasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
@@ -1421,6 +1430,12 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
+        if (vchunk_config.enabled && !vchunk_etcd_endpoints.empty()) {
+            vchunk_metadata_store = std::make_shared<EtcdVChunkMetadataStore>(
+                vchunk_etcd_endpoints, vchunk_config, cluster_id);
+        }
     }
 
     // Static factory method to create a builder
@@ -1487,6 +1502,11 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.io_pattern_cfm = io_pattern_cfm_;
+    config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
+    config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
     return config;
 }
 
