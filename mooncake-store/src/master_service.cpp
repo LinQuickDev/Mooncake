@@ -454,9 +454,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 "io_pattern_cfm_auth_token is required when "
                 "io_pattern_cfm_endpoint is configured");
         }
-        const std::string node_id = config.io_pattern_cfm.node_id.empty()
-                                        ? config.cluster_id
-                                        : config.io_pattern_cfm.node_id;
+        // In CVM mode every SubMaster owns a different slot set. Use the
+        // stable SubMaster id by default so CFM keeps their reports and
+        // policy queues separate; cluster_id is only a legacy fallback.
+        const std::string node_id =
+            config.io_pattern_cfm.node_id.empty()
+                ? (config.master_id.empty() ? config.cluster_id
+                                            : config.master_id)
+                : config.io_pattern_cfm.node_id;
         auto transport = std::make_shared<io_pattern::CoroRpcCfmTransport>(
             config.io_pattern_cfm.endpoint, node_id,
             std::chrono::milliseconds(config.io_pattern_cfm.timeout_ms));

@@ -1214,7 +1214,8 @@ Configure a central CFM receiver with `io_pattern_cfm_auth_token`. Configure eac
 reporting/policy-consuming Master with:
 
 - `io_pattern_cfm_endpoint=host:port`
-- `io_pattern_cfm_node_id=<stable unique node id>` (defaults to `cluster_id`)
+- `io_pattern_cfm_node_id=<stable unique node id>` (defaults to the local CVM
+  SubMaster `master_id`, with `cluster_id` only as a legacy fallback)
 - the same `io_pattern_cfm_auth_token`
 - on the central receiver only, a distinct
   `io_pattern_cfm_producer_auth_token` for policy producers

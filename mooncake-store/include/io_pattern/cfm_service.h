@@ -39,8 +39,22 @@ class CfmService final {
     bool EnqueuePolicy(std::string node_id, std::string payload,
                        std::string_view token);
 
+    // Returns the metrics aggregated for one CFM node. In a CVM deployment a
+    // node is a stable SubMaster identity, so policy generation for one slot
+    // owner must never observe keys reported by another SubMaster.
+    IoPatternSnapshot SnapshotForNode(std::string_view node_id) const;
+
    private:
+    struct NodeRuntime {
+        std::shared_ptr<IoPatternRuntime> runtime;
+        std::unique_ptr<CfmIngress> ingress;
+    };
+
     bool EnqueueValidated(std::string node_id, std::string payload);
+    std::shared_ptr<NodeRuntime> GetOrCreateNodeRuntime(
+        std::string_view node_id);
+    std::shared_ptr<NodeRuntime> FindNodeRuntime(
+        std::string_view node_id) const;
     void SchedulePolicyProduction(std::string node_id, MetricBatch batch);
     void PolicyProducerWorker();
     void ProducePolicies(std::string_view node_id, const MetricBatch& batch);
@@ -48,6 +62,9 @@ class CfmService final {
     std::shared_ptr<IoPatternRuntime> runtime_;
     std::shared_ptr<CfmBinaryCodec> codec_;
     CfmIngress ingress_;
+    mutable std::mutex node_runtimes_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<NodeRuntime>>
+        node_runtimes_;
     const std::string auth_token_;
     const std::string producer_auth_token_;
     const size_t policy_queue_capacity_;

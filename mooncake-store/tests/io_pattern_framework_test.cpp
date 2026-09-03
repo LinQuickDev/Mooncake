@@ -1077,6 +1077,41 @@ TEST(IoPatternFrameworkTest, CfmServiceAuthenticatesAndBoundsPolicyQueues) {
     EXPECT_EQ(admissions, 1);
 }
 
+TEST(IoPatternFrameworkTest, CfmAggregatesMetricsBySubmasterNode) {
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    CfmService service(runtime, "secret", 8, "producer");
+    CfmBinaryCodec codec;
+
+    MetricBatch submaster_a;
+    submaster_a.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "key-a"},
+                     .block_size = 64,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = true});
+    MetricBatch submaster_b;
+    submaster_b.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "key-b"},
+                     .block_size = 128,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = true});
+
+    ASSERT_TRUE(service.Send("submaster-a", "report_metric_batch",
+                             codec.EncodeMetricBatch(submaster_a), "secret"));
+    ASSERT_TRUE(service.Send("submaster-b", "report_metric_batch",
+                             codec.EncodeMetricBatch(submaster_b), "secret"));
+
+    const auto snapshot_a = service.SnapshotForNode("submaster-a");
+    const auto snapshot_b = service.SnapshotForNode("submaster-b");
+    ASSERT_EQ(snapshot_a.keys.size(), 1);
+    ASSERT_EQ(snapshot_b.keys.size(), 1);
+    EXPECT_EQ(snapshot_a.keys.front().object.key, "key-a");
+    EXPECT_EQ(snapshot_b.keys.front().object.key, "key-b");
+}
+
 TEST(IoPatternFrameworkTest, CoroRpcCfmTransportRunsTheProductionWirePath) {
     auto runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
@@ -1118,7 +1153,7 @@ TEST(IoPatternFrameworkTest, CoroRpcCfmTransportRunsTheProductionWirePath) {
     EXPECT_TRUE(transport.Send("report_metric_batch",
                                codec.EncodeMetricBatch(batch),
                                std::chrono::milliseconds(500)));
-    const auto snapshot = runtime->Snapshot();
+    const auto snapshot = service->SnapshotForNode("node-a");
     ASSERT_EQ(snapshot.keys.size(), 1);
     ASSERT_EQ(snapshot.storage.size(), 1);
     EXPECT_EQ(snapshot.keys.front().object.key, "remote-key");
@@ -1185,6 +1220,56 @@ TEST(IoPatternFrameworkTest, CfmProducesNodePolicyFromHighWatermarkReport) {
     EXPECT_EQ(eviction->candidates.front().object.key, "cold-key");
     EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, true,
                                          "node-secret"));
+}
+
+TEST(IoPatternFrameworkTest, CfmPolicyDoesNotCrossSubmasterKeySets) {
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    CfmService service(runtime, "node-secret", 8, "producer-secret");
+    CfmBinaryCodec codec;
+
+    MetricBatch submaster_b;
+    submaster_b.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "key-b"},
+                     .block_size = 4096,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = false});
+    ASSERT_TRUE(service.Send("submaster-b", "report_metric_batch",
+                             codec.EncodeMetricBatch(submaster_b),
+                             "node-secret"));
+
+    MetricBatch submaster_a;
+    submaster_a.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "key-a"},
+                     .block_size = 1024,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = false});
+    submaster_a.storage.push_back(
+        StorageMetric{.tier = CacheTier::kL1Host,
+                      .used_bytes = 950,
+                      .capacity_bytes = 1000,
+                      .memory_used_ratio = 0.95F});
+    ASSERT_TRUE(service.Send("submaster-a", "report_metric_batch",
+                             codec.EncodeMetricBatch(submaster_a),
+                             "node-secret"));
+
+    std::optional<std::pair<uint64_t, std::string>> delivery;
+    for (size_t attempt = 0; attempt < 100 && !delivery; ++attempt) {
+        delivery = service.PollPolicy("submaster-a", "node-secret");
+        if (!delivery) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(delivery.has_value());
+    const auto command = codec.DecodePolicy(delivery->second);
+    ASSERT_TRUE(command.has_value());
+    const auto* eviction = std::get_if<EvictionPlan>(&*command);
+    ASSERT_NE(eviction, nullptr);
+    ASSERT_FALSE(eviction->candidates.empty());
+    for (const auto& candidate : eviction->candidates) {
+        EXPECT_EQ(candidate.object.key, "key-a");
+    }
 }
 
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {

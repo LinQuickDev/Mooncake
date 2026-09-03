@@ -164,7 +164,8 @@ DEFINE_string(io_pattern_cfm_endpoint, "",
               "Central CFM Master RPC endpoint (host:port); empty serves CFM "
               "requests without outbound reporting");
 DEFINE_string(io_pattern_cfm_node_id, "",
-              "Stable node id used for CFM policy polling; defaults to cluster_id");
+              "Stable node id used for CFM policy polling; defaults to "
+              "the local CVM SubMaster master_id");
 DEFINE_string(io_pattern_cfm_auth_token, "",
               "Authentication token for CFM node report/poll RPCs");
 DEFINE_string(io_pattern_cfm_producer_auth_token, "",
@@ -1611,7 +1612,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (master_config.io_pattern_cfm.node_id.empty()) {
-        master_config.io_pattern_cfm.node_id = master_config.cluster_id;
+        // CVM policy routing is per SubMaster. master_id is stable across the
+        // CFM reporting, polling and ACK path; cluster_id would merge every
+        // SubMaster in the same CVM deployment into one CFM node.
+        master_config.io_pattern_cfm.node_id =
+            master_config.master_id.empty() ? master_config.cluster_id
+                                             : master_config.master_id;
     }
 
     const char* value = std::getenv("MC_RPC_PROTOCOL");

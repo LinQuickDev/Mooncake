@@ -55,12 +55,49 @@ bool CfmService::Send(std::string_view node_id, std::string_view method,
         metric_batch = codec_->DecodeMetricBatch(std::string(payload));
         if (!metric_batch) return false;
     }
-    if (!ingress_.Handle(method, payload, node_id)) return false;
+    // Direct producer commands are intentionally executed through the CFM
+    // service runtime. Metrics and snapshots, on the other hand, must remain
+    // node-local: a CVM node is a SubMaster with an independent slot/key set.
+    if (executes_policy) return ingress_.Handle(method, payload, node_id);
+    auto node_runtime = GetOrCreateNodeRuntime(node_id);
+    if (!node_runtime->ingress->Handle(method, payload, node_id)) return false;
     if (metric_batch) {
         SchedulePolicyProduction(std::string(node_id),
                                  std::move(*metric_batch));
     }
     return true;
+}
+
+IoPatternSnapshot CfmService::SnapshotForNode(std::string_view node_id) const {
+    const auto node_runtime = FindNodeRuntime(node_id);
+    return node_runtime ? node_runtime->runtime->Snapshot()
+                        : IoPatternSnapshot{};
+}
+
+std::shared_ptr<CfmService::NodeRuntime> CfmService::GetOrCreateNodeRuntime(
+    std::string_view node_id) {
+    std::lock_guard lock(node_runtimes_mutex_);
+    const std::string id(node_id);
+    const auto existing = node_runtimes_.find(id);
+    if (existing != node_runtimes_.end()) return existing->second;
+
+    auto node_runtime = std::make_shared<NodeRuntime>();
+    node_runtime->runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    node_runtime->ingress =
+        std::make_unique<CfmIngress>(node_runtime->runtime, codec_);
+    node_runtimes_.emplace(id, node_runtime);
+    return node_runtime;
+}
+
+std::shared_ptr<CfmService::NodeRuntime> CfmService::FindNodeRuntime(
+    std::string_view node_id) const {
+    std::lock_guard lock(node_runtimes_mutex_);
+    const auto it = node_runtimes_.find(std::string(node_id));
+    return it == node_runtimes_.end() ? nullptr : it->second;
 }
 
 std::optional<std::pair<uint64_t, std::string>> CfmService::PollPolicy(
@@ -165,7 +202,9 @@ void CfmService::PolicyProducerWorker() {
 
 void CfmService::ProducePolicies(std::string_view node_id,
                                  const MetricBatch& batch) {
-    if (!runtime_ || node_id.empty()) return;
+    const auto node_runtime = FindNodeRuntime(node_id);
+    if (!node_runtime || node_id.empty()) return;
+    const auto& runtime = node_runtime->runtime;
 
     std::unordered_map<ObjectRef, uint32_t, ObjectRefHash> match_lengths;
     std::string session_id;
@@ -207,7 +246,7 @@ void CfmService::ProducePolicies(std::string_view node_id,
         }
         if (target_bytes == 0) {
             uint64_t tier_bytes = 0;
-            for (const auto& key : runtime_->Snapshot().keys) {
+            for (const auto& key : runtime->Snapshot().keys) {
                 if ((key.replica_tiers & CacheTierBit(storage.tier)) == 0) {
                     continue;
                 }
@@ -223,8 +262,8 @@ void CfmService::ProducePolicies(std::string_view node_id,
                 static_cast<long double>(tier_bytes) * excess_ratio /
                 std::max(0.01F, used_ratio));
         }
-        auto result = runtime_->Plan(storage.tier, target_bytes, trace, {},
-                                     session_id);
+        auto result = runtime->Plan(storage.tier, target_bytes, trace, {},
+                                    session_id);
         if (result.degraded) continue;
         if (!result.eviction.candidates.empty()) {
             EnqueueValidated(std::string(node_id),
@@ -238,8 +277,8 @@ void CfmService::ProducePolicies(std::string_view node_id,
     }
 
     if (!produced_prefetch && !trace.events.empty()) {
-        auto result = runtime_->Plan(CacheTier::kL1Host, 0, trace, {},
-                                     session_id);
+        auto result = runtime->Plan(CacheTier::kL1Host, 0, trace, {},
+                                    session_id);
         if (!result.degraded && !result.prefetch.candidates.empty()) {
             EnqueueValidated(std::string(node_id),
                              codec_->EncodePolicy(result.prefetch));
