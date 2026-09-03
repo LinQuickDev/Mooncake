@@ -93,6 +93,15 @@ struct MasterView {
     ViewVersionId view_version = 0;
 };
 
+// A single submaster replay source for a standby. master_id doubles as the
+// per-source OpLog namespace (see ha/oplog/oplog_batch_types.h).
+struct MasterSource {
+    std::string master_id;
+    std::string address;
+};
+
+using MasterSources = std::vector<MasterSource>;
+
 struct LeadershipSession {
     MasterView view;
     // Backend-issued opaque ownership token. Only the backend that created
