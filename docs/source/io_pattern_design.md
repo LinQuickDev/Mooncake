@@ -965,6 +965,99 @@ metadata. Its handlers use the existing safe quota-eviction and
 promotion-on-hit queues; HBM stays inference-runtime-owned and is never moved
 by the Store master.
 
+### Current implementation architecture
+
+The following diagram is the implementation-level view. It distinguishes the
+local Store data path from the optional *remote* central CFM deployment: metric
+reporting is asynchronous, while a received CFM command is executed by the
+same storage handlers as a locally planned command. The two `MasterService`
+boxes are deployment roles, not two mandatory Mooncake service types. A normal
+deployment has one active Master (plus an optional HA standby); a separate
+central CFM Master is needed only when metrics and policy are centralized
+across multiple Masters. The roles may also be co-located for a single-Master
+deployment.
+
+```mermaid
+flowchart TB
+    subgraph producers["Metric producers"]
+        direction LR
+        inference["vLLM / SGLang bridge\nInferenceMetrics"]
+        access["Store Get/Put paths\nAccessRecord"]
+        storage["Storage and watermark paths\nStorageMetric"]
+    end
+
+    subgraph local["Reporting / policy-consuming MasterService"]
+        direction TB
+        runtime["IoPatternRuntime"]
+        collector["IoPatternCollectorImpl\nper-tenant/object aggregation\nrolling snapshot"]
+        reporter["IoPatternReporter\nbounded MetricBatch queue\nadaptive 100/200/500/1000 ms flush"]
+        analyzer["ResilientAnalyzer\nSlidingWindowAnalyzer\nbudget + timeout fallback"]
+        policy["DegradingPolicyEngine\nWorkloadPolicyEngine\nper-session templates"]
+        executor["TierOperationExecutor"]
+        feedback["PolicyFeedbackWindow +\nAdaptivePolicyTuner"]
+        admission_worker["Admission worker\nbounded deferred queue"]
+
+        runtime --> collector
+        collector --> reporter
+        collector --> analyzer
+        analyzer --> policy
+        policy --> executor
+        executor --> feedback
+        feedback -. "tune eviction weights" .-> policy
+        policy --> admission_worker
+    end
+
+    subgraph local_ops["Store-owned safe execution handlers"]
+        direction LR
+        evict["Eviction\ntenant-qualified quota eviction"]
+        prefetch["Prefetch\nLOCAL_DISK → MEMORY promotion queue"]
+        admit["Admission\npost-write retention / promotion"]
+    end
+
+    subgraph transport["Optional authenticated CFM transport"]
+        direction LR
+        codec["CfmBinaryCodec\nversioned CFM2 wire format"]
+        channel["CfmRpcChannel\nauthenticate + encode/decode"]
+        resilient["ResilientCfmChannel\nbounded retry + degradation state"]
+        rpc["CoroRpcCfmTransport\nexisting coro_rpc client pool"]
+        codec --> channel --> resilient
+        channel --> rpc
+    end
+
+    subgraph central["Central CFM MasterService"]
+        direction TB
+        rpc_service["CfmRpcService\nAuthenticate / Send / Receive /\nAcknowledge / EnqueuePolicy"]
+        service["CfmService\nauthentication + per-node bounded queues"]
+        ingress["CfmIngress\ndecode and normalize remote metrics"]
+        central_runtime["IoPatternRuntime\nCollector → Analyzer → PolicyEngine"]
+        producer_worker["PolicyProducerWorker\nproduce high-watermark eviction\nand trace-derived prefetch commands"]
+        policy_queue["Policy queue per stable node_id\ndelivery_id + ACK state"]
+        rpc_service --> service --> ingress --> central_runtime --> producer_worker --> policy_queue
+    end
+
+    inference --> runtime
+    access --> runtime
+    storage --> runtime
+    executor --> evict
+    executor --> prefetch
+    executor --> admit
+
+    reporter -->|"report_metric_batch"| channel
+    rpc -->|"authenticated RPC"| rpc_service
+    policy_queue -->|"poll_policy"| rpc
+    resilient --> client["CfmClientImpl\nPollAndDispatchPolicy"]
+    client -->|"PolicyCommand"| runtime
+    client -->|"ACK success / failure"| resilient
+
+    external_producer["External policy producer\nproducer credential"] -->|"enqueue_policy"| rpc_service
+    observability["IoPatternObservability\nlatency, hit rate, false positives,\ndegradation, report drops"] -.-> runtime
+```
+
+`CfmClientImpl` is deliberately not the normal metric-reporting entry point in
+the production wiring. `IoPatternReporter` sends metric batches directly
+through `CfmRpcChannel`; the client object owns the polling, dispatch and ACK
+loop for CFM-issued policy commands.
+
 ## Implemented
 
 - `IoPatternCollectorImpl` aggregates inference, access and storage metrics by
