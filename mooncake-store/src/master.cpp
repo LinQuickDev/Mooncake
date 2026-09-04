@@ -160,6 +160,20 @@ DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
+DEFINE_string(io_pattern_cfm_endpoint, "",
+              "Central CFM Master RPC endpoint (host:port); empty serves CFM "
+              "requests without outbound reporting");
+DEFINE_string(io_pattern_cfm_node_id, "",
+              "Stable node id used for CFM policy polling; defaults to "
+              "the local CVM SubMaster RPC endpoint");
+DEFINE_string(io_pattern_cfm_auth_token, "",
+              "Authentication token for CFM node report/poll RPCs");
+DEFINE_string(io_pattern_cfm_producer_auth_token, "",
+              "Separate token authorized to enqueue CFM policies");
+DEFINE_uint32(io_pattern_cfm_timeout_ms, 500,
+              "CFM RPC request timeout in milliseconds");
+DEFINE_uint32(io_pattern_cfm_policy_queue_capacity, 4096,
+              "Maximum queued CFM policies per node");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Mem eviction ratio must be between 0.0 and 1.0";
@@ -297,6 +311,15 @@ DEFINE_int64(global_file_segment_size,
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
+DEFINE_uint32(submaster_count, 1,
+              "Maximum number of simultaneously serving submaster in the "
+              "cluster (CVM quota coordination, first-come-first-served). "
+              "Masters ranked beyond this limit are demoted to standby.");
+DEFINE_uint32(cvm_http_port, 0,
+              "Port for the CVM external HTTP API (CvmHttpServer). 0 keeps it "
+              "disabled.");
+DEFINE_string(cvm_http_host, "0.0.0.0",
+              "Bind host for the CVM external HTTP API (CvmHttpServer).");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
@@ -460,6 +483,27 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     // Initialize the master service configuration from the default config
     default_config.GetBool("enable_cxl", &master_config.enable_cxl,
                            FLAGS_enable_cxl);
+    default_config.GetBool("enable_vchunk",
+                           &master_config.vchunk_config.enabled, false);
+    default_config.GetString("vchunk_etcd_endpoints",
+                             &master_config.vchunk_etcd_endpoints, "");
+    default_config.GetUInt64(
+        "vchunk_creating_timeout_ms",
+        &master_config.vchunk_config.creating_timeout_ms, 30'000);
+    default_config.GetUInt64(
+        "vchunk_releasing_timeout_ms",
+        &master_config.vchunk_config.releasing_timeout_ms, 60'000);
+    default_config.GetUInt32("vchunk_max_slice_retry",
+                             &master_config.vchunk_config.max_slice_retry, 3);
+    default_config.GetUInt32("vchunk_max_slice_count",
+                             &master_config.vchunk_config.max_slice_count,
+                             4096);
+    default_config.GetUInt64("vchunk_max_metadata_bytes",
+                             &master_config.vchunk_config.max_metadata_bytes,
+                             1024U * 1024U);
+    default_config.GetUInt32(
+        "vchunk_max_creating_objects",
+        &master_config.vchunk_config.max_creating_objects, 1024);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,
@@ -483,6 +527,26 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
+    default_config.GetString("io_pattern_cfm_endpoint",
+                             &master_config.io_pattern_cfm.endpoint,
+                             FLAGS_io_pattern_cfm_endpoint);
+    default_config.GetString("io_pattern_cfm_node_id",
+                             &master_config.io_pattern_cfm.node_id,
+                             FLAGS_io_pattern_cfm_node_id);
+    default_config.GetString("io_pattern_cfm_auth_token",
+                             &master_config.io_pattern_cfm.auth_token,
+                             FLAGS_io_pattern_cfm_auth_token);
+    default_config.GetString(
+        "io_pattern_cfm_producer_auth_token",
+        &master_config.io_pattern_cfm.producer_auth_token,
+        FLAGS_io_pattern_cfm_producer_auth_token);
+    default_config.GetUInt32("io_pattern_cfm_timeout_ms",
+                             &master_config.io_pattern_cfm.timeout_ms,
+                             FLAGS_io_pattern_cfm_timeout_ms);
+    default_config.GetUInt32(
+        "io_pattern_cfm_policy_queue_capacity",
+        &master_config.io_pattern_cfm.policy_queue_capacity,
+        FLAGS_io_pattern_cfm_policy_queue_capacity);
     default_config.GetDurationMs("default_kv_lease_ttl",
                                  &master_config.default_kv_lease_ttl,
                                  mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL);
@@ -779,6 +843,41 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 
     google::CommandLineFlagInfo info;
+    if ((google::GetCommandLineFlagInfo("io_pattern_cfm_endpoint", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cfm.endpoint = FLAGS_io_pattern_cfm_endpoint;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cfm_node_id", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cfm.node_id = FLAGS_io_pattern_cfm_node_id;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cfm_auth_token", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cfm.auth_token =
+            FLAGS_io_pattern_cfm_auth_token;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_cfm_producer_auth_token", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cfm.producer_auth_token =
+            FLAGS_io_pattern_cfm_producer_auth_token;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cfm_timeout_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cfm.timeout_ms = FLAGS_io_pattern_cfm_timeout_ms;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_cfm_policy_queue_capacity", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cfm.policy_queue_capacity =
+            FLAGS_io_pattern_cfm_policy_queue_capacity;
+    }
     if ((google::GetCommandLineFlagInfo("enable_cxl", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1054,6 +1153,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
+    }
+    if ((google::GetCommandLineFlagInfo("submaster_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.submaster_count = FLAGS_submaster_count;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_http_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_http_port = static_cast<uint16_t>(FLAGS_cvm_http_port);
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_http_host", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_http_host = FLAGS_cvm_http_host;
     }
     if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
          !info.is_default) ||
@@ -1477,6 +1591,34 @@ int main(int argc, char* argv[]) {
                    << ", must be 'cachelib' or 'offset'";
         return 1;
     }
+    if (!master_config.io_pattern_cfm.endpoint.empty() &&
+        master_config.io_pattern_cfm.auth_token.empty()) {
+        LOG(FATAL) << "io_pattern_cfm_auth_token is required when "
+                      "io_pattern_cfm_endpoint is configured";
+        return 1;
+    }
+    if (!master_config.io_pattern_cfm.producer_auth_token.empty() &&
+        master_config.io_pattern_cfm.producer_auth_token ==
+            master_config.io_pattern_cfm.auth_token) {
+        LOG(FATAL) << "io_pattern_cfm_producer_auth_token must differ from "
+                      "io_pattern_cfm_auth_token";
+        return 1;
+    }
+    if (master_config.io_pattern_cfm.timeout_ms == 0 ||
+        master_config.io_pattern_cfm.timeout_ms > 10'000 ||
+        master_config.io_pattern_cfm.policy_queue_capacity == 0) {
+        LOG(FATAL) << "io_pattern_cfm_timeout_ms must be in [1, 10000] and "
+                      "io_pattern_cfm_policy_queue_capacity must be non-zero";
+        return 1;
+    }
+    if (master_config.io_pattern_cfm.node_id.empty()) {
+        // CVM registers each SubMaster with the same address used as its
+        // stable local_hostname. cluster_id would merge every SubMaster in
+        // the same CVM deployment into one CFM node.
+        master_config.io_pattern_cfm.node_id =
+            master_config.rpc_address + ":" +
+            std::to_string(master_config.rpc_port);
+    }
 
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     std::string protocol = "tcp";
@@ -1546,6 +1688,14 @@ int main(int argc, char* argv[]) {
         << ", client_ttl=" << master_config.client_live_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
+        << ", io_pattern_cfm_endpoint="
+        << (master_config.io_pattern_cfm.endpoint.empty()
+                ? "<server-only>"
+                : master_config.io_pattern_cfm.endpoint)
+        << ", io_pattern_cfm_node_id="
+        << master_config.io_pattern_cfm.node_id
+        << ", io_pattern_cfm_server_enabled="
+        << !master_config.io_pattern_cfm.auth_token.empty()
         << ", rpc_address=" << master_config.rpc_address
         << ", rpc_interface=" << master_config.rpc_interface
         << ", rpc_conn_timeout_seconds="

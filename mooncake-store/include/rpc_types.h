@@ -122,6 +122,22 @@ struct MoveStartResponse {
 };
 YLT_REFL(MoveStartResponse, source, target);
 
+/**
+ * @brief Response structure for InterMasterHandshake: identity + ownership
+ * summary of a submaster, used by other submasters to verify the inter-master
+ * RPC channel (CVM multi-submaster coordination, forwarding path).
+ */
+struct InterMasterHandshakeResponse {
+    std::string master_id;
+    uint64_t lease_id{0};
+    uint32_t owned_slot_count{0};
+    std::string version;
+
+    InterMasterHandshakeResponse() = default;
+};
+YLT_REFL(InterMasterHandshakeResponse, master_id, lease_id, owned_slot_count,
+         version);
+
 enum class JobType {
     DRAIN = 0,
 };

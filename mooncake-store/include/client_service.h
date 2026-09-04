@@ -908,8 +908,30 @@ class Client {
     std::mutex leader_switch_mutex_;
     std::optional<ha::MasterView> current_master_view_;
     std::string direct_master_address_;
+    // Etcd endpoints parsed from the HA backend entry, used to load the KV
+    // partition routing snapshot. Empty in non-HA mode.
+    std::string etcd_connstring_;
+    // Resolved cluster namespace (cluster_id) cached after the first routing
+    // load; reused by the periodic routing refresh loop.
+    std::string cluster_id_;
+    // CVM multi-submaster mode: set when the client bootstraps from the
+    // /cvm/<ns>/masters/ registry (no single-leader master_view in etcd).
+    // Empty in single-leader HA mode and direct mode. Also drives the
+    // ping-failure re-discovery path.
+    std::string cvm_cluster_namespace_;
+    // CVM 多 submaster：已发现的全部 primary submaster 地址（含当前连接的
+    // 那个）。用于 client 侧全量 mount（同一 segment 挂到所有 submaster）与
+    // 多 submaster 心跳（防止各 submaster 因收不到 ping 而误卸载 segment）。
+    // 由 ConnectToCvmSubmasters 填充。
+    std::mutex cvm_submaster_addresses_mutex_;
+    std::vector<std::string> cvm_submaster_addresses_;
+    // 串行化 TryLoadRoutingOnce（及其内部对 cluster_id_ 的读写），
+    // 用于 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新之间。
+    std::mutex routing_load_mutex_;
     std::thread leader_monitor_thread_;
     std::atomic<bool> leader_monitor_running_{false};
+    std::thread routing_refresh_thread_;
+    std::atomic<bool> routing_refresh_running_{false};
     std::thread storage_heartbeat_thread_;
     std::atomic<bool> storage_heartbeat_running_{false};
     std::thread task_poll_thread_;
@@ -918,8 +940,25 @@ class Client {
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    // CVM multi-submaster bootstrap/failover: connect the etcd store client,
+    // discover the cluster namespace from /cvm/<ns>/masters/, and connect to
+    // the first live primary submaster (first-registered first, matching the
+    // CvmController ranking). On success sets cvm_cluster_namespace_.
+    ErrorCode ConnectToCvmSubmasters(const std::string& etcd_endpoints);
+    void LoadPartitionRouting();
+    void TryLoadRoutingOnce();
+    void RoutingRefreshThreadMain();
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
+    // CVM 多 submaster：向所有 primary submaster 定向 Ping（不切换当前连接），
+    // 各 submaster 收到 ping 后会保活该 client；返回 NEED_REMOUNT 的 submaster
+    // 会被重新 mount（重新注册 segment）。单 submaster 失败不影响其他。
+    void HeartbeatAllSubmasters();
+    // CVM 多 submaster：重新扫描 /cvm/<ns>/masters/ 注册表，更新已发现的
+    // primary 地址列表；对新增的 submaster 全量 mount 所有本地 segment，使
+    // 新加入的 submaster 也具备给本 client 分配副本的能力。由路由刷新线程
+    // 周期调用。
+    void RefreshSubmasterAddresses();
     void TaskPollThreadMain();
     void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();

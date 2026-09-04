@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 #ifdef USE_NOF
 #include <numa.h>
 #endif
@@ -34,6 +35,10 @@
 #include "transport/transport.h"
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
+#include "cvm/cvm_keys.h"
+#include "cvm/cvm_types.h"
+#include "cvm/etcd_view_store.h"
+#include "etcd_helper.h"
 #include "types.h"
 #include "client_buffer.h"
 #include "utils.h"
@@ -43,6 +48,12 @@
 #include "crc_checksum.h"
 #include "environ.h"
 #include "mooncake_logging.h"
+
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
 
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
@@ -347,6 +358,11 @@ Client::~Client() {
         leader_monitor_thread_.join();
     }
 
+    routing_refresh_running_ = false;
+    if (routing_refresh_thread_.joinable()) {
+        routing_refresh_thread_.join();
+    }
+
     {
         std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
         graceful_unmount_timer_stopping_ = true;
@@ -557,8 +573,24 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return current_view.error();
         }
         if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            // No single-leader master_view is published. In the CVM
+            // multi-submaster architecture masters never write master_view;
+            // they register under /cvm/<ns>/masters/ instead. Fall back to
+            // the CVM registry to bootstrap the connection. Per-key routing
+            // is loaded afterwards via LoadPartitionRouting() from the
+            // kv_view snapshot in etcd.
+            LOG(INFO) << "No master_view in HA backend; trying CVM "
+                         "multi-submaster bootstrap from /cvm/ registry";
+            auto err =
+                ConnectToCvmSubmasters(ha_backend_spec.value()->connstring);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "No master is available in HA backend (nor a "
+                              "CVM submaster registry)";
+                return err;
+            }
+            direct_master_address_.clear();
+            etcd_connstring_ = ha_backend_spec.value()->connstring;
+            return ErrorCode::OK;
         }
 
         const auto& master_view = current_view.value().value();
@@ -570,6 +602,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
+        etcd_connstring_ = ha_backend_spec.value()->connstring;
 
         leader_monitor_running_ = true;
         leader_monitor_thread_ =
@@ -588,6 +621,264 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         last_ping_success_.store(true);
         return ErrorCode::OK;
+    }
+}
+
+ErrorCode Client::ConnectToCvmSubmasters(const std::string& etcd_endpoints) {
+    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "ConnectToCvmSubmasters: failed to connect etcd: " << err;
+        return err;
+    }
+
+    // Discover cluster namespaces that have registered masters by scanning
+    // the /cvm/ key space for /cvm/<ns>/masters/<master_id> keys.
+    const std::string cvm_root(std::string(mooncake::cvm::kCvmRootPrefix));
+    const std::string cvm_root_end = mooncake::cvm::PrefixEnd(cvm_root);
+    const std::string masters_suffix("/masters/");
+    std::string json;
+    EtcdRevisionId revision = 0;
+    err = EtcdHelper::GetRangeAsJson(cvm_root.data(), cvm_root.size(),
+                                     cvm_root_end.data(), cvm_root_end.size(),
+                                     0 /* no limit */, json, revision);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "ConnectToCvmSubmasters: failed to scan /cvm/ prefix: "
+                   << err;
+        return err;
+    }
+
+    std::set<std::string> namespaces;
+    {
+        Json::Value root;
+        Json::CharReaderBuilder reader;
+        std::string errors;
+        std::istringstream stream(json);
+        if (!Json::parseFromStream(reader, stream, &root, &errors) ||
+            !root.isArray()) {
+            LOG(ERROR) << "ConnectToCvmSubmasters: failed to parse /cvm/ "
+                          "range JSON: "
+                       << errors;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        for (const auto& item : root) {
+            if (!item.isObject() || !item["key"].isString()) {
+                continue;
+            }
+            const std::string key = item["key"].asString();
+            if (!key.starts_with(cvm_root)) {
+                continue;
+            }
+            const size_t ns_begin = cvm_root.size();
+            const size_t masters_pos = key.find(masters_suffix, ns_begin);
+            // Key layout: /cvm/<ns>/masters/<master_id>. Reject namespaces
+            // containing '/' (not a valid masters key).
+            if (masters_pos == std::string::npos ||
+                key.find('/', ns_begin) != masters_pos) {
+                continue;
+            }
+            namespaces.insert(key.substr(ns_begin, masters_pos - ns_begin));
+        }
+    }
+    if (namespaces.empty()) {
+        LOG(ERROR) << "ConnectToCvmSubmasters: no /cvm/<ns>/masters/ "
+                      "registry found in etcd";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (namespaces.size() > 1) {
+        std::ostringstream oss;
+        for (const auto& ns : namespaces) {
+            oss << " " << ns;
+        }
+        LOG(WARNING) << "ConnectToCvmSubmasters: multiple CVM namespaces "
+                        "found ("
+                     << oss.str() << "); using the first one";
+    }
+
+    // Try each namespace; within a namespace, prefer primaries ordered by
+    // registration time (first-registered first), matching the
+    // CvmController first-come-first-served ranking. Fall back to standbys
+    // only if no primary is reachable, so the client can still bootstrap.
+    for (const auto& ns : namespaces) {
+        std::vector<cvm::MasterRegistration> masters;
+        ViewVersionId version = 0;
+        err = cvm::EtcdViewStore::LoadAllMasters(ns, masters, version);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "ConnectToCvmSubmasters: LoadAllMasters failed "
+                            "for namespace "
+                         << ns << ": " << err;
+            continue;
+        }
+        std::sort(masters.begin(), masters.end(),
+                  [](const cvm::MasterRegistration& a,
+                     const cvm::MasterRegistration& b) {
+                      if (a.registered_at_ms != b.registered_at_ms) {
+                          return a.registered_at_ms < b.registered_at_ms;
+                      }
+                      return a.master_id < b.master_id;
+                  });
+
+        auto try_connect_group = [&](bool primaries_only) {
+            for (const auto& reg : masters) {
+                if (primaries_only &&
+                    reg.role != static_cast<int32_t>(cvm::MasterRole::kPrimary)) {
+                    continue;
+                }
+                auto connect_err = master_client_.Connect(reg.address);
+                if (connect_err != ErrorCode::OK) {
+                    LOG(WARNING) << "ConnectToCvmSubmasters: connect to "
+                                 << reg.master_id << " (" << reg.address
+                                 << ") failed: " << toString(connect_err);
+                    continue;
+                }
+                cvm_cluster_namespace_ = ns;
+                // 收集该 namespace 下所有 primary 地址，用于 client 侧全量
+                // mount 与多 submaster 心跳（同一 segment 挂到所有 submaster）。
+                {
+                    std::lock_guard<std::mutex> lock(
+                        cvm_submaster_addresses_mutex_);
+                    cvm_submaster_addresses_.clear();
+                    // 去重：etcd 中可能存在指向同一 address 的重复 primary
+                    // 注册（如重启残留 lease），不去重会导致全量 mount 对同一
+                    // submaster 重复调用、master 日志刷屏。
+                    std::set<std::string> seen;
+                    for (const auto& reg2 : masters) {
+                        if (reg2.role ==
+                                static_cast<int32_t>(
+                                    cvm::MasterRole::kPrimary) &&
+                            !reg2.address.empty() &&
+                            seen.insert(reg2.address).second) {
+                            cvm_submaster_addresses_.push_back(reg2.address);
+                        }
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                    current_master_view_.reset();
+                }
+                // Seed cluster_id_ with the CVM namespace so
+                // TryLoadRoutingOnce skips fsdir-based discovery: GetFsdir
+                // returns an empty string when the submaster has no storage
+                // root configured, which would otherwise leave the partition
+                // routing permanently unloaded.
+                {
+                    std::lock_guard<std::mutex> lock(routing_load_mutex_);
+                    cluster_id_ = ns;
+                }
+                last_ping_success_.store(true);
+                LOG(INFO) << "ConnectToCvmSubmasters: connected to submaster "
+                         << reg.master_id << " (" << reg.address
+                         << ", role=" << reg.role
+                         << ", namespace=" << ns << ")";
+                return ErrorCode::OK;
+            }
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        };
+
+        if (try_connect_group(true) == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+        if (try_connect_group(false) == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+        LOG(WARNING) << "ConnectToCvmSubmasters: no reachable master in "
+                       "namespace "
+                    << ns;
+    }
+
+    LOG(ERROR) << "ConnectToCvmSubmasters: no reachable submaster in any "
+                  "CVM namespace";
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+}
+
+void Client::LoadPartitionRouting() {
+    // Routing is only meaningful in HA mode where etcd is available.
+    if (etcd_connstring_.empty()) {
+        LOG(INFO) << "LoadPartitionRouting skipped: non-HA mode (no etcd "
+                     "endpoints)";
+        return;
+    }
+    LOG(INFO) << "LoadPartitionRouting: etcd_endpoints=[" << etcd_connstring_
+              << "]";
+
+    // First attempt (best effort). A failure here must not fail client
+    // startup; the refresh loop started below keeps retrying until it
+    // succeeds.
+    TryLoadRoutingOnce();
+
+    // Start the periodic refresh/retry loop unconditionally in HA mode, so a
+    // first-attempt failure (etcd temporarily unavailable, GetFsdir hiccup) is
+    // retried on the next cycle instead of leaving the client permanently in
+    // single-master fallback.
+    if (!routing_refresh_running_.exchange(true)) {
+        routing_refresh_thread_ =
+            std::thread([this]() { this->RoutingRefreshThreadMain(); });
+    }
+}
+
+void Client::TryLoadRoutingOnce() {
+    // 串行化 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新，
+    // 避免并发读写 cluster_id_ 与路由表。
+    std::lock_guard<std::mutex> lock(routing_load_mutex_);
+    // Resolve the cluster namespace (cluster_id) from the fsdir returned by
+    // master, which is formatted as "<root_fs_dir>/<cluster_id>". The result is
+    // stable, so it is cached in cluster_id_ and reused across retries.
+    std::string cluster_id = cluster_id_;
+    if (cluster_id.empty()) {
+        auto fsdir_response = master_client_.GetFsdir();
+        if (!fsdir_response) {
+            LOG(WARNING) << "TryLoadRoutingOnce: GetFsdir failed, err="
+                         << toString(fsdir_response.error()) << " (will retry)";
+            return;
+        }
+        const std::string& fsdir = fsdir_response.value();
+        if (fsdir.empty()) {
+            LOG(WARNING) << "TryLoadRoutingOnce: GetFsdir returned empty fsdir";
+            return;
+        }
+        LOG(INFO) << "TryLoadRoutingOnce: fsdir=" << fsdir;
+
+        const size_t pos = fsdir.find_last_of('/');
+        if (pos == std::string::npos) {
+            LOG(WARNING) << "TryLoadRoutingOnce: invalid fsdir format (no '/'), "
+                            "fsdir="
+                         << fsdir;
+            return;
+        }
+        cluster_id = fsdir.substr(pos + 1);
+        if (cluster_id.empty()) {
+            LOG(WARNING) << "TryLoadRoutingOnce: empty cluster_id parsed from "
+                            "fsdir="
+                         << fsdir;
+            return;
+        }
+        cluster_id_ = cluster_id;
+        LOG(INFO) << "TryLoadRoutingOnce: resolved cluster_id=" << cluster_id;
+    }
+
+    ErrorCode err =
+        master_client_.LoadRoutingFromEtcd(etcd_connstring_, cluster_id);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "TryLoadRoutingOnce: failed to load routing, "
+                        "cluster_id="
+                     << cluster_id << " err=" << err;
+        return;
+    }
+    LOG(INFO) << "TryLoadRoutingOnce: routing loaded, cluster_id=" << cluster_id;
+}
+
+void Client::RoutingRefreshThreadMain() {
+    // Refresh cadence aligned with SlotOwnerHeartbeat (5s) and
+    // CvmController::SyncLoop (5s). Slot migration is a low-frequency event,
+    // so a fixed sleep (rather than a fast poll) keeps steady-state etcd load
+    // low while still picking up changes promptly.
+    constexpr auto kRefreshInterval = std::chrono::milliseconds(5000);
+
+    while (routing_refresh_running_.load()) {
+        std::this_thread::sleep_for(kRefreshInterval);
+        TryLoadRoutingOnce();
+        // CVM 多 submaster：同步刷新已发现的 primary 地址，并对新增的
+        // submaster 全量 mount，处理运行期 submaster 增删。
+        RefreshSubmasterAddresses();
     }
 }
 
@@ -923,6 +1214,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         return std::nullopt;
     }
 
+    // Load the KV partition routing table from etcd (HA mode only). Best
+    // effort: a routing load failure must not fail client startup.
+    client->LoadPartitionRouting();
+
     // Initialize storage backend if storage_root_dir is valid
     auto config_response = client->master_client_.GetStorageConfig();
     if (!config_response) {
@@ -1100,6 +1395,19 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto result = master_client_.GetReplicaList(object_key);
+    // 松耦合重路由：SLOT_NOT_OWNED 表示本地 slot→submaster 视图过期
+    // （分区已重平衡）。刷新一次路由快照后重试，submaster 经 etcd 收敛视图。
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        !etcd_connstring_.empty()) {
+        LOG(WARNING) << "Query: SLOT_NOT_OWNED for key=" << object_key
+                     << ", refreshing slot routing and retrying once";
+        TryLoadRoutingOnce();
+        result = master_client_.GetReplicaList(object_key);
+        if (result) {
+            LOG(INFO) << "Query: re-route retry succeeded for key="
+                      << object_key;
+        }
+    }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -1122,6 +1430,26 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+
+    // 松耦合重路由：任一项返回 SLOT_NOT_OWNED 说明视图过期，刷新一次后
+    // 整体重试；读操作幂等，重复查询已成功项无害。
+    if (!etcd_connstring_.empty()) {
+        bool has_slot_not_owned = false;
+        for (const auto& r : response) {
+            if (!r && r.error() == ErrorCode::SLOT_NOT_OWNED) {
+                has_slot_not_owned = true;
+                break;
+            }
+        }
+        if (has_slot_not_owned) {
+            LOG(WARNING) << "BatchQuery: SLOT_NOT_OWNED in batch of "
+                         << object_keys.size()
+                         << " keys, refreshing slot routing and retrying once";
+            TryLoadRoutingOnce();
+            response =
+                master_client_.BatchGetReplicaList(object_keys, tenant_id);
+        }
+    }
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -3139,12 +3467,30 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
-    auto unmount_result = master_client_.UnmountSegment(it->second.id);
-    if (!unmount_result) {
-        ErrorCode err = unmount_result.error();
-        LOG(ERROR) << "Failed to unmount segment from master: "
-                   << toString(err);
-        return tl::unexpected(err);
+    // 全量 unmount：与全量 mount 对称，向所有 primary submaster 注销 segment
+    //（单个失败仅告警，不阻断本地 unregister）。单 master/直连走原路径。
+    std::vector<std::string> unmount_targets;
+    {
+        std::lock_guard<std::mutex> addr_lock(cvm_submaster_addresses_mutex_);
+        unmount_targets = cvm_submaster_addresses_;
+    }
+    if (!unmount_targets.empty()) {
+        for (const auto& addr : unmount_targets) {
+            auto r = master_client_.UnmountSegmentTo(addr, it->second.id);
+            if (!r) {
+                LOG(WARNING) << "unmount_segment_from_submaster_failed addr="
+                             << addr << " id=" << it->second.id
+                             << " error=" << r.error();
+            }
+        }
+    } else {
+        auto unmount_result = master_client_.UnmountSegment(it->second.id);
+        if (!unmount_result) {
+            ErrorCode err = unmount_result.error();
+            LOG(ERROR) << "Failed to unmount segment from master: "
+                       << toString(err);
+            return tl::unexpected(err);
+        }
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
@@ -3233,12 +3579,40 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
-        auto mount_result = master_client_.MountSegment(segment);
-        if (!mount_result) {
-            ErrorCode err = mount_result.error();
-            LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
-                       << " size=" << size << ", error=" << err;
-            return tl::unexpected(err);
+        // 全量 mount：CVM 多 submaster 模式下，同一 segment 挂到所有 primary
+        // submaster（任一成功即可），使任何 slot owner 都能本地分配副本；
+        // 单 master/直连模式下 cvm_submaster_addresses_ 为空，走原 MountSegment。
+        std::vector<std::string> mount_targets;
+        {
+            std::lock_guard<std::mutex> addr_lock(
+                cvm_submaster_addresses_mutex_);
+            mount_targets = cvm_submaster_addresses_;
+        }
+        if (!mount_targets.empty()) {
+            bool any_mounted = false;
+            for (const auto& addr : mount_targets) {
+                auto r = master_client_.MountSegmentTo(addr, segment);
+                if (r) {
+                    any_mounted = true;
+                } else {
+                    LOG(WARNING) << "mount_segment_to_submaster_failed addr="
+                                 << addr << " id=" << segment.id
+                                 << " error=" << r.error();
+                }
+            }
+            if (!any_mounted) {
+                LOG(ERROR) << "mount_segment_to_all_submasters_failed base="
+                           << buffer << " size=" << size;
+                return tl::unexpected(ErrorCode::RPC_FAIL);
+            }
+        } else {
+            auto mount_result = master_client_.MountSegment(segment);
+            if (!mount_result) {
+                ErrorCode err = mount_result.error();
+                LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                           << " size=" << size << ", error=" << err;
+                return tl::unexpected(err);
+            }
         }
 
         segment_id = segment.id;
@@ -3263,13 +3637,35 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
         return UnmountSegmentImpl(segment);
     }
 
-    auto result =
-        master_client_.GracefulUnmountSegment(segment_id, grace_period_ms);
-    if (!result) {
-        ErrorCode err = result.error();
-        LOG(ERROR) << "Failed to graceful unmount segment from master: "
-                   << toString(err);
-        return tl::unexpected(err);
+    // 全量优雅卸载：与全量 mount/unmount 对称，向所有 primary submaster 发起
+    // 优雅卸载。单个失败即返回错误，避免部分 submaster 已进入优雅卸载而其余
+    // 未生效导致状态不一致。单 master/直连模式走原路径。
+    std::vector<std::string> graceful_targets;
+    {
+        std::lock_guard<std::mutex> addr_lock(cvm_submaster_addresses_mutex_);
+        graceful_targets = cvm_submaster_addresses_;
+    }
+    if (!graceful_targets.empty()) {
+        for (const auto& addr : graceful_targets) {
+            auto r = master_client_.GracefulUnmountSegmentTo(
+                addr, segment_id, grace_period_ms);
+            if (!r) {
+                LOG(ERROR) << "Failed to graceful unmount segment from "
+                              "submaster addr="
+                           << addr << " id=" << segment_id
+                           << " error=" << r.error();
+                return tl::unexpected(r.error());
+            }
+        }
+    } else {
+        auto result =
+            master_client_.GracefulUnmountSegment(segment_id, grace_period_ms);
+        if (!result) {
+            ErrorCode err = result.error();
+            LOG(ERROR) << "Failed to graceful unmount segment from master: "
+                       << toString(err);
+            return tl::unexpected(err);
+        }
     }
 
     gracefully_unmounting_segments_.emplace(segment->first, segment->second);
@@ -3311,17 +3707,47 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
         }
     }
 
-    auto status = master_client_.QuerySegmentStatusById(segment_id);
+    std::vector<std::string> status_targets;
+    {
+        std::lock_guard<std::mutex> addr_lock(cvm_submaster_addresses_mutex_);
+        status_targets = cvm_submaster_addresses_;
+    }
+
     bool removed = false;
-    if (!status) {
-        if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
-            removed = true;
-        } else {
-            LOG(WARNING) << "Failed to query graceful unmount segment status: "
-                         << toString(status.error());
-        }
-    } else if (status.value() == SegmentStatus::UNDEFINED) {
+    if (!status_targets.empty()) {
+        // 多 submaster：仅当所有 primary submaster 均确认移除后才视为完成，
+        // 保证优雅卸载在所有 submaster 对称生效后才释放本地 MR 与回调。
         removed = true;
+        for (const auto& addr : status_targets) {
+            auto status =
+                master_client_.QuerySegmentStatusByIdTo(addr, segment_id);
+            if (!status) {
+                if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                    continue;  // 该 submaster 已移除
+                }
+                LOG(WARNING) << "Failed to query graceful unmount segment "
+                                "status from submaster addr="
+                             << addr << " error=" << status.error();
+                removed = false;
+            } else if (status.value() == SegmentStatus::UNDEFINED) {
+                continue;  // 该 submaster 已移除
+            } else {
+                removed = false;
+            }
+        }
+    } else {
+        auto status = master_client_.QuerySegmentStatusById(segment_id);
+        if (!status) {
+            if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                removed = true;
+            } else {
+                LOG(WARNING)
+                    << "Failed to query graceful unmount segment status: "
+                    << toString(status.error());
+            }
+        } else if (status.value() == SegmentStatus::UNDEFINED) {
+            removed = true;
+        }
     }
 
     if (removed) {
@@ -4138,6 +4564,143 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     }
 }
 
+void Client::HeartbeatAllSubmasters() {
+    std::vector<std::string> targets;
+    {
+        std::lock_guard<std::mutex> lock(cvm_submaster_addresses_mutex_);
+        targets = cvm_submaster_addresses_;
+    }
+    if (targets.empty()) {
+        return;  // 单 master/直连模式，无多 submaster 心跳
+    }
+
+    // 去重：当前 active master 由主循环 master_client_.Ping() 单独 ping，
+    // 这里跳过，避免同一 submaster 被重复 ping。
+    const std::string active_address = master_client_.GetCurrentAddress();
+
+    for (const auto& addr : targets) {
+        if (addr == active_address) {
+            continue;
+        }
+        auto ping_result = master_client_.PingTo(addr);
+        if (!ping_result) {
+            VLOG(1) << "HeartbeatAllSubmasters: ping submaster failed addr="
+                    << addr << " error=" << ping_result.error();
+            continue;
+        }
+        if (ping_result.value().client_status == ClientStatus::NEED_REMOUNT) {
+            // 该 submaster 侧没有本 client 的 segment（可能被误判过期卸载），
+            // 重新 mount 所有本地 segment 到该 submaster，恢复其分配能力。
+            LOG(INFO) << "HeartbeatAllSubmasters: submaster " << addr
+                      << " requires remount";
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            for (const auto& [seg_id, segment] : mounted_segments_) {
+                auto r = master_client_.MountSegmentTo(addr, segment);
+                if (!r) {
+                    LOG(WARNING) << "remount_segment_to_submaster_failed addr="
+                                 << addr << " id=" << seg_id
+                                 << " error=" << r.error();
+                }
+            }
+        }
+    }
+}
+
+void Client::RefreshSubmasterAddresses() {
+    // 仅在 CVM 多 submaster 模式下有意义（有已知 namespace）。
+    if (cvm_cluster_namespace_.empty()) {
+        return;
+    }
+
+    std::vector<cvm::MasterRegistration> masters;
+    ViewVersionId version = 0;
+    ErrorCode err = cvm::EtcdViewStore::LoadAllMasters(cvm_cluster_namespace_,
+                                                       masters, version);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "RefreshSubmasterAddresses: LoadAllMasters failed: "
+                     << err;
+        return;
+    }
+
+    std::vector<std::string> new_addresses;
+    for (const auto& reg : masters) {
+        if (reg.role == static_cast<int32_t>(cvm::MasterRole::kPrimary) &&
+            !reg.address.empty()) {
+            new_addresses.push_back(reg.address);
+        }
+    }
+    std::sort(new_addresses.begin(), new_addresses.end());
+    // 去重：与 ConnectToCvmSubmasters 保持一致，避免重复 primary 注册导致
+    // 全量 mount 对同一 submaster 重复调用。
+    new_addresses.erase(
+        std::unique(new_addresses.begin(), new_addresses.end()),
+        new_addresses.end());
+
+    // 若本轮扫描为空（etcd 抖动或所有 primary 异常），保持现有地址列表不变
+    //（sticky），避免短暂异常清空地址列表导致心跳与全量 mount 退化。
+    if (new_addresses.empty()) {
+        LOG(WARNING) << "RefreshSubmasterAddresses: no primary masters found, "
+                        "keeping existing addresses";
+        return;
+    }
+
+    // 对比现有地址，找出新增/移除的 submaster；同时用最新结果替换地址列表。
+    std::vector<std::string> added;
+    std::vector<std::string> removed;
+    {
+        std::lock_guard<std::mutex> lock(cvm_submaster_addresses_mutex_);
+        for (const auto& addr : new_addresses) {
+            if (std::find(cvm_submaster_addresses_.begin(),
+                          cvm_submaster_addresses_.end(),
+                          addr) == cvm_submaster_addresses_.end()) {
+                added.push_back(addr);
+            }
+        }
+        for (const auto& addr : cvm_submaster_addresses_) {
+            if (std::find(new_addresses.begin(), new_addresses.end(), addr) ==
+                new_addresses.end()) {
+                removed.push_back(addr);
+            }
+        }
+        cvm_submaster_addresses_ = std::move(new_addresses);
+    }
+
+    // 对新增的 submaster 全量 mount 所有本地 segment，使其具备分配能力。
+    if (!added.empty()) {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (const auto& addr : added) {
+            LOG(INFO) << "RefreshSubmasterAddresses: new submaster " << addr
+                      << ", mounting all local segments";
+            for (const auto& [seg_id, segment] : mounted_segments_) {
+                auto r = master_client_.MountSegmentTo(addr, segment);
+                if (!r) {
+                    LOG(WARNING) << "mount_segment_to_new_submaster_failed addr="
+                                 << addr << " id=" << seg_id
+                                 << " error=" << r.error();
+                }
+            }
+        }
+    }
+
+    // 对被移除的 submaster 全量 unmount，保证 segment 生命周期对称闭合。
+    // 单个失败仅告警不阻断（其 lease 最终会过期回收）。
+    if (!removed.empty()) {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (const auto& addr : removed) {
+            LOG(INFO) << "RefreshSubmasterAddresses: submaster removed " << addr
+                      << ", unmounting all local segments";
+            for (const auto& [seg_id, segment] : mounted_segments_) {
+                auto r = master_client_.UnmountSegmentTo(addr, segment.id);
+                if (!r) {
+                    LOG(WARNING)
+                        << "unmount_segment_from_removed_submaster_failed addr="
+                        << addr << " id=" << seg_id << " error=" << r.error();
+                }
+            }
+        }
+    }
+}
+
 void Client::StorageHeartbeatThreadMain() {
     // How many failed pings before reconnecting via the HA coordinator
     const int max_ping_fail_count = 3;
@@ -4213,6 +4776,10 @@ void Client::StorageHeartbeatThreadMain() {
                 std::future_status::ready) {
             remount_segment_future = std::future<void>();
         }
+
+        // CVM 多 submaster 心跳：向所有 primary submaster 定向 ping 保活，
+        // 避免各 submaster 因收不到本 client 的 ping 而误判过期并卸载 segment。
+        HeartbeatAllSubmasters();
 
         // Ping master
         auto ping_result = master_client_.Ping();
@@ -4308,6 +4875,20 @@ void Client::StorageHeartbeatThreadMain() {
             }
 
             LOG(INFO) << "Reconnected to master " << next_view.leader_address;
+            ping_fail_count = 0;
+        } else if (!cvm_cluster_namespace_.empty()) {
+            // CVM multi-submaster mode: the connected submaster died or
+            // became unreachable. Re-discover live submasters from the
+            // /cvm/ registry and reconnect to another one.
+            LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                       << " times (CVM submaster mode); re-discovering "
+                          "submasters from etcd";
+            auto err = ConnectToCvmSubmasters(etcd_connstring_);
+            if (err != ErrorCode::OK) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
             ping_fail_count = 0;
         } else {
             const std::string current_master_address = direct_master_address_;

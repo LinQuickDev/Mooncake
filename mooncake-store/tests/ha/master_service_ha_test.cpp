@@ -1600,7 +1600,7 @@ TEST_F(MasterServiceBatchRecordE2ETest, PromotionCatchesUpToDurablePrefix) {
 
     HotStandbyService standby(standby_config);
     standby.SetCatchUpBatchKvBackendForTesting(backend);
-    auto start_err = standby.Start("", "", cluster_id);
+    auto start_err = standby.Start({}, "", cluster_id);
     ASSERT_EQ(ErrorCode::OK, start_err);
     ASSERT_EQ(StandbyState::WATCHING, standby.GetState());
 

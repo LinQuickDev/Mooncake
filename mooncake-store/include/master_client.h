@@ -1,7 +1,10 @@
 #pragma once
 
 #include <csignal>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -22,6 +25,8 @@
 #include "store_rpc_client_io_context.h"
 #include "task_manager.h"
 #include "metadata_store.h"
+#include "partition/partition_router.h"
+#include "vchunk_metadata.h"
 
 namespace mooncake {
 
@@ -79,6 +84,8 @@ class MasterClient {
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(), 
                            detail::MakeMasterRpcClientPoolConfig()),
+          targeted_accessor_(GetStoreRpcClientIoContextPool(),
+                             detail::MakeMasterRpcClientPoolConfig()),
           client_id_(client_id),
           tenant_id_(NormalizeTenantId(std::move(tenant_id))),
           metrics_(metrics) {
@@ -121,6 +128,27 @@ class MasterClient {
      */
     [[nodiscard]] ErrorCode Connect(
         const std::string& master_addr = kDefaultMasterAddress);
+
+    /**
+     * @brief Loads the slot -> submaster mapping from the etcd KV view
+     * snapshot into the partition router. Must be called after etcd is
+     * reachable and the cluster namespace (cluster_id) is known.
+     * @param etcd_endpoints Etcd endpoints, semicolon separated.
+     * @param cluster_namespace Cluster namespace used to locate the snapshot.
+     * @return ErrorCode indicating success/failure.
+     */
+    [[nodiscard]] ErrorCode LoadRoutingFromEtcd(
+        const std::string& etcd_endpoints,
+        const std::string& cluster_namespace);
+
+    /**
+     * @brief Resolves the submaster (primary_master_id) that owns the slot of
+     * the given key, using the currently loaded partition routing table.
+     * @param key Object key.
+     * @return submaster id on success, std::nullopt if no mapping is loaded.
+     */
+    [[nodiscard]] std::optional<std::string> ResolveSubmaster(
+        const std::string& key) const;
 
     /**
      * @brief Checks if an object exists
@@ -261,6 +289,25 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type);
+
+    [[nodiscard]] tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
+        const std::string& tenant_id, const std::string& key,
+        uint64_t total_size, int64_t now_ms);
+    [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutEnd(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& vchunk_id, int64_t now_ms);
+    [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutRevoke(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& vchunk_id);
+    [[nodiscard]] tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
+        const std::string& tenant_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& lease_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> RemoveVChunk(
+        const std::string& tenant_id, const std::string& key, int64_t now_ms);
+    [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
+    GetVChunkRuntimeInfo();
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -432,6 +479,14 @@ class MasterClient {
     [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
 
+    /**
+     * @brief 定向 QuerySegmentStatusById：向指定 submaster 查询 segment 状态
+     * （不切换当前连接）。用于多 submaster 优雅卸载时确认所有 primary
+     * submaster 均已移除该 segment。
+     */
+    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusByIdTo(
+        const std::string& address, const UUID& segment_id);
+
     [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
     GetStorageConfig();
 
@@ -441,6 +496,46 @@ class MasterClient {
      * containing view version and client status
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+
+    /**
+     * @brief 返回 client_accessor_ 当前连接的 submaster 地址（IP:Port）。
+     * 供后台心跳去重使用——HeartbeatAllSubmasters 跳过当前 active 地址，
+     * 避免与主循环的 Ping() 对同一 submaster 重复 ping。
+     */
+    std::string GetCurrentAddress() const;
+
+    /**
+     * @brief 定向 Ping：向指定 submaster 发送 Ping（不切换当前连接）。
+     * 用于 client 侧多 submaster 心跳，防止各 submaster 因收不到 ping 而
+     * 误判 client 过期并卸载其 segment。返回 NEED_REMOUNT 时调用方应对该
+     * submaster 重新 mount。
+     */
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> PingTo(
+        const std::string& address);
+
+    /**
+     * @brief 定向 MountSegment：向指定 submaster 注册 segment（不切换当前
+     * 连接）。用于 client 侧全量 mount——同一 segment 挂载到所有 primary
+     * submaster，使任何 slot owner 都能本地分配副本。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSegmentTo(
+        const std::string& address, const Segment& segment);
+
+    /**
+     * @brief 定向 UnmountSegment：向指定 submaster 注销 segment（不切换当前
+     * 连接）。与全量 mount 对称，保证 segment 生命周期在所有 submaster 闭合。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegmentTo(
+        const std::string& address, const UUID& segment_id);
+
+    /**
+     * @brief 定向 GracefulUnmountSegment：向指定 submaster 发起优雅卸载（不
+     * 切换当前连接）。与全量 unmount 对称，保证优雅卸载在所有 submaster 生效。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> GracefulUnmountSegmentTo(
+        const std::string& address, const UUID& segment_id,
+        uint64_t grace_period_ms);
+
 
     /**
      * @brief Mounts a local disk segment into the master.
@@ -699,6 +794,16 @@ class MasterClient {
         Args&&... args);
 
     /**
+     * @brief 定向 RPC：向指定 submaster 发请求，使用独立的 targeted_accessor_
+     * 缓存 per-address pool，不切换 client_accessor_ 的"当前地址"。供后台心跳
+     * /全量 mount/unmount 使用，避免与业务请求（SwitchToSubmaster + invoke_rpc）
+     * 的当前地址切换竞态。
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_to(
+        const std::string& address, Args&&... args);
+
+    /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
      * @tparam ResultType The expected return type of the RPC call
@@ -712,6 +817,34 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     void WarmupRpcPool();
+
+    /**
+     * @brief Switches the underlying RPC pool to the submaster that owns the
+     * slot of the given key (single-target switching). Keeps the current
+     * connection when the routing table is not loaded (single-master mode).
+     * @return ErrorCode::OK on switch (or no-op), otherwise an error.
+     */
+    [[nodiscard]] ErrorCode SwitchToSubmaster(const std::string& tenant_id,
+                                              const std::string& key);
+
+    // Refreshes the previously configured CVM snapshot after a server reports
+    // SLOT_NOT_OWNED. The caller remains responsible for a bounded retry.
+    [[nodiscard]] ErrorCode RefreshSubmasterRouting();
+
+    /**
+     * @brief Switches the underlying RPC pool to the given submaster address.
+     * @param address Submaster address (primary_master_id).
+     */
+    void SwitchToSubmasterByAddress(const std::string& address);
+
+    /**
+     * @brief Groups key indices by their owning submaster. Keys without a
+     * resolved submaster are grouped under an empty string ("").
+     * @return Map from submaster address to original key indices.
+     */
+    [[nodiscard]] std::map<std::string, std::vector<size_t>>
+    GroupKeysBySubmaster(const std::vector<std::string>& keys,
+                         const std::string& tenant_id);
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
@@ -741,11 +874,25 @@ class MasterClient {
 
     RpcClientPool client_accessor_;
 
+    // 定向 RPC 用独立 pool 访问器：后台心跳/全量 mount/unmount 用它直发指定
+    // submaster，与业务请求的 client_accessor_（SwitchToSubmaster 切"当前地址"）
+    // 完全隔离，避免"当前地址"竞态。invoke_rpc_to 用 GetOrCreateClientPool 的
+    // 返回值发请求，不依赖该访问器的"当前地址"，因此可被多线程并发调用。
+    RpcClientPool targeted_accessor_;
+
     // The client identification.
     const UUID client_id_;
 
     // Tenant identity for this client instance.
     const TenantId tenant_id_;
+
+    // KV partition routing table (slot -> submaster). Loaded from etcd.
+    partition::PartitionRouter partition_router_;
+    mutable std::mutex routing_config_mutex_;
+    std::string routing_cluster_namespace_;
+    // Protects the target switch and the following vchunk RPC as one unit.
+    // RpcClientPool itself is thread-safe, but its selected target is shared.
+    mutable std::mutex vchunk_routed_rpc_mutex_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;

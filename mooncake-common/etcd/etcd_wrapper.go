@@ -811,8 +811,49 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 	return 0
 }
 
+//export EtcdStoreBatchPutWithLeaseWrapper
+func EtcdStoreBatchPutWithLeaseWrapper(keys **C.char, keySizes *C.int, values **C.char, valueSizes *C.int, count C.int, leaseId int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+
+	n := int(count)
+	if n == 0 {
+		return 0
+	}
+
+	// Unsafe casting to access C arrays as Go slices; key/value buffers are
+	// binary-safe (carry explicit sizes).
+	keyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(keys))[:n:n]
+	keySizeList := (*[1 << 28]C.int)(unsafe.Pointer(keySizes))[:n:n]
+	valPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(values))[:n:n]
+	valSizeList := (*[1 << 28]C.int)(unsafe.Pointer(valueSizes))[:n:n]
+
+	ops := make([]clientv3.Op, 0, n)
+	for i := 0; i < n; i++ {
+		k := C.GoStringN(keyPtrs[i], keySizeList[i])
+		v := C.GoStringN(valPtrs[i], valSizeList[i])
+		// Bind all keys to the single master lease. Caller is responsible for
+		// fencing (the keys must already be absent / owned by self); this is an
+		// unconditional atomic batch, so it can also be reused for reaffirm.
+		ops = append(ops, clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId))))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := cli.Txn(ctx).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, deleteKeys **C.char, deleteKeySizes *C.int, deleteCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -821,6 +862,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 
 	cmpN := int(compareCount)
 	putN := int(putCount)
+	deleteN := int(deleteCount)
 
 	cmps := make([]clientv3.Cmp, 0, cmpN)
 	if cmpN > 0 {
@@ -844,7 +886,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		}
 	}
 
-	ops := make([]clientv3.Op, 0, putN)
+	ops := make([]clientv3.Op, 0, putN+deleteN)
 	if putN > 0 {
 		putKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putKeys))[:putN:putN]
 		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
@@ -854,6 +896,14 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
 			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
 			ops = append(ops, clientv3.OpPut(k, v))
+		}
+	}
+	if deleteN > 0 {
+		deleteKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(deleteKeys))[:deleteN:deleteN]
+		deleteKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(deleteKeySizes))[:deleteN:deleteN]
+		for i := 0; i < deleteN; i++ {
+			k := C.GoStringN(deleteKeyPtrs[i], deleteKeySizeList[i])
+			ops = append(ops, clientv3.OpDelete(k))
 		}
 	}
 

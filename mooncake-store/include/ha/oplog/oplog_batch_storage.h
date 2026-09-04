@@ -11,7 +11,11 @@ namespace mooncake {
 
 class OpLogBatchStorage {
    public:
-    OpLogBatchStorage(std::string cluster_id, HaKvBackend& backend);
+    // source_id is the stable master id of the submaster owning this OpLog
+    // stream. When empty, the legacy cluster-level (single-source) layout is
+    // used; when non-empty, keys are namespaced per source.
+    OpLogBatchStorage(std::string cluster_id, HaKvBackend& backend,
+                      std::string source_id = std::string());
 
     ErrorCode InitDurablePrefix(DurablePrefix& prefix);
     ErrorCode ReadDurablePrefix(DurablePrefix& prefix);
@@ -26,6 +30,7 @@ class OpLogBatchStorage {
     ErrorCode RejectLegacyLayout() const;
 
     std::string cluster_id_;
+    std::string source_id_;
     HaKvBackend& backend_;
     bool cluster_id_valid_{false};
 };

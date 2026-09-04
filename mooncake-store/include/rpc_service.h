@@ -13,6 +13,7 @@
 #include "rpc_types.h"
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
+#include "io_pattern/cfm_service.h"
 #include "segment.h"
 
 namespace mooncake {
@@ -92,6 +93,24 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
+        const std::string& tenant_id, const std::string& key,
+        uint64_t total_size, int64_t now_ms);
+    tl::expected<void, ErrorCode> VChunkPutEnd(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& vchunk_id, int64_t now_ms);
+    tl::expected<void, ErrorCode> VChunkPutRevoke(
+        const std::string& tenant_id, const std::string& key,
+        const std::string& vchunk_id);
+    tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
+        const std::string& tenant_id, const std::string& key);
+    tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
+        const std::string& lease_id);
+    tl::expected<void, ErrorCode> RemoveVChunk(const std::string& tenant_id,
+                                               const std::string& key,
+                                               int64_t now_ms);
+    VChunkRuntimeInfo GetVChunkRuntimeInfo();
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
@@ -267,6 +286,63 @@ class WrappedMasterService {
                             uint64_t initial_oplog_sequence_id,
                             const std::vector<StandbySegmentInfo>& segments);
 
+    // CVM slot ownership publishing, driven by the HA supervisor. These
+    // forward to the wrapped MasterService (NOT RPC endpoints).
+    void SetCvmLeaseId(EtcdLeaseId lease_id);
+    ErrorCode StartSlotOwnerHeartbeat();
+    void StopSlotOwnerHeartbeat();
+
+    // CVM inter-master RPC lifecycle, driven by the HA supervisor (NOT an
+    // RPC endpoint). Starts/stops the peer discovery + connection pools.
+    ErrorCode StartInterMasterRpc();
+    void StopInterMasterRpc();
+
+    // Inter-master handshake RPC: returns this submaster's identity and
+    // ownership summary so peers can verify the inter-master channel.
+    tl::expected<InterMasterHandshakeResponse, ErrorCode>
+    InterMasterHandshake();
+
+    // Inter-master allocation forwarding (CVM plan B): allocate memory
+    // replicas in this submaster's locally mounted segments on behalf of a
+    // slot-owning peer. Strictly within `preferred_segments` when given.
+    // This submaster keeps the real handles alive (keepalive registry);
+    // the slot owner materializes dummy-allocator replicas from the
+    // returned descriptors and owns the metadata.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterAllocateReplicas(
+        const std::string& tenant_id, const std::string& key,
+        uint64_t slice_length, uint64_t replica_num,
+        const std::vector<std::string>& preferred_segments);
+
+    // Frees the keepalive entry (and thus the handles) previously created
+    // by InterMasterAllocateReplicas. Returns true when an entry existed.
+    tl::expected<bool, ErrorCode> InterMasterFreeReplicas(
+        const std::string& tenant_id, const std::string& key);
+
+    // Inter-master read forwarding (CVM plan B): local GetReplicaList /
+    // BatchGetReplicaList query for a forwarding peer. These do NOT
+    // re-forward, so an inconsistent view terminates the chain at the first
+    // hop instead of looping.
+    tl::expected<GetReplicaListResponse, ErrorCode> InterMasterGetReplicaList(
+        const std::string& key, const std::string& tenant_id);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const std::string& tenant_id);
+
+    // Inter-master write forwarding (model B): relays a FULL PutStart to the
+    // slot-owning submaster so it allocates + writes metadata locally.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> InterMasterPutStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t slice_length,
+        const ReplicateConfig& config);
+
+    // Upsert variant of InterMasterPutStart (owner overwrites-if-exists).
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterUpsertStart(const UUID& client_id, const std::string& key,
+                           const std::string& tenant_id, uint64_t slice_length,
+                           const ReplicateConfig& config);
+
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
@@ -322,8 +398,11 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    io_pattern::CfmRpcService& CfmRpcEndpoint() { return cfm_rpc_service_; }
+
    private:
     MasterService master_service_;
+    io_pattern::CfmRpcService cfm_rpc_service_;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

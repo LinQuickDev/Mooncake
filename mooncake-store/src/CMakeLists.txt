@@ -16,6 +16,13 @@ set(MOONCAKE_STORE_SOURCES
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp
+    cvm/etcd_view_store.cpp
+    cvm/cvm_controller.cpp
+    cvm/slot_owner_heartbeat.cpp
+    cvm/slot_migrator.cpp
+    cvm/cvm_http_server.cpp
+    cvm/inter_master_rpc.cpp
+    partition/partition_router.cpp
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
@@ -61,6 +68,25 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
+    io_pattern/collector_impl.cpp
+    io_pattern/reporter.cpp
+    io_pattern/cfm_client_impl.cpp
+    io_pattern/cfm_ingress.cpp
+    io_pattern/cfm_service.cpp
+    io_pattern/cfm_protocol.cpp
+    io_pattern/resilient_cfm_channel.cpp
+    io_pattern/feedback.cpp
+    io_pattern/degrading_policy_engine.cpp
+    io_pattern/legacy_eviction_ops.cpp
+    io_pattern/kmeans_analyzer.cpp
+    io_pattern/observability.cpp
+    io_pattern/sliding_window_analyzer.cpp
+    io_pattern/tier_executor.cpp
+    io_pattern/resilient_analyzer.cpp
+    io_pattern/rpc_transport.cpp
+    io_pattern/runtime.cpp
+    io_pattern/threshold_analyzer.cpp
+    io_pattern/policy_strategies.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp
@@ -75,6 +101,15 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     memory_alloc.cpp
+    vchunk_config.cpp
+    vchunk_metadata.cpp
+    vchunk_allocation_strategy.cpp
+    vchunk_master_manager.cpp
+    vchunk_client.cpp
+    vchunk_control_plane.cpp
+    vchunk_transfer_engine.cpp
+    vchunk_metadata_store.cpp
+    vchunk_metrics.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
 

@@ -2,17 +2,32 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
 #include "config_helper.h"
 #include "types.h"
+#include "vchunk_config.h"
+#include "vchunk_metadata_store.h"
 
 namespace mooncake {
 
 // Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
 class HttpMetadataServer;
+
+struct IoPatternCfmConfig {
+    // Empty endpoint means this Master only serves the CFM RPC endpoints.
+    // Set host:port to report to and poll policies from a central CFM Master.
+    std::string endpoint;
+    std::string node_id;
+    std::string auth_token;
+    std::string producer_auth_token;
+    uint32_t timeout_ms{500};
+    uint32_t policy_queue_capacity{4096};
+};
 
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
@@ -36,6 +51,7 @@ struct MasterConfig {
     std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
+    IoPatternCfmConfig io_pattern_cfm;
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
@@ -58,8 +74,7 @@ struct MasterConfig {
     // Master view lease TTL in seconds (HA leadership lease).
     // When the lease expires without successful renewal, the Master
     // is considered dead and a standby can take over.
-    int64_t master_view_lease_ttl_sec =
-        DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+    int64_t master_view_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
 
     // OpLog store configuration
     bool enable_oplog = false;
@@ -74,6 +89,14 @@ struct MasterConfig {
     int metrics_report_lease_ttl_sec = DEFAULT_METRICS_REPORT_LEASE_TTL_SEC;
 
     std::string cluster_id;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
+    uint32_t submaster_count = 1;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
@@ -132,6 +155,8 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
@@ -202,6 +227,7 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
@@ -213,6 +239,12 @@ class MasterServiceSupervisorConfig {
     uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    uint32_t submaster_count = 1;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
@@ -255,6 +287,8 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     bool strict_replica_allocation = false;
@@ -339,6 +373,7 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
@@ -350,6 +385,9 @@ class MasterServiceSupervisorConfig {
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
 
         enable_metrics_report_to_backend =
             config.enable_metrics_report_to_backend;
@@ -415,6 +453,10 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
+                                    ? config.etcd_endpoints
+                                    : config.vchunk_etcd_endpoints;
 
         pod_name = config.pod_name;
         pod_namespace = config.pod_namespace;
@@ -526,6 +568,7 @@ class WrappedMasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -533,6 +576,19 @@ class WrappedMasterServiceConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // Stable identifier of this master instance, used as the SlotOwner
+    // primary_master_id for the KV partition view. Empty disables the
+    // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
+    std::string master_id;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled; set a non-zero port to expose /kv_view,
+    // /segment_view and /health for inspection.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
+    uint32_t submaster_count = 1;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -568,6 +624,8 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -616,6 +674,7 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -624,6 +683,9 @@ class WrappedMasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -683,6 +745,10 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
+                                    ? config.etcd_endpoints
+                                    : config.vchunk_etcd_endpoints;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -733,6 +799,7 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -741,6 +808,10 @@ class WrappedMasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        master_id = config.local_hostname;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
@@ -773,6 +844,8 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
     }
 };
 
@@ -841,6 +914,9 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+    IoPatternCfmConfig io_pattern_cfm_;
+    VChunkConfig vchunk_config_{};
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -982,6 +1058,17 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
         enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_vchunk_config(VChunkConfig config) {
+        vchunk_config_ = std::move(config);
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_vchunk_metadata_store(
+        std::shared_ptr<VChunkMetadataStore> store) {
+        vchunk_metadata_store_ = std::move(store);
         return *this;
     }
 
@@ -1130,6 +1217,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_io_pattern_cfm(IoPatternCfmConfig config) {
+        io_pattern_cfm_ = std::move(config);
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -1185,6 +1277,8 @@ class MasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    // CFM transport and authentication settings used by this MasterService.
+    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -1192,6 +1286,19 @@ class MasterServiceConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // Stable identifier of this master instance, used as the SlotOwner
+    // primary_master_id for the KV partition view. Empty disables the
+    // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
+    std::string master_id;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled; set a non-zero port to expose /kv_view,
+    // /segment_view and /health for inspection.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
+    uint32_t submaster_count = 1;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -1227,6 +1334,9 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
+    std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -1271,12 +1381,17 @@ class MasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        master_id = config.master_id;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
+        submaster_count = config.submaster_count;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =
@@ -1315,6 +1430,12 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
+        if (vchunk_config.enabled && !vchunk_etcd_endpoints.empty()) {
+            vchunk_metadata_store = std::make_shared<EtcdVChunkMetadataStore>(
+                vchunk_etcd_endpoints, vchunk_config, cluster_id);
+        }
     }
 
     // Static factory method to create a builder
@@ -1381,6 +1502,11 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.io_pattern_cfm = io_pattern_cfm_;
+    config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
+    config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
     return config;
 }
 
