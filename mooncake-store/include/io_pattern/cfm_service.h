@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -43,6 +44,9 @@ class CfmService final {
     // node is a stable SubMaster identity, so policy generation for one slot
     // owner must never observe keys reported by another SubMaster.
     IoPatternSnapshot SnapshotForNode(std::string_view node_id) const;
+    IoPatternObservabilitySnapshot ObservabilityForNode(
+        std::string_view node_id, double window_seconds = 0.0) const;
+    bool WaitForPolicyIdle(std::chrono::milliseconds timeout);
 
    private:
     struct NodeRuntime {
@@ -77,7 +81,9 @@ class CfmService final {
     std::mutex producer_mutex_;
     std::condition_variable producer_cv_;
     std::deque<std::pair<std::string, MetricBatch>> pending_metric_batches_;
+    size_t active_policy_productions_{0};
     bool producer_stopping_{false};
+    std::condition_variable producer_idle_cv_;
     std::thread producer_worker_;
 };
 

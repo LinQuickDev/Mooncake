@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "types.h"
+#include "../types.h"
 
 namespace mooncake::io_pattern {
 

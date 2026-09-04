@@ -48,13 +48,16 @@ class IoPatternRuntime final {
         LegacyFallback legacy_fallback{LegacyFallback::kLru};
     };
 
-    explicit IoPatternRuntime(Handlers handlers, Config config = {});
+    explicit IoPatternRuntime(Handlers handlers);
+    IoPatternRuntime(Handlers handlers, Config config);
     ~IoPatternRuntime();
 
     void ReportInferenceMetrics(const InferenceMetrics& metrics);
     void RecordAccess(const std::string& key, const AccessRecord& record);
     void RecordStorageMetric(const StorageMetric& metric);
     void MergeSnapshot(const IoPatternSnapshot& snapshot);
+    bool FlushReports();
+    void StopReports();
 
     PolicyExecutionStatus Execute(
         CacheTier eviction_tier, uint64_t eviction_bytes,

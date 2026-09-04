@@ -266,4 +266,13 @@ bool IoPatternCollectorImpl::FlushReports() {
     return !reporter || reporter->Flush();
 }
 
+void IoPatternCollectorImpl::StopReports() {
+    std::shared_ptr<IoPatternReporter> reporter;
+    {
+        std::lock_guard lock(mutex_);
+        reporter = reporter_;
+    }
+    if (reporter) reporter->Stop();
+}
+
 }  // namespace mooncake::io_pattern

@@ -1215,7 +1215,7 @@ reporting/policy-consuming Master with:
 
 - `io_pattern_cfm_endpoint=host:port`
 - `io_pattern_cfm_node_id=<stable unique node id>` (defaults to the local CVM
-  SubMaster `master_id`, with `cluster_id` only as a legacy fallback)
+  SubMaster RPC endpoint, `rpc_address:rpc_port`)
 - the same `io_pattern_cfm_auth_token`
 - on the central receiver only, a distinct
   `io_pattern_cfm_producer_auth_token` for policy producers

@@ -1523,6 +1523,22 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     return ErrorCode::OK;
 }
 #else
+ErrorCode MasterService::StartInterMasterRpc() { return ErrorCode::OK; }
+
+void MasterService::StopInterMasterRpc() {}
+
+tl::expected<std::vector<Replica>, ErrorCode>
+MasterService::TryAllocateReplicasRemotely(
+    const std::string& /*key*/, const TenantId& /*tenant_id*/,
+    uint64_t /*value_length*/, size_t /*replica_num*/,
+    const std::vector<std::string>& /*preferred_segments*/) {
+    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+void MasterService::EnqueueRemoteFreeIfTracked(
+    const TenantId& /*tenant_id*/, const std::string& /*key*/,
+    QuotaEraseMode /*quota_mode*/) {}
+
 ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
 
 ErrorCode MasterService::ExportSlotMetadata(uint16_t /*slot*/) {

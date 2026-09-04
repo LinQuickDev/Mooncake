@@ -74,6 +74,21 @@ IoPatternSnapshot CfmService::SnapshotForNode(std::string_view node_id) const {
                         : IoPatternSnapshot{};
 }
 
+IoPatternObservabilitySnapshot CfmService::ObservabilityForNode(
+    std::string_view node_id, double window_seconds) const {
+    const auto node_runtime = FindNodeRuntime(node_id);
+    return node_runtime
+               ? node_runtime->runtime->ObservabilitySnapshot(window_seconds)
+               : IoPatternObservabilitySnapshot{};
+}
+
+bool CfmService::WaitForPolicyIdle(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(producer_mutex_);
+    return producer_idle_cv_.wait_for(lock, timeout, [this] {
+        return pending_metric_batches_.empty() && active_policy_productions_ == 0;
+    });
+}
+
 std::shared_ptr<CfmService::NodeRuntime> CfmService::GetOrCreateNodeRuntime(
     std::string_view node_id) {
     std::lock_guard lock(node_runtimes_mutex_);
@@ -86,7 +101,8 @@ std::shared_ptr<CfmService::NodeRuntime> CfmService::GetOrCreateNodeRuntime(
         IoPatternRuntime::Handlers{
             .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
-            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        IoPatternRuntime::Config{});
     node_runtime->ingress =
         std::make_unique<CfmIngress>(node_runtime->runtime, codec_);
     node_runtimes_.emplace(id, node_runtime);
@@ -190,6 +206,7 @@ void CfmService::PolicyProducerWorker() {
             if (producer_stopping_) return;
             pending = std::move(pending_metric_batches_.front());
             pending_metric_batches_.pop_front();
+            ++active_policy_productions_;
         }
         try {
             ProducePolicies(pending.first, pending.second);
@@ -197,6 +214,11 @@ void CfmService::PolicyProducerWorker() {
             // Policy production is best effort and must never terminate the
             // RPC service. The next metric batch will trigger a fresh plan.
         }
+        {
+            std::lock_guard lock(producer_mutex_);
+            --active_policy_productions_;
+        }
+        producer_idle_cv_.notify_all();
     }
 }
 

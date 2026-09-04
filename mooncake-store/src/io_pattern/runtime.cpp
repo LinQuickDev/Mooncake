@@ -6,6 +6,9 @@
 
 namespace mooncake::io_pattern {
 
+IoPatternRuntime::IoPatternRuntime(Handlers handlers)
+    : IoPatternRuntime(std::move(handlers), Config{}) {}
+
 IoPatternRuntime::IoPatternRuntime(Handlers handlers, Config config)
     : config_(config),
       executor_(std::move(handlers.eviction), std::move(handlers.prefetch),
@@ -133,6 +136,10 @@ void IoPatternRuntime::MergeSnapshot(const IoPatternSnapshot& snapshot) {
         observability_.RecordReportDrop(dropped_after - dropped_before);
     }
 }
+
+bool IoPatternRuntime::FlushReports() { return collector_->FlushReports(); }
+
+void IoPatternRuntime::StopReports() { collector_->StopReports(); }
 
 PatternResult IoPatternRuntime::AnalyzeWithinBudget(
     const IoPatternSnapshot& snapshot, bool& degraded) {

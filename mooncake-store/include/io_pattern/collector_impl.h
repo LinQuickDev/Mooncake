@@ -25,9 +25,10 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
         std::function<uint64_t()> now_ns;
     };
 
-    explicit IoPatternCollectorImpl(Config config = {},
-                                    std::shared_ptr<IoPatternReporter> reporter =
-                                        nullptr)
+    IoPatternCollectorImpl()
+        : IoPatternCollectorImpl(Config{}, nullptr) {}
+    explicit IoPatternCollectorImpl(
+        Config config, std::shared_ptr<IoPatternReporter> reporter = nullptr)
         : config_(config), reporter_(std::move(reporter)) {}
     void ReportInferenceMetrics(const InferenceMetrics& metrics) override;
     void RecordAccess(const std::string& key,
@@ -40,6 +41,7 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
     uint64_t dropped() const;
     bool degraded() const;
     bool FlushReports();
+    void StopReports();
 
    private:
     struct StorageMetricKey {

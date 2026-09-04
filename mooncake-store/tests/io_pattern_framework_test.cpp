@@ -1255,6 +1255,7 @@ TEST(IoPatternFrameworkTest, CfmPolicyDoesNotCrossSubmasterKeySets) {
     ASSERT_TRUE(service.Send("submaster-a", "report_metric_batch",
                              codec.EncodeMetricBatch(submaster_a),
                              "node-secret"));
+    ASSERT_TRUE(service.WaitForPolicyIdle(std::chrono::milliseconds(500)));
 
     std::optional<std::pair<uint64_t, std::string>> delivery;
     for (size_t attempt = 0; attempt < 100 && !delivery; ++attempt) {
@@ -1262,6 +1263,8 @@ TEST(IoPatternFrameworkTest, CfmPolicyDoesNotCrossSubmasterKeySets) {
         if (!delivery) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     ASSERT_TRUE(delivery.has_value());
+    EXPECT_GE(service.ObservabilityForNode("submaster-a").policy_decisions,
+              1);
     const auto command = codec.DecodePolicy(delivery->second);
     ASSERT_TRUE(command.has_value());
     const auto* eviction = std::get_if<EvictionPlan>(&*command);

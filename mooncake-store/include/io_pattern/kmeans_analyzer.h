@@ -13,7 +13,8 @@ class KMeansWorkloadAnalyzer final : public IoPatternAnalyzer {
         ThresholdAnalyzerConfig thresholds{};
     };
 
-    explicit KMeansWorkloadAnalyzer(Config config = {}) : config_(config) {}
+    KMeansWorkloadAnalyzer() = default;
+    explicit KMeansWorkloadAnalyzer(Config config) : config_(config) {}
 
     PatternResult Analyze(const IoPatternSnapshot& snapshot) const override;
     WorkloadType DetectWorkloadType(
@@ -22,7 +23,7 @@ class KMeansWorkloadAnalyzer final : public IoPatternAnalyzer {
                               const IoPatternSnapshot& snapshot) const override;
 
    private:
-    Config config_;
+    Config config_{};
 };
 
 }  // namespace mooncake::io_pattern
