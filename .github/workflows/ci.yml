@@ -950,6 +950,18 @@ jobs:
       run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
 
+    # Mock-injected jetty ACK-timeout rebuild coverage (status=9 -> drain ->
+    # flush -> rebuild). Deterministic and hardware-free, scoped to the UB leg
+    # so the other matrices don't pay for it.
+    - name: Test (kunpeng URMA jetty rebuild)
+      if: matrix.name == 'ub-mock'
+      run: |
+        cd build-tent
+        ctest --test-dir mooncake-transfer-engine/tests \
+          -R urma_jetty_rebuild_test \
+          --output-on-failure
+      shell: bash
+
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
       shell: bash

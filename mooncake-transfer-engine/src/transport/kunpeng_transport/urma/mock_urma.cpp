@@ -1,4 +1,5 @@
 #include "urma_api.h"
+#include "mock_urma_test_ctrl.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -10,10 +11,48 @@
 
 namespace {
 
+// One outstanding work request posted to a JFC. We record the owning jetty's
+// local id alongside user_ctx so that polled completions can populate
+// urma_cr_t::local_id, which the production poll loop uses to locate the jetty
+// owner for fence CQEs and ACK-timeout completions.
+struct PendingWr {
+    uint64_t user_ctx;
+    uint32_t jetty_local_id;
+    // When true, urma_poll_jfc skips this WR (it stays outstanding) so only
+    // urma_flush_jetty can complete it. Lets a test leave a residual WR on the
+    // jetty to exercise the rebuild flush-delivery path.
+    bool withhold = false;
+};
+
 struct JfcState {
     std::mutex mutex;
-    std::deque<uint64_t> pending_ctx;
+    std::deque<PendingWr> pending;
 };
+
+// Scripted test hooks. All are guarded by g_script_mutex and are inert
+// (defaults) until a test arms them. mock_urma_test_reset() restores defaults.
+struct MockScript {
+    // Poll-status override: while poll_status_count > 0, polled completions
+    // use poll_status instead of URMA_CR_SUCCESS.
+    urma_cr_status_t poll_status = URMA_CR_SUCCESS;
+    int poll_status_count = 0;
+    // Fence CQEs to inject, one per poll that owns the matching jetty.
+    std::deque<uint32_t> flush_done_ids;
+    // Flush-error scripting: while flush_err_count > 0, urma_flush_jetty
+    // returns that many WR_FLUSH_ERR completions from the jetty's pending WRs.
+    int flush_err_count = 0;
+    // When true, the next urma_create_jetty returns NULL.
+    bool fail_next_create_jetty = false;
+    // When true, the next urma_delete_jetty returns an error without freeing,
+    // exercising the rebuild delete-failure path that must keep the handle.
+    bool fail_next_delete_jetty = false;
+    // While > 0, the next WRs posted via urma_post_jetty_send_wr are marked
+    // withhold (skipped by poll, only flushable). Decremented per WR posted.
+    int withhold_next_post_count = 0;
+};
+
+std::mutex g_script_mutex;
+MockScript g_script;
 
 std::shared_mutex g_rw_mutex;
 bool initialized = false;
@@ -310,7 +349,7 @@ urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
         context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
-    urma_target_seg_t *tseg = new urma_target_seg_t;
+    auto *tseg = new urma_target_seg_t;
     tseg->seg = *seg;
     *token_value = {.token = seg->token_id};
     seg_map[tseg] = 1;
@@ -342,15 +381,23 @@ urma_status_t urma_get_async_event(urma_context_t *ctx,
 void urma_ack_async_event(urma_async_event_t *event) {}
 
 urma_jetty_t *urma_create_jetty(urma_context_t *ctx, urma_jetty_cfg_t *cfg) {
+    {
+        std::lock_guard<std::mutex> script_lock(g_script_mutex);
+        if (g_script.fail_next_create_jetty) {
+            g_script.fail_next_create_jetty = false;
+            return nullptr;
+        }
+    }
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
+    static std::atomic<uint32_t> next_jetty_id{1};
     urma_jetty_t *jetty = new urma_jetty_t;
     memset(&jetty->jetty_id.eid, 0, sizeof(urma_eid_t));
     jetty->jetty_id.eid.raw[0] = 1;
     jetty->jetty_id.uasid = 0;
-    jetty->jetty_id.id = 1;
+    jetty->jetty_id.id = next_jetty_id.fetch_add(1);
     jetty->jetty_cfg = *cfg;
     jetty->remote_jetty = nullptr;
     jetty_map[jetty] = 1;
@@ -358,6 +405,13 @@ urma_jetty_t *urma_create_jetty(urma_context_t *ctx, urma_jetty_cfg_t *cfg) {
 }
 
 urma_status_t urma_delete_jetty(urma_jetty_t *jetty) {
+    {
+        std::lock_guard<std::mutex> script_lock(g_script_mutex);
+        if (g_script.fail_next_delete_jetty) {
+            g_script.fail_next_delete_jetty = false;
+            return URMA_FAIL;  // keep the jetty allocated; caller must retry
+        }
+    }
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
         return URMA_EINVAL;
@@ -420,6 +474,54 @@ urma_status_t urma_modify_jetty(urma_jetty_t *jetty, urma_jetty_attr_t *attr) {
     return URMA_SUCCESS;
 }
 
+int urma_flush_jetty(urma_jetty_t *jetty, int cr_cnt, urma_cr_t *cr) {
+    urma_jfc_t *jfc = nullptr;
+    uint32_t local_id = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+        if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
+            return -1;
+        }
+        jfc = jetty->jetty_cfg.jfs_cfg.jfc;
+        local_id = jetty->jetty_id.id;
+    }
+
+    int want = 0;
+    {
+        std::lock_guard<std::mutex> script_lock(g_script_mutex);
+        if (g_script.flush_err_count > 0) {
+            want = std::min(cr_cnt, g_script.flush_err_count);
+            g_script.flush_err_count -= want;
+        }
+    }
+    if (want <= 0) return 0;
+
+    // Draw up to `want` of this jetty's outstanding WRs from its JFC and
+    // report them as flushed, mirroring the real provider's flush completion.
+    JfcState *state = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+        auto it = jfc_state_map.find(jfc);
+        if (it == jfc_state_map.end()) return 0;
+        state = it->second;
+    }
+    std::lock_guard<std::mutex> jfc_lock(state->mutex);
+    int produced = 0;
+    for (auto it = state->pending.begin();
+         it != state->pending.end() && produced < want;) {
+        if (it->jetty_local_id != local_id) {
+            ++it;
+            continue;
+        }
+        cr[produced].status = URMA_CR_WR_FLUSH_ERR;
+        cr[produced].user_ctx = it->user_ctx;
+        cr[produced].local_id = it->jetty_local_id;
+        ++produced;
+        it = state->pending.erase(it);
+    }
+    return produced;
+}
+
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                                       urma_jfs_wr_t **bad_wr) {
     {
@@ -450,7 +552,16 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
         std::lock_guard<std::mutex> jfc_lock(state->mutex);
         urma_jfs_wr_t *current_wr = wr;
         while (current_wr) {
-            state->pending_ctx.push_back(current_wr->user_ctx);
+            bool withhold = false;
+            {
+                std::lock_guard<std::mutex> script_lock(g_script_mutex);
+                if (g_script.withhold_next_post_count > 0) {
+                    withhold = true;
+                    --g_script.withhold_next_post_count;
+                }
+            }
+            state->pending.push_back(
+                PendingWr{current_wr->user_ctx, jetty->jetty_id.id, withhold});
             current_wr = current_wr->next;
         }
     }
@@ -472,17 +583,110 @@ int urma_poll_jfc(urma_jfc_t *jfc, int num_entries, urma_cr_t *cr_list) {
         state = it->second;
     }
 
+    std::lock_guard<std::mutex> jfc_lock(state->mutex);
     int num_completed = 0;
+
+    // Scripted flush-done fence: emit at most one per poll, matching how the
+    // real provider delivers a single FLUSH_ERR_DONE marker per drained jetty.
+    // It carries user_ctx=0 and the owning jetty's local_id so the production
+    // poll loop routes it to onFlushDone.
     {
-        std::lock_guard<std::mutex> jfc_lock(state->mutex);
-        int available = static_cast<int>(state->pending_ctx.size());
-        num_completed = std::min(num_entries, available);
-        for (int i = 0; i < num_completed; ++i) {
-            cr_list[i].status = URMA_CR_SUCCESS;
-            cr_list[i].user_ctx = state->pending_ctx[i];
+        std::lock_guard<std::mutex> script_lock(g_script_mutex);
+        if (num_completed < num_entries && !g_script.flush_done_ids.empty()) {
+            uint32_t fence_id = g_script.flush_done_ids.front();
+            bool owns = false;
+            for (const auto &p : state->pending) {
+                if (p.jetty_local_id == fence_id) {
+                    owns = true;
+                    break;
+                }
+            }
+            // The jetty may already be fully flushed (no pending WRs left);
+            // still deliver the fence on this JFC if it ever hosted the jetty.
+            // For the mock's single-JFC-per-endpoint usage we deliver on the
+            // first JFC when no pending match is found.
+            if (owns || state->pending.empty()) {
+                g_script.flush_done_ids.pop_front();
+                cr_list[num_completed].status = URMA_CR_WR_FLUSH_ERR_DONE;
+                cr_list[num_completed].user_ctx = 0;
+                cr_list[num_completed].local_id = fence_id;
+                ++num_completed;
+            }
         }
-        state->pending_ctx.erase(state->pending_ctx.begin(),
-                                 state->pending_ctx.begin() + num_completed);
+    }
+
+    int capacity = num_entries - num_completed;
+    int wr_completed = 0;
+    for (auto it = state->pending.begin();
+         it != state->pending.end() && wr_completed < capacity;) {
+        if (it->withhold) {
+            ++it;  // leave outstanding for the flush path
+            continue;
+        }
+        urma_cr_status_t status = URMA_CR_SUCCESS;
+        {
+            std::lock_guard<std::mutex> script_lock(g_script_mutex);
+            if (g_script.poll_status_count > 0) {
+                status = g_script.poll_status;
+                --g_script.poll_status_count;
+            }
+        }
+        cr_list[num_completed].status = status;
+        cr_list[num_completed].user_ctx = it->user_ctx;
+        cr_list[num_completed].local_id = it->jetty_local_id;
+        ++num_completed;
+        ++wr_completed;
+        it = state->pending.erase(it);
     }
     return num_completed;
+}
+
+// ---------------------------------------------------------------------------
+// Test-only scripted control API. See mock_urma_test_ctrl.h.
+// ---------------------------------------------------------------------------
+
+void mock_urma_test_reset(void) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script = MockScript{};
+}
+
+void mock_urma_set_next_poll_status(int status, int count) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.poll_status = static_cast<urma_cr_status_t>(status);
+    g_script.poll_status_count = count;
+}
+
+void mock_urma_enqueue_flush_done(uint32_t jetty_local_id) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.flush_done_ids.push_back(jetty_local_id);
+}
+
+void mock_urma_set_flush_returns_errors(int count) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.flush_err_count = count;
+}
+
+void mock_urma_withhold_next_post(int count) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.withhold_next_post_count = count;
+}
+
+void mock_urma_unwithhold_all(void) {
+    std::shared_lock<std::shared_mutex> rw_lock(g_rw_mutex);
+    for (auto &entry : jfc_state_map) {
+        std::lock_guard<std::mutex> jfc_lock(entry.second->mutex);
+        for (auto &wr : entry.second->pending) {
+            wr.withhold = false;
+        }
+    }
+}
+
+void mock_urma_fail_next_delete_jetty(void) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.fail_next_delete_jetty = true;
+}
+
+void mock_urma_fail_next_create_jetty(void) {
+    std::lock_guard<std::mutex> script_lock(g_script_mutex);
+    g_script.fail_next_create_jetty = true;
 }

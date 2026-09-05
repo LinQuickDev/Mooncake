@@ -296,6 +296,19 @@ if(USE_UB)
   # conditions and other stability issues, so keep it out of CI for now. Run
   # manually with ./ub_transport_test. add_test(NAME ub_transport_test COMMAND
   # ub_transport_test)
+
+  # Mock-injected jetty ACK-timeout rebuild tests. Deterministic and free of
+  # worker-pool races, so registered with ctest and wired into the ub-mock CI.
+  add_executable(urma_jetty_rebuild_test
+                 ${WORKSPACE}/urma_jetty_rebuild_test.cpp)
+  target_link_libraries(urma_jetty_rebuild_test PUBLIC transfer_engine gtest
+                                                       gtest_main glog::glog
+                                                       pthread)
+  target_include_directories(
+    urma_jetty_rebuild_test
+    PRIVATE ${urma_INCLUDE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/kunpeng_transport/urma)
+  add_test(NAME urma_jetty_rebuild_test COMMAND urma_jetty_rebuild_test)
 endif()
 
 if(USE_SUNRISE)
