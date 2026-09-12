@@ -1,12 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
 #include <variant>
-#include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
@@ -14,6 +14,8 @@
 
 #include "environ.h"
 #include "client_metric.h"
+#include "config/rpc_protocol_config.h"
+#include "config/rpc_timeout_config.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -48,23 +50,39 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
     }
 }
 
-inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+// Applies the RPC timeout overrides to any mooncake-store RPC client config.
+// Shared by the client->master pool and the store->store offload pool so the
+// two cannot drift. Absent overrides leave the caller's defaults in place.
+// A negative request timeout disables the per-request timer.
+template <typename ClientConfig>
+inline void ApplyRpcTimeoutOverrides(ClientConfig& client_config,
+                                     const RpcTimeoutConfig& config) {
+    if (config.request_timeout.has_value()) {
+        client_config.request_timeout_duration = *config.request_timeout;
+    }
+    if (config.connect_timeout.has_value()) {
+        client_config.connect_timeout_duration = *config.connect_timeout;
+    }
+}
+
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
+    bool ha_enabled = false) {
     RpcClientPool::PoolConfig config;
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (ha_enabled) {
+        // HA monitor and heartbeat loops own the retry schedule. Keep each
+        // attempt bounded so a deleted pod IP that silently drops SYNs cannot
+        // block failover on YLT's default 4 x 30-second retry budget.
+        config.connect_retry_count = 0;
+        config.reconnect_wait_time = std::chrono::milliseconds{0};
+        config.client_config.connect_timeout_duration = std::chrono::seconds{1};
+    }
+
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
-    // Default request and connect timeouts remain coro_rpc's built-in 30s.
-    // A negative request timeout disables the per-request timer.
-    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
-        config.client_config.request_timeout_duration =
-            std::chrono::milliseconds(std::atoll(timeout_ms));
-    }
-    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
-        config.client_config.connect_timeout_duration =
-            std::chrono::milliseconds(std::atoll(connect_ms));
-    }
+    ApplyRpcTimeoutOverrides(config.client_config,
+                             RpcTimeoutConfig::FromEnvironment());
     return config;
 }
 
@@ -79,6 +97,12 @@ class MasterClient {
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(), 
                            detail::MakeMasterRpcClientPoolConfig()),
+          ha_control_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
+          ha_probe_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
           client_id_(client_id),
           tenant_id_(NormalizeTenantId(std::move(tenant_id))),
           metrics_(metrics) {
@@ -108,6 +132,8 @@ class MasterClient {
                 pool_conf);
     }
     ~MasterClient();
+
+    void EnableHaConnectionPolicy();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 
@@ -450,6 +476,13 @@ class MasterClient {
         const UUID& client_id, bool enable_offloading);
 
     /**
+     * @brief Deregisters this client's local disk segment from the master,
+     * dropping the LOCAL_DISK replicas it owns. Idempotent.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-persisted objects.
      * @param enable_offloading Indicates whether persistence is enabled for
@@ -549,6 +582,13 @@ class MasterClient {
         const std::string& key, const std::string& tenant_id,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode>
+    DynamicReplicaCopyStart(const std::string& key,
+                            const std::string& tenant_id,
+                            const std::string& src_segment,
+                            const std::vector<std::string>& tgt_segments,
+                            const UUID& dynamic_replication_lease_id,
+                            uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief End a copy operation
@@ -558,6 +598,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Revoke a copy operation
@@ -568,6 +612,10 @@ class MasterClient {
         const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Start a move operation
@@ -698,6 +746,16 @@ class MasterClient {
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
         Args&&... args);
 
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_pool(
+        RpcClientPool& client_accessor, Args&&... args);
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode>
+    invoke_rpc_with_client_pool(
+        const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+        Args&&... args);
+
     /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -740,6 +798,8 @@ class MasterClient {
     };
 
     RpcClientPool client_accessor_;
+    RpcClientPool ha_control_client_accessor_;
+    RpcClientPool ha_probe_client_accessor_;
 
     // The client identification.
     const UUID client_id_;
@@ -755,6 +815,7 @@ class MasterClient {
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
+    std::atomic<bool> ha_connection_policy_enabled_{false};
 };
 
 }  // namespace mooncake

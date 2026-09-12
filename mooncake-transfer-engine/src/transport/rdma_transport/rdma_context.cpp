@@ -20,12 +20,14 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cassert>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <thread>
 
@@ -165,7 +167,6 @@ RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
           [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }),
       next_comp_channel_index_(0),
       next_comp_vector_index_(0),
-      next_cq_list_index_(0),
       worker_pool_(nullptr),
       active_(true) {
     static std::once_flag g_once_flag;
@@ -194,6 +195,23 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     // Create endpoint store based on configuration
     auto &config = globalConfig();
+    if (config.workers_per_ctx <= 0) {
+        LOG(ERROR) << "Invalid workers_per_ctx=" << config.workers_per_ctx
+                   << " for device " << device_name_;
+        return ERR_INVALID_ARGUMENT;
+    }
+    transfer_worker_count_ = config.workers_per_ctx;
+    if (num_cq_list < static_cast<size_t>(transfer_worker_count_)) {
+        LOG(INFO) << "Increasing RDMA CQ count for " << device_name_ << " from "
+                  << num_cq_list << " to " << transfer_worker_count_
+                  << " to keep each transfer worker on a dedicated CQ";
+        num_cq_list = static_cast<size_t>(transfer_worker_count_);
+    }
+    endpoint_lifecycle_locks_.clear();
+    endpoint_lifecycle_locks_.reserve(
+        static_cast<size_t>(transfer_worker_count_));
+    for (int i = 0; i < transfer_worker_count_; ++i)
+        endpoint_lifecycle_locks_.push_back(std::make_unique<std::mutex>());
     switch (config.endpoint_store_type) {
         case EndpointStoreType::FIFO:
             endpoint_store_ =
@@ -209,7 +227,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     }
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
-                   << port << " with GID " << gid_index;
+                   << static_cast<int>(port) << " with GID " << gid_index;
         return ERR_CONTEXT;
     }
 
@@ -389,10 +407,12 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
+int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
-#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
+    (void)length;
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
+    defined(USE_SUPA)
     // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
     // memory uses the plain ibv_reg_mr() path. GPU memory is exported once as a
     // dma_buf fd that every NIC then imports, so the driver keeps a single
@@ -403,7 +423,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                Environ::Get().GetWithNvidiaPeermem()) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
@@ -411,7 +431,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
         // Ensure a CUDA context is current — worker threads or callers
         // from non-CUDA threads may lack one.
         unsigned int devOrd = 0;
@@ -438,33 +458,72 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
             return ERR_CONTEXT;
         }
 
         int dmabuf_fd;
+        // cuMemGetAddressRange() only reports the mapping that contains addr.
+        // For memory allocated through the CUDA virtual memory management API
+        // (cuMemCreate + cuMemMap), as used by PyTorch's
+        // PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, that mapping is a
+        // single growth chunk — 20 MiB by default, see c10's
+        // large_segment_size / large_segment_size_mb — even though the
+        // surrounding VA reservation is contiguous and orders of magnitude
+        // larger. Exporting only that chunk makes offset + length exceed the
+        // resulting dma_buf, and ibv_reg_dmabuf_mr() below then fails with
+        // EINVAL for every buffer larger than one chunk (Mooncake#2511).
+        //
+        // When the reported allocation does not cover the range the caller is
+        // about to register, export exactly [addr, addr + length) instead.
+        // cuMemGetHandleForAddressRange() accepts a range spanning several
+        // mappings as long as they are contiguously mapped, which is precisely
+        // the expandable-segment layout. The export base is page-aligned so
+        // that offset % page_size == iova % page_size, which
+        // ibv_reg_dmabuf_mr() requires.
+        CUdeviceptr exportBase = allocBase;
+        size_t exportSize = allocSize;
+        uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
+        if (exportOffset + length > allocSize) {
+            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
+            if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
+            exportBase = (CUdeviceptr)aligned;
+            exportOffset = (uintptr_t)addr - aligned;
+            exportSize =
+                (exportOffset + length + page - 1) & ~(size_t)(page - 1);
+            VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
+                    << " (base=" << (uintptr_t)allocBase
+                    << " size=" << allocSize << ") does not cover length "
+                    << length << "; exporting the requested range instead"
+                    << " (base=" << (uintptr_t)exportBase
+                    << " size=" << exportSize
+                    << "). Expected for CUDA VMM allocations such as PyTorch"
+                       " expandable_segments.";
+        }
+
         // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
         // on some GPU/driver combinations (e.g. B200).
         result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, allocBase, allocSize,
+            &dmabuf_fd, exportBase, exportSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
-                       << " base=" << (uintptr_t)allocBase
-                       << " size=" << allocSize << " cuda error=" << errStr;
-#if defined(USE_CUDA)
+                       << " base=" << (uintptr_t)exportBase
+                       << " size=" << exportSize << " cuda error=" << errStr;
+#if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
             return ERR_CONTEXT;
         }
         out.method = DmabufExport::Method::kDmabufReg;
         out.fd = dmabuf_fd;
-        out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
-#if defined(USE_CUDA)
+        out.offset = exportOffset;
+#if defined(USE_CUDA) || defined(USE_SUPA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
     }
@@ -582,7 +641,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     }
     mrMeta.addr = addr;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
-    defined(USE_HIP_DMABUF)
+    defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
         // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
         // by the caller until every NIC has registered; this MR takes its own
@@ -598,7 +657,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
-        PLOG(ERROR) << "Failed to register memory " << addr;
+        PLOG(ERROR) << "Failed to register memory " << addr << " length "
+                    << length << " dmabuf_offset " << exp.offset;
         return ERR_CONTEXT;
     }
     return 0;
@@ -606,6 +666,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
                                       const DmabufExport &exp) {
+    // Placeholder context for a failed RNIC: no PD to register against.
+    if (!pd_) return 0;
     MemoryRegionMeta mrMeta;
     int ret = registerMemoryRegionInternal(addr, length, access, exp, mrMeta);
     if (ret != 0) {
@@ -617,11 +679,12 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    if (!pd_) return 0;  // placeholder context: skip the dma_buf export too
     // Single-NIC convenience path: export, register, and close the fd here.
     // The shared-fd benefit only matters when a buffer is registered against
     // multiple NICs (see RdmaTransport::registerLocalMemoryInternal).
     DmabufExport exp;
-    int ret = exportDmabuf(addr, exp);
+    int ret = exportDmabuf(addr, length, exp);
     if (ret != 0) {
         return ret;
     }
@@ -636,17 +699,29 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
+    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
+    // reading mr->length (or the cached region length) afterwards is a use-
+    // after-free. We restore fork state on the same range to undo the
+    // MADV_DONTFORK applied at register time (see issue #3639).
+    void *region_addr = iter->second.addr;
+    size_t region_length = iter->second.mr->length;
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
+    }
+    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << region_addr << " (" << region_length
+                      << " bytes), deregister already succeeded";
     }
     memory_region_map_.erase(iter);
     return 0;
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
+    if (!pd_) return 0;  // placeholder context
     DmabufExport exp;
-    int ret = exportDmabuf(addr, exp);
+    int ret = exportDmabuf(addr, length, exp);
     if (ret != 0) {
         return ret;
     }
@@ -663,6 +738,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
 }
 
 uint32_t RdmaContext::rkey(void *addr) {
+    // Placeholder context holds no MRs; its zero key is never selected.
+    if (!pd_) return 0;
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
     if (iter != memory_region_map_.end()) return iter->second.mr->rkey;
@@ -672,6 +749,7 @@ uint32_t RdmaContext::rkey(void *addr) {
 }
 
 uint32_t RdmaContext::lkey(void *addr) {
+    if (!pd_) return 0;  // see rkey()
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
     if (iter != memory_region_map_.end()) return iter->second.mr->lkey;
@@ -704,6 +782,18 @@ RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
+    int cq_index = cqIndexForPeer(peer_nic_path);
+    if (cq_index < 0) return nullptr;
+    return endpoint(peer_nic_path, cq_index);
+}
+
+std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
+    const std::string &peer_nic_path, int cq_index) {
+    if (cq_list_.empty()) {
+        LOG(ERROR) << "No CQ available for endpoint on " << deviceName();
+        return nullptr;
+    }
+
     if (!active_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Context is not active: " << deviceName();
         return nullptr;
@@ -719,9 +809,16 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
         return endpoint;
     }
 
-    endpoint = endpoint_store_->insertEndpoint(peer_nic_path, this);
+    endpoint =
+        endpoint_store_->insertEndpoint(peer_nic_path, this, cq(cq_index));
     endpoint_store_->reclaimEndpoint();
     return endpoint;
+}
+
+std::shared_ptr<RdmaEndPoint> RdmaContext::findEndpoint(
+    const std::string &peer_nic_path) {
+    if (!endpoint_store_) return nullptr;
+    return endpoint_store_->getEndpoint(peer_nic_path);
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::getEndpointByPtr(
@@ -802,9 +899,53 @@ int RdmaContext::gidIndex() const {
     return gid_index_;
 }
 
-ibv_cq *RdmaContext::cq() {
-    int index = (next_cq_list_index_++) % cq_list_.size();
-    return cq_list_[index].native;
+ibv_cq *RdmaContext::cq(int cq_index) {
+    if (cq_list_.empty()) return nullptr;
+    if (cq_index < 0) return nullptr;
+    return cq_list_[static_cast<size_t>(cq_index) % cq_list_.size()].native;
+}
+
+int RdmaContext::postingThreadForPeer(const std::string &peer_nic_path) const {
+    if (transfer_worker_count_ <= 0) {
+        LOG(ERROR) << "Invalid transfer_worker_count_="
+                   << transfer_worker_count_ << " for endpoint on "
+                   << deviceName();
+        return -1;
+    }
+    return static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
+                            static_cast<size_t>(transfer_worker_count_));
+}
+
+int RdmaContext::cqIndexForPostingThread(int thread_id) const {
+    const int cq_count = cqCount();
+    if (cq_count <= 0 || thread_id < 0) return -1;
+    if (thread_id < cq_count) return thread_id;
+    return thread_id % cq_count;
+}
+
+int RdmaContext::cqIndexForPeer(const std::string &peer_nic_path) const {
+    return cqIndexForPostingThread(postingThreadForPeer(peer_nic_path));
+}
+
+std::unique_lock<std::mutex> RdmaContext::lockEndpointLifecycle(
+    const std::string &peer_nic_path) const {
+    const int owner_thread = postingThreadForPeer(peer_nic_path);
+    if (owner_thread < 0 ||
+        static_cast<size_t>(owner_thread) >= endpoint_lifecycle_locks_.size()) {
+        return std::unique_lock<std::mutex>();
+    }
+    return std::unique_lock<std::mutex>(
+        *endpoint_lifecycle_locks_[owner_thread]);
+}
+
+std::vector<std::unique_lock<std::mutex>>
+RdmaContext::lockAllEndpointLifecycles() const {
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(endpoint_lifecycle_locks_.size());
+    for (auto &lifecycle_lock : endpoint_lifecycle_locks_) {
+        locks.emplace_back(*lifecycle_lock);
+    }
+    return locks;
 }
 
 ibv_comp_channel *RdmaContext::compChannel() {
@@ -1205,8 +1346,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr attr;
         int ret = ibv_query_port(context, port, &attr);
         if (ret) {
-            LOG(ERROR) << "Failed to query port " << port << " on "
-                       << device_name << ": " << strerror(ret);
+            LOG(ERROR) << "Failed to query port " << static_cast<int>(port)
+                       << " on " << device_name << ": " << strerror(ret);
             int close_ret = ibv_close_device(context);
             if (close_ret) {
                 LOG(ERROR) << "ibv_close_device(" << device_name
@@ -1241,7 +1382,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if defined(USE_MACA) || defined(USE_CUDA)
+#if defined(USE_MACA) || defined(USE_CUDA) || defined(USE_SUPA)
         // Verify DMA-BUF support against the GPU device(s) that the local
         // topology explicitly maps to this RNIC, rather than assuming the
         // verbs enumeration order matches GPU enumeration.
@@ -1289,7 +1430,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             } else {
                 // cuInit is process-global and idempotent; call it once before
                 // the per-device loop, not per cuDeviceGet.
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
                 CUresult result = cuInit(0);
                 if (result != CUDA_SUCCESS) {
                     LOG(ERROR) << "Failed to initialize CUDA driver for RNIC "
@@ -1333,7 +1474,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ret = ibv_query_port(context, port, &port_attr);
         if (ret) {
             LOG(WARNING) << "Failed to query port attributes on " << device_name
-                         << "/" << port << ": " << strerror(ret);
+                         << "/" << static_cast<int>(port) << ": "
+                         << strerror(ret);
             int close_ret = ibv_close_device(context);
             if (close_ret) {
                 LOG(ERROR) << "ibv_close_device(" << device_name
@@ -1352,34 +1494,37 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                                          found_gid_index);
             if (gid_state != GidNetworkState::GID_NOT_FOUND) {
                 LOG(INFO) << "Find best gid index: " << found_gid_index
-                          << " on " << device_name << "/" << port
-                          << " (network state: "
+                          << " on " << device_name << "/"
+                          << static_cast<int>(port) << " (network state: "
                           << GidNetworkStateToString(gid_state) << ")";
                 gid_index = found_gid_index;
             } else {
                 LOG(WARNING) << "No suitable GID found on " << device_name
-                             << "/" << port;
+                             << "/" << static_cast<int>(port);
                 goto cleanup_context_and_devices;
             }
         } else {
             // Also check network state for user-specified GID
             bool has_ndev = !readGidNdev(device_name, port, gid_index).empty();
             if (!has_ndev) {
-                LOG(WARNING) << "User-specified GID index " << gid_index
-                             << " on " << device_name << "/" << port
-                             << " has no associated network device, "
-                             << "may not be optimal for RDMA operations";
+                LOG(WARNING)
+                    << "User-specified GID index " << gid_index << " on "
+                    << device_name << "/" << static_cast<int>(port)
+                    << " has no associated network device, "
+                    << "may not be optimal for RDMA operations";
             }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
-                      << " on " << device_name << "/" << port << " ("
-                      << (has_ndev ? "with" : "without") << " network device)";
+                      << " on " << device_name << "/" << static_cast<int>(port)
+                      << " (" << (has_ndev ? "with" : "without")
+                      << " network device)";
         }
 
         // Continue with GID validation
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
             LOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                       << device_name << "/" << port << ": " << strerror(ret);
+                       << device_name << "/" << static_cast<int>(port) << ": "
+                       << strerror(ret);
             goto cleanup_context_and_devices;
         }
 
@@ -1397,6 +1542,12 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         lid_ = attr.lid;
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+        // XDR (encoding 256) overflows the uint8_t field above, which then
+        // reads 0; the extended field carries it on rdma-core builds that
+        // have one.
+        if (attr.active_speed_ex) active_speed_ = attr.active_speed_ex;
+#endif
         active_width_ = attr.active_width;
         {
             std::lock_guard<std::mutex> guard(gid_lock_);

@@ -15,7 +15,7 @@
 #include "master_perf.h"
 #include "mooncake_logging.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 
 namespace mooncake {
 

@@ -26,7 +26,9 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
-#include "utils.h"
+#include "nvme_kv_backend.h"
+#include "common/timestamp.h"
+#include "common/file_util.h"
 #include "crc32c.h"
 
 #include <ylt/util/tl/expected.hpp>
@@ -50,6 +52,10 @@ struct FdGuard {
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
+#ifdef USE_3FS
+#include "storage/distributed/hf3fs_adapter.h"
+#endif
 
 // spdiag perf points for the offload owner-side disk load breakdown.
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
@@ -57,249 +63,6 @@ struct FdGuard {
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {
-
-namespace {
-thread_local StorageReadStats* current_storage_read_stats = nullptr;
-}
-
-StorageReadStats* CurrentStorageReadStats() {
-    return current_storage_read_stats;
-}
-
-ScopedStorageReadStats::ScopedStorageReadStats(StorageReadStats* stats)
-    : previous_(current_storage_read_stats) {
-    current_storage_read_stats = stats;
-}
-
-ScopedStorageReadStats::~ScopedStorageReadStats() {
-    current_storage_read_stats = previous_;
-}
-
-bool FilePerKeyConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
-        return false;
-    }
-    return true;
-}
-
-bool BucketBackendConfig::Validate() const {
-    if (bucket_keys_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
-        return false;
-    }
-    if (bucket_size_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
-        return false;
-    }
-    return true;
-}
-
-FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
-    FilePerKeyConfig config;
-
-    config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
-
-    config.enable_eviction = GetEnvOr<bool>(
-        "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
-        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction));
-
-    return config;
-}
-
-BucketBackendConfig BucketBackendConfig::FromEnvironment() {
-    BucketBackendConfig config;
-
-    config.bucket_keys_limit = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
-
-    config.bucket_size_limit = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
-
-    config.max_total_size =
-        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
-                          GetEnvOr<int64_t>("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
-                                            config.max_total_size));
-
-    const auto policy_str = GetEnvStringOr(
-        "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
-        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
-    if (policy_str == "fifo") {
-        config.eviction_policy = BucketEvictionPolicy::FIFO;
-    } else if (policy_str == "lru") {
-        config.eviction_policy = BucketEvictionPolicy::LRU;
-    } else {
-        config.eviction_policy = BucketEvictionPolicy::NONE;
-    }
-
-    config.disable_ssd_eviction =
-        GetEnvOr<bool>("MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION", false);
-
-    config.gc_enable = GetEnvOr<bool>("MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE",
-                                       config.gc_enable);
-    config.gc_interval_ms =
-        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS",
-                          config.gc_interval_ms);
-    // Parse doubles manually: GetEnvOr uses std::stoll which cannot parse
-    // fractional values like "0.25".
-    {
-        const char* ratio_env =
-            std::getenv("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
-        if (ratio_env && !std::string(ratio_env).empty()) {
-            try {
-                config.gc_deleted_ratio = std::stod(std::string(ratio_env));
-            } catch (...) {
-                // keep default
-            }
-        }
-        const char* wm_env = std::getenv(
-            "MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO");
-        if (wm_env && !std::string(wm_env).empty()) {
-            try {
-                config.gc_high_watermark_ratio =
-                    std::stod(std::string(wm_env));
-            } catch (...) {
-                // keep default
-            }
-        }
-    }
-    config.gc_max_buckets_per_round = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND",
-        config.gc_max_buckets_per_round);
-    config.gc_merge_enable = GetEnvOr<bool>(
-        "MOONCAKE_OFFLOAD_BUCKET_GC_MERGE_ENABLE", config.gc_merge_enable);
-
-    return config;
-}
-
-bool OffsetAllocatorBackendConfig::Validate() const {
-    if (persist_mode == OffsetPersistMode::kRelaxed) {
-        if (persist_interval_seconds < 5) {
-            LOG(ERROR) << "OffsetAllocatorBackendConfig: "
-                          "persist_interval_seconds must be >= 5 for "
-                          "kRelaxed mode";
-            return false;
-        }
-    }
-    if (high_ratio <= 0.0 || high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
-        return false;
-    }
-    if (low_ratio <= 0.0 || low_ratio >= high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: low_ratio must be in (0, "
-                      "high_ratio)";
-        return false;
-    }
-    if (keys_high_ratio <= 0.0 || keys_high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: keys_high_ratio must be in (0,1]";
-        return false;
-    }
-    if (keys_low_ratio <= 0.0 || keys_low_ratio >= keys_high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: keys_low_ratio must be in "
-                      "(0, keys_high_ratio)";
-        return false;
-    }
-    if (max_evict_per_offload == 0) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: max_evict_per_offload "
-                      "must be > 0";
-        return false;
-    }
-    if (fallback_evict_batch == 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: fallback_evict_batch must be > 0";
-        return false;
-    }
-    if (max_capacity_nodes < 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
-        return false;
-    }
-    return true;
-}
-
-static std::optional<double> GetEnvDouble(const char* name) {
-    const char* env = std::getenv(name);
-    if (!env || env[0] == '\0') return std::nullopt;
-    try {
-        return std::stod(env);
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
-OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
-    OffsetAllocatorBackendConfig cfg;
-
-    const char* pol = std::getenv("MOONCAKE_OFFSET_EVICTION_POLICY");
-    if (pol) {
-        std::string s(pol);
-        if (s == "fifo" || s == "FIFO" || s == "Fifo") {
-            cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
-        }
-        // NONE is default; LRU reserved for phase 2
-    }
-
-    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_HIGH_RATIO"))
-        cfg.high_ratio = *v;
-    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_LOW_RATIO")) cfg.low_ratio = *v;
-    // Both byte and key watermarks derive from the same ratio pair.
-    cfg.keys_high_ratio = cfg.high_ratio;
-    cfg.keys_low_ratio = cfg.low_ratio;
-
-    cfg.max_capacity_nodes = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFSET_MAX_CAPACITY_NODES", cfg.max_capacity_nodes);
-
-    // Read eviction cap as int64_t to guard against negative env values
-    // which would wrap to SIZE_MAX with GetEnvOr<size_t>.
-    auto max_evict_raw =
-        GetEnvOr<int64_t>("MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD",
-                          static_cast<int64_t>(cfg.max_evict_per_offload));
-    if (max_evict_raw > 0) {
-        cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
-    } else if (max_evict_raw <= 0) {
-        LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
-                     << max_evict_raw << " is non-positive; using default "
-                     << cfg.max_evict_per_offload;
-    }
-
-    // Persistence mode
-    const char* persist = std::getenv("MOONCAKE_OFFSET_PERSIST_MODE");
-    if (persist) {
-        std::string s(persist);
-        if (s == "disabled" || s == "DISABLED") {
-            cfg.persist_mode = OffsetPersistMode::kDisabled;
-        } else if (s == "relaxed" || s == "RELAXED") {
-            cfg.persist_mode = OffsetPersistMode::kRelaxed;
-        } else if (s == "strict" || s == "STRICT") {
-            cfg.persist_mode = OffsetPersistMode::kStrict;
-        } else {
-            LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
-                         << "; using default (disabled)";
-        }
-    }
-
-    cfg.persist_interval_seconds =
-        GetEnvOr<int64_t>("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
-                          cfg.persist_interval_seconds);
-
-    // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
-    const char* crc_env = std::getenv("MOONCAKE_OFFSET_RECORD_CRC");
-    if (crc_env) {
-        std::string s(crc_env);
-        for (auto& c : s) c = static_cast<char>(std::tolower(c));
-        if (s == "0" || s == "false" || s == "off") {
-            cfg.enable_record_crc = false;
-        }
-    }
-
-    return cfg;
-}
-
-StorageBackendInterface::StorageBackendInterface(
-    const FileStorageConfig& config)
-    : file_storage_config_(config) {}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -713,14 +476,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
 void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if
-    // used in multi-thread environment Check if the file exists before
-    // attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the
-    // corresponding file it will be fixed in the next version
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(50));  // sleep for 50 us
-
+    // StoreObject holds the same striped path lock across file creation, write,
+    // and queue insertion. Acquiring it here serializes deletion with those
+    // operations without relying on a timing delay.
     MutexLocker path_locker(&GetFilePathMutex(path));
 
     // Eviction disabled, use simple delete (no queue tracking)
@@ -1501,9 +1259,9 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = FileUtil::ResolvePathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
@@ -1560,8 +1318,8 @@ StorageBackendAdaptor::EvictAboveDiskWatermark(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
-                                   file_per_key_config_.fsdir);
+    auto path = FileUtil::ResolvePathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
@@ -1574,9 +1332,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
         const auto io_start = std::chrono::steady_clock::now();
         KVEntry kv;
         kv.key = key;
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = FileUtil::ResolvePathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
@@ -1855,6 +1613,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
+    VLOG(1) << "Written bucket with id: " << bucket_id;
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
@@ -1888,8 +1647,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                 CHECK(inserted)
                     << "Reserved key became duplicated: " << bucket_keys[i];
             }
+            auto ts = 0LL;
+            // Update LRU timestamp for in case of eviction.
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                ts =
+                    std::chrono::steady_clock::now().time_since_epoch().count();
+                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+            }
             buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(0LL, bucket_id);
+            lru_index_.emplace(ts, bucket_id);
         }
         if (duplicate_found) {
             LOG(ERROR) << "Reserved key became duplicated before commit, "
@@ -2049,10 +1816,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     }
     pt_plan.End(0);
     if (stats) {
-        stats->plan_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - plan_start)
-                .count();
+        stats->plan_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - plan_start)
+                             .count();
     }
     // Lock released here - bucket files protected by BucketReadGuards
     // which remain alive until this function returns (~line bucket_guards
@@ -2095,86 +1861,123 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-            const auto disk_start = std::chrono::steady_clock::now();
-            const char* io_mode = "preadv";
-
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                io_mode = "io_uring_direct";
-                // Calculate aligned read range
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            struct BatchReadPlan {
+                const ReadPlan* plan;
+                size_t offset_in_buffer;
+                size_t min_required;
+            };
+
+            std::vector<UringFile::ReadDesc> read_descs;
+            std::vector<BatchReadPlan> batch_read_plans;
+            read_descs.reserve(read_plans.size());
+            batch_read_plans.reserve(read_plans.size());
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end = actual_offset +
-                                   static_cast<int64_t>(plan.dest_slice.size);
+                int64_t data_end =
+                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
                 int64_t aligned_end = static_cast<int64_t>(align_up(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
                     static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
+                size_t offset_in_buffer =
+                    static_cast<size_t>(actual_offset - aligned_offset);
 
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                SpDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
-                                           SpDiag::PerfLevel::MODULE);
-                pt_uring.Start();
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-                pt_uring.End(read_res ? 0 : -1);
+                read_descs.push_back(UringFile::ReadDesc{
+                    plan.dest_slice.ptr, aligned_size, aligned_offset});
+                batch_read_plans.push_back(
+                    BatchReadPlan{&plan, offset_in_buffer,
+                                  offset_in_buffer + plan.dest_slice.size});
+            }
 
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
+            SpDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
+                                       SpDiag::PerfLevel::MODULE);
+            pt_uring.Start();
+            const auto disk_start = std::chrono::steady_clock::now();
+            auto batch_read_result = uring_file->batch_read(
+                read_descs.data(), static_cast<int>(read_descs.size()));
+            pt_uring.End(batch_read_result ? 0 : -1);
+            if (stats) {
+                stats->disk_read_us +=
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - disk_start)
+                        .count();
+                stats->io_mode = "io_uring_batch";
+            }
+            if (!batch_read_result) {
+                for (size_t i = 0; i < read_descs.size(); ++i) {
+                    if (read_descs[i].error == ErrorCode::OK) continue;
+                    LOG(ERROR)
+                        << "batch_read failed for key: "
+                        << batch_read_plans[i].plan->key
+                        << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
+                        << ", error=" << read_descs[i].error;
                 }
-            } else
+                return tl::make_unexpected(batch_read_result.error());
+            }
+
+            for (size_t i = 0; i < read_descs.size(); ++i) {
+                const auto& desc = read_descs[i];
+                const auto& batch_plan = batch_read_plans[i];
+                const auto& plan = *batch_plan.plan;
+                if (!desc.completed) {
+                    LOG(ERROR)
+                        << "batch_read did not complete for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (desc.bytes_read < batch_plan.min_required) {
+                    LOG(ERROR)
+                        << "batch_read short read for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id
+                        << ", expected at least: " << batch_plan.min_required
+                        << " (aligned_size=" << desc.len
+                        << ", data_size=" << plan.dest_slice.size
+                        << "), got: " << desc.bytes_read;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                batch_object.at(plan.key).ptr =
+                    static_cast<char*>(plan.dest_slice.ptr) +
+                    batch_plan.offset_in_buffer;
+            }
+            continue;
+        }
 #endif
-        {
-            // Fallback to per-key vector_read for non-UringFile (PosixFile).
+
+        for (const auto& plan : read_plans) {
+            int64_t actual_offset = plan.offset + plan.key_size;
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
             SpDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
                                        SpDiag::PerfLevel::MODULE);
             pt_posix.Start();
-            read_res = file->vector_read(&iov, 1, actual_offset);
-            pt_posix.End(read_res ? 0 : -1);
+            const auto disk_start = std::chrono::steady_clock::now();
+            auto read_result = file->vector_read(&iov, 1, actual_offset);
+            pt_posix.End(read_result ? 0 : -1);
             if (stats) {
                 const auto read_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - disk_start)
                         .count();
                 stats->disk_read_us += read_us;
+                stats->io_mode = "preadv";
                 if (read_us > stats->slowest_disk_read_us) {
                     stats->slowest_disk_read_us = read_us;
                     stats->slowest_key = plan.key;
                 }
-                if (stats->io_mode == "unknown") {
-                    stats->io_mode = io_mode;
-                } else if (stats->io_mode != io_mode) {
-                    stats->io_mode = "mixed";
-                }
             }
-
-            if (!read_res) {
-                if (stats) {
-                    stats->status = "read_fail";
-                    stats->error_key = plan.key;
-                    stats->error_code = read_res.error();
-                }
+            if (!read_result) {
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+                           << ", error: " << read_result.error();
+                return tl::make_unexpected(read_result.error());
             }
 
-            if (read_res.value() != plan.dest_slice.size) {
+            if (read_result.value() != plan.dest_slice.size) {
                 if (stats) {
                     stats->status = "short_read";
                     stats->error_key = plan.key;
@@ -2182,10 +1985,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 }
                 LOG(ERROR) << "Read size mismatch for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
+                           << ", got: " << read_result.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-        }
         }
     }
 
@@ -2345,12 +2147,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         continue;
                     }
                     object_bucket_map_.emplace(
-                        key, StorageObjectMetadata{
-                                 metadata_it->first,
-                                 metadata_it->second->metadatas[i].offset,
-                                 metadata_it->second->metadatas[i].key_size,
-                                 metadata_it->second->metadatas[i].data_size,
-                                 ""});
+                        key,
+                        StorageObjectMetadata{
+                            metadata_it->first,
+                            metadata_it->second->metadatas[i].offset,
+                            metadata_it->second->metadatas[i].key_size,
+                            metadata_it->second->metadatas[i].data_size, ""});
                 }
             }
         }
@@ -2570,10 +2372,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
+    if (offloading_objects.empty()) {
+        return {};
+    }
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
+    auto carryover_objects = std::move(ungrouped_offloading_objects);
+    bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
-    int64_t residue_count = static_cast<int64_t>(
-        offloading_objects.size() + ungrouped_offloading_objects.size());
+    int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
+                                                 carryover_objects.size());
     int64_t total_count = residue_count;
 
     auto is_exist_func =
@@ -2586,20 +2393,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
 
-        if (!ungrouped_offloading_objects.empty()) {
-            for (const auto& ungrouped_it : ungrouped_offloading_objects) {
+        if (!carryover_loaded) {
+            for (const auto& ungrouped_it : carryover_objects) {
                 bucket_data_size += ungrouped_it.second;
                 bucket_keys.push_back(ungrouped_it.first);
                 bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
             }
             VLOG(1) << "Ungrouped offloading objects have been processed and "
                        "cleared; count="
-                    << ungrouped_offloading_objects.size();
-            ungrouped_offloading_objects.clear();
+                    << carryover_objects.size();
+            carryover_loaded = true;
         }
 
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
-             i < bucket_backend_config_.bucket_keys_limit; ++i) {
+        while (static_cast<int64_t>(bucket_keys.size()) <
+               bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
@@ -2609,6 +2416,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                         << "Total ungrouped count: "
                         << ungrouped_offloading_objects.size();
                 return {};
+            }
+
+            if (carryover_objects.find(it->first) != carryover_objects.end()) {
+                ++it;
+                continue;
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
@@ -2772,21 +2584,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     } else
 #endif
     {
@@ -2804,13 +2601,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     }
+
+    // Flush bucket data to stable storage before writing metadata.
+    // This prevents a crash from leaving valid metadata pointing at
+    // incomplete data (write-ordering durability guarantee).
+    // StorageFile declares a virtual datasync() overridden by both PosixFile
+    // (fdatasync) and UringFile, so a single call covers both write paths and
+    // the branches above only keep their own write logic.
+    auto sync_result = file->datasync();
+    // Test-only: override sync result to exercise the same !sync_result
+    // cleanup path as a real fdatasync() failure.
+    if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+        sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Invalidate cache for this file since content changed
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(bucket_data_path);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
@@ -2906,7 +2722,9 @@ void BucketStorageBackend::RollbackCommittedBucket(
 
         // Remove bucket metadata
         total_size_ -= bucket_meta->meta_size;
-        lru_index_.erase({0LL, bucket_id});
+        lru_index_.erase(
+            {bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
+             bucket_id});
         buckets_.erase(bucket_it);
     }
 
@@ -3010,6 +2828,56 @@ BucketStorageBackend::SelectEvictionCandidate() {
     }
 }
 
+int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
+    namespace fs = std::filesystem;
+    auto now = std::chrono::steady_clock::now();
+    if (cached_disk_bytes_ >= 0 &&
+        now - cached_disk_bytes_at_ <
+            std::chrono::milliseconds(
+                bucket_backend_config_.disk_scan_cache_ms)) {
+        return cached_disk_bytes_;
+    }
+    int64_t total = 0;
+    std::error_code ec;
+    // Recursive scan: matches Init()'s recursive_directory_iterator and the
+    // du/kubelet accounting basis (the whole subtree, not just top-level
+    // entries), so nested content can never be silently missed.
+    fs::recursive_directory_iterator it(storage_path_, ec), end;
+    if (ec) {
+        // Cannot even open storage_path_. This is a hard safety cap, so fail
+        // CLOSED: report the cap as reached so eviction/rejection engages
+        // instead of letting the disk overflow, and do NOT cache the result
+        // (next call re-scans once the directory is readable again).
+        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
+                     << storage_path_ << ": " << ec.message()
+                     << ", failing closed";
+        return bucket_backend_config_.max_physical_bytes;
+    }
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            // Iteration errored partway. Returning the partial total would
+            // under-count and silently open the cap; fail closed and skip
+            // caching so the next call re-scans.
+            LOG(WARNING) << "[Bucket] physcap disk scan error under "
+                         << storage_path_ << ": " << ec.message()
+                         << ", failing closed";
+            return bucket_backend_config_.max_physical_bytes;
+        }
+        struct stat st;
+        // st_blocks counts 512-byte blocks actually allocated on disk — the
+        // same basis as du / kubelet's emptyDir accounting (handles block
+        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
+        // file concurrently deleted during eviction) is skipped best-effort:
+        // that only under-counts by ~one file and avoids spurious fail-closed.
+        if (::stat(it->path().c_str(), &st) == 0) {
+            total += static_cast<int64_t>(st.st_blocks) * 512;
+        }
+    }
+    cached_disk_bytes_ = total;
+    cached_disk_bytes_at_ = now;
+    return total;
+}
+
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys) {
@@ -3078,6 +2946,32 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
+    // On-disk footprint of the incoming write (~required_size); 0 for
+    // watermark-driven eviction, which has no incoming write. Added to the
+    // physical check below so we free enough room for THIS write, not merely
+    // enough to bring current usage back under the cap.
+    const int64_t incoming_physical_size =
+        write_keys.empty() ? 0 : required_size;
+
+    // Ground-truth physical usage of the offload directory (cached),
+    // snapshotted once. As buckets are selected for eviction their files get
+    // deleted in the later FinalizeEviction, so (physical_used_start -
+    // accumulated_freed_space) projects the physical bytes that will remain
+    // after this round.
+    const int64_t physical_used_start =
+        bucket_backend_config_.max_physical_bytes > 0
+            ? ActualDiskBytesUsedLocked()
+            : 0;
+    // True when the projected physical usage after this round — real disk usage
+    // minus what we free here, plus the incoming write — would still exceed the
+    // physical cap. Shared by the in-loop "keep evicting" test and the
+    // post-loop "reject the write" test.
+    const auto phys_over_cap = [&](uint64_t freed) {
+        return bucket_backend_config_.max_physical_bytes > 0 &&
+               physical_used_start + incoming_physical_size -
+                       static_cast<int64_t>(freed) >
+                   bucket_backend_config_.max_physical_bytes;
+    };
 
     while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
         bool quota_exceeded = total_size_ + pending_eviction_size_ +
@@ -3088,11 +2982,18 @@ BucketStorageBackend::PrepareEviction(
         bool disk_still_full =
             initial_disk_full && (accumulated_freed_space < deficit);
 
-        if (!quota_exceeded && !disk_still_full) break;
+        // Physical hard cap on real on-disk usage (not total_size_, which
+        // under-counts lingering bucket files, and not fs::space(), which is
+        // blind to cgroup/emptyDir quotas).
+        bool phys_exceeded = phys_over_cap(accumulated_freed_space);
+
+        if (!quota_exceeded && !disk_still_full && !phys_exceeded) break;
 
         if (evict_count == 0) {
             LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"
                       << bucket_backend_config_.max_total_size
+                      << " physical=" << physical_used_start << "/"
+                      << bucket_backend_config_.max_physical_bytes
                       << " required=" << required_size
                       << " disk_full=" << initial_disk_full;
         }
@@ -3137,8 +3038,12 @@ BucketStorageBackend::PrepareEviction(
                                     pending_write_size_ +
                                     synthetic_required_size >
                                 bucket_backend_config_.max_total_size;
+    // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
+    // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
+    // rather than overrun the disk quota and get OOM-evicted.
+    const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && quota_exceeded) {
+    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3302,10 +3207,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         if (bucket_cleanup_failed) {
             cleanup_failed_count++;
         }
+        VLOG(1) << "Evicted bucket with id: " << bucket_id
+                << ", policy: " << bucket_backend_config_.eviction_policy;
     }
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
+        // Files were just deleted; force the next physical-usage query to
+        // rescan rather than return the now-stale (higher) cached value.
+        {
+            SharedMutexLocker lock(&mutex_);
+            cached_disk_bytes_ = -1;
+        }
     }
     if (cleanup_failed_count != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -3558,8 +3471,8 @@ bool BucketStorageBackend::CompactBuckets(
             auto& bucket = it->second;
             if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
             bucket->compacting_.store(true, std::memory_order_relaxed);
-            int64_t ts = bucket->last_access_ns_.load(
-                std::memory_order_relaxed);
+            int64_t ts =
+                bucket->last_access_ns_.load(std::memory_order_relaxed);
             old_buckets[bid] = {bucket, ts};
             old_bucket_generations[bid] = bucket->generation_;
 
@@ -3568,8 +3481,7 @@ bool BucketStorageBackend::CompactBuckets(
                 auto map_it = object_bucket_map_.find(key);
                 if (map_it != object_bucket_map_.end() &&
                     map_it->second.bucket_id == bid) {
-                    live_keys_info.push_back(
-                        {key, bid, bucket->metadatas[i]});
+                    live_keys_info.push_back({key, bid, bucket->metadatas[i]});
                 }
             }
         }
@@ -3647,8 +3559,7 @@ bool BucketStorageBackend::CompactBuckets(
     int64_t group_size = 0;
 
     for (const auto& info : live_keys_info) {
-        int64_t key_total =
-            info.meta.key_size + info.meta.data_size;
+        int64_t key_total = info.meta.key_size + info.meta.data_size;
         if (group_count >= bucket_backend_config_.bucket_keys_limit ||
             (group_count > 0 && group_size + key_total >
                                     bucket_backend_config_.bucket_size_limit)) {
@@ -3666,10 +3577,8 @@ bool BucketStorageBackend::CompactBuckets(
         (group_size >= bucket_backend_config_.bucket_size_limit);
     if (!group_full && !space_pressure) {
         // Not enough live keys to fill a bucket; defer to next round.
-        LOG(INFO) << "[GC] CompactBuckets deferred: group_count="
-                  << group_count
-                  << " group_size=" << group_size
-                  << " bucket_keys_limit="
+        LOG(INFO) << "[GC] CompactBuckets deferred: group_count=" << group_count
+                  << " group_size=" << group_size << " bucket_keys_limit="
                   << bucket_backend_config_.bucket_keys_limit
                   << " bucket_size_limit="
                   << bucket_backend_config_.bucket_size_limit
@@ -3685,8 +3594,7 @@ bool BucketStorageBackend::CompactBuckets(
     std::unordered_map<std::string, std::vector<Slice>> first_group;
 
     // Group first_group_keys by old_bucket_id to open each file once.
-    std::unordered_map<int64_t,
-                       std::vector<const GroupedKey*>> keys_by_bucket;
+    std::unordered_map<int64_t, std::vector<const GroupedKey*>> keys_by_bucket;
     for (const auto& gk : first_group_keys) {
         keys_by_bucket[gk.old_bucket_id].push_back(&gk);
     }
@@ -3700,8 +3608,7 @@ bool BucketStorageBackend::CompactBuckets(
             if (!data_path) {
                 read_ok = false;
             } else {
-                auto file_result =
-                    OpenFile(data_path.value(), FileMode::Read);
+                auto file_result = OpenFile(data_path.value(), FileMode::Read);
                 if (!file_result) {
                     read_ok = false;
                 } else {
@@ -3726,10 +3633,9 @@ bool BucketStorageBackend::CompactBuckets(
                         }
                         live_data_buffers[gk->key] = std::move(data);
                         first_group.emplace(
-                            gk->key,
-                            std::vector<Slice>{Slice{
-                                live_data_buffers[gk->key].data(),
-                                live_data_buffers[gk->key].size()}});
+                            gk->key, std::vector<Slice>{Slice{
+                                         live_data_buffers[gk->key].data(),
+                                         live_data_buffers[gk->key].size()}});
                     }
                 }
             }
@@ -3752,8 +3658,7 @@ bool BucketStorageBackend::CompactBuckets(
         reset_compacting();
         return false;
     }
-    auto write_result =
-        WriteBucket(new_bucket_id, build_result.value(), iovs);
+    auto write_result = WriteBucket(new_bucket_id, build_result.value(), iovs);
     if (!write_result) {
         LOG(ERROR) << "CompactBuckets: WriteBucket failed";
         reset_compacting();
@@ -3766,8 +3671,7 @@ bool BucketStorageBackend::CompactBuckets(
     // A key is "migrated" if it's in the first_group AND still maps to an
     // old bucket being compacted. Old buckets with no remaining live keys
     // (all migrated or removed) can be deleted.
-    std::set<int64_t> old_bucket_ids_set(bucket_ids.begin(),
-                                         bucket_ids.end());
+    std::set<int64_t> old_bucket_ids_set(bucket_ids.begin(), bucket_ids.end());
     // Use the coldest last_access_ns among old buckets for the new bucket.
     int64_t new_last_access_ns = std::numeric_limits<int64_t>::max();
     for (auto& [bid, pr] : old_buckets) {
@@ -3811,8 +3715,8 @@ bool BucketStorageBackend::CompactBuckets(
 
         // Insert new bucket.
         total_size_ += new_bucket->data_size + new_bucket->meta_size;
-        new_bucket->last_access_ns_.store(
-            new_last_access_ns, std::memory_order_relaxed);
+        new_bucket->last_access_ns_.store(new_last_access_ns,
+                                          std::memory_order_relaxed);
         buckets_.emplace(new_bucket_id, new_bucket);
         lru_index_.emplace(new_last_access_ns, new_bucket_id);
 
@@ -3836,8 +3740,7 @@ bool BucketStorageBackend::CompactBuckets(
                 buckets_to_delete.push_back(bid);
             } else {
                 // Reset compacting_ so this bucket can be compacted later.
-                old_bucket->compacting_.store(false,
-                                              std::memory_order_relaxed);
+                old_bucket->compacting_.store(false, std::memory_order_relaxed);
             }
         }
 
@@ -3845,8 +3748,7 @@ bool BucketStorageBackend::CompactBuckets(
         for (int64_t bid : buckets_to_delete) {
             auto it = buckets_.find(bid);
             if (it != buckets_.end()) {
-                total_size_ -=
-                    it->second->data_size + it->second->meta_size;
+                total_size_ -= it->second->data_size + it->second->meta_size;
                 buckets_.erase(it);
                 int64_t ts = old_buckets[bid].second;
                 lru_index_.erase({ts, bid});
@@ -3873,8 +3775,7 @@ void BucketStorageBackend::WaitForInflightReads(
         if (++spin_count > kMaxSpinIterations) {
             std::this_thread::yield();
             spin_count = 0;
-            if (std::chrono::steady_clock::now() - wait_start >
-                kMaxWaitTime) {
+            if (std::chrono::steady_clock::now() - wait_start > kMaxWaitTime) {
                 LOG(ERROR) << "CompactBucket: timed out waiting for "
                               "in-flight reads, inflight_reads="
                            << bucket->inflight_reads_.load(
@@ -3940,11 +3841,9 @@ void BucketStorageBackend::GCThreadFunc() {
             if (bucket_backend_config_.max_total_size > 0) {
                 double used_ratio =
                     static_cast<double>(total_size_) /
-                    static_cast<double>(
-                        bucket_backend_config_.max_total_size);
+                    static_cast<double>(bucket_backend_config_.max_total_size);
                 space_pressure = used_ratio >=
-                                 bucket_backend_config_
-                                     .gc_high_watermark_ratio;
+                                 bucket_backend_config_.gc_high_watermark_ratio;
             }
         }
 
@@ -3958,18 +3857,15 @@ void BucketStorageBackend::GCThreadFunc() {
                  count < bucket_backend_config_.gc_max_buckets_per_round;
                  ++it) {
                 int64_t deleted =
-                    it->second->deleted_bytes_.load(
-                        std::memory_order_relaxed);
+                    it->second->deleted_bytes_.load(std::memory_order_relaxed);
                 if (deleted <= 0) continue;
-                if (it->second->compacting_.load(
-                        std::memory_order_relaxed))
+                if (it->second->compacting_.load(std::memory_order_relaxed))
                     continue;
                 int64_t data_size = it->second->data_size;
-                double ratio =
-                    (data_size > 0)
-                        ? static_cast<double>(deleted) /
-                              static_cast<double>(data_size)
-                        : 0.0;
+                double ratio = (data_size > 0)
+                                   ? static_cast<double>(deleted) /
+                                         static_cast<double>(data_size)
+                                   : 0.0;
                 if (!space_pressure &&
                     ratio < bucket_backend_config_.gc_deleted_ratio) {
                     continue;
@@ -3985,8 +3881,8 @@ void BucketStorageBackend::GCThreadFunc() {
                 // Cross-bucket merge: collect live keys from multiple
                 // tombstone buckets into one new bucket.
                 if (CompactBuckets(candidates, space_pressure)) {
-                    LOG(INFO) << "[GC] merged " << candidates.size()
-                              << " bucket(s)";
+                    LOG(INFO)
+                        << "[GC] merged " << candidates.size() << " bucket(s)";
                 } else {
                     LOG(WARNING) << "[GC] CompactBuckets failed for "
                                  << candidates.size()
@@ -3999,15 +3895,13 @@ void BucketStorageBackend::GCThreadFunc() {
                     if (CompactBuckets({bid}, space_pressure)) {
                         ++compacted;
                     } else {
-                        LOG(WARNING)
-                            << "[GC] CompactBuckets failed for bucket "
-                            << bid << ", will retry next round";
+                        LOG(WARNING) << "[GC] CompactBuckets failed for bucket "
+                                     << bid << ", will retry next round";
                         break;
                     }
                 }
                 if (compacted > 0) {
-                    LOG(INFO) << "[GC] compacted " << compacted
-                              << " bucket(s)";
+                    LOG(INFO) << "[GC] compacted " << compacted << " bucket(s)";
                 }
             }
         }
@@ -5949,10 +5843,9 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     // Step 2: Perform disk I/O without holding any locks
     // Allocations and data file are kept alive by shared_ptr refs in read_plans
     if (stats) {
-        stats->plan_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - plan_start)
-                .count();
+        stats->plan_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - plan_start)
+                             .count();
         stats->io_mode = "preadv";
     }
     for (const auto& plan : read_plans) {
@@ -6251,6 +6144,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return std::make_shared<OffsetAllocatorStorageBackend>(
                 config, offset_backend_config);
         }
+        case StorageBackendType::kNvmeKv:
+            return std::make_shared<NvmeKvStorageBackend>(config);
+
         case StorageBackendType::kDistributed: {
             auto distributed_config =
                 DistributedStorageConfig::FromEnvironment();
@@ -6259,7 +6155,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
                     "Invalid DistributedStorage configuration");
             }
             std::unique_ptr<FileSystemAdapter> adapter;
-            if (distributed_config.fs_adapter_type == "hf3fs") {
+            if (distributed_config.fs_adapter_type == "posix") {
+                adapter = std::make_unique<PosixFsAdapter>();
+            } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
                 adapter = std::make_unique<Hf3fsAdapter>();
 #else

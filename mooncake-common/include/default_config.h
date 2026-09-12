@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <ylt/easylog.hpp>
 
+#include "ascii_string.h"
+
 namespace mooncake {
 class DefaultConfig {
    public:
@@ -130,6 +132,10 @@ class DefaultConfig {
     void GetString(const std::string& key, std::string* val,
                    const std::string& default_value = "") const;
 
+    [[nodiscard]] bool Contains(const std::string& key) const {
+        return data_.find(key) != data_.end();
+    }
+
     void SetPath(const std::string& path) { path_ = path; }
 
    private:
@@ -164,10 +170,7 @@ inline void init_ylt_log_level() {
         easylog::Severity severity = easylog::Severity::WARN;
         const char* env_level = std::getenv("MC_YLT_LOG_LEVEL");
         if (env_level && *env_level) {
-            std::string level_str(env_level);
-            std::transform(level_str.begin(), level_str.end(),
-                           level_str.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
+            const std::string level_str = AsciiToLower(env_level);
             if (level_str == "trace") {
                 severity = easylog::Severity::TRACE;
             } else if (level_str == "debug") {

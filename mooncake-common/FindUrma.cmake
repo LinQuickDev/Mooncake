@@ -84,3 +84,27 @@ set(URMA_API_INCLUDE_DIR ${_URMA_API_INCLUDE_DIR})
 set(URMA_UBAGG_INCLUDE_DIR ${_URMA_UBAGG_INCLUDE_DIR})
 set(URMA_INCLUDE_DIRS ${urma_INCLUDE_DIR})
 message(STATUS "urma_INCLUDE_DIR: ${urma_INCLUDE_DIR}")
+
+# Community TENT and classic UB share the same headers and optional library.
+find_library(
+  URMA_LIBRARY
+  NAMES urma
+  PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
+
+if(NOT TARGET Urma::urma)
+  add_library(Urma::urma INTERFACE IMPORTED GLOBAL)
+  set_property(TARGET Urma::urma PROPERTY INTERFACE_INCLUDE_DIRECTORIES
+                                         "${urma_INCLUDE_DIR}")
+  if(URMA_LIBRARY)
+    set_property(TARGET Urma::urma PROPERTY INTERFACE_LINK_LIBRARIES
+                                           "${URMA_LIBRARY}")
+  endif()
+endif()
+
+set(URMA_INCLUDE_DIR "${urma_INCLUDE_DIR}")
+set(URMA_FOUND TRUE)
+if(URMA_LIBRARY)
+  message(STATUS "URMA library: ${URMA_LIBRARY}")
+else()
+  message(STATUS "URMA library not found; real UB backends will be unavailable")
+endif()
