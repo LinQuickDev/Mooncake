@@ -143,6 +143,31 @@ DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
 DEFINE_double(nof_eviction_high_watermark_ratio,
               mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in NoF SSD");
+DEFINE_bool(io_pattern_cold_eviction, false,
+            "Enable report-driven cold-data eviction (embedded CFM component): "
+            "merged client reports may drive bounded evictions of the coldest "
+            "keys even when the memory high-watermark is not exceeded");
+DEFINE_uint64(io_pattern_cold_eviction_bytes_per_cycle, 0,
+              "Max bytes one report-driven cold-eviction pass may request "
+              "(0 disables the cold driver)");
+DEFINE_uint64(io_pattern_cold_idle_threshold_us, 0,
+              "Minimum idle_time_us for a key to be eligible for a "
+              "report-driven cold-eviction pass (0 disables the idle gate)");
+DEFINE_uint64(io_pattern_tier_down_bytes_per_cycle, 0,
+              "Max bytes one report-driven tier-down pass may copy per cycle. "
+              "The pass runs below the memory watermark and copies the coldest "
+              "objects down while keeping their MEMORY replica, so a later "
+              "reclaim can discard them safely; a cycle that reaches the "
+              "watermark evicts instead. 0 keeps the driver off, so this budget "
+              "is the only switch the driver has");
+DEFINE_uint32(io_pattern_admission_frequency_threshold, 2,
+              "Min access count for a reported key before the io_pattern "
+              "policy admits it (set 1 to admit on first sight)");
+DEFINE_double(io_pattern_admission_watermark_ratio, -1.0,
+              "Capacity watermark for io_pattern admission, as a ratio of "
+              "capacity; a negative value derives it from "
+              "eviction_high_watermark_ratio so admission stops before "
+              "eviction starts");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -533,6 +558,25 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
+    default_config.GetBool("io_pattern_cold_eviction",
+                           &master_config.io_pattern_cold_eviction,
+                           FLAGS_io_pattern_cold_eviction);
+    default_config.GetUInt64("io_pattern_cold_eviction_bytes_per_cycle",
+                             &master_config.io_pattern_cold_eviction_bytes_per_cycle,
+                             FLAGS_io_pattern_cold_eviction_bytes_per_cycle);
+    default_config.GetUInt64("io_pattern_cold_idle_threshold_us",
+                             &master_config.io_pattern_cold_idle_threshold_us,
+                             FLAGS_io_pattern_cold_idle_threshold_us);
+    default_config.GetUInt64("io_pattern_tier_down_bytes_per_cycle",
+                             &master_config.io_pattern_tier_down_bytes_per_cycle,
+                             FLAGS_io_pattern_tier_down_bytes_per_cycle);
+    default_config.GetUInt32(
+        "io_pattern_admission_frequency_threshold",
+        &master_config.io_pattern_admission_frequency_threshold,
+        FLAGS_io_pattern_admission_frequency_threshold);
+    default_config.GetDouble("io_pattern_admission_watermark_ratio",
+                             &master_config.io_pattern_admission_watermark_ratio,
+                             FLAGS_io_pattern_admission_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
@@ -896,6 +940,47 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.nof_eviction_high_watermark_ratio =
             FLAGS_nof_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cold_eviction", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cold_eviction =
+            FLAGS_io_pattern_cold_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_cold_eviction_bytes_per_cycle", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cold_eviction_bytes_per_cycle =
+            FLAGS_io_pattern_cold_eviction_bytes_per_cycle;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cold_idle_threshold_us",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cold_idle_threshold_us =
+            FLAGS_io_pattern_cold_idle_threshold_us;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_tier_down_bytes_per_cycle",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_tier_down_bytes_per_cycle =
+            FLAGS_io_pattern_tier_down_bytes_per_cycle;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_admission_frequency_threshold", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_admission_frequency_threshold =
+            FLAGS_io_pattern_admission_frequency_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_admission_watermark_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_admission_watermark_ratio =
+            FLAGS_io_pattern_admission_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||

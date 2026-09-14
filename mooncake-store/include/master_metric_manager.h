@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -11,6 +12,10 @@
 #include "ylt/metric/histogram.hpp"
 
 namespace mooncake {
+
+namespace io_pattern {
+class IoPatternRuntime;
+}
 
 class MasterMetricManager {
    public:
@@ -277,8 +282,6 @@ class MasterMetricManager {
     // nof eviction metrics
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
-
-    // Eviction Metrics Getters
     // total eviction metrics
     int64_t get_eviction_success();
     int64_t get_eviction_attempts();
@@ -294,6 +297,35 @@ class MasterMetricManager {
     int64_t get_nof_eviction_attempts();
     int64_t get_nof_evicted_key_count();
     int64_t get_nof_evicted_size();
+
+    // Report-driven IO Pattern policy execution metrics. These count the
+    // SubMaster-local policy cycles that run when merged client reports
+    // (report_snapshot / report_metric_batch) indicate storage pressure, so
+    // remote-mode eviction/prefetch/admission execution is observable in
+    // master admin metrics (not only the embedded watermark path).
+    void inc_io_pattern_report_cycles(int64_t val = 1);
+    void inc_io_pattern_report_evictions(int64_t val = 1);
+    void inc_io_pattern_report_eviction_failures(int64_t val = 1);
+    void inc_io_pattern_report_prefetches(int64_t val = 1);
+    void inc_io_pattern_report_prefetch_failures(int64_t val = 1);
+    void inc_io_pattern_report_admissions(int64_t val = 1);
+    void inc_io_pattern_report_admission_failures(int64_t val = 1);
+    void inc_io_pattern_report_degraded(int64_t val = 1);
+    // Report-driven IO Pattern execution metrics getters
+    int64_t get_io_pattern_report_cycles();
+    int64_t get_io_pattern_report_evictions();
+    int64_t get_io_pattern_report_eviction_failures();
+    int64_t get_io_pattern_report_prefetches();
+    int64_t get_io_pattern_report_prefetch_failures();
+    int64_t get_io_pattern_report_admissions();
+    int64_t get_io_pattern_report_admission_failures();
+    int64_t get_io_pattern_report_degraded();
+
+    // Scrape the local runtime directly, including access-only traffic. A weak
+    // reference keeps the metrics singleton from extending MasterService life.
+    void set_io_pattern_runtime(
+        std::weak_ptr<io_pattern::IoPatternRuntime> runtime);
+    void clear_io_pattern_runtime(const io_pattern::IoPatternRuntime* runtime);
 
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
@@ -426,6 +458,7 @@ class MasterMetricManager {
 
     // Update all metrics once to ensure zero values are serialized
     void update_metrics_for_zero_output();
+    std::string serialize_io_pattern_metrics();
     std::string get_summary_string(bool update_summary_snapshot);
 
     struct SummaryCounters {
@@ -528,6 +561,8 @@ class MasterMetricManager {
 
     // --- Metric Members ---
     std::mutex summary_snapshot_mutex_;
+    std::mutex io_pattern_runtime_mutex_;
+    std::weak_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
     SummarySnapshot summary_snapshot_;
 
     // Memory Storage Metrics
@@ -683,6 +718,16 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+
+    // Report-driven IO Pattern policy execution metrics
+    ylt::metric::counter_t io_pattern_report_cycles_;
+    ylt::metric::counter_t io_pattern_report_evictions_;
+    ylt::metric::counter_t io_pattern_report_eviction_failures_;
+    ylt::metric::counter_t io_pattern_report_prefetches_;
+    ylt::metric::counter_t io_pattern_report_prefetch_failures_;
+    ylt::metric::counter_t io_pattern_report_admissions_;
+    ylt::metric::counter_t io_pattern_report_admission_failures_;
+    ylt::metric::counter_t io_pattern_report_degraded_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

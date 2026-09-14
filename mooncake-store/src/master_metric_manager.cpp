@@ -6,8 +6,10 @@
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
+#include <optional>
 
 #include "utils.h"
+#include "io_pattern/runtime.h"
 
 namespace mooncake {
 
@@ -330,6 +332,36 @@ MasterMetricManager::MasterMetricManager()
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
 
+      // Report-driven IO Pattern policy execution metrics
+      io_pattern_report_cycles_(
+          "master_io_pattern_report_cycles_total",
+          "Total report-driven IO Pattern policy cycles executed after "
+          "merged client reports"),
+      io_pattern_report_evictions_(
+          "master_io_pattern_report_evictions_total",
+          "Total eviction executions from report-driven IO Pattern cycles"),
+      io_pattern_report_eviction_failures_(
+          "master_io_pattern_report_eviction_failures_total",
+          "Total failed eviction executions from report-driven IO Pattern "
+          "cycles"),
+      io_pattern_report_prefetches_(
+          "master_io_pattern_report_prefetches_total",
+          "Total prefetch executions from report-driven IO Pattern cycles"),
+      io_pattern_report_prefetch_failures_(
+          "master_io_pattern_report_prefetch_failures_total",
+          "Total failed prefetch executions from report-driven IO Pattern "
+          "cycles"),
+      io_pattern_report_admissions_(
+          "master_io_pattern_report_admissions_total",
+          "Total admission executions from report-driven IO Pattern cycles"),
+      io_pattern_report_admission_failures_(
+          "master_io_pattern_report_admission_failures_total",
+          "Total failed admission executions from report-driven IO Pattern "
+          "cycles"),
+      io_pattern_report_degraded_(
+          "master_io_pattern_report_degraded_total",
+          "Total degraded report-driven IO Pattern policy cycles"),
+
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
                              "Total number of discarded PutStart operations"),
@@ -620,6 +652,16 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     eviction_attempts_.inc(0);
     evicted_key_count_.inc(0);
     evicted_size_.inc(0);
+
+    // Update report-driven IO Pattern policy execution counters
+    io_pattern_report_cycles_.inc(0);
+    io_pattern_report_evictions_.inc(0);
+    io_pattern_report_eviction_failures_.inc(0);
+    io_pattern_report_prefetches_.inc(0);
+    io_pattern_report_prefetch_failures_.inc(0);
+    io_pattern_report_admissions_.inc(0);
+    io_pattern_report_admission_failures_.inc(0);
+    io_pattern_report_degraded_.inc(0);
 
     // Update PutStart Discard Metrics
     put_start_discard_cnt_.inc(0);
@@ -1557,6 +1599,73 @@ int64_t MasterMetricManager::get_nof_evicted_size() {
     return nof_evicted_size_.value();
 }
 
+void MasterMetricManager::inc_io_pattern_report_cycles(int64_t val) {
+    io_pattern_report_cycles_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_evictions(int64_t val) {
+    io_pattern_report_evictions_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_eviction_failures(
+    int64_t val) {
+    io_pattern_report_eviction_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_prefetches(int64_t val) {
+    io_pattern_report_prefetches_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_prefetch_failures(
+    int64_t val) {
+    io_pattern_report_prefetch_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_admissions(int64_t val) {
+    io_pattern_report_admissions_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_admission_failures(
+    int64_t val) {
+    io_pattern_report_admission_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_degraded(int64_t val) {
+    io_pattern_report_degraded_.inc(val);
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_cycles() {
+    return io_pattern_report_cycles_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_evictions() {
+    return io_pattern_report_evictions_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_eviction_failures() {
+    return io_pattern_report_eviction_failures_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_prefetches() {
+    return io_pattern_report_prefetches_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_prefetch_failures() {
+    return io_pattern_report_prefetch_failures_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_admissions() {
+    return io_pattern_report_admissions_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_admission_failures() {
+    return io_pattern_report_admission_failures_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_degraded() {
+    return io_pattern_report_degraded_.value();
+}
+
 // PutStart Discard Metrics Getters
 int64_t MasterMetricManager::get_put_start_discard_cnt() {
     return put_start_discard_cnt_.value();
@@ -1773,6 +1882,97 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+void MasterMetricManager::set_io_pattern_runtime(
+    std::weak_ptr<io_pattern::IoPatternRuntime> runtime) {
+    std::lock_guard lock(io_pattern_runtime_mutex_);
+    io_pattern_runtime_ = std::move(runtime);
+}
+
+void MasterMetricManager::clear_io_pattern_runtime(
+    const io_pattern::IoPatternRuntime* runtime) {
+    std::lock_guard lock(io_pattern_runtime_mutex_);
+    if (io_pattern_runtime_.lock().get() == runtime)
+        io_pattern_runtime_.reset();
+}
+
+std::string MasterMetricManager::serialize_io_pattern_metrics() {
+    io_pattern::IoPatternObservabilitySnapshot observation;
+    io_pattern::PolicyFeedbackStats feedback;
+    {
+        // Unregister waits for snapshots and their temporary strong reference
+        // to finish, so a scrape cannot defer runtime worker shutdown beyond
+        // the lifetime of the MasterService captured by its handlers.
+        std::lock_guard lock(io_pattern_runtime_mutex_);
+        auto runtime = io_pattern_runtime_.lock();
+        if (!runtime) return {};
+        observation = runtime->ObservabilitySnapshot();
+        feedback = runtime->FeedbackSnapshot();
+    }
+
+    // Serialize snapshots rather than incrementing counters by cumulative
+    // values. Local metric objects keep concurrent scrapes independent and
+    // cannot retain stale values from a previous runtime.
+    std::string result;
+    const auto gauge = [&result](const char* name, const char* help,
+                                 double value) {
+        ylt::metric::gauge_d metric(name, help);
+        metric.update(value);
+        metric.serialize(result);
+    };
+    const auto counter = [&result](const char* name, const char* help,
+                                   uint64_t value) {
+        ylt::metric::counter_t metric(name, help);
+        metric.inc(value);
+        metric.serialize(result);
+    };
+    gauge("master_io_pattern_collect_latency_us",
+          "Maximum collection latency in microseconds since runtime startup",
+          observation.collect_latency_us);
+    gauge("master_io_pattern_analyze_latency_us",
+          "Maximum analysis latency in microseconds since runtime startup",
+          observation.analyze_latency_us);
+    gauge("master_io_pattern_policy_decision_qps",
+          "Average policy decisions per second since runtime startup; use rate "
+          "of master_io_pattern_policy_decisions_total for a rolling rate",
+          observation.policy_decision_qps);
+    counter("master_io_pattern_policy_decisions_total",
+            "Total policy decisions since runtime startup",
+            observation.policy_decisions);
+    gauge("master_io_pattern_strategy_hit_rate",
+          "Fraction of policy decisions with eviction or prefetch candidates",
+          observation.strategy_hit_rate);
+    gauge("master_io_pattern_false_positive_rate",
+          "Observed prefetch misses divided by total policy decisions",
+          observation.false_positive_rate);
+    counter("master_io_pattern_degrade_count",
+            "Total recorded degradation events since runtime startup",
+            observation.degrade_count);
+    counter("master_io_pattern_report_drop_count",
+            "Total collector drops recorded since runtime startup",
+            observation.report_drop_count);
+    gauge(
+        "master_io_pattern_hit_rate_delta",
+        "Mean hit rate delta in the bounded feedback sample window; automatic "
+        "samples compare consecutive groups of 64 accesses",
+        feedback.hit_rate_delta);
+    gauge("master_io_pattern_eviction_churn",
+          "Mean eviction feedback in the bounded sample window; automatic "
+          "samples are eviction candidate count divided by snapshot key count",
+          feedback.eviction_churn);
+    gauge("master_io_pattern_ttft_delta",
+          "Mean externally supplied TTFT delta in the bounded feedback sample "
+          "window; zero unless supplied via RecordFeedback",
+          feedback.ttft_delta);
+    gauge("master_io_pattern_prefetch_accuracy",
+          "Mean prefetch accuracy in the bounded feedback sample window; "
+          "samples without prefetch feedback currently contribute zero",
+          feedback.prefetch_accuracy);
+    gauge("master_io_pattern_feedback_samples",
+          "Number of samples currently retained in the feedback window",
+          feedback.samples);
+    return result;
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -1936,6 +2136,17 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_eviction_attempts_);
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
+
+    // Serialize report-driven IO Pattern policy execution metrics
+    serialize_metric(io_pattern_report_cycles_);
+    serialize_metric(io_pattern_report_evictions_);
+    serialize_metric(io_pattern_report_eviction_failures_);
+    serialize_metric(io_pattern_report_prefetches_);
+    serialize_metric(io_pattern_report_prefetch_failures_);
+    serialize_metric(io_pattern_report_admissions_);
+    serialize_metric(io_pattern_report_admission_failures_);
+    serialize_metric(io_pattern_report_degraded_);
+    ss << serialize_io_pattern_metrics();
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);
@@ -2590,6 +2801,52 @@ std::string MasterMetricManager::get_summary_string(
        << nof_eviction_attempts << ", "
        << "keys=" << nof_evicted_key_count << ", "
        << "size=" << byte_size_to_string(nof_evicted_size);
+
+    // Report-driven IO Pattern policy execution summary (cumulative)
+    ss << " | IO Pattern (report-driven): "
+       << "cycles=" << io_pattern_report_cycles_.value() << ", "
+       << "evict=" << io_pattern_report_evictions_.value() << "/"
+       << io_pattern_report_eviction_failures_.value() << ", "
+       << "prefetch=" << io_pattern_report_prefetches_.value() << "/"
+       << io_pattern_report_prefetch_failures_.value() << ", "
+       << "admit=" << io_pattern_report_admissions_.value() << "/"
+       << io_pattern_report_admission_failures_.value() << ", "
+       << "degraded=" << io_pattern_report_degraded_.value();
+
+    std::optional<io_pattern::IoPatternObservabilitySnapshot> observation;
+    io_pattern::PolicyFeedbackStats feedback;
+    {
+        // As with /metrics, release the temporary strong reference under the
+        // registration lock so service shutdown cannot race a summary read.
+        std::lock_guard lock(io_pattern_runtime_mutex_);
+        auto runtime = io_pattern_runtime_.lock();
+        if (runtime) {
+            observation = runtime->ObservabilitySnapshot();
+            feedback = runtime->FeedbackSnapshot();
+        }
+    }
+    if (observation) {
+        // Keep precision local: small deltas must remain visible without
+        // changing the formatting of the rest of the admin summary.
+        std::ostringstream io_summary;
+        io_summary
+            << std::setprecision(6) << " | IO Pattern (runtime, lifetime): "
+            << "collect_latency_max_us=" << observation->collect_latency_us
+            << ", analyze_latency_max_us=" << observation->analyze_latency_us
+            << ", policy_decision_qps=" << observation->policy_decision_qps
+            << ", policy_decisions=" << observation->policy_decisions
+            << ", strategy_hit_rate=" << observation->strategy_hit_rate
+            << ", false_positive_rate=" << observation->false_positive_rate
+            << ", degrade_count=" << observation->degrade_count
+            << ", report_drop_count=" << observation->report_drop_count
+            << " | IO Pattern (feedback, sample window): "
+            << "hit_rate_delta=" << feedback.hit_rate_delta
+            << ", eviction_churn=" << feedback.eviction_churn
+            << ", ttft_delta=" << feedback.ttft_delta
+            << ", prefetch_accuracy=" << feedback.prefetch_accuracy
+            << ", feedback_samples=" << feedback.samples;
+        ss << io_summary.str();
+    }
 
     // Discard summary
     ss << " | Discard: "

@@ -52,6 +52,11 @@
 
 namespace mooncake {
 
+namespace io_pattern {
+class CfmService;
+class IoPatternRuntime;
+}
+
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
 class MasterSnapshotRepository;
@@ -84,6 +89,9 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 class MasterServiceHATest;
+// Friended so the offload-on-evict tests can drive the legacy eviction fallback
+// that the IO Pattern eviction handler runs when a plan under-delivers.
+class OffloadOnEvictTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -119,6 +127,7 @@ class MasterService {
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
     friend class test::MasterServiceHATest;
+    friend class test::OffloadOnEvictTest;
 
    public:
     using NoFProbeFn =
@@ -432,6 +441,10 @@ class MasterService {
 
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
+
+    std::shared_ptr<io_pattern::CfmService> GetCfmService() const {
+        return io_pattern_cfm_service_;
+    }
 
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
@@ -980,6 +993,34 @@ class MasterService {
      */
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
+    /**
+     * @brief Policy-driven tier-down dispatch counters. Independent of the
+     * eviction counters because a demotion copies an object down and keeps its
+     * MEMORY replica: it frees no bytes, so folding it into freed memory would
+     * make a tier-down plan look like a plan that under-delivered.
+     */
+    uint64_t tier_down_attempt_count() const {
+        return tier_down_attempts_.load(std::memory_order_relaxed);
+    }
+    uint64_t tier_down_success_count() const {
+        return tier_down_successes_.load(std::memory_order_relaxed);
+    }
+    uint64_t tier_down_failure_count() const {
+        return tier_down_failures_.load(std::memory_order_relaxed);
+    }
+    /// Candidates skipped because their disk copy is still in flight: a
+    /// non-zero, persistent value means the tier-down driver is waiting on the
+    /// client's offload queue rather than making progress.
+    uint64_t tier_down_skipped_in_flight_count() const {
+        return tier_down_skipped_in_flight_.load(std::memory_order_relaxed);
+    }
+    /// Candidates skipped because they already hold a LOCAL_DISK replica. A
+    /// persistent value means selection is re-picking keys that are already
+    /// paved down (each cycle's budget is being spent on nothing).
+    uint64_t tier_down_skipped_paved_count() const {
+        return tier_down_skipped_paved_.load(std::memory_order_relaxed);
+    }
+
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
@@ -1012,7 +1053,24 @@ class MasterService {
         uint64_t evicted_objects{0};
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes);
+        const TenantId& tenant_id, uint64_t target_bytes,
+        const std::unordered_set<std::string>* candidate_keys = nullptr);
+
+    // After an eviction pass, reports a kRemoved tier event for every candidate
+    // key whose MEMORY replica is actually gone, so the IO Pattern collector
+    // stops claiming an L1 replica for it. Presence is read from authoritative
+    // metadata rather than inferred from access recency: an evicted key must
+    // become promotable again, while a cold key that has simply not been read
+    // must stay eligible for eviction.
+    void ReportEvictedKeysAsTierRemovals(
+        const TenantId& tenant,
+        const std::unordered_set<std::string>& candidate_keys);
+
+    // Runs the legacy lease-ordered eviction for an IO Pattern plan that could
+    // not free its byte target (stale candidates, active leases, pins, or an
+    // empty candidate set), so a watermark request still makes progress.
+    // Returns true when the fallback ran.
+    bool RunLegacyEvictionFallback(uint64_t shortfall_bytes);
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
@@ -1694,6 +1752,11 @@ class MasterService {
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    auto PutEndInternal(const UUID& client_id, const ObjectMeta& object_meta,
+                        const TenantId& tenant_id, ReplicaType replica_type,
+                        uint32_t write_batch_size, bool overwrite)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Helper to discard expired processing keys.
      */
@@ -1751,6 +1814,29 @@ class MasterService {
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true);
+
+    /**
+     * @brief Queue one MEMORY replica of `object_id` for a LOCAL_DISK copy
+     * (tier down) and keep the MEMORY replica in place.
+     *
+     * This is the demotion counterpart of an eviction: it never removes a
+     * replica and never frees bytes, so the caller must not count its result as
+     * reclaimed memory. Acquires its own RW shard accessor; safe to call from
+     * the io_pattern eviction handler, which does not hold one while this runs.
+     *
+     * The outcome is reported instead of a bare bool: "nothing left to do" and
+     * "queued" are operationally different, and collapsing a key that already
+     * holds a LOCAL_DISK replica -- or whose copy is still in flight -- into
+     * success is what hides a spinning tier-down driver.
+     */
+    enum class TierDownOutcome {
+        kQueued,
+        kAlreadyInFlight,
+        kAlreadyPaved,
+        kNotFound,
+        kPushFailed,
+    };
+    TierDownOutcome TryQueueTierDown(const ObjectIdentity& object_id);
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,
@@ -1804,6 +1890,10 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    // Serializes legacy eviction fallbacks: the watermark thread and the
+    // report-driven worker can both observe a shortfall, and BatchEvict has no
+    // re-entrancy protection.
+    std::mutex legacy_eviction_mutex_;
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
@@ -2203,6 +2293,29 @@ class MasterService {
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
+
+    // The IO-pattern pipeline is deliberately owned by MasterService: the
+    // master has the authoritative replica map and is the only component that
+    // can safely translate a policy plan into promotion/eviction operations.
+    // CFM is embedded here as a component of this SubMaster: reports addressed
+    // to the keys this master owns are merged into the local runtime over the
+    // regular coro_rpc endpoint, so no remote reporting channel, policy poller
+    // or credential is needed.
+    std::shared_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
+    std::shared_ptr<io_pattern::CfmService> io_pattern_cfm_service_;
+
+    // Policy-driven tier down. Kept separate from the eviction counters because a
+    // demotion queues a disk copy and frees no memory: folding it into freed
+    // bytes would make a tier-down plan look like a plan that under-delivered.
+    // Written only from the io_pattern eviction handler; relaxed order is enough
+    // because these are advisory observability counters.
+    std::atomic<uint64_t> tier_down_attempts_{0};
+    std::atomic<uint64_t> tier_down_successes_{0};
+    std::atomic<uint64_t> tier_down_failures_{0};
+    // Outcomes that are neither progress nor failure. Kept separate so a stalled
+    // driver is visible instead of being counted as successful demotions.
+    std::atomic<uint64_t> tier_down_skipped_in_flight_{0};
+    std::atomic<uint64_t> tier_down_skipped_paved_{0};
 
     const std::string ha_backend_type_;
 

@@ -11,6 +11,10 @@
 #include <vector>
 
 #include "types.h"
+#include "io_pattern/cfm_protocol.h"
+#include "io_pattern/cfm_service.h"
+#include "io_pattern/runtime.h"
+#include "io_pattern/types.h"
 
 namespace mooncake::test {
 
@@ -22,6 +26,64 @@ class OffloadOnEvictTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    // Friend access to the private legacy-eviction fallback, which the runtime's
+    // eviction handler runs when an IO Pattern plan cannot free its byte target.
+    // OffloadOnEvictTest is friended; TEST_F-generated subclasses are not, hence
+    // this static funnel.
+    static bool RunLegacyEvictionFallbackForTesting(MasterService* service,
+                                                    uint64_t shortfall_bytes) {
+        return service->RunLegacyEvictionFallback(shortfall_bytes);
+    }
+
+    // Friend access to the embedded io_pattern runtime, so a test can hand the
+    // eviction handler a plan directly and observe how each candidate action is
+    // dispatched. OffloadOnEvictTest is friended; TEST_F-generated subclasses are
+    // not, hence this static funnel.
+    static ErrorCode ExecuteEvictionPlan(MasterService* service,
+                                         const io_pattern::EvictionPlan& plan) {
+        return service->io_pattern_runtime_->ExecuteCommand(plan);
+    }
+
+    // Friend access to the embedded CFM endpoint, so a test can drive a real
+    // report-driven cycle through the MasterService wiring (flags -> config ->
+    // runtime driver -> policy -> handler) instead of calling the runtime
+    // directly. Returns false when the report was rejected.
+    static bool SendIoPatternReport(MasterService* service,
+                                    const io_pattern::MetricBatch& batch) {
+        io_pattern::CfmBinaryCodec codec;
+        return service->io_pattern_cfm_service_->Send(
+            "report_metric_batch", codec.EncodeMetricBatch(batch));
+    }
+
+    // Friend access to the tier-event hook the master uses when an offload
+    // completes, so a test can make a key look already-paved without having to
+    // drive a whole offload round trip.
+    static void MarkLowerTierReplicaForTesting(MasterService* service,
+                                               const std::string& key,
+                                               io_pattern::CacheTier tier) {
+        service->io_pattern_runtime_->RecordTierEvent(io_pattern::CacheEvent{
+            .type = io_pattern::CacheEventType::kInserted,
+            .object = {TenantId::Default(), key},
+            .target_tier = tier});
+    }
+
+    // A demotion must leave a readable MEMORY replica behind; an eviction must
+    // not. Reads the same client-facing view a Get would.
+    bool HasCompleteMemoryReplica(MasterService& service,
+                                  const std::string& key) const {
+        auto replica_list = service.GetReplicaList(key, TenantId::Default());
+        if (!replica_list.has_value()) {
+            return false;
+        }
+        for (const auto& descriptor : replica_list.value().replicas) {
+            if (descriptor.is_memory_replica() &&
+                descriptor.status == ReplicaStatus::COMPLETE) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
@@ -422,6 +484,249 @@ TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
         << "OffloadObjectHeartbeat returned " << queued.size()
         << " stale entries after BatchRemove; EraseMetadata failed to clean "
            "offloading_objects.";
+}
+
+// The runtime's eviction handler falls back to the legacy lease-ordered
+// eviction when an IO Pattern plan cannot free its byte target. That path is
+// what keeps a watermark request making progress when the plan's candidates are
+// stale, leased, pinned, or empty -- the report-driven worker relies on it
+// because it has no eviction thread of its own.
+TEST_F(OffloadOnEvictTest, LegacyEvictionFallbackRunsForUnderDeliveringPlan) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 100;
+    auto service = std::make_unique<MasterService>(config);
+    auto ctx = PrepareSegment(*service, "fallback-segment", kDefaultSegmentBase,
+                              8 * 1024 * 1024);
+    for (int i = 0; i < 8; ++i) {
+        PutObject(*service, ctx.client_id, "fb-" + std::to_string(i), 4096);
+    }
+
+    // No shortfall is a no-op and reports success.
+    EXPECT_TRUE(RunLegacyEvictionFallbackForTesting(service.get(), 0));
+
+    // A real shortfall runs the legacy path: the segment is mounted, so a
+    // capacity is known and the guard mutex is free.
+    EXPECT_TRUE(RunLegacyEvictionFallbackForTesting(service.get(), 1));
+}
+
+// =============================================================================
+// Policy-driven tier down: the io_pattern eviction handler must copy the key
+// down to LOCAL_DISK while keeping its MEMORY replica. A demotion frees no
+// bytes, so it may not be counted as freed memory and may not turn the plan into
+// a reclaim shortfall -- otherwise the legacy fallback evicts exactly the keys
+// the driver chose to keep.
+// =============================================================================
+
+TEST_F(OffloadOnEvictTest, TierDownPlanQueuesOffloadAndKeepsMemoryReplica) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    // No lease protection: if the handler wrongly treated the demotion budget as
+    // a reclaim shortfall, the legacy fallback would be free to reclaim one of
+    // these keys immediately, so a surviving MEMORY replica is real evidence the
+    // fallback never ran.
+    config.default_kv_lease_ttl = 0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "tier_down_segment", kDefaultSegmentBase,
+                              seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    PutObject(*service, ctx.client_id, "td_demote");
+    PutObject(*service, ctx.client_id, "td_keep");
+
+    const io_pattern::EvictionPlan plan{
+        .source_tier = io_pattern::CacheTier::kL1Host,
+        .target_bytes = 1024,
+        .candidates = {io_pattern::EvictionCandidate{
+            .object = {TenantId::Default(), "td_demote"},
+            .bytes = 1024,
+            .score = 1.0F,
+            .target_tier = io_pattern::CacheTier::kLocalDisk,
+            .action = io_pattern::EvictionAction::kTierDown}},
+        .tier_down_target_bytes = 1024};
+
+    EXPECT_EQ(ExecuteEvictionPlan(service.get(), plan), ErrorCode::OK);
+
+    // The chosen key was queued for a LOCAL_DISK copy ...
+    auto queued = DrainOffloadQueue(*service, ctx.client_id);
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_TRUE(queued.count("td_demote") > 0);
+
+    // ... and both keys still serve from MEMORY: demotion is a copy, not a
+    // reclaim, so nothing was freed and the fallback was never asked to free it.
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_demote"));
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_keep"));
+
+    // Tier down is counted on its own counters, independently of freed bytes.
+    EXPECT_EQ(service->tier_down_attempt_count(), 1u);
+    EXPECT_EQ(service->tier_down_success_count(), 1u);
+    EXPECT_EQ(service->tier_down_failure_count(), 0u);
+
+    service->RemoveAll();
+}
+
+// The contrast case: the same plan shape labelled kEvict must go to the quota
+// eviction path and never to the demotion path.
+//
+// The configuration matters here. With offload_on_evict enabled, ordinary
+// eviction *also* defers its victim to the offload queue ("No memory freed ...
+// deferred for disk offload"), so an empty queue would prove nothing. This test
+// therefore runs the legacy write-through mode (enable_offload=true,
+// offload_on_evict=false), where only a tier-down dispatch can queue an offload:
+// PutEnd pushes one entry, which is drained before the plan runs, and eviction
+// reclaims without offloading.
+TEST_F(OffloadOnEvictTest, EvictActionPlanNeverQueuesOffload) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = false;
+    config.default_kv_lease_ttl = 0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "evict_action_segment",
+                              kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    PutObject(*service, ctx.client_id, "ev_reclaim");
+
+    // Legacy write-through: one entry from PutEnd, drained so that anything left
+    // in the queue afterwards can only have come from the plan below.
+    auto pre_plan = DrainOffloadQueue(*service, ctx.client_id);
+    ASSERT_EQ(pre_plan.size(), 1u);
+
+    const io_pattern::EvictionPlan plan{
+        .source_tier = io_pattern::CacheTier::kL1Host,
+        .target_bytes = 1024,
+        .candidates = {io_pattern::EvictionCandidate{
+            .object = {TenantId::Default(), "ev_reclaim"},
+            .bytes = 1024,
+            .score = 1.0F,
+            .target_tier = io_pattern::CacheTier::kL3NofSsd,
+            .action = io_pattern::EvictionAction::kEvict}},
+        .tier_down_target_bytes = 0};
+
+    ExecuteEvictionPlan(service.get(), plan);
+
+    auto queued = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_TRUE(queued.empty())
+        << "a kEvict candidate must not be queued for a LOCAL_DISK copy";
+    EXPECT_EQ(service->tier_down_attempt_count(), 0u);
+    EXPECT_EQ(service->tier_down_success_count(), 0u);
+    EXPECT_EQ(service->tier_down_failure_count(), 0u);
+
+    service->RemoveAll();
+}
+
+// End to end through the MasterService wiring: the config flag must reach the
+// report-driven driver, the driver must label the plan, and the handler must
+// copy the key down while keeping it in memory.
+TEST_F(OffloadOnEvictTest, TierDownDriverDemotesReportedKeyWithoutReclaiming) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.default_kv_lease_ttl = 0;
+    // The wiring under test: the budget alone enables the driver, there is no
+    // enable flag.
+    config.io_pattern_tier_down_bytes_per_cycle = 4096;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "tier_down_report_segment",
+                              kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    PutObject(*service, ctx.client_id, "td_report", 4096);
+
+    // No storage metric: the merged report carries no pressure, so only the
+    // tier-down driver can act on this cycle. The access record is what puts the
+    // key into the analyzed snapshot with an L1 replica bit.
+    io_pattern::MetricBatch batch;
+    batch.accesses.push_back(io_pattern::AccessRecord{
+        .object = {TenantId::Default(), "td_report"},
+        .observed_at_ns = 1,
+        .block_size = 4096,
+        .tier = io_pattern::CacheTier::kL1Host,
+        .operation = io_pattern::IoOperation::kGet,
+        .is_hit = true});
+    ASSERT_TRUE(SendIoPatternReport(service.get(), batch));
+
+    // The cycle runs on the runtime's background worker, so wait for the
+    // demotion to reach the offload queue.
+    std::unordered_map<std::string, int64_t> queued;
+    WaitUntil([&] {
+        queued = DrainOffloadQueue(*service, ctx.client_id);
+        return !queued.empty();
+    });
+    ASSERT_EQ(queued.size(), 1u) << "tier-down driver queued "
+                                 << queued.size() << " object(s)";
+    EXPECT_TRUE(queued.count("td_report") > 0);
+
+    // The demotion copied the key down and kept serving it from MEMORY: nothing
+    // was reclaimed, so the reclaim path was never involved.
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_report"));
+    EXPECT_GE(service->tier_down_attempt_count(), 1u);
+    EXPECT_GE(service->tier_down_success_count(), 1u);
+    EXPECT_EQ(service->tier_down_failure_count(), 0u);
+
+    service->RemoveAll();
+}
+
+// End to end through the driver: a key that already holds a lower-tier replica
+// must not consume the tier-down budget, otherwise the same keys are re-copied
+// every cycle and the SSD never grows past one budget's worth.
+TEST_F(OffloadOnEvictTest, TierDownDriverPavesFreshKeysBeforePavedOnes) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.default_kv_lease_ttl = 0;
+    // Exactly one object per cycle, so the chosen candidate is unambiguous.
+    config.io_pattern_tier_down_bytes_per_cycle = 4096;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "tier_down_progress_segment",
+                              kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    PutObject(*service, ctx.client_id, "td_paved", 4096);
+    PutObject(*service, ctx.client_id, "td_fresh", 4096);
+    // "td_paved" was put first, so it is the colder key and would normally win
+    // the budget. Marking it as already holding a lower-tier replica is what an
+    // offload completion does, and it must hand the budget to "td_fresh".
+    MarkLowerTierReplicaForTesting(service.get(), "td_paved",
+                                   io_pattern::CacheTier::kL3NofSsd);
+
+    io_pattern::MetricBatch batch;
+    for (const char* key : {"td_paved", "td_fresh"}) {
+        batch.accesses.push_back(io_pattern::AccessRecord{
+            .object = {TenantId::Default(), key},
+            .observed_at_ns = 1,
+            .block_size = 4096,
+            .tier = io_pattern::CacheTier::kL1Host,
+            .operation = io_pattern::IoOperation::kGet,
+            .is_hit = true});
+    }
+    ASSERT_TRUE(SendIoPatternReport(service.get(), batch));
+
+    std::unordered_map<std::string, int64_t> queued;
+    WaitUntil([&] {
+        queued = DrainOffloadQueue(*service, ctx.client_id);
+        return !queued.empty();
+    });
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_TRUE(queued.count("td_fresh") > 0)
+        << "tier down re-picked a key that already has a disk replica";
+    // Both keys keep serving from MEMORY: demotion is a copy, not a reclaim.
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_paved"));
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_fresh"));
+
+    service->RemoveAll();
 }
 
 }  // namespace mooncake::test

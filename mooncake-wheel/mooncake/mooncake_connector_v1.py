@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue
 from os import getenv
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
 import numpy as np
@@ -69,6 +69,31 @@ VLLM_MOONCAKE_SENDER_WORKERS = int(getenv("VLLM_MOONCAKE_SENDER_WORKERS", 10))
 VLLM_MOONCAKE_PROTOCOL = getenv("VLLM_MOONCAKE_PROTOCOL", "rdma")
 
 logger = init_logger(__name__)
+
+
+class IoPatternBridge:
+    """Optional connector-side bridge for IO Pattern metric reporting.
+
+    Deployments may attach an object implementing ``report_inference_metrics``
+    to ``vllm_config``. The connector remains usable when it is absent.
+    """
+
+    def report_inference_metrics(self, **metrics: Any) -> None:
+        raise NotImplementedError
+
+
+class CallbackIoPatternBridge(IoPatternBridge):
+    """Concrete bridge that forwards complete metric records to a CFM adapter.
+
+    The callback is deliberately injected by the deployment so this connector
+    stays independent of a particular Python/C++ RPC binding.
+    """
+
+    def __init__(self, report: Callable[..., None]) -> None:
+        self._report = report
+
+    def report_inference_metrics(self, **metrics: Any) -> None:
+        self._report(**metrics)
 
 
 class MooncakeAgentMetadata(
@@ -131,6 +156,8 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config.engine_id is not None
         super().__init__(vllm_config, role)
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        self.io_pattern_bridge: Optional[IoPatternBridge] = getattr(
+            vllm_config, "io_pattern_bridge", None)
         
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[MooncakeConnectorScheduler] = \
@@ -235,6 +262,12 @@ class MooncakeConnectorScheduler:
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self.vllm_config = vllm_config
         self.engine_id: EngineId = engine_id
+        self.io_pattern_bridge: Optional[IoPatternBridge] = getattr(
+            vllm_config, "io_pattern_bridge", None)
+        # Kept on the scheduler, which owns all three hook points below.
+        # Each request contributes partial observations until completion.
+        self._io_pattern_metrics: dict[ReqId, dict[str, Any]] = {}
+        self.io_pattern_layout = get_kv_cache_layout()
         self.side_channel_host = get_ip()
         self.side_channel_port = get_mooncake_side_channel_port(vllm_config)
 
@@ -277,6 +310,11 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             count = len(request.prompt_token_ids) - num_computed_tokens
             if count > 0:
+                self._io_pattern_metrics.setdefault(request.request_id, {}).update(
+                    match_length=count,
+                    continuous_prefix_length=count,
+                    token_count=len(request.prompt_token_ids),
+                )
                 return count, True
 
         # No remote prefill for this request.
@@ -294,6 +332,12 @@ class MooncakeConnectorScheduler:
 
         if not params:
             return
+
+        self._io_pattern_metrics.setdefault(request.request_id, {}).update(
+            prefix_depth=params.get("prefix_depth", len(blocks.get_unhashed_block_ids())),
+            prefix_fanout=params.get("prefix_fanout", 0),
+            continuous_prefix_length=num_external_tokens,
+        )
 
         if params.get("do_remote_prefill"):
             assert self.kv_role != "kv_producer"
@@ -357,7 +401,29 @@ class MooncakeConnectorScheduler:
             "MooncakeConnector request_finished, request_status=%s, "
             "kv_transfer_params=%s", request.status, params)
         if not params:
+            # A request may finish before allocation; discard any partial
+            # observation so aborted requests cannot accumulate indefinitely.
+            self._io_pattern_metrics.pop(request.request_id, None)
             return False, None
+        if self.io_pattern_bridge is not None:
+            try:
+                metrics = self._io_pattern_metrics.pop(request.request_id, {})
+                token_count = metrics.get("token_count", len(block_ids))
+                self.io_pattern_bridge.report_inference_metrics(
+                    session_id=request.request_id,
+                    token_count=token_count,
+                    prefix_depth=metrics.get("prefix_depth", params.get("prefix_depth", 0)),
+                    prefix_fanout=metrics.get("prefix_fanout", params.get("prefix_fanout", 0)),
+                    match_length=metrics.get("match_length", params.get("match_length", 0)),
+                    continuous_prefix_length=metrics.get(
+                        "continuous_prefix_length", params.get("continuous_prefix_length", 0)),
+                    recompute_cost=params.get("recompute_cost", float(token_count)),
+                    request_priority=getattr(request, "priority", 0),
+                    layout=self.io_pattern_layout,
+                    layout_group=params.get("layout_group", 0),
+                )
+            except Exception:  # metrics must never affect the data path
+                logger.debug("IO Pattern metric report failed", exc_info=True)
 
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,

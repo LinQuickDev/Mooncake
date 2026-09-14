@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -47,6 +48,13 @@ struct MasterConfig {
     double eviction_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    // When true, merged client reports may drive bounded evictions of the
+    // coldest keys even when the memory watermark is not exceeded. All three
+    // default to disabled (watermark-only eviction) unless explicitly set.
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     int64_t client_live_ttl_sec;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
@@ -61,8 +69,7 @@ struct MasterConfig {
     // Master view lease TTL in seconds (HA leadership lease).
     // When the lease expires without successful renewal, the Master
     // is considered dead and a standby can take over.
-    int64_t master_view_lease_ttl_sec =
-        DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+    int64_t master_view_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
 
     // OpLog store configuration
     bool enable_oplog = false;
@@ -78,7 +85,8 @@ struct MasterConfig {
 
     std::string cluster_id;
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
-    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
     uint32_t submaster_count = 1;
     // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
     // HTTP server disabled.
@@ -161,6 +169,19 @@ struct MasterConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     // Max promotion tasks PromotionObjectHeartbeat returns to a single
     // client per call. Each task is a synchronous SSD-read + RDMA-write
     // on the client; serializing them avoids blocking past the client-
@@ -283,7 +304,26 @@ class MasterServiceSupervisorConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    // Mirrors MasterConfig / WrappedMasterServiceConfig; carried through the
+    // supervisor config used by HA deployments.
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -324,6 +364,11 @@ class MasterServiceSupervisorConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
@@ -338,6 +383,12 @@ class MasterServiceSupervisorConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -440,8 +491,8 @@ class MasterServiceSupervisorConfig {
         enable_cxl = config.enable_cxl;
         vchunk_config = config.vchunk_config;
         vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
-                                     ? config.etcd_endpoints
-                                     : config.vchunk_etcd_endpoints;
+                                    ? config.etcd_endpoints
+                                    : config.vchunk_etcd_endpoints;
 
         pod_name = config.pod_name;
         pod_namespace = config.pod_namespace;
@@ -523,6 +574,10 @@ class WrappedMasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -540,6 +595,19 @@ class WrappedMasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -570,7 +638,8 @@ class WrappedMasterServiceConfig {
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
-    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
     uint32_t submaster_count = 1;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -628,6 +697,11 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
@@ -644,6 +718,12 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -729,8 +809,8 @@ class WrappedMasterServiceConfig {
         enable_cxl = config.enable_cxl;
         vchunk_config = config.vchunk_config;
         vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
-                                     ? config.etcd_endpoints
-                                     : config.vchunk_etcd_endpoints;
+                                    ? config.etcd_endpoints
+                                    : config.vchunk_etcd_endpoints;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -751,6 +831,11 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
@@ -768,6 +853,12 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -1222,6 +1313,10 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -1239,6 +1334,19 @@ class MasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -1269,7 +1377,8 @@ class MasterServiceConfig {
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
-    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
     uint32_t submaster_count = 1;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1324,6 +1433,11 @@ class MasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
@@ -1340,6 +1454,12 @@ class MasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -1473,6 +1593,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.vchunk_config = vchunk_config_;
+    config.vchunk_metadata_store = vchunk_metadata_store_;
     config.vchunk_config = vchunk_config_;
     config.vchunk_metadata_store = vchunk_metadata_store_;
     return config;

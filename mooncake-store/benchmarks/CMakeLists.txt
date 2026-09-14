@@ -38,6 +38,16 @@ target_link_libraries(
   stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
                                gflags::gflags glog::glog pthread)
 
+# CFM client benchmark. Simulates vLLM inference requests as KV-cache block
+# accesses and reports both client performance and IO Pattern observability.
+add_executable(cfm_client_bench cfm_client_bench.cpp)
+target_link_libraries(
+  cfm_client_bench PRIVATE mooncake_store transfer_engine asio_shared
+                          gflags::gflags glog::glog pthread)
+if(STORE_USE_ETCD)
+  target_link_libraries(cfm_client_bench PRIVATE ${ETCD_WRAPPER_LIB})
+endif()
+
 # Benchmark for vLLM Store Connector path
 # Triggers: batch_put_from_multi_buffers / batchIsExist /
 # batch_get_into_multi_buffers (and setup/register_buffer/tearDownAll).
