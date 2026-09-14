@@ -119,7 +119,7 @@ yuanrong 构建了一套五层递进的可靠性栈，光口故障处理是其�
 - **incarnation 全链路围栏**：哈希环 → 准入快照 → 健康注册表 → 连接实例检查全部按 incarnation 隔离；请求可携带远端 `uniqueInstanceId`，不匹配返回 `K_URMA_NEED_CONNECT`（urma_manager.cpp:3397-3405）。
 - **传输顾问**：同 host worker → SHM（fd 传递零拷贝）；URMA 可用 → UB；否则 TCP。SHM 候选取自路由拓扑而非本地探测（transport_advisor.cpp:28-44）。
 - **读路径重建选举**：UB 面缺失时单 rebuilder 选举 + 1000ms 冷却，非选举者内联降级 TCP（data_plane_manager.cpp:1058-1156）。
-- **预热**：客户端进程内预热（20×256KB + 80×1B，16 路，500ms 预算）+ k8s 部署后 worker↔worker 定向预热 playbook（64 worker = 4032 个有向 Remote Get，验证每个方向而非假设对称）。
+- **预热**：客户端进程内预热（20×256KB + 80×1B，16 路，500ms 预算）+ k8s 部署后 worker↔worker 定向预热 playbook（64 worker = 4032 个有向 Remote Get，验证每个方向而非假设对称）。注意：playbook 引用的 `scripts/operations/urma_warmup.py` 脚本在其仓库中并不存在（playbook 领先于代码，属待完成项）。
 
 ---
 
@@ -192,7 +192,7 @@ yuanrong 构建了一套五层递进的可靠性栈，光口故障处理是其�
 **强项**（应保留）：
 - 多设备并发：每 HCA 独立 `UbContext` + 切片随机扇出（ub_transport.cpp:925-951；topology.cpp:786-807），重试时确定性轮转所有 NIC。
 - 拓扑发现：NUMA + PCI 距离 + JSON 覆盖 + `MC_NIC_PEER_AFFINITY` rail 对齐（topology.cpp:511-604）。
-- Master HA：围栏选举（warming 占位 → producer_view claim → lease TTL 预热）+ 校验和有序 OpLog + 分块快照 + supervisor 状态机（master_service_supervisor.cpp:239-640）。
+- Master HA：围栏选举（warming 占位 `__mooncake_service_warming__`，etcd_leader_coordinator.cpp:27 → producer_view claim，master_service_supervisor.cpp:205-219 → lease TTL 预热）+ 校验和有序 OpLog + 分块快照 + supervisor 状态机（master_service_supervisor.cpp:239-640）。
 - SIEVE endpoint 缓存 + 延迟回收（有在途切片不释放，ub_context.cpp:40-167）；`failed_target_ids` 100ms 快速失败负缓存。
 - SSD 分层：tombstone GC + bucket 压实 + push 模式 owner 直写。
 - 副本运维基础：已有 `CreateCopyTask` / `CreateMoveTask`、动态副本 lease/version fence，以及人工 `CreateDrainJob`；Drain 会把源 segment 标记为 DRAINING，按并发度创建 MoveTask，并避开 hard-pin、未过期 lease、未完成副本和已有复制任务（master_service.cpp:13871-13910, 14075-14203）。
@@ -200,7 +200,7 @@ yuanrong 构建了一套五层递进的可靠性栈，光口故障处理是其�
 - 观测性：SpDiag PerfPoint + trace_id 全链路 + MC_LOG 异步环形日志。
 
 **弱项**（gap 所在）：
-- UB 故障处理：`DEV_FATAL/PORT_DOWN → set_active(false)+disconnectAll`，但 **monitor 线程每秒无条件 `set_active(true)`**（ub_context.cpp:622-625）击穿闩锁；32 次失败启发式用的是**生命周期累计计数器**（ub_context.h:84），历史成功后永远不再触发；无熔断、无 TCP 降级、无恢复探测。
+- UB 故障处理：`DEV_FATAL/PORT_DOWN → set_active(false)+disconnectAll`，但 **monitor 线程每秒无条件 `set_active(true)`**（ub_context.cpp:622-624）击穿闩锁；32 次失败启发式用的是**生命周期累计计数器**（ub_context.h:84，且为非原子 `uint64_t`，多 worker 线程自增存在数据竞争），历史成功后永远不再触发；无熔断、无 TCP 降级、无恢复探测。
 - Jetty 模型粗糙：classic UB 默认 `num_jetty_per_ep=1`、每 context 仅 2 个共享 JFC、随机选 jetty、无池化无生命周期状态机、无 per-peer 公平性。这里的 `volatile int*` 仅存在于 classic UB；generic RDMA 已改用 `std::atomic<int>*`（urma_endpoint.h:205-207；rdma_endpoint.h:224）。
 - NIC 选择闭环不一致：classic 路径 `getNicLoadStats()` 恒空（transfer_engine.cpp:264-267）；TENT 路径会返回 `inflight_bytes` 与 `ewma_bandwidth_bps`（transfer_engine.cpp:803-818），但 TENT 需显式通过 `MC_USE_TENT` 启用，不能据此认为 classic UB 已有反馈选路。
 - 超时所有权不闭合：`MultiTransport` 检测到 slice 超时只对外返回 TIMEOUT，并未把 task 置 finished（multi_transport.cpp:274-308）；`freeBatchID` 又拒绝释放未完成 task（multi_transport.cpp:113-126）。这避免了立即 UAF，但 CQE 永不到达时 batch、slice、staging 可能永久占用。另有确定性缺陷：initial dispatch 与 redispatch 的若干直接 `markFailed()` 分支绕过 `onStagedSliceFinalFailure()`，导致 `completed_slices` 无法收敛（ub_context.cpp:242,261,269,280,530,539；ub_transport.cpp:366-392）。
