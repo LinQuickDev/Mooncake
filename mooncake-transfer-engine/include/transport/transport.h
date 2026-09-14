@@ -205,6 +205,9 @@ class Transport {
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
 
             check_batch_completion(false);
+            if (task->scheduled)
+                __atomic_fetch_add(&task->scheduled_completed_slices, 1,
+                                   __ATOMIC_RELEASE);
         }
 
         void markFailed() {
@@ -212,6 +215,9 @@ class Transport {
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 
             check_batch_completion(true);
+            if (task->scheduled)
+                __atomic_fetch_add(&task->scheduled_completed_slices, 1,
+                                   __ATOMIC_RELEASE);
         }
 
         volatile int64_t ts;
@@ -322,6 +328,9 @@ class Transport {
     };
 
     struct TransferTask {
+        // Publish only after completion has finished accessing batch state.
+        bool scheduled = false;
+        uint64_t scheduled_completed_slices = 0;
         volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
@@ -402,6 +411,14 @@ class Transport {
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
+    }
+
+    // Bound a proposed byte range by physical descriptor capacity. Only
+    // transports with worker-published completion may opt into scheduling.
+    virtual Status scheduledTransferLength(const TransferRequest &request,
+                                           uint32_t max_slices,
+                                           size_t &length) {
+        return Status::NotImplemented("Transport has no scheduling adapter");
     }
 
     /// @brief Get the status of a submitted transfer. This function shall not

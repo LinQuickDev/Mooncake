@@ -141,6 +141,22 @@ class TransferEngineImpl {
         return s;
     }
 
+    Status configureScheduling(const scheduling::SchedulerConfig& config) {
+        if (!multi_transports_)
+            return Status::InvalidArgument("Initialize TE before scheduling");
+        return multi_transports_->configureScheduling(config);
+    }
+
+    Status submitScheduledTransfer(
+        BatchID batch_id,
+        const std::vector<ScheduledTransferRequest>& entries) {
+        return multi_transports_->submitScheduledTransfer(batch_id, entries);
+    }
+
+    Status cancelTransfer(BatchID batch_id, size_t task_id) {
+        return multi_transports_->cancelTransfer(batch_id, task_id);
+    }
+
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg) {

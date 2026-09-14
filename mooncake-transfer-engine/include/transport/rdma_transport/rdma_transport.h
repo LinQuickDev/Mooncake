@@ -92,6 +92,10 @@ class RdmaTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    Status scheduledTransferLength(const TransferRequest &request,
+                                   uint32_t max_slices,
+                                   size_t &length) override;
+
     Status getTransferStatus(BatchID batch_id,
                              std::vector<TransferStatus> &status);
 

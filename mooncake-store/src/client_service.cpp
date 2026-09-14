@@ -1183,6 +1183,13 @@ ErrorCode Client::InitTransferEngine(
     return ErrorCode::OK;
 }
 
+Status Client::configureScheduling(
+    const scheduling::SchedulerConfig& scheduler_config) {
+    if (!transfer_engine_)
+        return Status::InvalidArgument("Transfer engine is not initialized");
+    return transfer_engine_->configureScheduling(scheduler_config);
+}
+
 void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is

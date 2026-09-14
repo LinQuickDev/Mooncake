@@ -1,5 +1,15 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_executable(scheduler_policy_test scheduler_policy_test.cpp)
+target_link_libraries(scheduler_policy_test PRIVATE transfer_engine gtest
+                                                    gtest_main)
+add_test(NAME scheduler_policy_test COMMAND scheduler_policy_test)
+
+add_executable(scheduler_core_test scheduler_core_test.cpp)
+target_link_libraries(scheduler_core_test PRIVATE transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME scheduler_core_test COMMAND scheduler_core_test)
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)

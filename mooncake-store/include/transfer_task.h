@@ -21,6 +21,7 @@
 #include "rpc_types.h"
 #include "storage_backend.h"
 #include "client_metric.h"
+#include "operation_options.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -564,7 +565,8 @@ class TransferSubmitter {
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code,
-                                         void* ptr = nullptr, size_t size = 0);
+                                         void* ptr = nullptr, size_t size = 0,
+                                         const OperationOptions& options = {});
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -577,7 +579,7 @@ class TransferSubmitter {
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code, const OperationOptions& options = {});
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -664,11 +666,12 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
-        uint64_t src_offset = 0);
+        uint64_t src_offset = 0, const OperationOptions& options = {});
 
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, uint64_t src_offset);
+        const std::vector<Slice>& slices, uint64_t src_offset,
+        const OperationOptions& options = {});
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
@@ -681,7 +684,8 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        const SchedulingHint& hint = {});
 };
 
 }  // namespace mooncake

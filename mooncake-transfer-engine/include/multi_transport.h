@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "transport/transport.h"
+#include "scheduler/scheduler_core.h"
 
 namespace mooncake {
 class TransferEngineImplTestPeer;
@@ -42,6 +43,12 @@ class MultiTransport {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
+
+    // Configure before submitting any batches. Scheduling is opt-in.
+    Status configureScheduling(const scheduling::SchedulerConfig &config);
+    Status submitScheduledTransfer(
+        BatchID batch_id, const std::vector<ScheduledTransferRequest> &entries);
+    Status cancelTransfer(BatchID batch_id, size_t task_id);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_submitTransfer(BatchID batch_id,
@@ -86,6 +93,8 @@ class MultiTransport {
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+    // Destroy first: drain scheduled work while transports still exist.
+    std::unique_ptr<scheduling::SchedulerCore> scheduler_;
 };
 }  // namespace mooncake
 

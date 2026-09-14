@@ -166,6 +166,26 @@ RdmaTransport::RdmaTransport() {
     }
 }
 
+Status RdmaTransport::scheduledTransferLength(const TransferRequest &request,
+                                              uint32_t max_slices,
+                                              size_t &length) {
+    auto local = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto target = metadata_->getSegmentDescByID(request.target_id);
+    if (!local || !target || !max_slices || !globalConfig().slice_size)
+        return Status::InvalidArgument("Invalid RDMA scheduling range");
+    SliceLengthCalculator calculator{request, globalConfig().slice_size,
+                                     globalConfig().fragment_limit, local.get(),
+                                     target.get()};
+    length = 0;
+    for (uint32_t count = 0; count < max_slices && length < request.length;
+         ++count) {
+        auto bytes = calculator.calculate(length);
+        if (!bytes) return Status::InvalidArgument("Empty RDMA slice");
+        length += bytes;
+    }
+    return Status::OK();
+}
+
 RdmaTransport::~RdmaTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
     for (auto &entry : batch_desc_set_) delete entry.second;

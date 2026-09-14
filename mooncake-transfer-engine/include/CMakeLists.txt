@@ -10,6 +10,11 @@ install(FILES transfer_metadata.h DESTINATION include)
 install(FILES ub_allocator.h DESTINATION include)
 install(FILES common/base/status.h DESTINATION include/common/base)
 install(FILES transport/transport.h DESTINATION include/transport)
+install(FILES
+        scheduler/scheduling_hint.h
+        scheduler/scheduler_policy.h
+        scheduler/scheduler_core.h
+        DESTINATION include/scheduler)
 
 # Device API headers (header-only, consumed by EP kernel)
 install(FILES transport/device/device_transport.h DESTINATION include/transport/device)

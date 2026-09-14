@@ -1001,7 +1001,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size,
+    const OperationOptions& options) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1013,7 +1014,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0);
+            future = submitMemoryReadOperation(handle, slices, 0, options);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
@@ -1022,8 +1023,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+                    future = submitTransferEngineOperation(handle, slices,
+                                                           op_code, 0, options);
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -1059,7 +1060,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, const OperationOptions& options) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
@@ -1088,7 +1089,12 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+    auto hint = options.scheduling.value_or(SchedulingHint{});
+    if (!options.scheduling)
+        hint.intent = op_code == TransferRequest::READ
+                          ? TaskIntent::FOREGROUND_GET
+                          : TaskIntent::BACKGROUND_PUT;
+    future = submitTransfer(requests, hint);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1223,7 +1229,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests, const SchedulingHint& hint) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -1233,7 +1239,10 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     }
 
     // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
+    std::vector<ScheduledTransferRequest> scheduled;
+    scheduled.reserve(requests.size());
+    for (const auto& request : requests) scheduled.push_back({request, hint});
+    Status s = engine_.submitScheduledTransfer(batch_id, scheduled);
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
@@ -1259,7 +1268,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset,
+    const OperationOptions& options) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -1293,12 +1303,17 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    auto hint = options.scheduling.value_or(SchedulingHint{});
+    if (!options.scheduling)
+        hint.intent = op_code == TransferRequest::READ
+                          ? TaskIntent::FOREGROUND_GET
+                          : TaskIntent::BACKGROUND_PUT;
+    return submitTransfer(requests, hint);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, const OperationOptions& options) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1306,8 +1321,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
                                      src_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-        return submitTransferEngineOperation(handle, slices,
-                                             TransferRequest::READ, src_offset);
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::READ, src_offset, options);
     }
 
     LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "

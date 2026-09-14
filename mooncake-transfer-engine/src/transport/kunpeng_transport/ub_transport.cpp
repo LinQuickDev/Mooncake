@@ -728,6 +728,17 @@ Status UbTransport::submitTransferTask(
                     << "UbTransport: Address not registered by any device(s) "
                     << source_addr;
                 if (staged_request) cleanupStagingForTask(&task, true);
+                if (task.scheduled) {
+                    // Earlier watermark batches may already be in flight.
+                    // Complete only the unposted suffix here; the scheduler
+                    // retains the grant until that prefix also drains.
+                    __sync_fetch_and_add(&task.slice_count, 1);
+                    slice->markFailed();
+                    for (auto& pending : slices_to_post)
+                        for (auto* unposted : pending.second)
+                            unposted->markFailed();
+                    slices_to_post.clear();
+                }
                 return Status::AddressNotRegistered(
                     "UbTransport: not registered by any device(s), "
                     "address: " +
@@ -817,6 +828,18 @@ Status UbTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         status.s = WAITING;
     }
+    return Status::OK();
+}
+
+Status UbTransport::scheduledTransferLength(const TransferRequest& request,
+                                            uint32_t max_slices,
+                                            size_t& length) {
+    const uint64_t block = globalConfig().slice_size;
+    if (!block || !max_slices)
+        return Status::InvalidArgument("Invalid UB slice budget");
+    length = request.length;
+    if (uint64_t(max_slices) <= UINT64_MAX / block)
+        length = std::min<uint64_t>(length, block * max_slices);
     return Status::OK();
 }
 

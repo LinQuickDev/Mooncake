@@ -1,6 +1,8 @@
 #include <gflags/gflags.h>
 #include <algorithm>
+#include <array>
 #include <csignal>
+#include <string_view>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
@@ -8,6 +10,7 @@
 #include "config.h"
 #include "mooncake_logging.h"
 #include "real_client.h"
+#include "scheduler/scheduler_policy.h"
 
 using namespace mooncake;
 
@@ -23,6 +26,16 @@ DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_string(tenant_id, "default", "Tenant identifier");
+DEFINE_bool(scheduling, false, "Enable Transfer Engine scheduling");
+DEFINE_uint64(scheduler_quantum_bytes, 1ULL << 20, "Scheduler byte quantum");
+DEFINE_uint64(scheduler_max_inflight_bytes, 16ULL << 20,
+              "Scheduler maximum in-flight bytes");
+DEFINE_uint64(scheduler_reserved_high_bytes, 1ULL << 20,
+              "Scheduler bytes reserved for HIGH traffic");
+DEFINE_uint32(scheduler_max_slices, 32,
+              "Scheduler maximum transport slices per grant");
+DEFINE_string(scheduler_class_weights, "8:4:1",
+              "Scheduler class weights in HIGH:MEDIUM:LOW order");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(start_offload_rpc_server, true,
             "Expose TCP RPC for disk-tier reads "
@@ -35,6 +48,40 @@ DEFINE_int32(offload_rpc_thread_num, 8,
              "--start_offload_rpc_server are true.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
+
+namespace {
+
+std::array<uint32_t, 3> parseClassWeights() {
+    const std::string_view text = FLAGS_scheduler_class_weights;
+    const size_t first_separator = text.find(':');
+    const size_t second_separator =
+        first_separator == std::string_view::npos
+            ? std::string_view::npos
+            : text.find(':', first_separator + 1);
+    LOG_ASSERT(first_separator != std::string_view::npos &&
+               second_separator != std::string_view::npos &&
+               text.find(':', second_separator + 1) == std::string_view::npos)
+        << "--scheduler_class_weights must be HIGH:MEDIUM:LOW, for example "
+           "8:4:1";
+
+    const std::array<std::string_view, 3> tokens = {
+        text.substr(0, first_separator),
+        text.substr(first_separator + 1,
+                    second_separator - first_separator - 1),
+        text.substr(second_separator + 1),
+    };
+    std::array<uint32_t, 3> weights{};
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const auto value = mooncake::parseFromString<uint32_t>(tokens[i]);
+        LOG_ASSERT(value.has_value() && *value > 0)
+            << "--scheduler_class_weights entries must be positive uint32 "
+               "values";
+        weights[i] = *value;
+    }
+    return weights;
+}
+
+}  // namespace
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
@@ -141,6 +188,34 @@ int main(int argc, char *argv[]) {
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
+    }
+
+    if (FLAGS_scheduling) {
+        mooncake::scheduling::SchedulerConfig scheduler_config;
+        scheduler_config.quantum_bytes = FLAGS_scheduler_quantum_bytes;
+        scheduler_config.max_inflight_bytes =
+            FLAGS_scheduler_max_inflight_bytes;
+        scheduler_config.reserved_high_bytes =
+            FLAGS_scheduler_reserved_high_bytes;
+        scheduler_config.max_slices = FLAGS_scheduler_max_slices;
+        scheduler_config.class_weights = parseClassWeights();
+        const auto status =
+            client_inst->configureScheduling(scheduler_config);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to configure Transfer Engine scheduling: "
+                       << status.ToString();
+            return -1;
+        }
+        LOG(INFO) << "Transfer Engine scheduling enabled with class weights "
+                  << scheduler_config.class_weights[0] << ':'
+                  << scheduler_config.class_weights[1] << ':'
+                  << scheduler_config.class_weights[2]
+                  << ", quantum_bytes=" << scheduler_config.quantum_bytes
+                  << ", max_inflight_bytes="
+                  << scheduler_config.max_inflight_bytes
+                  << ", reserved_high_bytes="
+                  << scheduler_config.reserved_high_bytes
+                  << ", max_slices=" << scheduler_config.max_slices;
     }
 
     if (client_inst->start_dummy_client_monitor()) {

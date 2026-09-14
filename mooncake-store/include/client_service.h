@@ -95,6 +95,9 @@ class Client {
         std::map<std::string, std::string> labels = {},
         const std::string& tenant_id = "default");
 
+    Status configureScheduling(
+        const scheduling::SchedulerConfig& scheduler_config);
+
     /**
      * @brief Retrieves data for a given key
      * @param object_key Key to retrieve

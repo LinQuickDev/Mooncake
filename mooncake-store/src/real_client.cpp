@@ -696,6 +696,13 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+Status RealClient::configureScheduling(
+    const scheduling::SchedulerConfig &scheduler_config) {
+    if (!client_)
+        return Status::InvalidArgument("Real client is not initialized");
+    return client_->configureScheduling(scheduler_config);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,

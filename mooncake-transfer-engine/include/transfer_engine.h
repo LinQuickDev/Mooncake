@@ -122,6 +122,11 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
 
+    Status configureScheduling(const scheduling::SchedulerConfig& config);
+    Status submitScheduledTransfer(
+        BatchID batch_id, const std::vector<ScheduledTransferRequest>& entries);
+    Status cancelTransfer(BatchID batch_id, size_t task_id);
+
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg);

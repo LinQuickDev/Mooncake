@@ -1,5 +1,5 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
-include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../../mooncake-common/FindSpDiag.cmake)
 add_subdirectory(common)
 add_subdirectory(transport)
 
