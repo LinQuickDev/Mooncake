@@ -1,0 +1,399 @@
+#include "vchunk_client.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "master_config.h"
+#include "master_service.h"
+
+namespace mooncake {
+namespace {
+
+Segment MakeSegment(const std::string& name, uintptr_t base) {
+    Segment segment;
+    segment.name = name;
+    segment.base = base;
+    segment.size = 32U * 1024U * 1024U;
+    segment.protocol = "tcp";
+    segment.te_endpoint = name;
+    return segment;
+}
+
+class MemoryDataPlane final : public VChunkDataPlane {
+   public:
+    ErrorCode Write(const VChunkMetadataRecord& record, const void* source,
+                    size_t length,
+                    std::chrono::steady_clock::time_point deadline) override {
+        ++write_attempts;
+        if (write_failures_remaining > 0) {
+            --write_failures_remaining;
+            return ErrorCode::TRANSFER_FAIL;
+        }
+        if (fail_write || std::chrono::steady_clock::now() >= deadline) {
+            return fail_write ? ErrorCode::TRANSFER_FAIL
+                              : ErrorCode::RPC_TIMEOUT;
+        }
+        if (!source || record.total_size != length) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        std::vector<std::vector<uint8_t>> slices;
+        size_t offset = 0;
+        for (const auto& slice : record.slices) {
+            if (slice.slice_index != slices.size() ||
+                slice.logical_length > length - offset) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+            const auto* begin = static_cast<const uint8_t*>(source) + offset;
+            slices.emplace_back(begin, begin + slice.logical_length);
+            offset += slice.logical_length;
+        }
+        if (offset != length) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        objects[record.vchunk_id] = std::move(slices);
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Read(const VChunkMetadataRecord& record, void* destination,
+                   size_t length,
+                   std::chrono::steady_clock::time_point deadline) override {
+        ++read_attempts;
+        if (read_failures_remaining > 0) {
+            --read_failures_remaining;
+            return ErrorCode::TRANSFER_FAIL;
+        }
+        if (fail_read || std::chrono::steady_clock::now() >= deadline) {
+            return fail_read ? ErrorCode::TRANSFER_FAIL
+                             : ErrorCode::RPC_TIMEOUT;
+        }
+        if (block_reads) {
+            std::unique_lock<std::mutex> guard(sync_mutex);
+            read_entered = true;
+            sync_cv.notify_all();
+            sync_cv.wait(guard, [&] { return release_read; });
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        const auto it = objects.find(record.vchunk_id);
+        if (it == objects.end()) {
+            return ErrorCode::OBJECT_NOT_FOUND;
+        }
+        size_t offset = 0;
+        for (size_t i = 0; i < it->second.size(); ++i) {
+            if (record.slices[i].slice_index != i ||
+                it->second[i].size() > length - offset) {
+                return ErrorCode::TRANSFER_FAIL;
+            }
+            std::memcpy(static_cast<uint8_t*>(destination) + offset,
+                        it->second[i].data(), it->second[i].size());
+            offset += it->second[i].size();
+        }
+        return offset == length ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
+    }
+
+    bool fail_write{false};
+    bool fail_read{false};
+    int write_failures_remaining{0};
+    int read_failures_remaining{0};
+    int write_attempts{0};
+    int read_attempts{0};
+    bool block_reads{false};
+    bool read_entered{false};
+    bool release_read{false};
+    std::mutex sync_mutex;
+    std::condition_variable sync_cv;
+    std::mutex mutex;
+    std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> objects;
+};
+
+class LegacySpy final : public VChunkLegacyPath {
+   public:
+    ErrorCode Put(const TenantId&, const std::string&, const void*,
+                  size_t) override {
+        ++puts;
+        return ErrorCode::OK;
+    }
+    ErrorCode Get(const TenantId&, const std::string&, void*, size_t) override {
+        ++gets;
+        return ErrorCode::OK;
+    }
+    ErrorCode Remove(const TenantId&, const std::string&) override {
+        ++removes;
+        return ErrorCode::OK;
+    }
+    int puts{0};
+    int gets{0};
+    int removes{0};
+};
+
+class DelayingControlPlane final : public VChunkControlPlane {
+   public:
+    DelayingControlPlane(VChunkControlPlane& delegate,
+                         std::chrono::milliseconds delay)
+        : delegate_(delegate), delay_(delay) {}
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
+        const TenantId& tenant_id, const std::string& key, uint64_t total_size,
+        int64_t now_ms) override {
+        std::this_thread::sleep_for(delay_);
+        return delegate_.PutStart(tenant_id, key, total_size, now_ms);
+    }
+
+    ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
+                     const std::string& vchunk_id, int64_t now_ms) override {
+        return delegate_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+    }
+
+    ErrorCode PutRevoke(const TenantId& tenant_id, const std::string& key,
+                        const std::string& vchunk_id) override {
+        return delegate_.PutRevoke(tenant_id, key, vchunk_id);
+    }
+
+    tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
+        const TenantId& tenant_id, const std::string& key) override {
+        std::this_thread::sleep_for(delay_);
+        return delegate_.Get(tenant_id, key);
+    }
+
+    ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
+                     int64_t now_ms) override {
+        return delegate_.Remove(tenant_id, key, now_ms);
+    }
+
+   private:
+    VChunkControlPlane& delegate_;
+    std::chrono::milliseconds delay_;
+};
+
+struct ClientFixture : testing::Test {
+    ClientFixture() : service(MakeConfig()) {
+        const auto client_id = generate_uuid();
+        EXPECT_TRUE(service.MountSegment(
+                               MakeSegment("vchunk-a", 0xB00000000ULL),
+                               client_id)
+                        .has_value());
+        EXPECT_TRUE(service.MountSegment(
+                               MakeSegment("vchunk-b", 0xC00000000ULL),
+                               client_id)
+                        .has_value());
+    }
+
+    static MasterServiceConfig MakeConfig() {
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.vchunk_config.enabled = true;
+        return config;
+    }
+
+    int64_t now{100};
+    MasterService service;
+    MemoryDataPlane data;
+    LegacySpy legacy;
+};
+
+TEST_F(ClientFixture, PutGetRemoveRoundTripForPiercingSizes) {
+    const std::array<size_t, 6> sizes{4096, 64U * 1024U, 256U * 1024U,
+                                      1024U * 1024U, 4U * 1024U * 1024U,
+                                      1024U * 1024U + 17U};
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::mt19937 random(7);
+    for (const auto size : sizes) {
+        std::vector<uint8_t> source(size);
+        std::generate(source.begin(), source.end(), [&] { return random(); });
+        std::vector<uint8_t> destination(size, 0);
+        const auto key = "key-" + std::to_string(size);
+        ASSERT_EQ(client.Put(TenantId("tenant"), key, source.data(), size),
+                  ErrorCode::OK);
+        ASSERT_EQ(client.Get(TenantId("tenant"), key, destination.data(), size),
+                  ErrorCode::OK);
+        EXPECT_EQ(destination, source);
+        EXPECT_EQ(client.Remove(TenantId("tenant"), key), ErrorCode::OK);
+        EXPECT_EQ(client.Remove(TenantId("tenant"), key), ErrorCode::OK);
+        EXPECT_EQ(client.Get(TenantId("tenant"), key, destination.data(), size),
+                  ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
+TEST_F(ClientFixture, FailedWriteRevokesCreatingObject) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::vector<uint8_t> source(8192, 1);
+    data.fail_write = true;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "key", source.data(),
+                         source.size()),
+              ErrorCode::TRANSFER_FAIL);
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "key").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(ClientFixture, FailedReadDoesNotReturnPartialSuccess) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::vector<uint8_t> source(8192, 3);
+    ASSERT_EQ(client.Put(TenantId("tenant"), "key", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    std::vector<uint8_t> destination(source.size(), 0);
+    data.fail_read = true;
+    EXPECT_EQ(client.Get(TenantId("tenant"), "key", destination.data(),
+                         destination.size()),
+              ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(ClientFixture, DisabledVChunkUsesOnlyLegacyPath) {
+    VChunkClient client(false, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    uint8_t value = 1;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "key", &value, 1), ErrorCode::OK);
+    EXPECT_EQ(client.Get(TenantId("tenant"), "key", &value, 1), ErrorCode::OK);
+    EXPECT_EQ(client.Remove(TenantId("tenant"), "key"), ErrorCode::OK);
+    EXPECT_EQ(legacy.puts, 1);
+    EXPECT_EQ(legacy.gets, 1);
+    EXPECT_EQ(legacy.removes, 1);
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "key").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(ClientFixture, InflightGetCompletesWhileRemoveBlocksNewReads) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::vector<uint8_t> source(8192, 9);
+    ASSERT_EQ(client.Put(TenantId("tenant"), "key", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    data.block_reads = true;
+    std::vector<uint8_t> destination(source.size(), 0);
+    ErrorCode read_result = ErrorCode::INTERNAL_ERROR;
+    std::thread reader([&] {
+        read_result = client.Get(TenantId("tenant"), "key", destination.data(),
+                                 destination.size());
+    });
+    {
+        std::unique_lock<std::mutex> guard(data.sync_mutex);
+        data.sync_cv.wait(guard, [&] { return data.read_entered; });
+    }
+
+    EXPECT_EQ(client.Remove(TenantId("tenant"), "key"), ErrorCode::OK);
+    std::vector<uint8_t> second(source.size(), 0);
+    EXPECT_EQ(client.Get(TenantId("tenant"), "key", second.data(),
+                         second.size()),
+              ErrorCode::OBJECT_NOT_FOUND);
+    {
+        std::lock_guard<std::mutex> guard(data.sync_mutex);
+        data.release_read = true;
+    }
+    data.sync_cv.notify_all();
+    reader.join();
+    EXPECT_EQ(read_result, ErrorCode::OK);
+    EXPECT_EQ(destination, source);
+}
+
+TEST_F(ClientFixture, BatchKeepsPerKeyFailuresIndependent) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::vector<uint8_t> first(4096, 1);
+    std::vector<uint8_t> third(4096, 3);
+    const std::vector<VChunkClient::PutRequest> puts{
+        {"first", first.data(), first.size()}, {"bad", nullptr, 4096},
+        {"third", third.data(), third.size()}};
+    const auto put_results = client.BatchPut(TenantId("tenant"), puts);
+    ASSERT_EQ(put_results.size(), 3U);
+    EXPECT_EQ(put_results[0], ErrorCode::OK);
+    EXPECT_EQ(put_results[1], ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(put_results[2], ErrorCode::OK);
+
+    std::vector<uint8_t> first_out(first.size());
+    std::vector<uint8_t> missing(first.size());
+    std::vector<uint8_t> third_out(third.size());
+    const std::vector<VChunkClient::GetRequest> gets{
+        {"first", first_out.data(), first_out.size()},
+        {"missing", missing.data(), missing.size()},
+        {"third", third_out.data(), third_out.size()}};
+    const auto get_results = client.BatchGet(TenantId("tenant"), gets);
+    EXPECT_EQ(get_results[0], ErrorCode::OK);
+    EXPECT_EQ(get_results[1], ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(get_results[2], ErrorCode::OK);
+    EXPECT_EQ(first_out, first);
+    EXPECT_EQ(third_out, third);
+}
+
+TEST_F(ClientFixture, RetriesRetryableTransfersWithinConfiguredLimit) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; }, 2);
+    std::vector<uint8_t> source(4096, 5);
+    data.write_failures_remaining = 1;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "key", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    EXPECT_EQ(data.write_attempts, 2);
+    const auto metrics = client.MetricsSnapshot();
+    EXPECT_EQ(metrics.retries, 1U);
+    EXPECT_EQ(metrics.requests[static_cast<size_t>(VChunkOperation::PUT)], 1U);
+    EXPECT_EQ(metrics.successes[static_cast<size_t>(VChunkOperation::PUT)], 1U);
+}
+
+TEST_F(ClientFixture, CircuitBreakerStopsOnlyNewVChunkCreation) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; }, 0,
+                        1);
+    std::vector<uint8_t> source(4096, 5);
+    ASSERT_EQ(client.Put(TenantId("tenant"), "active", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    data.fail_write = true;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "failed", source.data(),
+                         source.size()),
+              ErrorCode::TRANSFER_FAIL);
+    data.fail_write = false;
+    EXPECT_EQ(client.Put(TenantId("tenant"), "blocked", source.data(),
+                         source.size()),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(data.write_attempts, 2);
+    std::vector<uint8_t> output(source.size());
+    EXPECT_EQ(client.Get(TenantId("tenant"), "active", output.data(),
+                         output.size()),
+              ErrorCode::OK);
+    EXPECT_EQ(output, source);
+    EXPECT_EQ(client.Remove(TenantId("tenant"), "active"), ErrorCode::OK);
+}
+
+TEST_F(ClientFixture, ControlPlaneLatencyConsumesOperationTimeout) {
+    LocalVChunkControlPlane local(service);
+    DelayingControlPlane delayed(local, std::chrono::milliseconds(20));
+    VChunkClient timed_client(true, delayed, data, legacy,
+                              std::chrono::milliseconds(1),
+                              [this] { return ++now; });
+    std::vector<uint8_t> source(4096, 7);
+    EXPECT_EQ(timed_client.Put(TenantId("tenant"), "slow-put", source.data(),
+                               source.size()),
+              ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "slow-put").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+
+    VChunkClient setup_client(true, service, data, legacy,
+                              std::chrono::seconds(1),
+                              [this] { return ++now; });
+    ASSERT_EQ(setup_client.Put(TenantId("tenant"), "slow-get", source.data(),
+                               source.size()),
+              ErrorCode::OK);
+    std::vector<uint8_t> destination(source.size());
+    EXPECT_EQ(timed_client.Get(TenantId("tenant"), "slow-get",
+                               destination.data(), destination.size()),
+              ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(data.read_attempts, 0);
+}
+
+}  // namespace
+}  // namespace mooncake

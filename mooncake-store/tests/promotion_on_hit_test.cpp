@@ -752,11 +752,11 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
 
     // Find two keys that hash to the same shard. MasterService::
     // getShardIndex is private but the formula is deterministic
-    // (std::hash<std::string>{}(key) % kNumShards), so we can mirror
-    // it here. kNumShards=1024 (master_service.h:889).
+    // (cvm::KeySlot(default_tenant, key) % kNumShards), so we can mirror
+    // it here. kNumShards=1024.
     constexpr size_t kNumShardsLocal = 1024;
     auto shard_of = [](const std::string& k) {
-        return std::hash<std::string>{}(k) % kNumShardsLocal;
+        return cvm::KeySlot(TenantId::Default(), k) % kNumShardsLocal;
     };
     const std::string k1 = "qlim_first";
     std::string k2;
@@ -986,7 +986,7 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
     // independently). With the global counter, only the first goes in.
     constexpr size_t kNumShardsLocal = 1024;
     auto shard_of = [](const std::string& k) {
-        return std::hash<std::string>{}(k) % kNumShardsLocal;
+        return cvm::KeySlot(TenantId::Default(), k) % kNumShardsLocal;
     };
     const std::string k1 = "xshard_first";
     std::string k2;

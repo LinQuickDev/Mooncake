@@ -103,7 +103,7 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     HotStandbyService service(MakeSnapshotOnlyConfig());
     service.SetSnapshotProvider(std::move(provider.value()));
 
-    ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    ASSERT_EQ(ErrorCode::OK, service.Start({}, "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service.GetState());
     EXPECT_EQ(1u, service.GetMetadataCount());
     EXPECT_EQ(descriptor_.last_included_seq,
@@ -131,7 +131,7 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     HotStandbyService service(MakeSnapshotOnlyConfig());
     service.SetSnapshotProvider(std::move(provider.value()));
 
-    ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    ASSERT_EQ(ErrorCode::OK, service.Start({}, "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service.GetState());
     EXPECT_EQ(0u, service.GetMetadataCount());
     EXPECT_EQ(0u, service.GetLatestAppliedSequenceId());
@@ -160,7 +160,7 @@ TEST(StandbyControllerTest, PromoteStandbyReturnsStartFailure) {
     auto controller = ha::CreateStandbyController(spec, config);
     ASSERT_NE(controller, nullptr);
     EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              controller->StartStandby(std::nullopt));
+              controller->StartStandby({}));
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, controller->PromoteStandby());
 }
 
@@ -212,7 +212,7 @@ TEST(StandbyControllerTest,
 
     // After failed start
     EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              controller->StartStandby(std::nullopt));
+              controller->StartStandby({}));
     result = controller->PromoteStandbyAndExport();
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
@@ -236,7 +236,7 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     auto controller = ha::CreateStandbyController(spec, config);
     ASSERT_NE(controller, nullptr);
 
-    EXPECT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+    EXPECT_EQ(ErrorCode::OK, controller->StartStandby({}));
 
     auto result = controller->PromoteStandbyAndExport();
     ASSERT_TRUE(result.has_value()) << toString(result.error());

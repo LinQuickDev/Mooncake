@@ -47,7 +47,7 @@ StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
 
 MasterRuntimeState MapStandbyRuntimeState(
     const StandbySyncStatus& status,
-    const std::optional<MasterView>& observed_leader,
+    const MasterSources& sources,
     const StandbyRuntimeCapabilities& capabilities) {
     switch (status.state) {
         case StandbyState::STOPPED:
@@ -60,7 +60,7 @@ MasterRuntimeState MapStandbyRuntimeState(
             return MasterRuntimeState::kRecovering;
         case StandbyState::WATCHING:
             if (capabilities.has_oplog_following &&
-                observed_leader.has_value() && status.lag_entries > 0) {
+                !sources.empty() && status.lag_entries > 0) {
                 return MasterRuntimeState::kCatchingUp;
             }
             return MasterRuntimeState::kStandby;
@@ -73,7 +73,7 @@ MasterRuntimeState MapStandbyRuntimeState(
 
 class NoopStandbyController final : public StandbyController {
    public:
-    ErrorCode StartStandby(const std::optional<MasterView>&) override {
+    ErrorCode StartStandby(const MasterSources&) override {
         return ErrorCode::OK;
     }
 
@@ -83,10 +83,12 @@ class NoopStandbyController final : public StandbyController {
 
     tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
         override {
-        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        // 无 standby 回放能力时没有数据可导出，返回空上下文让 primary 直接
+        // serving（数据复制/迁移由 P2/P4 处理），而非让升级序列死循环。
+        return PromotionContext{};
     }
 
-    void UpdateObservedLeader(const std::optional<MasterView>&) override {}
+    void UpdateObservedLeader(const MasterSources&) override {}
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
         return MasterRuntimeState::kStandby;
@@ -149,17 +151,22 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         standby_service_->Stop();
     }
 
-    ErrorCode StartStandby(
-        const std::optional<MasterView>& observed_leader) override {
+    ErrorCode StartStandby(const MasterSources& sources) override {
         bool standby_running = false;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            observed_leader_ = observed_leader;
+            observed_sources_ = sources;
             standby_running = standby_running_;
         }
         if (standby_running) {
-            NotifyRuntimeStateIfChanged();
-            return ErrorCode::OK;
+            // 运行中：动态重绑（若源集合变化）。UpdateSources 内部幂等，未
+            // 运行则等价 Start，源集合不变则 no-op，变化则 Stop+Start。
+            ErrorCode err = standby_service_->UpdateSources(
+                sources, oplog_connstring_, config_.cluster_id);
+            if (err == ErrorCode::OK) {
+                NotifyRuntimeStateIfChanged();
+            }
+            return err;
         }
 
         if (dependency_init_error_ != ErrorCode::OK) {
@@ -169,8 +176,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
 
         ErrorCode err = standby_service_->Start(
-            observed_leader.has_value() ? observed_leader->leader_address : "",
-            oplog_connstring_, config_.cluster_id);
+            sources, oplog_connstring_, config_.cluster_id);
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -274,28 +280,27 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         return ctx;
     }
 
-    void UpdateObservedLeader(
-        const std::optional<MasterView>& observed_leader) override {
+    void UpdateObservedLeader(const MasterSources& sources) override {
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            observed_leader_ = observed_leader;
+            observed_sources_ = sources;
         }
         NotifyRuntimeStateIfChanged();
     }
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
-        std::optional<MasterView> observed_leader;
+        MasterSources observed_sources;
         bool standby_running = false;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            observed_leader = observed_leader_;
+            observed_sources = observed_sources_;
             standby_running = standby_running_;
         }
         if (!standby_running) {
             return MasterRuntimeState::kStandby;
         }
         return MapStandbyRuntimeState(standby_service_->GetSyncStatus(),
-                                      observed_leader, capabilities_);
+                                      observed_sources, capabilities_);
     }
 
     void SetStandbyRuntimeStateCallback(
@@ -338,7 +343,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     std::string oplog_connstring_;
 
     mutable std::mutex state_mutex_;
-    std::optional<MasterView> observed_leader_;
+    MasterSources observed_sources_;
     bool standby_running_ = false;
     ErrorCode last_standby_error_{ErrorCode::OK};
 

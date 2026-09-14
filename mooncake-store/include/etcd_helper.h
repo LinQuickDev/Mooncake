@@ -71,6 +71,18 @@ class EtcdHelper {
     static ErrorCode BatchCreate(const std::vector<std::string>& keys,
                                  const std::vector<std::string>& values);
 
+    /*
+     * @brief Atomically put a batch of key-value pairs in a single txn, all
+     *        bound to the given lease. Returns OK if all writes committed,
+     *        ETCD_OPERATION_ERROR otherwise. Caller is responsible for fencing
+     *        (the keys must already be absent / owned by self) before calling;
+     *        it never checks existence, so it can also be reused to reaffirm
+     *        existing lease-bound keys.
+     */
+    static ErrorCode BatchPutWithLease(const std::vector<std::string>& keys,
+                                       const std::vector<std::string>& values,
+                                       EtcdLeaseId lease_id);
+
     enum class TxnCompareKind {
         kValueEquals = 0,
         kKeyNotExists = 1,
@@ -94,7 +106,9 @@ class EtcdHelper {
      * fail.
      */
     static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
-                                      const std::vector<TxnPut>& puts);
+                                      const std::vector<TxnPut>& puts,
+                                      const std::vector<std::string>&
+                                          delete_keys = {});
 
     /*
      * @brief Grant a lease from the etcd.

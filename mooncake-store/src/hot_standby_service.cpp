@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <set>
 #include <thread>
 
 #include "etcd_helper.h"
@@ -19,8 +20,8 @@ namespace mooncake {
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
     metadata_store_ = std::make_unique<StandbyMetadataStore>();
-    // OpLogApplier is re-created in Start() with the resolved cluster_id.
-    oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
+    // Per-source OpLogApplier/reader replicas are created in Start() with the
+    // resolved cluster_id and source list.
 
     // Register callback for state change logging and metrics.
     state_machine_.RegisterCallback([this](StandbyState old_state,
@@ -153,7 +154,7 @@ HotStandbyService::~HotStandbyService() {
     }
 }
 
-ErrorCode HotStandbyService::Start(const std::string& primary_address,
+ErrorCode HotStandbyService::Start(const std::vector<ha::MasterSource>& sources,
                                    const std::string& oplog_endpoints,
                                    const std::string& cluster_id) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -174,8 +175,9 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     if (verification_thread_.joinable()) {
         verification_thread_.join();
     }
-    batch_standby_reader_.reset();
+    sources_.clear();
     batch_standby_kv_backend_.reset();
+    baseline_segments_.clear();
 
     last_error_.store(ErrorCode::OK, std::memory_order_release);
 
@@ -186,7 +188,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         return ErrorCode::INTERNAL_ERROR;  // State machine rejected START
     }
 
-    config_.primary_address = primary_address;
+    config_.sources = sources;
     oplog_endpoints_ = oplog_endpoints;
     cluster_id_ = cluster_id;
 
@@ -226,11 +228,39 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
 }
 
 uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
-    if (oplog_applier_) {
-        uint64_t expected = oplog_applier_->GetExpectedSequenceId();
-        return expected > 0 ? expected - 1 : 0;
+    uint64_t max_applied = 0;
+    for (const auto& [source_id, replica] : sources_) {
+        if (replica.applier) {
+            const uint64_t expected = replica.applier->GetExpectedSequenceId();
+            const uint64_t applied = expected > 0 ? expected - 1 : 0;
+            max_applied = std::max(max_applied, applied);
+        }
+    }
+    if (max_applied > 0) {
+        return max_applied;
     }
     return applied_seq_id_.load(std::memory_order_acquire);
+}
+
+void HotStandbyService::CollectSegmentsLocked(
+    std::vector<StandbySegmentInfo>& out) const {
+    out.clear();
+    // Merge segment registries across per-source appliers, deduplicating by
+    // transport_endpoint (segment identity in StandbySegmentRegistry).
+    std::unordered_map<std::string, StandbySegmentInfo> by_endpoint;
+    for (const auto& [source_id, replica] : sources_) {
+        if (!replica.applier) {
+            continue;
+        }
+        for (const auto& segment :
+             replica.applier->GetSegmentRegistry().GetAllSegments()) {
+            by_endpoint[segment.transport_endpoint] = segment;
+        }
+    }
+    out.reserve(by_endpoint.size());
+    for (const auto& [endpoint, segment] : by_endpoint) {
+        out.push_back(segment);
+    }
 }
 
 ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
@@ -248,8 +278,6 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
         metadata_store_ = std::make_unique<StandbyMetadataStore>();
     }
 
-    oplog_applier_ =
-        std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
     if (!config_.enable_oplog_following) {
         if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
             LOG(INFO) << "Snapshot-only restart discards local metadata and "
@@ -269,7 +297,6 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
         LOG(INFO) << "Standby warm start: reuse local metadata (keys="
                   << metadata_store_->GetKeyCount()
                   << "), recover last_seq_id=" << local_last_seq_id;
-        oplog_applier_->Recover(local_last_seq_id);
         baseline_seq_id = local_last_seq_id;
     } else {
         auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
@@ -287,7 +314,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     uint64_t& baseline_seq_id) {
     baseline_seq_id = 0;
     metadata_store_->Clear();
-    oplog_applier_->Recover(0);
+    baseline_segments_.clear();
 
     if (!config_.enable_snapshot_bootstrap || !snapshot_provider_) {
         return ErrorCode::OK;
@@ -327,11 +354,9 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
         metadata_store_->PutMetadata(entry.tenant_id, entry.key,
                                      entry.metadata);
     }
-    // Load segment registry from snapshot
-    if (oplog_applier_) {
-        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
-    }
-    oplog_applier_->Recover(snapshot.snapshot_sequence_id);
+    // Load segment registry from snapshot; applied to each per-source applier
+    // when OpLog following starts.
+    baseline_segments_ = snapshot.segments;
     baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
 }
@@ -344,8 +369,18 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     } else {
         batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
     }
-    batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
-        cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
+
+    sources_.clear();
+    for (const auto& source : config_.sources) {
+        auto applier =
+            std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
+        applier->LoadSegmentRegistry(baseline_segments_);
+        auto reader = std::make_unique<OpLogBatchStandbyReader>(
+            cluster_id_, *batch_standby_kv_backend_, *applier, source.master_id);
+        sources_.emplace(
+            source.master_id,
+            SourceReplica{std::move(applier), std::move(reader)});
+    }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
     replication_loop_running_.store(true, std::memory_order_release);
@@ -357,7 +392,8 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     }
 
     LOG(INFO) << "HotStandbyService started, watching OpLog for cluster: "
-              << cluster_id_ << ", state=" << StandbyStateToString(GetState());
+              << cluster_id_ << ", sources=" << sources_.size()
+              << ", state=" << StandbyStateToString(GetState());
     return ErrorCode::OK;
 }
 
@@ -423,19 +459,62 @@ void HotStandbyService::Stop() {
               << StandbyStateToString(GetState());
 }
 
+ErrorCode HotStandbyService::UpdateSources(
+    const std::vector<ha::MasterSource>& sources,
+    const std::string& oplog_endpoints,
+    const std::string& cluster_id) {
+    // 判断是否需要重绑（比较 master_id 集合）。
+    bool running = false;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        running = IsRunning();
+        if (running) {
+            if (config_.sources.size() != sources.size()) {
+                changed = true;
+            } else {
+                std::set<std::string> old_ids;
+                std::set<std::string> new_ids;
+                for (const auto& s : config_.sources) {
+                    old_ids.insert(s.master_id);
+                }
+                for (const auto& s : sources) {
+                    new_ids.insert(s.master_id);
+                }
+                changed = (old_ids != new_ids);
+            }
+        }
+    }
+
+    if (!running) {
+        return Start(sources, oplog_endpoints, cluster_id);
+    }
+    if (!changed) {
+        return ErrorCode::OK;
+    }
+
+    // 运行中且源集合变化：停止后重启。metadata_store_ 是成员变量，Stop 不
+    // 清空，Start 里 PrepareBootstrapBaselineLocked 会复用已回放的元数据。
+    LOG(INFO) << "HotStandbyService rebinding replay sources: "
+              << config_.sources.size() << " -> " << sources.size();
+    Stop();
+    return Start(sources, oplog_endpoints, cluster_id);
+}
+
 StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     StandbySyncStatus status;
 
-    // Get applied sequence ID from OpLogApplier
-    if (oplog_applier_) {
-        uint64_t expected = oplog_applier_->GetExpectedSequenceId();
-        status.applied_seq_id = (expected > 0) ? (expected - 1) : 0;
-        if (status.applied_seq_id == 0) {
-            status.applied_seq_id = applied_seq_id_.load();  // Fallback
+    // Get applied sequence ID from per-source OpLogAppliers (max across
+    // sources; each source owns an independent sequence space).
+    uint64_t max_applied = 0;
+    for (const auto& [source_id, replica] : sources_) {
+        if (replica.applier) {
+            const uint64_t expected = replica.applier->GetExpectedSequenceId();
+            max_applied = std::max(max_applied, expected > 0 ? expected - 1 : 0);
         }
-    } else {
-        status.applied_seq_id = applied_seq_id_.load();
     }
+    status.applied_seq_id =
+        max_applied > 0 ? max_applied : applied_seq_id_.load();
 
     // Primary sequence ID (best-effort): updated by ReplicationLoop via etcd
     // `/latest`.
@@ -494,9 +573,9 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         LOG(INFO) << "Promotion does not require final OpLog catch-up";
         return ErrorCode::OK;
     }
-    if (!oplog_applier_) {
-        LOG(ERROR) << "Final catch-up requires OpLogApplier";
-        return ErrorCode::INTERNAL_ERROR;
+    if (sources_.empty()) {
+        LOG(INFO) << "Final catch-up skipped: no OpLog sources";
+        return ErrorCode::OK;
     }
 
     if (catch_up_batch_kv_backend_for_testing_) {
@@ -510,55 +589,60 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
     HaKvBackend& backend) {
-    std::unique_ptr<OpLogBatchStandbyReader> local_reader;
-    OpLogBatchStandbyReader* reader = batch_standby_reader_.get();
-    if (reader == nullptr) {
-        local_reader = std::make_unique<OpLogBatchStandbyReader>(
-            cluster_id_, backend, *oplog_applier_);
-        reader = local_reader.get();
-    }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
     const auto initial_retry_delay =
         std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
     const auto max_retry_delay =
         std::max(initial_retry_delay, std::chrono::milliseconds(1000));
-    auto retry_delay = initial_retry_delay;
-    auto wait_to_retry = [&] {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            return false;
+
+    for (auto& [source_id, replica] : sources_) {
+        OpLogBatchStandbyReader* reader = replica.reader.get();
+        std::unique_ptr<OpLogBatchStandbyReader> local_reader;
+        if (reader == nullptr) {
+            local_reader = std::make_unique<OpLogBatchStandbyReader>(
+                cluster_id_, backend, *replica.applier, source_id);
+            reader = local_reader.get();
         }
-        std::this_thread::sleep_for(std::min(
-            retry_delay, std::chrono::duration_cast<std::chrono::milliseconds>(
-                             deadline - now)));
-        retry_delay = std::min(retry_delay * 2, max_retry_delay);
-        return true;
-    };
-    for (;;) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-        }
-        auto result = reader->PollOnce();
-        if (result.error != ErrorCode::OK) {
-            if (result.disposition !=
-                    OpLogBatchStandbyPollDisposition::RETRYABLE ||
-                !wait_to_retry()) {
+
+        auto retry_delay = initial_retry_delay;
+        auto wait_to_retry = [&] {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::min(
+                retry_delay,
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now)));
+            retry_delay = std::min(retry_delay * 2, max_retry_delay);
+            return true;
+        };
+        for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline) {
                 return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
             }
-            continue;
-        }
-        retry_delay = initial_retry_delay;
-        if (!result.durable_prefix_present) {
-            return GetLocalLastAppliedSequenceIdLocked() == 0
-                       ? ErrorCode::OK
-                       : ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-        }
-        if (GetLocalLastAppliedSequenceIdLocked() >=
-            result.durable_prefix.last_seq) {
-            return ErrorCode::OK;
+            auto result = reader->PollOnce();
+            if (result.error != ErrorCode::OK) {
+                if (result.disposition !=
+                        OpLogBatchStandbyPollDisposition::RETRYABLE ||
+                    !wait_to_retry()) {
+                    return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+                }
+                continue;
+            }
+            retry_delay = initial_retry_delay;
+            if (!result.durable_prefix_present) {
+                break;  // Source has no OpLog yet.
+            }
+            const uint64_t expected = replica.applier->GetExpectedSequenceId();
+            const uint64_t source_applied = expected > 0 ? expected - 1 : 0;
+            if (source_applied >= result.durable_prefix.last_seq) {
+                break;  // This source is caught up.
+            }
         }
     }
+    return ErrorCode::OK;
 }
 
 ErrorCode HotStandbyService::Promote() {
@@ -661,11 +745,7 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     } else {
         out.objects.clear();
     }
-    if (oplog_applier_) {
-        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
-    } else {
-        out.segments.clear();
-    }
+    CollectSegmentsLocked(out.segments);
 
     lock.unlock();
     Stop();
@@ -686,13 +766,7 @@ size_t HotStandbyService::GetMetadataCount() const {
 
 uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (oplog_applier_) {
-        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
-        // GetExpectedSequenceId returns the next expected sequence_id,
-        // so the latest applied is expected_seq - 1
-        return expected_seq > 0 ? expected_seq - 1 : 0;
-    }
-    return applied_seq_id_.load();
+    return GetLocalLastAppliedSequenceIdLocked();
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(
@@ -712,13 +786,8 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
         return false;
     }
 
-    // Get applied sequence ID (inline to avoid recursive mutex lock)
-    if (oplog_applier_) {
-        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
-        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
-    } else {
-        out.oplog_sequence_id = applied_seq_id_.load();
-    }
+    // Get applied sequence ID (max across per-source appliers)
+    out.oplog_sequence_id = GetLocalLastAppliedSequenceIdLocked();
 
     // Export object metadata
     if (metadata_store_) {
@@ -727,12 +796,8 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
         out.objects.clear();
     }
 
-    // Export segments from OpLogApplier's registry (Patch B)
-    if (oplog_applier_) {
-        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
-    } else {
-        out.segments.clear();
-    }
+    // Export segments merged across per-source appliers
+    CollectSegmentsLocked(out.segments);
 
     return true;
 }
@@ -775,10 +840,19 @@ void HotStandbyService::ReplicationLoop() {
             continue;
         }
 
-        if (batch_standby_reader_) {
+        // Poll each replay source independently. Sources own disjoint slot
+        // ranges and independent OpLog sequence spaces, so aggregate applied
+        // and primary sequence IDs as the max across all sources.
+        bool retry_backoff = false;
+        bool fatal = false;
+        for (auto& [source_id, replica] : sources_) {
+            if (!replica.reader) {
+                continue;
+            }
+
             const uint64_t expected_before =
-                oplog_applier_->GetExpectedSequenceId();
-            auto result = batch_standby_reader_->PollOnce();
+                replica.applier->GetExpectedSequenceId();
+            auto result = replica.reader->PollOnce();
             if (result.durable_prefix_present) {
                 const uint64_t current_primary = primary_seq_id_.load();
                 if (result.durable_prefix.last_seq > current_primary) {
@@ -787,10 +861,14 @@ void HotStandbyService::ReplicationLoop() {
             }
 
             const uint64_t expected_after =
-                oplog_applier_->GetExpectedSequenceId();
+                replica.applier->GetExpectedSequenceId();
             if (expected_after > 0) {
-                applied_seq_id_.store(expected_after - 1);
+                const uint64_t applied = expected_after - 1;
+                if (applied > applied_seq_id_.load()) {
+                    applied_seq_id_.store(applied);
+                }
             }
+
             if (result.error != ErrorCode::OK) {
                 last_error_.store(result.error, std::memory_order_release);
                 const bool made_progress = expected_after > expected_before;
@@ -803,39 +881,43 @@ void HotStandbyService::ReplicationLoop() {
                     }
                     if (now - *retry_started < retry_limit) {
                         LOG(WARNING)
-                            << "Transient batch-record standby poll failure, "
-                            << "retrying in " << retry_delay.count()
+                            << "Transient batch-record standby poll failure "
+                            << "for source=" << source_id << ", retrying in "
+                            << retry_delay.count()
                             << " ms, err=" << static_cast<int>(result.error);
                         NotifySyncStatus();
                         wait_for_next_poll(retry_delay);
                         retry_delay =
                             std::min(retry_delay * 2, max_retry_delay);
-                        continue;
+                        retry_backoff = true;
+                        break;
                     }
                     LOG(ERROR)
                         << "Batch-record standby retry timeout after "
                         << config_.batch_oplog_retry_timeout_sec
-                        << " seconds, err=" << static_cast<int>(result.error);
+                        << " seconds for source=" << source_id
+                        << ", err=" << static_cast<int>(result.error);
                 } else {
-                    LOG(ERROR) << "Fatal batch-record standby poll failure, "
-                               << "err=" << static_cast<int>(result.error);
+                    LOG(ERROR) << "Fatal batch-record standby poll failure "
+                               << "for source=" << source_id
+                               << ", err=" << static_cast<int>(result.error);
                 }
-                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-                replication_loop_cv_.notify_all();
+                fatal = true;
                 break;
             }
+
             retry_started.reset();
             retry_delay = retry_base;
             last_error_.store(ErrorCode::OK, std::memory_order_release);
         }
 
-        // Update applied_seq_id from OpLogApplier
-        if (oplog_applier_) {
-            uint64_t expected = oplog_applier_->GetExpectedSequenceId();
-            uint64_t current_applied = (expected > 0) ? (expected - 1) : 0;
-            if (current_applied > 0) {
-                applied_seq_id_.store(current_applied);
-            }
+        if (retry_backoff) {
+            continue;
+        }
+        if (fatal) {
+            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+            replication_loop_cv_.notify_all();
+            break;
         }
 
         const uint64_t applied_seq_id = applied_seq_id_.load();

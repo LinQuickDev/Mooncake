@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -25,6 +26,10 @@
 
 #include "allocation_strategy.h"
 #include "count_min_sketch.h"
+#include "cvm/cvm_controller.h"
+#include "cvm/inter_master_rpc.h"
+#include "cvm/slot_hash.h"
+#include "cvm/slot_owner_heartbeat.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -32,6 +37,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "vchunk_master_manager.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -142,6 +148,80 @@ class MasterService {
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
+    // CVM slot ownership publishing. The CvmController now lives in the HA
+    // supervisor so membership keeps running even while this node is a
+    // standby; the supervisor injects the lease id it granted and drives the
+    // heartbeat around serve start/stop.
+    void SetCvmLeaseId(EtcdLeaseId lease_id);
+    ErrorCode StartSlotOwnerHeartbeat();
+    void StopSlotOwnerHeartbeat();
+
+    // CVM inter-master RPC (multi-submaster coordination). Starts the
+    // etcd-driven member refresh loop so this master can reach its peers
+    // (handshake now; allocation forwarding later). Same lifecycle as the
+    // slot owner heartbeat: called by the supervisor around serve phases.
+    ErrorCode StartInterMasterRpc();
+    void StopInterMasterRpc();
+    cvm::InterMasterRpcClient* inter_master_rpc() const {
+        return inter_master_rpc_.get();
+    }
+
+    // Inter-master handshake data: stable identity, supervisor-granted lease
+    // and current owned-slot count (read path / forwarding diagnostics).
+    const std::string& master_id() const { return master_id_; }
+    EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
+    uint32_t GetOwnedSlotCount() const;
+
+    // Inter-master allocation forwarding (CVM plan B phase 2). Called by
+    // WrappedMasterService when a slot-owning peer asks this submaster
+    // (segment owner) to allocate memory replicas. `preferred_segments`
+    // is honored strictly when non-empty. Real handles are kept alive in
+    // a keepalive registry until InterMasterFreeReplicas arrives.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterAllocateReplicas(const std::string& tenant_id,
+                                const std::string& key, uint64_t slice_length,
+                                uint64_t replica_num,
+                                const std::vector<std::string>& preferred_segments);
+
+    // Frees the keepalive entry (and the handles) for (tenant, key).
+    // Idempotent: returns false when no entry exists.
+    tl::expected<bool, ErrorCode> InterMasterFreeReplicas(
+        const std::string& tenant_id, const std::string& key);
+
+    // Inter-master read forwarding (CVM plan B phase 2). Called by
+    // WrappedMasterService when a peer submaster forwards a GetReplicaList /
+    // BatchGetReplicaList request to this submaster (the slot owner). Unlike
+    // the client-facing GetReplicaList, these do NOT re-forward: they query
+    // the local metadata directly (peer trust), so an inconsistent view
+    // terminates the forward chain at the first hop instead of looping.
+    tl::expected<GetReplicaListResponse, ErrorCode> InterMasterGetReplicaList(
+        const std::string& key, const std::string& tenant_id);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const std::string& tenant_id);
+
+    // Inter-master write forwarding (model B). Called by WrappedMasterService
+    // when a peer submaster received a PutStart for a slot it does not own: it
+    // relays the FULL PutStart to this submaster (the slot owner), which
+    // executes the complete local alloc + metadata + keepalive and returns the
+    // descriptors for the caller to relay to the client. Because this is the
+    // slot owner, its OwnsSlot==true so the forward chain terminates here
+    // (peer trust, symmetric with InterMasterGetReplicaList).
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> InterMasterPutStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t slice_length,
+        const ReplicateConfig& config);
+
+    // Upsert variant of InterMasterPutStart: the slot owner executes the FULL
+    // UpsertStart (preserving the "overwrite if exists" preemption semantics
+    // that PutStart lacks), and returns the descriptors for the caller to
+    // relay to the client.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterUpsertStart(const UUID& client_id, const std::string& key,
+                           const std::string& tenant_id, uint64_t slice_length,
+                           const ReplicateConfig& config);
+
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
      *        unit tests can drive a single eviction cycle synchronously
@@ -163,6 +243,29 @@ class MasterService {
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
+        const TenantId& tenant_id, const std::string& key,
+        uint64_t total_size, bool is_ssd_segment, int64_t now_ms,
+        const std::set<std::string>& excluded_segments = {});
+    ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
+                           const std::string& vchunk_id, int64_t now_ms);
+    ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
+                              const std::string& key,
+                              const std::string& vchunk_id);
+    tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
+        const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
+        const TenantId& tenant_id, const std::string& key) const;
+    tl::expected<VChunkReadLease, ErrorCode> AcquireVChunkReadLease(
+        const TenantId& tenant_id, const std::string& key, int64_t now_ms);
+    ErrorCode ReleaseVChunkReadLease(const std::string& lease_id);
+    ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
+                           int64_t now_ms);
+    VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
+    tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
+                                                       size_t max_scan);
+    VChunkMetricsSnapshot GetVChunkMetrics() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -1471,20 +1574,23 @@ class MasterService {
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     bool TenantHasObjects(const TenantId& tenant_id) const;
 
-    // Helper to get shard index from tenant-scoped object identity.
+    // Helper to get the logical slot (Redis Cluster style, 16384 slots) for
+    // a tenant-scoped key. Slots are the unit of cross-master ownership.
+    uint16_t getSlot(const TenantId& tenant_id,
+                     const std::string& user_key) const {
+        return cvm::KeySlot(tenant_id, user_key);
+    }
+
+    // Helper to get shard index from tenant-scoped object identity. The
+    // physical shard is derived from the logical slot.
     size_t getShardIndex(const TenantId& tenant_id,
                          const std::string& user_key) const {
-        if (tenant_id.IsDefault()) {
-            return std::hash<std::string>{}(user_key) % kNumShards;
-        }
-        size_t seed = std::hash<std::string>{}(tenant_id.value());
-        boost::hash_combine(seed, user_key);
-        return seed % kNumShards;
+        return getSlot(tenant_id, user_key) % kNumShards;
     }
 
     // Legacy helper routes plain keys to the default tenant.
     size_t getShardIndex(const std::string& key) const {
-        return std::hash<std::string>{}(key) % kNumShards;
+        return getSlot(TenantId::Default(), key) % kNumShards;
     }
 
     size_t getMetadataShardIndex(const TenantId& tenant_id,
@@ -1507,6 +1613,9 @@ class MasterService {
         kFull,
         kPreserveOld,
         kAbortOnly,
+        // slot 交接：与 kFull 相同，但跳过 ReleaseLocalDiskUsage，因为数据字节
+        // 仍留在共享 segment（不应错误扣减 ssd_used_bytes）。
+        kHandoff,
     };
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
@@ -2103,6 +2212,114 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // Stable master id used by the SlotOwnerHeartbeat (empty = disabled).
+    const std::string master_id_;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    const uint16_t cvm_http_port_;
+    const std::string cvm_http_host_;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调）。
+    const uint32_t submaster_count_;
+    // Publishes this submaster's slot ownership to etcd for the KV partition
+    // view. Only started in HA mode when a stable master_id is configured.
+    std::unique_ptr<cvm::SlotOwnerHeartbeat> slot_owner_heartbeat_;
+    // Inter-master RPC client (CVM multi-submaster coordination): etcd-driven
+    // member table + per-peer cached coro_rpc pools. Started/stopped by the
+    // supervisor around serve phases, mirroring the heartbeat above.
+    std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
+
+    // ----- Inter-master allocation forwarding (CVM plan B phase 2) -----
+
+    // Segment-owner side: keepalive for replicas allocated on behalf of
+    // slot-owning peers, keyed by scoped key. The real handles stay alive
+    // here; the peer only holds dummy-allocator replicas. Freed by
+    // InterMasterFreeReplicas (broadcast by the slot owner on erase).
+    std::mutex inter_master_keepalive_mutex_;
+    std::unordered_map<std::string, std::vector<Replica>>
+        inter_master_keepalive_;
+
+    // Slot-owner side: scoped keys whose handles live on a peer submaster
+    // (remote-allocated or migrated-in). Drives the broadcast-free on
+    // EraseMetadata; kHandoff (slot migration) keeps the handles alive and
+    // transfers the responsibility to the importing master.
+    std::mutex remote_allocated_keys_mutex_;
+    std::unordered_set<std::string> remote_allocated_keys_;
+
+    // Slot-owner side: keeps the DummyBufferAllocator of remote replicas
+    // alive (the replicas hold only weak references), keyed by endpoint.
+    std::mutex remote_replica_allocator_keepalive_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<DummyBufferAllocator>>
+        remote_replica_allocator_keepalive_;
+
+    // Slot-owner side: local allocation failed, try peers (segment owners)
+    // before giving up. Called OUTSIDE the local allocator lock to avoid
+    // distributed deadlock (both masters forwarding simultaneously).
+    tl::expected<std::vector<Replica>, ErrorCode> TryAllocateReplicasRemotely(
+        const std::string& key, const TenantId& tenant_id,
+        uint64_t value_length, size_t replica_num,
+        const std::vector<std::string>& preferred_segments);
+
+    // EraseMetadata hook: when the erased object's handles live on a peer,
+    // enqueue a broadcast free (skipped for kHandoff: the data bytes must
+    // survive the slot migration).
+    void EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
+                                    const std::string& key,
+                                    QuotaEraseMode quota_mode);
+    // Lease id granted by the supervisor-owned CvmController. Reused by the
+    // SlotOwnerHeartbeat and segment owner records so they share the master
+    // registration lifecycle (auto-removed on lease expiry). 0 until the
+    // supervisor injects it via SetCvmLeaseId().
+    EtcdLeaseId cvm_lease_id_{0};
+    // 读路径 slot 所有权校验位图（A1）。由心跳 resolver 与晋升路径更新，
+    // GetReplicaList / BatchGetReplicaList 读路径校验，非 owner 拒绝服务。
+    // owned_slots_ready_ 为 false 表示 partition 未启用或尚未解析过，放行。
+    mutable std::shared_mutex owned_slots_mutex_;
+    std::vector<bool> owned_slot_lookup_;
+    bool owned_slots_ready_{false};
+    // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
+    bool owned_slot_count_logged_{false};
+    std::size_t last_logged_owned_count_{0};
+    // Segment view (CVM) 数据源：在 segment 挂载/卸载时把 segment owner 原始
+    // 记录同步到 etcd（segment_view/<id>），供 CvmController 聚合生成 segment
+    // view 快照。仅在 etcd HA backend 下生效，其余场景为空操作。
+    void PublishSegmentOwnerForCvm(const Segment& segment);
+    void RemoveSegmentOwnerForCvm(const UUID& segment_id);
+    // 动态 KV slot 划分：以 etcd 注册表为唯一事实源，读取已注册的 primary
+    // master 列表，按一致性哈希环（cvm::ResolveOwnedSlotsOnRing）计算本机
+    // 应拥有的 slot 集合。etcd 读取失败时沿用上一轮结果（sticky），避免
+    // 瞬时抖动引发全量抢夺；本机不在 primary 列表时返回空集合（不认领）。
+    // 供 SlotOwnerHeartbeat 动态解析器回调调用（运行在心跳线程）。
+    std::vector<uint16_t> ResolveOwnedSlotsForCvm();
+    // sticky 缓存：最近一次成功解析的 owned slot 集合（etcd 抖动时沿用）。
+    std::vector<uint16_t> cvm_last_resolved_owned_slots_;
+    mutable std::mutex cvm_resolver_mutex_;
+    // live primary → live primary 的 slot 元数据交接（P4 技术债 1）。
+    // ExportSlotMetadata 把 `slot` 下所有对象的元数据序列化后写入 etcd，再
+    // 从本地 metadata_shards_ 擦除；ImportSlotMetadata 从 etcd 读回并物化到
+    // 本地 metadata_shards_。数据字节始终留在 segment，不搬移。两者均由
+    // SlotOwnerHeartbeat 的 on_slot_released / on_slot_acquired 钩子在心跳
+    // 线程调用。
+    ErrorCode ExportSlotMetadata(uint16_t slot);
+    ErrorCode ImportSlotMetadata(uint16_t slot);
+    // A1：读路径 slot 所有权校验。UpdateOwnedSlots 由心跳 resolver 与晋升路径
+    // 调用，把最新 owned slot 集合写入位图；OwnsSlot 供读路径查询（未就绪放行）。
+    void UpdateOwnedSlots(const std::vector<uint16_t>& slots);
+    bool OwnsSlot(uint16_t slot) const;
+    // 读路径转发：解析任意 slot 的 owner master_id（基于一致性哈希环与
+    // etcd 中的 primary master 列表）。解析失败返回 nullopt。供 GetReplicaList
+    // / BatchGetReplicaList 在 OwnsSlot 失败时向 slot owner 转发请求。
+    std::optional<std::string> ResolveSlotOwnerMasterId(uint16_t slot) const;
+    // GetReplicaList 的本地查询核心：不含 slot 所有权校验与转发，供
+    // client-facing GetReplicaList 与 InterMasterGetReplicaList 复用。
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListLocal(
+        const ObjectIdentity& object_id);
+    // BatchGetReplicaList 的本地查询核心：不含 slot 所有权校验与转发，供
+    // client-facing BatchGetReplicaList 与 InterMasterBatchGetReplicaList
+    // 复用。
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListLocal(const std::vector<std::string>& keys,
+                             const TenantId& tenant_id);
+    bool OwnsVChunkSlot(uint16_t slot) const;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
@@ -2149,6 +2366,24 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
+    VChunkMasterManager vchunk_manager_;
+    bool vchunk_enabled_{false};
+    uint64_t vchunk_reaper_interval_ms_{1000};
+    size_t vchunk_reaper_max_scan_{128};
+    std::atomic<bool> vchunk_reaper_running_{false};
+    bool vchunk_recovery_pending_{false};
+    struct VChunkRemoteReadLease {
+        VChunkMasterManager::ReadHandle handle;
+        int64_t expires_at_ms{0};
+    };
+    std::mutex vchunk_read_leases_mutex_;
+    std::unordered_map<std::string, VChunkRemoteReadLease>
+        vchunk_read_leases_;
+    std::thread vchunk_reaper_thread_;
+    std::mutex vchunk_reaper_mutex_;
+    std::condition_variable vchunk_reaper_cv_;
+    void StartVChunkReaper();
+    void VChunkReaperThreadFunc();
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

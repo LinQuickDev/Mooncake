@@ -16,6 +16,8 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "etcd_helper.h"
+#include "partition/kv_hash_map.h"
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
@@ -88,6 +90,35 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutEnd> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
     static constexpr const char* value = "PutRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VChunkPutStart> {
+    static constexpr const char* value = "VChunkPutStart";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::VChunkPutEnd> {
+    static constexpr const char* value = "VChunkPutEnd";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::VChunkPutRevoke> {
+    static constexpr const char* value = "VChunkPutRevoke";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetVChunk> {
+    static constexpr const char* value = "GetVChunk";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::ReleaseVChunkReadLease> {
+    static constexpr const char* value = "ReleaseVChunkReadLease";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveVChunk> {
+    static constexpr const char* value = "RemoveVChunk";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetVChunkRuntimeInfo> {
+    static constexpr const char* value = "GetVChunkRuntimeInfo";
 };
 
 template <>
@@ -454,6 +485,45 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     return rpc_result;
 }
 
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_to(
+    const std::string& address, Args&&... args) {
+    // 定向 RPC：用独立 targeted_accessor_ 按地址取 pool，不切换
+    // client_accessor_ 的"当前地址"，避免与业务请求竞态。pool 取自返回值，
+    // 不依赖 targeted_accessor_ 的当前状态，因此可被多线程并发调用。
+    auto pool = targeted_accessor_.GetOrCreateClientPool(address);
+
+    if (metrics_) {
+        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    }
+
+    return async_simple::coro::syncAwait(
+        [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            auto ret = co_await pool->send_request(
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client& client) {
+                    return client.send_request<ServiceMethod>(
+                        std::forward<Args>(args)...);
+                });
+            if (!ret.has_value()) {
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            auto result = co_await std::move(ret.value());
+            if (!result) {
+                if (result.error().code == coro_rpc::errc::timed_out) {
+                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            if constexpr (std::is_void_v<ReturnType>) {
+                result->result();
+                co_return tl::expected<void, ErrorCode>{};
+            } else {
+                co_return std::move(result->result());
+            }
+        }());
+}
+
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
@@ -578,10 +648,131 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     return ErrorCode::OK;
 }
 
+ErrorCode MasterClient::LoadRoutingFromEtcd(
+    const std::string& etcd_endpoints, const std::string& cluster_namespace) {
+    if (etcd_endpoints.empty() || cluster_namespace.empty()) {
+        LOG(ERROR) << "LoadRoutingFromEtcd requires non-empty etcd_endpoints "
+                   << "and cluster_namespace";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect etcd for partition routing: " << err;
+        return err;
+    }
+
+    err = partition_router_.LoadFromEtcdSnapshot(cluster_namespace);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to load partition routing snapshot from etcd "
+                     << "(namespace=" << cluster_namespace << "): " << err;
+        return err;
+    }
+    {
+        std::lock_guard<std::mutex> lock(routing_config_mutex_);
+        routing_cluster_namespace_ = cluster_namespace;
+    }
+    LOG(INFO) << "Loaded partition routing from etcd: namespace="
+              << cluster_namespace << " entries=" << partition_router_.Size();
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterClient::RefreshSubmasterRouting() {
+    std::string cluster_namespace;
+    {
+        std::lock_guard<std::mutex> lock(routing_config_mutex_);
+        cluster_namespace = routing_cluster_namespace_;
+    }
+    if (cluster_namespace.empty()) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    return partition_router_.LoadFromEtcdSnapshot(cluster_namespace);
+}
+
+std::optional<std::string> MasterClient::ResolveSubmaster(
+    const std::string& key) const {
+    const uint16_t slot = partition::KvHashMap::Compute(tenant_id_, key);
+    auto submaster = partition_router_.ResolveSubmaster(slot);
+    if (submaster) {
+        LOG(INFO) << "ResolveSubmaster hit: tenant=" << tenant_id_.value()
+                  << " key=" << key << " slot=" << slot
+                  << " submaster=" << *submaster;
+    } else {
+        LOG(WARNING) << "ResolveSubmaster miss: tenant=" << tenant_id_.value()
+                     << " key=" << key << " slot=" << slot
+                     << " (routing not loaded or slot has no owner)";
+    }
+    return submaster;
+}
+
+void MasterClient::SwitchToSubmasterByAddress(const std::string& address) {
+    const std::string old_address = client_accessor_.GetAddress();
+    client_accessor_.GetOrCreateClientPool(address);
+    if (old_address != address) {
+        LOG(INFO) << "SwitchToSubmasterByAddress: [" << old_address << "] -> ["
+                  << address << "]";
+    }
+}
+
+ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
+                                          const std::string& key) {
+    // Routing not loaded (single-master mode): keep the current connection so
+    // existing behavior is preserved. Check Size() before ResolveSubmaster to
+    // avoid its per-miss WARNING log firing on every single-key request.
+    if (partition_router_.Size() == 0) {
+        return ErrorCode::OK;
+    }
+
+    const TenantId tenant(tenant_id);
+    const uint16_t slot = partition::KvHashMap::Compute(tenant, key);
+    auto submaster = partition_router_.ResolveSubmaster(slot);
+    if (!submaster) {
+        LOG(WARNING) << "SwitchToSubmaster miss: tenant=" << tenant_id
+                     << " key=" << key << " slot=" << slot
+                     << " (slot has no owner in routing table)";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    SwitchToSubmasterByAddress(*submaster);
+    LOG(INFO) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
+              << " slot=" << slot << " -> submaster=" << *submaster;
+    return ErrorCode::OK;
+}
+
+std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    std::map<std::string, std::vector<size_t>> groups;
+    const TenantId tenant(tenant_id);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const uint16_t slot = partition::KvHashMap::Compute(tenant, keys[i]);
+        auto submaster = partition_router_.ResolveSubmaster(slot);
+        groups[submaster.value_or("")].push_back(i);
+    }
+
+    std::string group_desc;
+    for (const auto& [submaster, indices] : groups) {
+        if (!group_desc.empty()) {
+            group_desc += ", ";
+        }
+        group_desc += (submaster.empty() ? std::string("<none>") : submaster);
+        group_desc += ":" + std::to_string(indices.size());
+    }
+    LOG(INFO) << "GroupKeysBySubmaster: tenant=" << tenant_id
+              << " total_keys=" << keys.size() << " groups=" << groups.size()
+              << " [" << group_desc << "]";
+    return groups;
+}
+
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
+
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id_.value(), object_key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     auto result = invoke_rpc<&WrappedMasterService::ExistKey, bool>(
         object_key, tenant_id_.value());
@@ -594,10 +785,43 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
-        object_keys.size(), object_keys, tenant_id_.value());
-    timer.LogResponse("result=", result.size(), " keys");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+                object_keys.size(), object_keys, tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " keys");
+        return result;
+    }
+
+    std::vector<tl::expected<bool, ErrorCode>> results(
+        object_keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(object_keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchExistKey: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(object_keys[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+                group_keys.size(), group_keys, tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " keys");
+    return results;
 }
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
@@ -662,6 +886,12 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id, object_key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
+
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
                              GetReplicaListResponse>(object_key, tenant_id,
@@ -682,12 +912,48 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
 
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
+                             GetReplicaListResponse>(
+                object_keys.size(), object_keys, tenant_id, trace_id,
+                client_id_);
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
+        object_keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id, trace_id, client_id_);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    auto groups = GroupKeysBySubmaster(object_keys, tenant_id);
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchGetReplicaList: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(object_keys[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
+                             GetReplicaListResponse>(
+                group_keys.size(), group_keys, tenant_id, trace_id, client_id_);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -696,6 +962,12 @@ MasterClient::PutStart(const std::string& key,
                        const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
+
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id_.value(), key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     uint64_t total_slice_length = 0;
     for (const auto& slice_length : slice_lengths) {
@@ -720,28 +992,73 @@ MasterClient::BatchPutStart(
 
     std::vector<uint64_t> total_slice_lengths;
     total_slice_lengths.reserve(slice_lengths.size());
-    for (const auto& slice_lengths : slice_lengths) {
+    for (const auto& per_key_lengths : slice_lengths) {
         uint64_t total_slice_length = 0;
-        for (const auto& slice_length : slice_lengths) {
+        for (const auto& slice_length : per_key_lengths) {
             total_slice_length += slice_length;
         }
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
-                                   std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value(),
-        trace_id);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
+                             std::vector<Replica::Descriptor>>(
+                keys.size(), client_id_, keys, total_slice_lengths, config,
+                tenant_id_.value(), trace_id);
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results(keys.size(),
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchPutStart: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        std::vector<uint64_t> group_total_slice_lengths;
+        group_keys.reserve(indices.size());
+        group_total_slice_lengths.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+            group_total_slice_lengths.push_back(total_slice_lengths[idx]);
+        }
+
+        auto group_result = invoke_batch_rpc<
+            &WrappedMasterService::BatchPutStart,
+            std::vector<Replica::Descriptor>>(
+            group_keys.size(), client_id_, group_keys,
+            group_total_slice_lengths, config, tenant_id_.value(), trace_id);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
     const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", object_meta.key);
+
+    ErrorCode switch_err =
+        SwitchToSubmaster(tenant_id_.value(), object_meta.key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
@@ -756,11 +1073,52 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     timer.LogRequest("keys_count=", object_metas.size());
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        object_metas.size(), client_id_, object_metas, replica_type,
-        tenant_id_.value(), trace_id);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
+                object_metas.size(), client_id_, object_metas, replica_type,
+                tenant_id_.value(), trace_id);
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        object_metas.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    std::vector<std::string> keys;
+    keys.reserve(object_metas.size());
+    for (const auto& meta : object_metas) {
+        keys.push_back(meta.key);
+    }
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchPutEnd: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<ObjectMeta> group_object_metas;
+        group_object_metas.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_object_metas.push_back(object_metas[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
+                group_object_metas.size(), client_id_, group_object_metas,
+                replica_type, tenant_id_.value(), trace_id);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutRevoke(
@@ -768,10 +1126,128 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id_.value(), key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
+
     auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
         client_id_, key, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
+    const std::string& tenant_id, const std::string& key, uint64_t total_size,
+    int64_t now_ms) {
+    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    const auto switch_err = SwitchToSubmaster(tenant_id, key);
+    if (switch_err != ErrorCode::OK) {
+        return tl::make_unexpected(switch_err);
+    }
+    auto result = invoke_rpc<&WrappedMasterService::VChunkPutStart,
+                             VChunkMetadataRecord>(tenant_id, key, total_size,
+                                                   now_ms);
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        RefreshSubmasterRouting() == ErrorCode::OK &&
+        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+        result = invoke_rpc<&WrappedMasterService::VChunkPutStart,
+                            VChunkMetadataRecord>(tenant_id, key, total_size,
+                                                  now_ms);
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& vchunk_id, int64_t now_ms) {
+    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    const auto switch_err = SwitchToSubmaster(tenant_id, key);
+    if (switch_err != ErrorCode::OK) {
+        return tl::make_unexpected(switch_err);
+    }
+    auto result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
+        tenant_id, key, vchunk_id, now_ms);
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        RefreshSubmasterRouting() == ErrorCode::OK &&
+        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+        result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
+            tenant_id, key, vchunk_id, now_ms);
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& vchunk_id) {
+    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    const auto switch_err = SwitchToSubmaster(tenant_id, key);
+    if (switch_err != ErrorCode::OK) {
+        return tl::make_unexpected(switch_err);
+    }
+    auto result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
+        tenant_id, key, vchunk_id);
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        RefreshSubmasterRouting() == ErrorCode::OK &&
+        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+        result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
+            tenant_id, key, vchunk_id);
+    }
+    return result;
+}
+
+tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
+    const std::string& tenant_id, const std::string& key) {
+    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    const auto switch_err = SwitchToSubmaster(tenant_id, key);
+    if (switch_err != ErrorCode::OK) {
+        return tl::make_unexpected(switch_err);
+    }
+    auto result = invoke_rpc<&WrappedMasterService::GetVChunk,
+                             VChunkReadLease>(tenant_id, key);
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        RefreshSubmasterRouting() == ErrorCode::OK &&
+        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+        result = invoke_rpc<&WrappedMasterService::GetVChunk,
+                            VChunkReadLease>(tenant_id, key);
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
+    const std::string& tenant_id, const std::string& key,
+    const std::string& lease_id) {
+    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    const auto switch_err = SwitchToSubmaster(tenant_id, key);
+    if (switch_err != ErrorCode::OK) {
+        return tl::make_unexpected(switch_err);
+    }
+    return invoke_rpc<&WrappedMasterService::ReleaseVChunkReadLease, void>(
+        lease_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
+    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
+    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    const auto switch_err = SwitchToSubmaster(tenant_id, key);
+    if (switch_err != ErrorCode::OK) {
+        return tl::make_unexpected(switch_err);
+    }
+    auto result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
+        tenant_id, key, now_ms);
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
+        RefreshSubmasterRouting() == ErrorCode::OK &&
+        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+        result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
+            tenant_id, key, now_ms);
+    }
+    return result;
+}
+
+tl::expected<VChunkRuntimeInfo, ErrorCode> MasterClient::GetVChunkRuntimeInfo() {
+    return invoke_rpc<&WrappedMasterService::GetVChunkRuntimeInfo,
+                      VChunkRuntimeInfo>();
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
@@ -779,10 +1255,45 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), client_id_, keys, replica_type, tenant_id_.value());
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
+                keys.size(), client_id_, keys, replica_type,
+                tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchPutRevoke: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
+                group_keys.size(), client_id_, group_keys, replica_type,
+                tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -791,6 +1302,12 @@ MasterClient::UpsertStart(const std::string& key,
                           const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
+
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id_.value(), key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     uint64_t total_slice_length = 0;
     for (const auto& slice_length : slice_lengths) {
@@ -822,18 +1339,63 @@ MasterClient::BatchUpsertStart(
         total_slice_lengths.emplace_back(total);
     }
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
-                                   std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value());
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
+                             std::vector<Replica::Descriptor>>(
+                keys.size(), client_id_, keys, total_slice_lengths, config,
+                tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results(keys.size(),
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchUpsertStart: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        std::vector<uint64_t> group_total_slice_lengths;
+        group_keys.reserve(indices.size());
+        group_total_slice_lengths.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+            group_total_slice_lengths.push_back(total_slice_lengths[idx]);
+        }
+
+        auto group_result = invoke_batch_rpc<
+            &WrappedMasterService::BatchUpsertStart,
+            std::vector<Replica::Descriptor>>(
+            group_keys.size(), client_id_, group_keys,
+            group_total_slice_lengths, config, tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
     const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
     timer.LogRequest("key=", object_meta.key);
+
+    ErrorCode switch_err =
+        SwitchToSubmaster(tenant_id_.value(), object_meta.key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
         client_id_, object_meta, replica_type, tenant_id_.value());
@@ -846,16 +1408,63 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
-        object_metas.size(), client_id_, object_metas, tenant_id_.value());
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
+                object_metas.size(), client_id_, object_metas,
+                tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        object_metas.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    std::vector<std::string> keys;
+    keys.reserve(object_metas.size());
+    for (const auto& meta : object_metas) {
+        keys.push_back(meta.key);
+    }
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchUpsertEnd: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<ObjectMeta> group_object_metas;
+        group_object_metas.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_object_metas.push_back(object_metas[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
+                group_object_metas.size(), client_id_, group_object_metas,
+                tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
     const std::string& key, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
     timer.LogRequest("key=", key);
+
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id_.value(), key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertRevoke, void>(
         client_id_, key, replica_type, tenant_id_.value());
@@ -868,17 +1477,55 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
-    auto result =
-        invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
-            keys.size(), client_id_, keys, tenant_id_.value());
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
+                keys.size(), client_id_, keys, tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchUpsertRevoke: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
+                group_keys.size(), client_id_, group_keys, tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
                                                    bool force) {
     ScopedVLogTimer timer(1, "MasterClient::Remove");
     timer.LogRequest("key=", key, ", force=", force);
+
+    ErrorCode switch_err = SwitchToSubmaster(tenant_id_.value(), key);
+    if (switch_err != ErrorCode::OK) {
+        timer.LogResponse("error_code=", switch_err);
+        return tl::make_unexpected(switch_err);
+    }
 
     auto result = invoke_rpc<&WrappedMasterService::Remove, void>(
         key, force, tenant_id_.value());
@@ -912,10 +1559,42 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
     ScopedVLogTimer timer(1, "MasterClient::BatchRemove");
     timer.LogRequest("keys_count=", keys.size(), ", force=", force);
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchRemove, void>(
-        keys.size(), keys, force, tenant_id_.value());
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result = invoke_batch_rpc<&WrappedMasterService::BatchRemove, void>(
+            keys.size(), keys, force, tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchRemove: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchRemove, void>(
+                group_keys.size(), group_keys, force, tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountSegment(
@@ -927,6 +1606,18 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
 
     auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
         segment, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MountSegmentTo(
+    const std::string& address, const Segment& segment) {
+    ScopedVLogTimer timer(1, "MasterClient::MountSegmentTo");
+    timer.LogRequest("address=", address, ", id=", segment.id,
+                     ", client_id=", client_id_);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::MountSegment, void>(
+        address, segment, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -979,6 +1670,18 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::UnmountSegmentTo(
+    const std::string& address, const UUID& segment_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountSegmentTo");
+    timer.LogRequest("address=", address, ", segment_id=", segment_id,
+                     ", client_id=", client_id_);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::UnmountSegment, void>(
+        address, segment_id, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegment(
     const UUID& segment_id, uint64_t grace_period_ms) {
     ScopedVLogTimer timer(1, "MasterClient::GracefulUnmountSegment");
@@ -988,6 +1691,21 @@ tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::GracefulUnmountSegment, void>(
             segment_id, client_id_, grace_period_ms);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegmentTo(
+    const std::string& address, const UUID& segment_id,
+    uint64_t grace_period_ms) {
+    ScopedVLogTimer timer(1, "MasterClient::GracefulUnmountSegmentTo");
+    timer.LogRequest("address=", address, ", segment_id=", segment_id,
+                     ", client_id=", client_id_,
+                     ", grace_period_ms=", grace_period_ms);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::GracefulUnmountSegment, void>(
+            address, segment_id, client_id_, grace_period_ms);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1047,6 +1765,21 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     return result;
 }
 
+std::string MasterClient::GetCurrentAddress() const {
+    return client_accessor_.GetAddress();
+}
+
+tl::expected<PingResponse, ErrorCode> MasterClient::PingTo(
+    const std::string& address) {
+    ScopedVLogTimer timer(1, "MasterClient::PingTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id_);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::Ping, PingResponse>(
+        address, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -1063,6 +1796,18 @@ tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatusById(
 
     auto result = invoke_rpc<&WrappedMasterService::QuerySegmentStatusById,
                              SegmentStatus>(segment_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<SegmentStatus, ErrorCode>
+MasterClient::QuerySegmentStatusByIdTo(const std::string& address,
+                                       const UUID& segment_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatusByIdTo");
+    timer.LogRequest("address=", address, ", segment_id=", segment_id);
+
+    auto result = invoke_rpc_to<&WrappedMasterService::QuerySegmentStatusById,
+                                SegmentStatus>(address, segment_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1447,11 +2192,45 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     timer.LogRequest("keys_count=", keys.size(), ", tenant_id=", tenant_id,
                      ", replica_type=", replica_type);
 
-    auto result =
-        invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica, void>(
-            keys.size(), client_id_, keys, tenant_id, replica_type);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
+    // Single-master mode (routing not loaded): use the original batch path.
+    if (partition_router_.Size() == 0) {
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica,
+                             void>(keys.size(), client_id_, keys, tenant_id,
+                                   replica_type);
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+    auto groups = GroupKeysBySubmaster(keys, tenant_id);
+    for (auto& [submaster, indices] : groups) {
+        if (submaster.empty()) {
+            LOG(WARNING) << "BatchEvictDiskReplica: " << indices.size()
+                         << " key(s) have no submaster, marked unavailable";
+            continue;
+        }
+        SwitchToSubmasterByAddress(submaster);
+
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+        }
+
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica,
+                             void>(group_keys.size(), client_id_, group_keys,
+                                   tenant_id, replica_type);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 }  // namespace mooncake

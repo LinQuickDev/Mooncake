@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <ylt/coro_io/client_pool.hpp>
@@ -26,9 +27,10 @@ coro_io::io_context_pool& GetRpcClientIoContextPool(uint32_t thread_count) {
 }
 
 /**
- * A replaceable client pool for callers that communicate with one target at a
- * time. Requests retain a shared_ptr to the old pool while they are in flight;
- * after an address switch the old pool is destroyed when those requests end.
+ * A client pool accessor that caches one client pool per target address, so
+ * callers that alternate between several targets (e.g. submaster routing)
+ * reuse existing connections instead of recreating a pool on every switch.
+ * The most recently selected pool is also exposed via GetClientPool().
  */
 class RpcClientPool {
    public:
@@ -38,18 +40,22 @@ class RpcClientPool {
     explicit RpcClientPool(coro_io::io_context_pool& io_context_pool,
                            PoolConfig config = {})
         : io_context_pool_(io_context_pool), config_(std::move(config)) {
-        // Address replacement supersedes background recovery of the old host.
+        // Explicit target selection supersedes background recovery of an old
+        // host; the pool's own connect/retry still applies per request.
         config_.host_alive_detect_duration = std::chrono::seconds(0);
     }
 
     std::shared_ptr<ClientPool> GetOrCreateClientPool(
         std::string_view address) {
         std::lock_guard<std::shared_mutex> lock(mutex_);
-        if (!client_pool_ || address_ != address) {
-            client_pool_ =
-                ClientPool::create(address, config_, io_context_pool_);
-            address_ = address;
+        std::string addr(address);
+        auto it = pools_.find(addr);
+        if (it == pools_.end()) {
+            auto pool = ClientPool::create(addr, config_, io_context_pool_);
+            it = pools_.emplace(addr, std::move(pool)).first;
         }
+        address_ = std::move(addr);
+        client_pool_ = it->second;
         return client_pool_;
     }
 
@@ -58,12 +64,21 @@ class RpcClientPool {
         return client_pool_;
     }
 
+    std::string GetAddress() const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        return address_;
+    }
+
    private:
     mutable std::shared_mutex mutex_;
     coro_io::io_context_pool& io_context_pool_;
     PoolConfig config_;
     std::string address_;
     std::shared_ptr<ClientPool> client_pool_;
+    // Cache of client pools keyed by target address, so switching back and
+    // forth between submaster addresses reuses existing connections instead of
+    // recreating the pool on every switch.
+    std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
 };
 
 }  // namespace mooncake

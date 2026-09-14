@@ -375,6 +375,9 @@ enum class ErrorCode : int32_t {
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
         -1011,  ///< Request cannot be done in current mode.
+    SLOT_NOT_OWNED =
+        -1012,  ///< The key's slot is not owned by this master (KV partition
+                ///< rebalanced); the client should re-route.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

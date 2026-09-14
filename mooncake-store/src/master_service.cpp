@@ -10,6 +10,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <map>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -37,6 +38,8 @@
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
+#include "cvm/etcd_view_store.h"
+#include "cvm/cvm_keys.h"
 #endif
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
@@ -197,6 +200,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     config.ha_backend_type == "etcd"),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
+      master_id_(config.master_id),
+      cvm_http_port_(config.cvm_http_port),
+      cvm_http_host_(config.cvm_http_host),
+      submaster_count_(config.submaster_count),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
@@ -206,6 +213,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
+      vchunk_manager_(config.vchunk_config, config.vchunk_metadata_store),
+      vchunk_enabled_(config.vchunk_config.enabled),
+      vchunk_reaper_interval_ms_(config.vchunk_config.reaper_interval_ms),
+      vchunk_reaper_max_scan_(config.vchunk_config.reaper_max_scan),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
@@ -228,6 +239,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
+    const bool partitioned_vchunk =
+        config.vchunk_config.enabled && config.enable_ha &&
+        config.ha_backend_type == "etcd" && config.submaster_count > 1;
+    if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
+        if (partitioned_vchunk) {
+            vchunk_recovery_pending_ = true;
+        } else {
+            const auto error =
+                vchunk_manager_.Recover(getCurrentTimeInMilli());
+            if (error != ErrorCode::OK) {
+                throw std::runtime_error("failed to recover vchunk metadata");
+            }
+        }
+    }
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -448,6 +473,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
 #endif
     }
 
+    // KV partition (CVM) ownership is now owned by the HA supervisor: the
+    // supervisor creates the CvmController (etcd lease + master registration +
+    // snapshot aggregation + membership loop), then injects the lease id and
+    // drives SlotOwnerHeartbeat around serve start/stop via
+    // SetCvmLeaseId() / StartSlotOwnerHeartbeat() / StopSlotOwnerHeartbeat().
+    // MasterService itself only publishes slot/segment ownership records.
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -528,6 +560,178 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+    if (vchunk_enabled_ && !vchunk_recovery_pending_) {
+        StartVChunkReaper();
+    }
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
+    const TenantId& tenant_id, const std::string& key, uint64_t total_size,
+    bool is_ssd_segment, int64_t now_ms,
+    const std::set<std::string>& excluded_segments) {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.PutStart(allocator_access.getAllocatorManager(),
+                                    tenant_id, key, total_size,
+                                    is_ssd_segment, now_ms,
+                                    excluded_segments);
+}
+
+ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      const std::string& vchunk_id,
+                                      int64_t now_ms) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return ErrorCode::SLOT_NOT_OWNED;
+    }
+    return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+}
+
+ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,
+                                         const std::string& key,
+                                         const std::string& vchunk_id) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return ErrorCode::SLOT_NOT_OWNED;
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.PutRevoke(tenant_id, key, vchunk_id);
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::GetVChunk(
+    const TenantId& tenant_id, const std::string& key) const {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+    return vchunk_manager_.Get(tenant_id, key);
+}
+
+tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
+MasterService::AcquireVChunkRead(const TenantId& tenant_id,
+                                 const std::string& key) const {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+    return vchunk_manager_.AcquireRead(tenant_id, key);
+}
+
+tl::expected<VChunkReadLease, ErrorCode>
+MasterService::AcquireVChunkReadLease(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      int64_t now_ms) {
+    constexpr int64_t kRemoteReadLeaseTtlMs = 5 * 60 * 1000;
+    if (now_ms < 0 ||
+        now_ms > std::numeric_limits<int64_t>::max() -
+                     kRemoteReadLeaseTtlMs) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto handle = AcquireVChunkRead(tenant_id, key);
+    if (!handle) {
+        return tl::make_unexpected(handle.error());
+    }
+    VChunkReadLease lease{handle->record(), UuidToString(generate_uuid())};
+    {
+        std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+        vchunk_read_leases_.emplace(
+            lease.lease_id,
+            VChunkRemoteReadLease{std::move(*handle),
+                                  now_ms + kRemoteReadLeaseTtlMs});
+    }
+    return lease;
+}
+
+ErrorCode MasterService::ReleaseVChunkReadLease(
+    const std::string& lease_id) {
+    if (lease_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+    vchunk_read_leases_.erase(lease_id);
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
+                                      const std::string& key,
+                                      int64_t now_ms) {
+    if (!vchunk_enabled_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
+        return ErrorCode::SLOT_NOT_OWNED;
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.Remove(tenant_id, key, now_ms);
+}
+
+VChunkRuntimeInfo MasterService::GetVChunkRuntimeInfo() const {
+    return {vchunk_enabled_, vchunk_manager_.HasPersistentMetadata()};
+}
+
+tl::expected<size_t, ErrorCode> MasterService::ReapExpiredVChunks(
+    int64_t now_ms, size_t max_scan) {
+    if (!vchunk_enabled_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    {
+        std::lock_guard<std::mutex> guard(vchunk_read_leases_mutex_);
+        std::erase_if(vchunk_read_leases_, [now_ms](const auto& item) {
+            return item.second.expires_at_ms <= now_ms;
+        });
+    }
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    return vchunk_manager_.ReapExpired(
+        now_ms, max_scan, [this](const VChunkMetadataRecord& record) {
+            return OwnsVChunkSlot(
+                cvm::KeySlot(TenantId(record.tenant_id), record.key));
+        });
+}
+
+VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
+    return vchunk_manager_.MetricsSnapshot();
+}
+
+void MasterService::VChunkReaperThreadFunc() {
+    std::unique_lock<std::mutex> lock(vchunk_reaper_mutex_);
+    while (vchunk_reaper_running_) {
+        if (vchunk_reaper_cv_.wait_for(
+                lock, std::chrono::milliseconds(vchunk_reaper_interval_ms_),
+                [this] { return !vchunk_reaper_running_.load(); })) {
+            break;
+        }
+        lock.unlock();
+        const auto result = ReapExpiredVChunks(getCurrentTimeInMilli(),
+                                               vchunk_reaper_max_scan_);
+        if (!result) {
+            LOG(ERROR) << "vchunk reaper failed, error="
+                       << static_cast<int>(result.error());
+        }
+        lock.lock();
+    }
+}
+
+void MasterService::StartVChunkReaper() {
+    bool expected = false;
+    if (!vchunk_reaper_running_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    vchunk_reaper_thread_ =
+        std::thread(&MasterService::VChunkReaperThreadFunc, this);
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -566,10 +770,808 @@ MasterService::CreateSnapshotCatalogStore() {
     throw std::invalid_argument("unknown snapshot catalog store type");
 }
 
+void MasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
+    cvm_lease_id_ = lease_id;
+}
+
+void MasterService::StopSlotOwnerHeartbeat() {
+    if (slot_owner_heartbeat_) {
+        slot_owner_heartbeat_->Stop();
+        slot_owner_heartbeat_.reset();
+    }
+}
+
+#ifdef STORE_USE_ETCD
+ErrorCode MasterService::StartSlotOwnerHeartbeat() {
+    const bool kv_partition_enabled = enable_ha_ &&
+                                      ha_backend_type_ == "etcd" &&
+                                      !master_id_.empty() &&
+                                      !cluster_id_.empty();
+    if (!kv_partition_enabled) {
+        return ErrorCode::OK;
+    }
+
+    // The supervisor's CvmController already connected the etcd client before
+    // this point; ConnectToEtcdStoreClient is idempotent so re-connecting is a
+    // safe no-op for direct constructions / tests.
+    ErrorCode connect_err =
+        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_);
+    if (connect_err != ErrorCode::OK) {
+        LOG(WARNING) << "StartSlotOwnerHeartbeat: failed to connect etcd: "
+                     << connect_err;
+        return connect_err;
+    }
+
+    if (slot_owner_heartbeat_) {
+        return ErrorCode::OK;  // already running
+    }
+
+    const auto initial_slots = ResolveOwnedSlotsForCvm();
+    UpdateOwnedSlots(initial_slots);
+    if (vchunk_recovery_pending_) {
+        const auto error = vchunk_manager_.Recover(
+            getCurrentTimeInMilli(), [this](const VChunkMetadataRecord& record) {
+                return OwnsVChunkSlot(
+                    cvm::KeySlot(TenantId(record.tenant_id), record.key));
+            });
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to recover owned vchunk metadata: "
+                       << static_cast<int>(error);
+            return error;
+        }
+        vchunk_recovery_pending_ = false;
+        StartVChunkReaper();
+    }
+
+    cvm::SlotOwnerHeartbeat::Config hb_config;
+    hb_config.cluster_namespace = cluster_id_;
+    hb_config.master_id = master_id_;
+    // Dynamic partition: recompute the owned slot set from the etcd master
+    // membership on every heartbeat so multiple submaster instances split the
+    // 16384 slots without overwriting each other.
+    hb_config.dynamic_slot_resolver = [this]() {
+        auto slots = ResolveOwnedSlotsForCvm();
+        UpdateOwnedSlots(slots);
+        return slots;
+    };
+    hb_config.lease_id = cvm_lease_id_;
+    // live primary → live primary 元数据交接（P4 技术债 1）：slot 平移时在
+    // 释放端导出对象元数据、在获得端导入，避免只依赖 standby 回放晋升路径。
+    hb_config.on_slot_acquired = [this](uint16_t slot) {
+        (void)ImportSlotMetadata(slot);
+    };
+    hb_config.on_slot_released = [this](uint16_t slot) {
+        (void)ExportSlotMetadata(slot);
+    };
+    const bool lease_bound = hb_config.lease_id != 0;
+    slot_owner_heartbeat_ =
+        std::make_unique<cvm::SlotOwnerHeartbeat>(std::move(hb_config));
+    ErrorCode hb_err = slot_owner_heartbeat_->Start();
+    if (hb_err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to start SlotOwnerHeartbeat: " << hb_err;
+        slot_owner_heartbeat_.reset();
+        return hb_err;
+    }
+    LOG(INFO) << "Started SlotOwnerHeartbeat: master_id=" << master_id_
+              << ", cluster_namespace=" << cluster_id_
+              << ", dynamic_partition=true"
+              << ", lease_bound=" << lease_bound;
+    return ErrorCode::OK;
+}
+
+#ifdef STORE_USE_ETCD
+ErrorCode MasterService::StartInterMasterRpc() {
+    const bool cvm_enabled = enable_ha_ && ha_backend_type_ == "etcd" &&
+                             !master_id_.empty() && !cluster_id_.empty();
+    if (!cvm_enabled) {
+        return ErrorCode::OK;
+    }
+
+    // The supervisor's CvmController already connected the etcd client;
+    // re-connecting is an idempotent no-op.
+    ErrorCode connect_err =
+        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_);
+    if (connect_err != ErrorCode::OK) {
+        LOG(WARNING) << "StartInterMasterRpc: failed to connect etcd: "
+                     << connect_err;
+        return connect_err;
+    }
+
+    if (inter_master_rpc_) {
+        return ErrorCode::OK;  // already running
+    }
+
+    inter_master_rpc_ = std::make_unique<cvm::InterMasterRpcClient>();
+    ErrorCode rc = inter_master_rpc_->Start(cluster_id_, master_id_);
+    if (rc != ErrorCode::OK) {
+        LOG(WARNING) << "StartInterMasterRpc: refresh loop not started: "
+                     << rc << " (manual member updates still work)";
+        // Keep the client object for manual member updates; only the
+        // etcd-driven refresh thread is unavailable.
+    }
+    LOG(INFO) << "Started InterMasterRpcClient: master_id=" << master_id_
+              << ", cluster_namespace=" << cluster_id_;
+    return ErrorCode::OK;
+}
+
+void MasterService::StopInterMasterRpc() {
+    if (inter_master_rpc_) {
+        inter_master_rpc_->Stop();
+        inter_master_rpc_.reset();
+    }
+}
+#else
+ErrorCode MasterService::StartInterMasterRpc() { return ErrorCode::OK; }
+void MasterService::StopInterMasterRpc() {}
+#endif
+
+uint32_t MasterService::GetOwnedSlotCount() const {
+    std::shared_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    if (!owned_slots_ready_) {
+        return 0;
+    }
+    return static_cast<uint32_t>(
+        std::count(owned_slot_lookup_.begin(), owned_slot_lookup_.end(), true));
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::InterMasterAllocateReplicas(
+    const std::string& tenant_id, const std::string& key,
+    uint64_t slice_length, uint64_t replica_num,
+    const std::vector<std::string>& preferred_segments) {
+    if (key.empty() || slice_length == 0 || replica_num == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ScopedAllocatorAccess allocator_access =
+        segment_manager_.getAllocatorAccess();
+    const auto& allocator_manager = allocator_access.getAllocatorManager();
+    const auto& local_names = allocator_manager.getNames();
+    if (local_names.empty()) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    // Strict mode: when preferred segments are given, only allocate in them.
+    // Exclude every other local segment so the strategy's random fallback
+    // cannot leak the allocation into unrelated segments.
+    std::set<std::string> excluded;
+    if (!preferred_segments.empty()) {
+        const std::unordered_set<std::string> preferred(
+            preferred_segments.begin(), preferred_segments.end());
+        bool any_preferred_local = false;
+        for (const auto& name : local_names) {
+            if (preferred.count(name) > 0) {
+                any_preferred_local = true;
+            } else {
+                excluded.insert(name);
+            }
+        }
+        if (!any_preferred_local) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    }
+
+    auto allocation = allocation_strategy_->Allocate(
+        allocator_manager, slice_length, replica_num, preferred_segments,
+        excluded, ReplicaType::MEMORY);
+    if (!allocation.has_value()) {
+        return tl::make_unexpected(allocation.error());
+    }
+    // Partial allocation is not forwarded: the slot owner requires the full
+    // replica count. Dropped here => destructors free the partial handles.
+    if (allocation->size() != replica_num) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    std::vector<Replica::Descriptor> descriptors;
+    descriptors.reserve(allocation->size());
+    for (const auto& replica : allocation.value()) {
+        descriptors.push_back(replica.get_descriptor());
+    }
+    const std::string scoped_key = TenantId(tenant_id).MakeScopedKey(key);
+    {
+        std::lock_guard<std::mutex> lock(inter_master_keepalive_mutex_);
+        // Replace any stale keepalive entry for the same key: erasing frees
+        // the old handles (idempotent re-PutStart after an aborted write).
+        inter_master_keepalive_.erase(scoped_key);
+        inter_master_keepalive_.emplace(scoped_key,
+                                        std::move(allocation.value()));
+    }
+    LOG(INFO) << "InterMasterAllocateReplicas: allocated "
+             << descriptors.size() << " replica(s) for scoped_key="
+             << scoped_key << ", slice_length=" << slice_length
+             << ", preferred_segments=" << preferred_segments.size();
+    return descriptors;
+}
+
+tl::expected<bool, ErrorCode> MasterService::InterMasterFreeReplicas(
+    const std::string& tenant_id, const std::string& key) {
+    const std::string scoped_key = TenantId(tenant_id).MakeScopedKey(key);
+    std::vector<Replica> released;
+    {
+        std::lock_guard<std::mutex> lock(inter_master_keepalive_mutex_);
+        auto it = inter_master_keepalive_.find(scoped_key);
+        if (it == inter_master_keepalive_.end()) {
+            return false;  // not the owner of this key's handles
+        }
+        released = std::move(it->second);
+        inter_master_keepalive_.erase(it);
+    }
+    // Replica destructors free the handles at this (segment owning) master.
+    LOG(INFO) << "InterMasterFreeReplicas: freed " << released.size()
+              << " replica(s) for scoped_key=" << scoped_key;
+    return true;
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterService::InterMasterGetReplicaList(const std::string& key,
+                                         const std::string& tenant_id) {
+    const TenantId tenant(tenant_id);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant);
+    // peer 互信：不校验 OwnsSlot、不再次转发，直接本地查询（转发链止于
+    // 第一跳，避免视图不一致时的循环转发）。
+    return GetReplicaListLocal(object_id);
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::InterMasterBatchGetReplicaList(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    const TenantId tenant(tenant_id);
+    return BatchGetReplicaListLocal(keys, tenant);
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::InterMasterPutStart(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    const TenantId tenant(tenant_id);
+    // peer 互信：调用方已按 slot 归属解析本机为 owner，直接执行完整本地
+    // PutStart（分配 + 写元数据 + keepalive）。本机 OwnsSlot==true，不会再
+    // 二次转发（转发链止于第一跳，避免视图不一致时的循环转发）。
+    return PutStart(client_id, key, tenant, slice_length, config);
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::InterMasterUpsertStart(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    const TenantId tenant(tenant_id);
+    // Upsert 转发：本机为 slot owner，执行完整本地 UpsertStart 以保留
+    // "已存在则覆盖（preemption）"语义；由 PutStart 转发走 PutStart 会丢失
+    // 该覆盖语义。peer 互信，不二次转发。
+    return UpsertStart(client_id, key, tenant, slice_length, config);
+}
+
+tl::expected<std::vector<Replica>, ErrorCode>
+MasterService::TryAllocateReplicasRemotely(
+    const std::string& key, const TenantId& tenant_id, uint64_t value_length,
+    size_t replica_num, const std::vector<std::string>& preferred_segments) {
+#ifdef STORE_USE_ETCD
+    if (!inter_master_rpc_ || replica_num == 0) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    const std::string tenant_str = tenant_id.value();
+    for (const auto& member : inter_master_rpc_->GetMembers()) {
+        if (member.master_id.empty() || member.master_id == master_id_) {
+            continue;
+        }
+        auto remote = inter_master_rpc_->AllocateReplicas(
+            member.master_id, tenant_str, key, value_length,
+            static_cast<uint64_t>(replica_num), preferred_segments);
+        if (!remote.has_value()) {
+            VLOG(1) << "Remote allocation on " << member.master_id
+                    << " failed for key=" << key << ": "
+                    << toString(remote.error());
+            continue;
+        }
+        if (remote->size() < replica_num) {
+            // Partial result: free it at the peer and keep probing.
+            inter_master_rpc_->FreeReplicas(member.master_id, tenant_str, key);
+            continue;
+        }
+
+        // Materialize dummy-allocator replicas from the descriptors (same
+        // pattern as ImportSlotMetadata). The real handles stay alive at the
+        // segment owner's keepalive registry.
+        std::vector<Replica> replicas;
+        replicas.reserve(remote->size());
+        for (const auto& desc : remote.value()) {
+            if (!desc.is_memory_replica()) {
+                continue;
+            }
+            const auto& mem_desc = desc.get_memory_descriptor();
+            const std::string& endpoint =
+                mem_desc.buffer_descriptor.transport_endpoint_;
+            std::shared_ptr<DummyBufferAllocator> alloc;
+            {
+                std::lock_guard<std::mutex> lock(
+                    remote_replica_allocator_keepalive_mutex_);
+                auto& slot = remote_replica_allocator_keepalive_[endpoint];
+                if (!slot) {
+                    slot = std::make_shared<DummyBufferAllocator>(endpoint,
+                                                                   endpoint);
+                }
+                alloc = slot;
+            }
+            replicas.emplace_back(
+                std::make_unique<AllocatedBuffer>(
+                    alloc, mem_desc.buffer_descriptor),
+                desc.status);
+        }
+        if (replicas.size() != replica_num) {
+            // Unexpected descriptor types: undo at the peer and fail.
+            inter_master_rpc_->FreeReplicas(member.master_id, tenant_str, key);
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(remote_allocated_keys_mutex_);
+            remote_allocated_keys_.insert(tenant_id.MakeScopedKey(key));
+        }
+        LOG(INFO) << "Allocated " << replicas.size()
+                  << " remote replica(s) for key=" << key
+                  << " on segment owner " << member.master_id;
+        return replicas;
+    }
+    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+#else
+    (void)key;
+    (void)tenant_id;
+    (void)value_length;
+    (void)replica_num;
+    (void)preferred_segments;
+    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+#endif
+}
+
+void MasterService::EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
+                                               const std::string& key,
+                                               QuotaEraseMode quota_mode) {
+#ifdef STORE_USE_ETCD
+    {
+        std::lock_guard<std::mutex> lock(remote_allocated_keys_mutex_);
+        if (remote_allocated_keys_.erase(tenant_id.MakeScopedKey(key)) == 0) {
+            return;  // handles (if any) are local
+        }
+    }
+    if (quota_mode == QuotaEraseMode::kHandoff) {
+        // Slot migration: the data bytes live on. The importing master
+        // re-registers the key and owns the remote free from now on.
+        return;
+    }
+    if (inter_master_rpc_) {
+        inter_master_rpc_->EnqueueBroadcastFree(tenant_id.value(), key);
+    }
+#endif
+}
+
+ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
+    // 1. Collect this slot's object metadata across all shards.
+    SlotMetadataExport export_payload;
+    export_payload.slot = slot;
+    export_payload.source_master_id = master_id_;
+
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            for (const auto& [user_key, metadata] : tenant_state.metadata) {
+                if (cvm::KeySlot(tenant_id, user_key) != slot) {
+                    continue;
+                }
+                StandbyObjectEntry entry;
+                entry.tenant_id = tenant_id.value();
+                entry.key = user_key;
+                entry.metadata.client_id = metadata.client_id;
+                entry.metadata.size = metadata.size;
+                entry.metadata.group_id = metadata.group_id;
+                entry.metadata.data_type = metadata.data_type;
+                const auto& replicas = metadata.GetAllReplicas();
+                entry.metadata.replicas.reserve(replicas.size());
+                for (const auto& replica : replicas) {
+                    entry.metadata.replicas.push_back(replica.get_descriptor());
+                }
+                export_payload.objects.push_back(std::move(entry));
+            }
+        }
+    }
+
+    // 2. Serialize (struct_pack) and persist as a binary etcd value.
+    auto bytes = struct_pack::serialize(export_payload);
+    std::string value(bytes.begin(), bytes.end());
+    const std::string key = cvm::SlotMetadataExportKey(cluster_id_, slot);
+    ErrorCode err =
+        EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "ExportSlotMetadata: put failed slot=" << slot
+                     << ", objects=" << export_payload.objects.size()
+                     << ", err=" << err;
+        return err;
+    }
+
+    // 3. Drop the exported objects from local metadata (release cleanup).
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_state = tenant_it->second;
+            for (auto it = tenant_state.metadata.begin();
+                 it != tenant_state.metadata.end();) {
+                if (cvm::KeySlot(tenant_it->first, it->first) == slot) {
+                    it = EraseMetadata(tenant_state, it, tenant_it->first,
+                                       QuotaEraseMode::kHandoff);
+                } else {
+                    ++it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
+
+    LOG(INFO) << "Exported slot metadata: slot=" << slot
+              << ", objects=" << export_payload.objects.size()
+              << ", bytes=" << value.size() << ", source=" << master_id_;
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
+    const std::string key = cvm::SlotMetadataExportKey(cluster_id_, slot);
+    std::string value;
+    EtcdRevisionId revision = 0;
+    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, revision);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        // No graceful export available (e.g. the previous owner died and the
+        // slot was reclaimed via standby replay). Nothing to pull.
+        return ErrorCode::OK;
+    }
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "ImportSlotMetadata: get failed slot=" << slot
+                     << ", err=" << err;
+        return err;
+    }
+
+    SlotMetadataExport export_payload;
+    if (struct_pack::deserialize_to(export_payload, value) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "ImportSlotMetadata: deserialize failed slot=" << slot
+                   << ", bytes=" << value.size();
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+
+    const auto resolve = [](const StandbyObjectEntry& entry) {
+        auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
+        TenantId tenant_id(entry.tenant_id);
+        if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
+            tenant_id = std::move(scoped_tenant_id);
+        }
+        return std::make_pair(std::move(tenant_id), std::move(user_key));
+    };
+
+    std::unordered_map<size_t, std::vector<const StandbyObjectEntry*>>
+        objects_by_shard;
+    for (const auto& entry : export_payload.objects) {
+        auto [tenant_id, user_key] = resolve(entry);
+        if (!tenant_id.IsValid()) {
+            LOG(WARNING) << "ImportSlotMetadata: invalid tenant for slot="
+                         << slot << ", key=" << entry.key;
+            continue;
+        }
+        const auto shard_idx = entry.metadata.group_id.empty()
+                                   ? getShardIndex(tenant_id, user_key)
+                                   : getShardIndex(entry.metadata.group_id);
+        objects_by_shard[shard_idx].push_back(&entry);
+    }
+
+    size_t imported = 0;
+    for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        auto now = std::chrono::system_clock::now();
+        for (const auto* entry_ptr : shard_objects) {
+            const auto& entry = *entry_ptr;
+            auto [tenant_id, user_key] = resolve(entry);
+            const auto& standby_meta = entry.metadata;
+            std::vector<Replica> replicas;
+            replicas.reserve(standby_meta.replicas.size());
+            for (const auto& desc : standby_meta.replicas) {
+                if (desc.is_memory_replica()) {
+                    const auto& mem_desc = desc.get_memory_descriptor();
+                    const std::string& endpoint =
+                        mem_desc.buffer_descriptor.transport_endpoint_;
+                    auto& alloc = standby_allocator_keepalive_[endpoint];
+                    if (!alloc) {
+                        alloc = std::make_shared<DummyBufferAllocator>(
+                            endpoint, endpoint);
+                    }
+                    replicas.emplace_back(
+                        std::make_unique<AllocatedBuffer>(
+                            alloc, mem_desc.buffer_descriptor),
+                        desc.status);
+                } else if (desc.is_nof_replica()) {
+                    const auto& nof_desc = desc.get_nof_descriptor();
+                    const std::string& endpoint =
+                        nof_desc.buffer_descriptor.transport_endpoint_;
+                    auto& alloc = standby_allocator_keepalive_[endpoint];
+                    if (!alloc) {
+                        alloc = std::make_shared<DummyBufferAllocator>(
+                            endpoint, endpoint);
+                    }
+                    replicas.emplace_back(
+                        std::make_unique<AllocatedBuffer>(
+                            alloc, nof_desc.buffer_descriptor),
+                        desc.status, ReplicaType::NOF_SSD);
+                } else if (desc.is_disk_replica()) {
+                    const auto& disk_desc = desc.get_disk_descriptor();
+                    replicas.emplace_back(disk_desc.file_path,
+                                          disk_desc.object_size, desc.status);
+                } else if (desc.is_local_disk_replica()) {
+                    const auto& local_disk_desc =
+                        desc.get_local_disk_descriptor();
+                    replicas.emplace_back(local_disk_desc.client_id,
+                                          local_disk_desc.object_size,
+                                          local_disk_desc.transport_endpoint,
+                                          desc.status);
+                }
+            }
+
+            auto& tenant_state = shard->tenants[tenant_id];
+            auto [metadata_it, inserted] = tenant_state.metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(user_key),
+                std::forward_as_tuple(
+                    standby_meta.client_id, now, standby_meta.size,
+                    std::move(replicas), false, false, standby_meta.data_type,
+                    standby_meta.group_id, tenant_id, user_key));
+            if (!inserted) {
+                // 新获得 slot 时理论上不应碰撞；若碰撞则跳过以避免重复记账。
+                LOG(WARNING) << "ImportSlotMetadata: duplicate key slot=" << slot
+                             << ", key=" << entry.key << ", skipped";
+                continue;
+            }
+            auto& metadata = metadata_it->second;
+            if (!standby_meta.group_id.empty()) {
+                RegisterGroupMember(tenant_state, tenant_id, user_key,
+                                    standby_meta.group_id);
+            }
+            tenant_state.processing_keys.erase(user_key);
+
+            // A2：补回交接对象的账务（object count、cache 计数、quota），与
+            // Export 侧 kHandoff 的释放对称，避免新 primary 账务缺失。
+            IncrementTenantMetadataObjectCount(tenant_id);
+            SyncCacheTotalAccounting(metadata);
+            const uint64_t committed_charge =
+                CompletedMemoryQuotaCharge(metadata);
+            metadata.reserved_quota_charge_bytes = 0;
+            metadata.pending_replaced_quota_charge_bytes = 0;
+            metadata.committed_quota_charge_bytes = 0;
+            if (committed_charge > 0) {
+                auto reserve_result =
+                    ReserveTenantQuota(tenant_id, committed_charge);
+                if (reserve_result) {
+                    CommitTenantQuota(tenant_id, committed_charge);
+                    metadata.committed_quota_charge_bytes = committed_charge;
+                } else {
+                    LOG(WARNING)
+                        << "ImportSlotMetadata: quota reserve failed tenant="
+                        << tenant_id.value() << ", bytes=" << committed_charge
+                        << ", err=" << reserve_result.error();
+                }
+            }
+            ++imported;
+        }
+    }
+
+    LOG(INFO) << "Imported slot metadata: slot=" << slot
+              << ", objects=" << imported
+              << ", source=" << export_payload.source_master_id;
+
+    // 技术债 3.3：一次性交接完成后删除 slot_meta 键，避免二进制导出残留。
+    // 删除失败仅告警不阻断——残留键会在下次 acquire 时被幂等重导。
+    const std::string end = cvm::PrefixEnd(key);
+    ErrorCode del_err =
+        EtcdHelper::DeleteRange(key.data(), key.size(), end.data(), end.size());
+    if (del_err != ErrorCode::OK) {
+        LOG(WARNING) << "ImportSlotMetadata: delete slot_meta failed slot="
+                     << slot << ", err=" << del_err;
+    }
+    return ErrorCode::OK;
+}
+#else
+ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
+
+ErrorCode MasterService::ExportSlotMetadata(uint16_t /*slot*/) {
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::ImportSlotMetadata(uint16_t /*slot*/) {
+    return ErrorCode::OK;
+}
+#endif
+
+#ifdef STORE_USE_ETCD
+void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
+    if (!enable_ha_ || ha_backend_type_ != "etcd" || master_id_.empty() ||
+        cluster_id_.empty()) {
+        return;
+    }
+    cvm::SegmentOwner owner;
+    owner.segment_id = UuidToString(segment.id);
+    owner.owner_master_id = master_id_;
+    owner.state = static_cast<int32_t>(cvm::SegmentOwnerState::kStable);
+
+    // Bind to the supervisor-owned CvmController's lease so segment ownership
+    // is auto-removed when this master dies; fall back to a persistent record
+    // when no lease has been injected yet.
+    ErrorCode err;
+    if (cvm_lease_id_ != 0) {
+        err = cvm::EtcdViewStore::SaveSegmentOwnerWithLease(
+            cluster_id_, owner, cvm_lease_id_);
+    } else {
+        err = cvm::EtcdViewStore::SaveSegmentOwner(cluster_id_, owner);
+    }
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "PublishSegmentOwnerForCvm SaveSegmentOwner failed: "
+                        "segment="
+                     << owner.segment_id << " err=" << err;
+    }
+}
+
+void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
+    if (!enable_ha_ || ha_backend_type_ != "etcd" || master_id_.empty() ||
+        cluster_id_.empty()) {
+        return;
+    }
+    const std::string id = UuidToString(segment_id);
+    ErrorCode err = cvm::EtcdViewStore::DeleteSegmentOwner(cluster_id_, id);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "RemoveSegmentOwnerForCvm DeleteSegmentOwner failed: "
+                        "segment="
+                     << id << " err=" << err;
+    }
+}
+
+std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
+    // etcd 读取失败：sticky 策略——沿用上一轮成功解析的结果（可能为空）。
+    // 绝不回退为全量接管：瞬时抖动引发的全量认领会与对端产生覆盖战
+    // （双方反复重写对方 slot 记录，导致 slot 分布持续震荡不收敛）。
+    std::vector<cvm::MasterRegistration> masters;
+    ViewVersionId version;
+    ErrorCode err =
+        cvm::EtcdViewStore::LoadAllMasters(cluster_id_, masters, version);
+    if (err != ErrorCode::OK) {
+        std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+        LOG(WARNING) << "ResolveOwnedSlotsForCvm: LoadAllMasters failed: " << err
+                     << ", keeping previous owned set (sticky), count="
+                     << cvm_last_resolved_owned_slots_.size();
+        return cvm_last_resolved_owned_slots_;
+    }
+
+    std::vector<std::string> ids;
+    ids.reserve(masters.size());
+    for (const auto& m : masters) {
+        // Only serving primaries own slots. Standbys do not publish slot
+        // ownership, so including them would strand part of the slot space.
+        if (static_cast<cvm::MasterRole>(m.role) != cvm::MasterRole::kPrimary) {
+            continue;
+        }
+        if (!m.master_id.empty()) {
+            ids.push_back(m.master_id);
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    // etcd 注册表是唯一事实源：本机必须已注册为 primary 才参与分配。
+    // 不再无条件注入本机 master_id——否则任一节点视图缺失对端时都会以
+    // n==1 身份全量接管，是 slot 覆盖战的直接根源。
+    const bool self_registered =
+        std::binary_search(ids.begin(), ids.end(), master_id_);
+    std::vector<uint16_t> slots;
+    if (self_registered) {
+        // 技术债 3.1：一致性哈希环分配已提取到 cvm::ResolveOwnedSlotsOnRing
+        // 纯函数（可单元测试），本机 owned slots 由 (ids, master_id_) 决定。
+        slots = cvm::ResolveOwnedSlotsOnRing(ids, master_id_);
+    } else {
+        LOG(WARNING) << "ResolveOwnedSlotsForCvm: self not registered as "
+                        "primary in etcd (masters="
+                     << ids.size() << "), owning no slots this cycle";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+        cvm_last_resolved_owned_slots_ = slots;
+    }
+    return slots;
+}
+
+std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
+    uint16_t slot) const {
+    std::vector<cvm::MasterRegistration> masters;
+    ViewVersionId version;
+    ErrorCode err =
+        cvm::EtcdViewStore::LoadAllMasters(cluster_id_, masters, version);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "ResolveSlotOwnerMasterId: LoadAllMasters failed: "
+                     << err << ", slot=" << slot;
+        return std::nullopt;
+    }
+
+    std::vector<std::string> ids;
+    ids.reserve(masters.size());
+    for (const auto& m : masters) {
+        if (static_cast<cvm::MasterRole>(m.role) != cvm::MasterRole::kPrimary) {
+            continue;
+        }
+        if (!m.master_id.empty()) {
+            ids.push_back(m.master_id);
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    // 与 ResolveOwnedSlotsForCvm 保持一致：纯粹以 etcd 注册表计算环，
+    // 不注入本机 master_id，保证所有权判定与认领发布使用同一个环。
+    // 解析结果为空（注册表无 primary）时由调用方跳过转发。
+    return cvm::ResolveSlotOwnerOnRing(ids, slot);
+}
+#else
+void MasterService::PublishSegmentOwnerForCvm(const Segment&) {}
+void MasterService::RemoveSegmentOwnerForCvm(const UUID&) {}
+std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() { return {}; }
+std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
+    uint16_t /*slot*/) const {
+    return std::nullopt;
+}
+#endif
+
+void MasterService::UpdateOwnedSlots(const std::vector<uint16_t>& slots) {
+    std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    owned_slot_lookup_.assign(cvm::kSlotCount, false);
+    for (uint16_t slot : slots) {
+        if (slot < cvm::kSlotCount) {
+            owned_slot_lookup_[slot] = true;
+        }
+    }
+    owned_slots_ready_ = true;
+    // 一致性哈希环分配结果（3.1）：仅在数量变化（含首次解析）时打印，
+    // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
+    if (!owned_slot_count_logged_ || slots.size() != last_logged_owned_count_) {
+        LOG(INFO) << "Owned slots updated (consistent-hash ring): count="
+                  << slots.size() << "/" << cvm::kSlotCount
+                  << (owned_slot_count_logged_ ? " (changed)" : "");
+        owned_slot_count_logged_ = true;
+        last_logged_owned_count_ = slots.size();
+    }
+    VLOG(1) << "UpdateOwnedSlots: " << slots.size() << " slots";
+}
+
+bool MasterService::OwnsSlot(uint16_t slot) const {
+    std::shared_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    if (!owned_slots_ready_) {
+        return true;  // partition 未启用或尚未解析过，放行
+    }
+    return slot < owned_slot_lookup_.size() && owned_slot_lookup_[slot];
+}
+
+bool MasterService::OwnsVChunkSlot(uint16_t slot) const {
+    std::shared_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    if (!owned_slots_ready_) {
+        const bool partitioned = enable_ha_ && ha_backend_type_ == "etcd" &&
+                                 submaster_count_ > 1;
+        return !partitioned;
+    }
+    return slot < owned_slot_lookup_.size() && owned_slot_lookup_[slot];
+}
+
 MasterService::~MasterService() {
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
+
+    // Stop the SlotOwnerHeartbeat thread before tearing down the rest.
+    StopSlotOwnerHeartbeat();
+    StopInterMasterRpc();
 
     // Stop and join the threads
     eviction_running_ = false;
@@ -583,6 +1585,7 @@ MasterService::~MasterService() {
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
+    vchunk_reaper_running_ = false;
     graceful_unmount_scheduler_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -591,6 +1594,7 @@ MasterService::~MasterService() {
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
+    vchunk_reaper_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -611,6 +1615,9 @@ MasterService::~MasterService() {
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
+    }
+    if (vchunk_reaper_thread_.joinable()) {
+        vchunk_reaper_thread_.join();
     }
 
     // Reset snapshot manager after all other threads have joined
@@ -833,7 +1840,27 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    // 幂等重挂载（segment 已存在）同样要把 client 标记为 OK：Ping 仅凭
+    // ok_client_ 判定 client_status，若此处不标记，HeartbeatAllSubmasters
+    // 收到 NEED_REMOUNT 后用普通 mount 重挂永远无法消除该状态，形成
+    // 每秒一次的 remount 死循环（并持续写 OpLog/segment_view）。
+    // 注意：必须在 segment 访问释放之后再加 client_mutex_，避免与
+    // ClientMonitorFunc 的 client_mutex_ -> segment access 加锁顺序倒挂。
+    if (mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        if (ok_client_.find(client_id) == ok_client_.end()) {
+            ok_client_.insert(client_id);
+            MasterMetricManager::instance().inc_active_clients();
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=mount_segment_idempotent_ok"
+                      << ", segment_name=" << segment.name;
+        }
+    }
+
+    // 幂等重挂载不产生新的元数据变更，segment 首次挂载时已记录
+    // SEGMENT_MOUNT OpLog，重复追加只会让 OpLog 无谓增长。
+    if (enable_oplog_ && ordered_oplog_writer_ &&
+        mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
         SegmentMountOp op;
         op.segment_name = segment.name;
         op.transport_endpoint = segment.te_endpoint;
@@ -849,6 +1876,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     if (mount_result == ErrorCode::OK) {
         RecomputeTenantEffectiveQuotas();
     }
+    PublishSegmentOwnerForCvm(segment);
     return {};
 }
 
@@ -1225,6 +2253,10 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
     }
     RecomputeTenantEffectiveQuotas();
+
+    for (const auto& seg : segments) {
+        PublishSegmentOwnerForCvm(seg);
+    }
 
     return {};
 }
@@ -2054,10 +3086,15 @@ MasterService::EraseMetadata(
     tenant_state.replication_tasks.erase(key);
     ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
 
-    ReleaseLocalDiskUsage(metadata.GetAllReplicas());
+    // kHandoff 跳过 ReleaseLocalDiskUsage：数据字节仍留在共享 segment，
+    // 不应在此扣减 ssd_used_bytes（否则造成账务偏差）。
+    if (quota_mode != QuotaEraseMode::kHandoff) {
+        ReleaseLocalDiskUsage(metadata.GetAllReplicas());
+    }
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
+        case QuotaEraseMode::kHandoff:
             AbortTenantQuota(tenant_id, metadata.reserved_quota_charge_bytes);
             ReleaseTenantQuota(tenant_id,
                                metadata.committed_quota_charge_bytes);
@@ -2071,6 +3108,10 @@ MasterService::EraseMetadata(
             AbortTenantQuota(tenant_id, metadata.reserved_quota_charge_bytes);
             break;
     }
+    // CVM 多 submaster：若该对象的句柄由 peer 分配（远程分配/迁移入），
+    // 广播释放到所有 peer 的 keepalive 注册表；kHandoff（slot 迁移）跳过，
+    // 保留数据字节并让导入方接管远程释放责任。
+    EnqueueRemoteFreeIfTracked(tenant_id, key, quota_mode);
     auto next = tenant_state.metadata.erase(it);
     DecrementTenantMetadataObjectCount(tenant_id);
     if (had_completed_disk && shard) {
@@ -2335,6 +3376,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
                                        std::string(bytes.begin(), bytes.end()));
     }
     RecomputeTenantEffectiveQuotas();
+    RemoveSegmentOwnerForCvm(segment_id);
     return {};
 }
 
@@ -2680,6 +3722,31 @@ void MasterService::RestoreFromStandbySnapshot(
 
     std::unordered_map<size_t, std::vector<const StandbyObjectEntry*>>
         objects_by_shard;
+
+    // P4：晋升时只物化「本机负责 slot」的对象元数据（数据字节留在 segment）。
+    // 仅在 etcd HA 动态分区下过滤；非 HA / 单机 / 测试路径 lookup 为空，退化
+    // 为恢复全部。ResolveOwnedSlotsForCvm 失败时 sticky 沿用上一轮结果
+    // （standby 晋升前为空 → 全量恢复），同样等价于不过滤。
+    std::vector<bool> owned_slot_lookup;
+    {
+        const bool kv_partition_enabled =
+            enable_ha_ && ha_backend_type_ == "etcd" &&
+            !master_id_.empty() && !cluster_id_.empty();
+        if (kv_partition_enabled) {
+            const std::vector<uint16_t> owned_slots =
+                ResolveOwnedSlotsForCvm();
+            if (!owned_slots.empty()) {
+                owned_slot_lookup.assign(cvm::kSlotCount, false);
+                for (uint16_t slot : owned_slots) {
+                    owned_slot_lookup[slot] = true;
+                }
+                // 同步到读路径 owned-slot 位图（A1），让新 primary 立即按
+                // 最新分区拒绝非本机 slot 的读请求。
+                UpdateOwnedSlots(owned_slots);
+            }
+        }
+    }
+
     for (const auto& entry : objects) {
         auto [tenant_id, user_key] = resolve_standby_object(entry);
         if (!tenant_id.IsValid()) {
@@ -2687,6 +3754,13 @@ void MasterService::RestoreFromStandbySnapshot(
                          << entry.tenant_id << ", key=" << entry.key
                          << ", skipping";
             continue;
+        }
+        // slot 过滤：只物化本机负责 slot 的元数据（P4 元数据迁移）。
+        if (!owned_slot_lookup.empty()) {
+            const uint16_t slot = cvm::KeySlot(tenant_id, user_key);
+            if (!owned_slot_lookup[slot]) {
+                continue;
+            }
         }
         const auto shard_idx = entry.metadata.group_id.empty()
                                    ? getShardIndex(tenant_id, user_key)
@@ -3193,8 +4267,43 @@ auto MasterService::GetOffloadEndpoints()
 auto MasterService::GetReplicaList(const std::string& key,
                                    const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+
+    // A1：读路径 slot 所有权校验。分区重均衡后本机不再负责该 slot 时，先
+    // 尝试向 slot owner 转发（方案 B 第二阶段）；转发失败再回退到
+    // SLOT_NOT_OWNED 让客户端根据最新 slot→master 视图重新路由。
+    const uint16_t slot = cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+    if (!OwnsSlot(slot)) {
+#ifdef STORE_USE_ETCD
+        auto owner = ResolveSlotOwnerMasterId(slot);
+        if (owner && !owner->empty() && *owner != master_id_ &&
+            inter_master_rpc_) {
+            auto result = inter_master_rpc_->GetReplicaList(
+                *owner, key, object_id.tenant_id.value());
+            if (result.has_value()) {
+                LOG(INFO) << "GetReplicaList forwarded: key=" << key
+                          << " slot=" << slot << " -> owner=" << *owner;
+                return result;
+            }
+            VLOG(1) << "GetReplicaList forward failed: key=" << key
+                    << " owner=" << *owner
+                    << " error=" << toString(result.error());
+        }
+#endif
+        LOG(WARNING) << "GetReplicaList: key=" << key << " slot=" << slot
+                     << " not owned by this master and forwarding failed, "
+                        "rejecting with SLOT_NOT_OWNED (client should "
+                        "re-route)";
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+
+    return GetReplicaListLocal(object_id);
+}
+
+auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const std::string& key = object_id.user_key;
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
@@ -3328,6 +4437,79 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     }
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+
+    // A1 + 方案 B 第二阶段：先按 slot 所有权把 keys 拆成「本地组」与
+    // 「转发组（按 owner master_id 分组）」。本地组走本地批量查询，转发组
+    // 通过 InterMasterRpcClient 转发给对应 slot owner。
+    std::vector<size_t> local_indices;
+    std::map<std::string, std::vector<size_t>> forward_groups;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const uint16_t slot = cvm::KeySlot(normalized_tenant, keys[i]);
+        if (OwnsSlot(slot)) {
+            local_indices.push_back(i);
+            continue;
+        }
+#ifdef STORE_USE_ETCD
+        auto owner = ResolveSlotOwnerMasterId(slot);
+        if (owner && !owner->empty() && *owner != master_id_ &&
+            inter_master_rpc_) {
+            forward_groups[*owner].push_back(i);
+            continue;
+        }
+#endif
+        LOG(WARNING) << "BatchGetReplicaList: key=" << keys[i]
+                     << " slot=" << slot
+                     << " not owned by this master and no forward target, "
+                        "rejecting with SLOT_NOT_OWNED";
+        results[i] = tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+
+    if (!local_indices.empty()) {
+        std::vector<std::string> local_keys;
+        local_keys.reserve(local_indices.size());
+        for (size_t idx : local_indices) {
+            local_keys.push_back(keys[idx]);
+        }
+        auto local_results =
+            BatchGetReplicaListLocal(local_keys, normalized_tenant);
+        for (size_t j = 0; j < local_indices.size(); ++j) {
+            results[local_indices[j]] = std::move(local_results[j]);
+        }
+    }
+
+#ifdef STORE_USE_ETCD
+    for (const auto& [owner, indices] : forward_groups) {
+        std::vector<std::string> group_keys;
+        group_keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            group_keys.push_back(keys[idx]);
+        }
+        auto group_result = inter_master_rpc_->BatchGetReplicaList(
+            owner, group_keys, normalized_tenant.value());
+        for (size_t j = 0; j < indices.size() && j < group_result.size();
+             ++j) {
+            results[indices[j]] = std::move(group_result[j]);
+        }
+    }
+#endif
+
+    return results;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
+                                        const TenantId& tenant_id) {
+    using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    assert(tenant_id.IsValid());
+
+    std::vector<GetResult> results(
+        keys.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    if (keys.empty()) {
+        return results;
+    }
+
+    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
@@ -3365,6 +4547,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                  original_idx != kInvalidKeyIndex;
                  original_idx = next_key_indexes[original_idx]) {
                 const std::string& key = keys[original_idx];
+
                 MasterMetricManager::instance().inc_total_get_nums();
 
                 if (tenant_it == shard->tenants.end()) {
@@ -3578,84 +4761,110 @@ auto MasterService::AllocateAndInsertMetadata(
                                                     : config.host_id;
         }
 
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-        if (allocator_manager.getNames().size() >= config.replica_num) {
-            for (const auto& name : allocator_manager.getNames()) {
-                const auto* allocators = allocator_manager.getAllocators(name);
-                if (allocators != nullptr &&
-                    std::any_of(allocators->begin(), allocators->end(),
-                                [](const auto& allocator) {
-                                    return allocator && allocator->size() > 0;
-                                })) {
-                    memory_eviction_may_help = true;
-                    break;
+        std::vector<std::string> preferred_segments;
+        tl::expected<std::vector<Replica>, ErrorCode> allocation_result =
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        {
+            ScopedAllocatorAccess allocator_access =
+                segment_manager_.getAllocatorAccess();
+            const auto& allocator_manager =
+                allocator_access.getAllocatorManager();
+            if (allocator_manager.getNames().size() >= config.replica_num) {
+                for (const auto& name : allocator_manager.getNames()) {
+                    const auto* allocators =
+                        allocator_manager.getAllocators(name);
+                    if (allocators != nullptr &&
+                        std::any_of(allocators->begin(), allocators->end(),
+                                    [](const auto& allocator) {
+                                        return allocator &&
+                                               allocator->size() > 0;
+                                    })) {
+                        memory_eviction_may_help = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        std::vector<std::string> preferred_segments;
-        auto append_preferred_segment = [&preferred_segments](
-                                            const std::string& segment_name) {
-            if (!segment_name.empty() &&
-                std::find(preferred_segments.begin(), preferred_segments.end(),
-                          segment_name) == preferred_segments.end()) {
-                preferred_segments.push_back(segment_name);
+            auto append_preferred_segment = [&preferred_segments](
+                                                const std::string&
+                                                    segment_name) {
+                if (!segment_name.empty() &&
+                    std::find(preferred_segments.begin(),
+                              preferred_segments.end(),
+                              segment_name) == preferred_segments.end()) {
+                    preferred_segments.push_back(segment_name);
+                }
+            };
+            if (!config.preferred_segment.empty()) {
+                append_preferred_segment(config.preferred_segment);
+            } else {
+                for (const auto& preferred_segment :
+                     config.preferred_segments) {
+                    append_preferred_segment(preferred_segment);
+                }
             }
-        };
-        if (!config.preferred_segment.empty()) {
-            append_preferred_segment(config.preferred_segment);
-        } else {
-            for (const auto& preferred_segment : config.preferred_segments) {
-                append_preferred_segment(preferred_segment);
+            if (!writer_host_id.empty()) {
+                auto host_ordered_segments =
+                    allocator_access.GetHostOrderedSegments(writer_host_id,
+                                                            key);
+                for (const auto& segment_name : host_ordered_segments) {
+                    append_preferred_segment(segment_name);
+                }
+                if (!host_ordered_segments.empty()) {
+                    VLOG(1) << "key=" << key
+                            << ", writer_host_id=" << writer_host_id
+                            << ", local_first_preferred_segments="
+                            << host_ordered_segments.size();
+                }
             }
-        }
-        if (!writer_host_id.empty()) {
-            auto host_ordered_segments =
-                allocator_access.GetHostOrderedSegments(writer_host_id, key);
-            for (const auto& segment_name : host_ordered_segments) {
-                append_preferred_segment(segment_name);
-            }
-            if (!host_ordered_segments.empty()) {
-                VLOG(1) << "key=" << key
-                        << ", writer_host_id=" << writer_host_id
-                        << ", local_first_preferred_segments="
-                        << host_ordered_segments.size();
-            }
-        }
 
-        const SsdMetricsProvider* ssd_provider = nullptr;
-        std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
-        if (allocation_strategy_type_ ==
-            AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
-            ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
-            ssd_provider = &*ssd_access;
-        }
+            const SsdMetricsProvider* ssd_provider = nullptr;
+            std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
+            if (allocation_strategy_type_ ==
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
+                ssd_access.emplace(
+                    segment_manager_.getLocalDiskSegmentAccess());
+                ssd_provider = &*ssd_access;
+            }
 
-        SpDiag::PerfPoint pt_alloc_mem(PerfKey::MASTER_PUT_ALLOCATE_MEM,
-                                       SpDiag::PerfLevel::KEY_MODULE);
-        pt_alloc_mem.Start();
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
-            ssd_provider);
-        pt_alloc_mem.End(allocation_result.has_value() ? 0 : -1);
+            SpDiag::PerfPoint pt_alloc_mem(PerfKey::MASTER_PUT_ALLOCATE_MEM,
+                                           SpDiag::PerfLevel::KEY_MODULE);
+            pt_alloc_mem.Start();
+            allocation_result = allocation_strategy_->Allocate(
+                allocator_manager, value_length, config.replica_num,
+                preferred_segments, std::set<std::string>(),
+                ReplicaType::MEMORY, ssd_provider);
+            pt_alloc_mem.End(allocation_result.has_value() ? 0 : -1);
+        }  // allocator_access 在此释放；远程转发在锁外执行，避免分布式死锁
 
         if (!allocation_result.has_value()) {
-            VLOG(1) << "Failed to allocate replicas for key=" << key
+            VLOG(1) << "Failed to allocate replicas locally for key=" << key
                     << ", error: " << allocation_result.error();
-            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                abort_reserved_quota();
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
-                MasterMetricManager::instance().inc_put_start_alloc_failures();
-                if (memory_eviction_may_help) {
-                    need_mem_eviction_ = true;
+            // CVM 多 submaster（方案 B 第二阶段）：本机本地分配失败（未挂载
+            // segment 或空间不足）时，尝试向持有该 segment 的 peer submaster
+            // 转发分配。远程分配成功则以 dummy-allocator 副本物化到本机元数据，
+            // 真实句柄留在 segment owner 的 keepalive 注册表中。
+            auto remote_replicas = TryAllocateReplicasRemotely(
+                key, tenant_id, value_length, config.replica_num,
+                preferred_segments);
+            if (remote_replicas.has_value()) {
+                replicas = std::move(remote_replicas.value());
+                allocated_memory_replicas = replicas.size();
+            } else {
+                if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
+                    abort_reserved_quota();
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                abort_reserved_quota();
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+                    MasterMetricManager::instance()
+                        .inc_put_start_alloc_failures();
+                    if (memory_eviction_may_help) {
+                        need_mem_eviction_ = true;
+                    }
+                    abort_reserved_quota();
+                    return tl::make_unexpected(
+                        ErrorCode::NO_AVAILABLE_HANDLE);
+                }
             }
         } else {
             allocated_memory_replicas = allocation_result->size();
@@ -3831,6 +5040,32 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 #endif
 
     UpdateClientHostId(client_id, config.host_id);
+
+#ifdef STORE_USE_ETCD
+    // 写路径 slot 归属校验 + 完整转发（模型 B）：本机若非该 key 的 slot
+    // owner，不得在本地写入元数据（否则元数据落在"非环 owner"上，而读路径
+    // 按环归属，会造成"写后读不到/写到错误位置"的不一致）。此处把整个
+    // PutStart 转发给 slot owner，由其本地分配 + 写元数据并返回 Descriptor。
+    // owner 侧 peer 互信（OwnsSlot==true）不再二次转发，转发链止于第一跳。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        if (!OwnsSlot(slot)) {
+            auto owner = ResolveSlotOwnerMasterId(slot);
+            if (owner && !owner->empty() && *owner != master_id_ &&
+                inter_master_rpc_) {
+                LOG(INFO) << "PutStart forwarded: key=" << object_id.user_key
+                          << " slot=" << slot << " -> owner=" << *owner;
+                return inter_master_rpc_->PutStart(
+                    *owner, client_id, object_id.user_key,
+                    object_id.tenant_id.value(), slice_length, config);
+            }
+            LOG(INFO) << "PutStart rejected with SLOT_NOT_OWNED: key="
+                      << object_id.user_key << " slot=" << slot;
+            return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+        }
+    }
+#endif
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -4431,6 +5666,31 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 #endif
 
     UpdateClientHostId(client_id, config.host_id);
+
+#ifdef STORE_USE_ETCD
+    // 写路径 slot 归属校验 + 完整转发（模型 B）：Upsert 为覆盖式写，一旦
+    // client 路由过期把请求发到非 slot owner，错位覆盖比 PutStart 危害更大。
+    // 此处与 PutStart 对称：把整个 UpsertStart 转发给 slot owner 执行。
+    // owner 侧 peer 互信（OwnsSlot==true）不再二次转发，转发链止于第一跳。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        if (!OwnsSlot(slot)) {
+            auto owner = ResolveSlotOwnerMasterId(slot);
+            if (owner && !owner->empty() && *owner != master_id_ &&
+                inter_master_rpc_) {
+                LOG(INFO) << "UpsertStart forwarded: key=" << object_id.user_key
+                          << " slot=" << slot << " -> owner=" << *owner;
+                return inter_master_rpc_->UpsertStart(
+                    *owner, client_id, object_id.user_key,
+                    object_id.tenant_id.value(), slice_length, config);
+            }
+            LOG(INFO) << "UpsertStart rejected with SLOT_NOT_OWNED: key="
+                      << object_id.user_key << " slot=" << slot;
+            return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+        }
+    }
+#endif
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -11327,7 +12587,8 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto storage = std::make_unique<OpLogBatchStorage>(cluster_id_, *backend);
+    auto storage = std::make_unique<OpLogBatchStorage>(cluster_id_, *backend,
+                                                       master_id_);
     DurablePrefix durable_prefix;
     ErrorCode err = storage->InitDurablePrefix(durable_prefix);
     if (err != ErrorCode::OK) {

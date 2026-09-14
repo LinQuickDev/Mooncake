@@ -20,6 +20,7 @@
 
 #include "allocator.h"
 #include "client_service.h"
+#include "cvm/slot_hash.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
@@ -788,10 +789,11 @@ TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
     auto find_group_id_on_different_shard = [](const std::string& key) {
         static constexpr size_t kMetadataShardCountForTest = 1024;
         const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+            cvm::KeySlot(TenantId::Default(), key) %
+            kMetadataShardCountForTest;
         for (int i = 0; i < 10000; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) %
+            if (cvm::KeySlot(TenantId::Default(), group_id) %
                     kMetadataShardCountForTest !=
                 key_shard) {
                 return group_id;

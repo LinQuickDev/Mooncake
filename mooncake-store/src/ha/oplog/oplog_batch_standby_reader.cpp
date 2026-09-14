@@ -26,8 +26,10 @@ void SetPollError(OpLogBatchStandbyPollResult& result, ErrorCode error,
 
 OpLogBatchStandbyReader::OpLogBatchStandbyReader(std::string cluster_id,
                                                  HaKvBackend& backend,
-                                                 OpLogApplier& applier)
-    : storage_(std::move(cluster_id), backend), applier_(applier) {}
+                                                 OpLogApplier& applier,
+                                                 std::string source_id)
+    : storage_(std::move(cluster_id), backend, std::move(source_id)),
+      applier_(applier) {}
 
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     size_t max_batches) {

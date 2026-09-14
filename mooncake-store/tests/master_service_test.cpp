@@ -199,10 +199,11 @@ class MasterServiceTest : public ::testing::Test {
     std::string FindGroupIdOnDifferentShard(const std::string& key) const {
         static constexpr size_t kMetadataShardCountForTest = 1024;
         const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+            cvm::KeySlot(TenantId::Default(), key) %
+            kMetadataShardCountForTest;
         for (int i = 0; i < 10000; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) %
+            if (cvm::KeySlot(TenantId::Default(), group_id) %
                     kMetadataShardCountForTest !=
                 key_shard) {
                 return group_id;
@@ -1043,8 +1044,8 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     std::string group_b;
     for (int i = 0; i < 10000; ++i) {
         group_b = key + "_tenant_b_group_" + std::to_string(i);
-        if (std::hash<std::string>{}(group_b) % 1024 !=
-            std::hash<std::string>{}(group_a) % 1024) {
+        if (cvm::KeySlot(TenantId::Default(), group_b) % 1024 !=
+            cvm::KeySlot(TenantId::Default(), group_a) % 1024) {
             break;
         }
     }
@@ -1325,8 +1326,8 @@ TEST_F(MasterServiceTest,
     std::string group_b;
     for (int i = 0; i < 10000; ++i) {
         group_b = key + "_other_group_" + std::to_string(i);
-        if (std::hash<std::string>{}(group_b) % 1024 !=
-            std::hash<std::string>{}(group_a) % 1024) {
+        if (cvm::KeySlot(TenantId::Default(), group_b) % 1024 !=
+            cvm::KeySlot(TenantId::Default(), group_a) % 1024) {
             break;
         }
     }

@@ -104,7 +104,7 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
 
     service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
-    EXPECT_EQ(ErrorCode::OK, service->Start("", "", cluster_id));
+    EXPECT_EQ(ErrorCode::OK, service->Start({}, "", cluster_id));
     EXPECT_EQ(StandbyState::WATCHING, service->GetState());
     return service;
 }
@@ -280,7 +280,7 @@ TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
 
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    ASSERT_EQ(ErrorCode::OK, service_->Start({}, "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(10u, service_->GetLatestAppliedSequenceId());
 
@@ -347,7 +347,7 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
 
-    auto err = service_->Start("", "", cluster_id_);
+    auto err = service_->Start({}, "", cluster_id_);
     EXPECT_EQ(ErrorCode::OK, err);
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(1u, service_->GetMetadataCount());
@@ -375,7 +375,7 @@ TEST_F(HotStandbyServiceTest,
         std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
             MakeSnapshot("20260330_120000_000", 42, "key-old", 4096))));
 
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    ASSERT_EQ(ErrorCode::OK, service_->Start({}, "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(1u, service_->GetMetadataCount());
@@ -385,7 +385,7 @@ TEST_F(HotStandbyServiceTest,
         std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
             MakeSnapshot("20260330_121500_000", 84, "key-new", 8192))));
 
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    ASSERT_EQ(ErrorCode::OK, service_->Start({}, "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(1u, service_->GetMetadataCount());
@@ -406,7 +406,7 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         tl::make_unexpected(ErrorCode::PERSISTENT_FAIL)));
 
-    auto err = service_->Start("", "", cluster_id_);
+    auto err = service_->Start({}, "", cluster_id_);
     EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
@@ -457,7 +457,7 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(LoadedSnapshot{})));
 
-    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(ErrorCode::OK, service_->Start({}, "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot snapshot;
@@ -811,7 +811,7 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
               batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
                                   EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
 
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    auto err = service_->Start({}, oplog_endpoints_, cluster_id_);
     if (err != ErrorCode::OK) {
         GTEST_SKIP() << "Service could not reach WATCHING state; "
                         "skipping promotion test";
@@ -836,7 +836,7 @@ TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
     ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
+              service_->Start({}, oplog_endpoints_, cluster_id_));
     batch_backend->FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
 
     StandbySnapshot out;
@@ -846,7 +846,7 @@ TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
 
 TEST_F(PromotionCatchUpTest, MissingDurablePrefixPromotesAtSequenceZero) {
     ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
+              service_->Start({}, oplog_endpoints_, cluster_id_));
     ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
@@ -861,7 +861,7 @@ TEST_F(PromotionCatchUpTest, MissingDurablePrefixRejectsNonzeroSequence) {
         std::optional<LoadedSnapshot>(MakeSnapshot("baseline", 1, "key", 1))));
 
     ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
+              service_->Start({}, oplog_endpoints_, cluster_id_));
     ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
     StandbySnapshot out;
     EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
@@ -871,7 +871,7 @@ TEST_F(PromotionCatchUpTest, MissingDurablePrefixRejectsNonzeroSequence) {
 
 TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {
     ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
+              service_->Start({}, oplog_endpoints_, cluster_id_));
     ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
     ASSERT_EQ(ErrorCode::OK,
               batch_backend_->Put(
@@ -902,7 +902,7 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
     }
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    auto err = service_->Start({}, oplog_endpoints_, cluster_id_);
     if (err != ErrorCode::OK) {
         GTEST_SKIP() << "Service could not reach WATCHING state; "
                         "skipping promotion test";
@@ -915,7 +915,7 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
 
 TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
     ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
+              service_->Start({}, oplog_endpoints_, cluster_id_));
     batch_backend_->SetGetError(ErrorCode::PERSISTENT_FAIL);
 
     StandbySnapshot out;
@@ -926,7 +926,7 @@ TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
 
 TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
     ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
+              service_->Start({}, oplog_endpoints_, cluster_id_));
     ASSERT_EQ(ErrorCode::OK,
               batch_backend_->Put(
                   BuildDurablePrefixKey(cluster_id_),

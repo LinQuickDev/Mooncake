@@ -31,7 +31,8 @@ struct OpLogBatchStandbyPollResult {
 class OpLogBatchStandbyReader {
    public:
     OpLogBatchStandbyReader(std::string cluster_id, HaKvBackend& backend,
-                            OpLogApplier& applier);
+                            OpLogApplier& applier,
+                            std::string source_id = std::string());
 
     OpLogBatchStandbyPollResult PollOnce(size_t max_batches = 1024);
 

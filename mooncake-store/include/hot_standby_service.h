@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "metadata_store.h"
+#include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/snapshot_provider.h"
@@ -34,6 +35,9 @@ enum class OpLogBatchStandbyPollDisposition;
 struct HotStandbyConfig {
     std::string standby_id;
     std::string primary_address;
+    // Submaster replay sources (one per submaster). When empty, this standby
+    // has no OpLog source to follow.
+    std::vector<ha::MasterSource> sources;
     uint32_t replication_port{0};
     uint32_t verification_interval_sec{30};
     uint32_t max_replication_lag_entries{1000};
@@ -89,15 +93,32 @@ class HotStandbyService {
     /**
      * @brief Start standby runtime: snapshot bootstrap plus optional OpLog
      * following
-     * @param primary_address Address of the Primary Master (not used with
-     * OpLog backend-based sync)
+     * @param sources Submaster replay sources (one per submaster); each source's
+     * master_id namespaces its own OpLog stream
      * @param oplog_endpoints Comma-separated OpLog backend endpoints
      * @param cluster_id Cluster identifier for OpLog path
      * @return ErrorCode::OK on success
      */
-    ErrorCode Start(const std::string& primary_address,
+    ErrorCode Start(const std::vector<ha::MasterSource>& sources,
                     const std::string& oplog_endpoints,
                     const std::string& cluster_id);
+
+    /**
+     * @brief Re-bind replay sources while keeping the accumulated metadata.
+     *
+     * Under dynamic binding (2c) a standby's responsible slot range changes as
+     * the cluster membership changes, so its replay source set must follow. If
+     * the standby is not yet running this is equivalent to Start(); if it is
+     * running and the source set is unchanged it is a no-op; otherwise it stops
+     * and restarts the replication loop with the new source set. The shared
+     * metadata_store_ is preserved across the restart, so already-replayed
+     * object metadata is not lost.
+     *
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode UpdateSources(const std::vector<ha::MasterSource>& sources,
+                            const std::string& oplog_endpoints,
+                            const std::string& cluster_id);
 
     /**
      * @brief Stop replication and disconnect from Primary
@@ -201,6 +222,7 @@ class HotStandbyService {
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
+    void CollectSegmentsLocked(std::vector<StandbySegmentInfo>& out) const;
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
     void StopReplicationLoop();
@@ -257,10 +279,18 @@ class HotStandbyService {
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};
 
-    // OpLog replication components
-    std::unique_ptr<OpLogApplier> oplog_applier_;
+    // Segment baseline loaded from snapshot bootstrap, applied to each
+    // per-source applier when OpLog following starts.
+    std::vector<StandbySegmentInfo> baseline_segments_;
+
+    // Per-source OpLog replication components. Keyed by source master_id. All
+    // appliers share the single metadata_store_ (sources own disjoint slots).
+    struct SourceReplica {
+        std::unique_ptr<OpLogApplier> applier;
+        std::unique_ptr<OpLogBatchStandbyReader> reader;
+    };
+    std::unordered_map<std::string, SourceReplica> sources_;
     std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
-    std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 
