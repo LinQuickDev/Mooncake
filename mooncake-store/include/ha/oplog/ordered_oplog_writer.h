@@ -1,10 +1,14 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
+#include <async_simple/Future.h>
+#include <async_simple/Promise.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "ha/oplog/oplog_batch_types.h"
@@ -15,11 +19,27 @@ namespace mooncake {
 struct OrderedOpLogWriterConfig {
     size_t max_entries_per_batch{1024};
     DurablePrefix initial_durable_prefix{};
+    std::chrono::milliseconds retry_timeout{0};
+};
+
+enum class OrderedOpLogWriterTerminalReason {
+    kRetryTimeout,
+    kFenced,
+    kNonRetryableWriteError,
+};
+
+struct OrderedOpLogWriterTerminalState {
+    ErrorCode error;
+    OrderedOpLogWriterTerminalReason reason;
+    DurablePrefix durable_prefix;
+    uint64_t occurred_at_ms;
 };
 
 class OrderedOpLogWriter {
    public:
     using DurableCallback = std::function<void(const OpLogEntry&)>;
+    using TerminalCallback =
+        std::function<void(const OrderedOpLogWriterTerminalState&)>;
     using WriteBatchFn =
         std::function<ErrorCode(const OpLogBatchRecord&, const DurablePrefix&)>;
 
@@ -53,19 +73,33 @@ class OrderedOpLogWriter {
     };
 
     OrderedOpLogWriter(OrderedOpLogWriterConfig config,
-                       WriteBatchFn write_batch);
-    ~OrderedOpLogWriter();
+                       WriteBatchFn write_batch,
+                       TerminalCallback terminal_callback = {});
+    virtual ~OrderedOpLogWriter();
 
     tl::expected<Reservation, ErrorCode> Reserve();
-    tl::expected<PendingHandle, ErrorCode> Commit(Reservation&& reservation,
-                                                  OpLogEntry entry,
-                                                  DurableCallback callback);
+    virtual tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     void Abort(Reservation&& reservation);
+
+    // Return a future for durability, independently of callback completion,
+    // without blocking the calling thread. An already-covered sequence is
+    // immediately ready with OK, even after terminal failure or Stop().
+    // Otherwise, terminal failure completes it with the terminal error, and
+    // Stop() completes it with UNAVAILABLE_IN_CURRENT_STATUS. Promises are
+    // fulfilled outside the writer mutex. Callers can co_await the future and
+    // use via(executor) to select the continuation's execution context.
+    async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
     bool IsAccepting() const;
     ErrorCode LastError() const;
+    std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
+    void SetTerminalCallback(TerminalCallback callback);
+    // Called by the service only after installing this writer. Older writers
+    // can no longer publish runtime metrics after this handoff.
+    void ActivateRuntimeMetrics();
     void Start();
-    void Stop();
+    virtual void Stop();
 
    private:
     struct Impl;

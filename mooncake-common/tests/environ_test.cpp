@@ -13,11 +13,13 @@
 // limitations under the License.
 
 #include "environ.h"
+#include "environment_variable.h"
 
 #include <gtest/gtest.h>
 
 #include <climits>
 #include <cstdlib>
+#include <optional>
 
 using mooncake::Environ;
 
@@ -32,20 +34,9 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TEST_UINT32");
         unsetenv("MC_TEST_UINT64");
         unsetenv("MC_TEST_SIZET");
+        unsetenv("MC_TEST_DOUBLE");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
-        // Make sure AWS vars don't leak in from the test runner's env.
-        unsetenv("MOONCAKE_AWS_REGION");
-        unsetenv("MOONCAKE_AWS_S3_ENDPOINT");
-        unsetenv("MOONCAKE_AWS_BUCKET_NAME");
-        unsetenv("MOONCAKE_AWS_ACCESS_KEY_ID");
-        unsetenv("MOONCAKE_AWS_SECRET_ACCESS_KEY");
-        unsetenv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING");
-        unsetenv("MOONCAKE_AWS_USE_HTTPS");
-        unsetenv("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION");
-        unsetenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION");
-        unsetenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS");
-        unsetenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS");
         unsetenv("MOONCAKE_STORE_CHECKSUM");
     }
 };
@@ -139,43 +130,25 @@ TEST_F(EnvironTest, UnsignedGettersUseRequestedDefaultForInvalidValues) {
     EXPECT_EQ(Environ::GetUInt64("MC_TEST_UINT64", 23), 23U);
 }
 
-// --- AWS / S3 fields ---
-//
-// NOTE: Environ is a singleton whose constructor caches every value the
-// first time Get() is called. So all AWS env vars must be set BEFORE the
-// first Environ::Get() in this process. We therefore cover the populate
-// path in a single test that takes the singleton's "first call" for
-// itself; the default-path behavior is implicitly covered by Environ's
-// constructor defaults (any earlier test would lock the cache to defaults
-// and prevent us from observing populated values here).
+// --- GetDouble ---
 
-TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
-    setenv("MOONCAKE_AWS_REGION", "us-east-1", 1);
-    setenv("MOONCAKE_AWS_S3_ENDPOINT", "https://s3.example.com", 1);
-    setenv("MOONCAKE_AWS_BUCKET_NAME", "my-bucket", 1);
-    setenv("MOONCAKE_AWS_ACCESS_KEY_ID", "AKIA-test", 1);
-    setenv("MOONCAKE_AWS_SECRET_ACCESS_KEY", "secret", 1);
-    setenv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING", "0", 1);
-    setenv("MOONCAKE_AWS_USE_HTTPS", "0", 1);
-    setenv("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION", "when_required", 1);
-    setenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported", 1);
-    setenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS", "5000", 1);
-    // Bogus request timeout should fall back to the registered default.
-    setenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS", "bogus", 1);
+TEST_F(EnvironTest, GetDoubleValidValue) {
+    setenv("MC_TEST_DOUBLE", " 0.75 ", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.75);
+}
+
+TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "0.75garbage", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "nan", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+}
+
+TEST_F(EnvironTest, StoreChecksumPopulatesFromEnv) {
     setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
 
     const auto& e = Environ::Get();
-    EXPECT_EQ(e.GetAwsRegion(), "us-east-1");
-    EXPECT_EQ(e.GetAwsS3Endpoint(), "https://s3.example.com");
-    EXPECT_EQ(e.GetAwsBucketName(), "my-bucket");
-    EXPECT_EQ(e.GetAwsAccessKeyId(), "AKIA-test");
-    EXPECT_EQ(e.GetAwsSecretAccessKey(), "secret");
-    EXPECT_FALSE(e.GetAwsUseVirtualAddressing());
-    EXPECT_FALSE(e.GetAwsUseHttps());
-    EXPECT_EQ(e.GetAwsRequestChecksumCalculation(), "when_required");
-    EXPECT_EQ(e.GetAwsResponseChecksumValidation(), "when_supported");
-    EXPECT_EQ(e.GetAwsConnectTimeoutMs(), 5000);
-    EXPECT_EQ(e.GetAwsRequestTimeoutMs(), 30000);
     EXPECT_TRUE(e.GetStoreChecksumEnabled());
 }
 
@@ -279,6 +252,36 @@ TEST_F(EnvironTest, GetStringEmpty) {
 TEST_F(EnvironTest, GetStringWithSpaces) {
     setenv("MC_TEST_STRING", "hello world", 1);
     EXPECT_EQ(Environ::GetString("MC_TEST_STRING", ""), "hello world");
+}
+
+TEST_F(EnvironTest, ReadsTypedEnvironmentVariableDefinitions) {
+    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
+    constexpr mooncake::EnvironmentVariable<bool> enabled{"MC_TEST_BOOL"};
+    constexpr mooncake::EnvironmentVariable<std::string> text{"MC_TEST_STRING"};
+
+    EXPECT_FALSE(Environ::Read(number).has_value());
+    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+
+    setenv(number.name, "42", 1);
+    setenv(enabled.name, "off", 1);
+    setenv(text.name, "", 1);
+
+    EXPECT_EQ(Environ::Read(number), 42);
+    EXPECT_EQ(Environ::Read(enabled), false);
+    ASSERT_TRUE(Environ::Read(text).has_value());
+    EXPECT_TRUE(Environ::Read(text)->empty());
+}
+
+TEST_F(EnvironTest, TypedReadOrWarnsAndUsesDefaultForInvalidValues) {
+    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
+    setenv(number.name, "invalid", 1);
+
+    testing::internal::CaptureStderr();
+    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+    const std::string logs = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(logs.find("MC_TEST_INT64"), std::string::npos);
+    EXPECT_NE(logs.find("using default 17"), std::string::npos);
 }
 
 int main(int argc, char** argv) {

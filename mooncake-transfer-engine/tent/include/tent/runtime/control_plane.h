@@ -19,6 +19,8 @@
 #include <netdb.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,6 +30,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <limits>
 
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
@@ -120,6 +123,16 @@ struct XferDataDesc {
     size_t length;
 };
 
+// Standard TCP RPC payload boundaries. READ retains the server's 1 GiB cap;
+// WRITE uses a 32-bit RPC attachment that includes XferDataDesc.
+inline constexpr size_t kTcpMaxReadBytes = size_t{1} << 30;
+inline constexpr size_t kTcpMaxWriteBytes =
+    std::numeric_limits<uint32_t>::max() - sizeof(XferDataDesc);
+
+inline constexpr size_t tcpMaxTransferBytes(Request::OpCode opcode) {
+    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+}
+
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;
 
@@ -142,6 +155,11 @@ class ControlClient {
                             const BootstrapDesc& request,
                             BootstrapDesc& response);
 
+    // Parse a BootstrapRdma RPC body. A non-empty reply_msg or missing GID is
+    // a handshake failure even when the RPC transport itself succeeded.
+    static Status decodeBootstrapResponse(const std::string& response_raw,
+                                          BootstrapDesc& response);
+
     static Status bootstrapUb(const std::string& server_addr,
                               const UbBootstrapDesc& request,
                               UbBootstrapDesc& response);
@@ -162,11 +180,21 @@ class ControlClient {
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
+    using DelegateCallback = std::function<void(Status, bool confirmed)>;
+    static void delegateAsync(const std::string& server_addr,
+                              const Request& request,
+                              DelegateCallback callback);
+
     static Status pinStageBuffer(const std::string& server_addr,
                                  const std::string& location, uint64_t& addr);
 
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);
+
+    using UnpinStageBufferCallback = std::function<void(Status)>;
+    static void unpinStageBufferAsync(const std::string& server_addr,
+                                      uint64_t addr,
+                                      UnpinStageBufferCallback callback);
 
     static void subscribeSegmentUpdateAsync(const std::string& server_addr,
                                             const std::string& subscriber_addr);
@@ -189,20 +217,16 @@ class ControlService {
 
     SegmentManager& segmentManager() { return *manager_.get(); }
 
-    void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback) {
-        bootstrap_callback_ = callback;
-    }
+    void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback);
 
     void setBootstrapUbCallback(const OnReceiveUbBootstrap& callback) {
         std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
         ub_bootstrap_callback_ = callback;
     }
 
-    void setNotifyCallback(const OnNotify& callback) {
-        notify_callback_ = callback;
-    }
+    void setNotifyCallback(const OnNotify& callback);
 
-    Status start(uint16_t& port, bool ipv6_ = false);
+    Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
 
    private:
     void onGetSegmentDesc(const std::string_view& request,
@@ -235,14 +259,30 @@ class ControlService {
     void onSegmentUpdated(const std::string_view& request,
                           std::string& response);
 
+    void finishBootstrapCallback();
+
+    void finishNotifyCallback();
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
+    std::mutex bootstrap_cb_mutex_;
+    std::condition_variable bootstrap_cb_cv_;
+    size_t bootstrap_callbacks_in_flight_ = 0;
+    std::chrono::milliseconds callback_drain_timeout_{std::chrono::seconds(5)};
     OnReceiveBootstrap bootstrap_callback_;
+    static thread_local const ControlService* active_bootstrap_service_;
+
     std::mutex ub_bootstrap_callback_mutex_;
     OnReceiveUbBootstrap ub_bootstrap_callback_;
+
+    std::mutex notify_cb_mutex_;
+    std::condition_variable notify_cb_cv_;
+    size_t notify_callbacks_in_flight_ = 0;
     OnNotify notify_callback_;
+    static thread_local const ControlService* active_notify_service_;
+
     TransferEngineImpl* impl_;
 };
 

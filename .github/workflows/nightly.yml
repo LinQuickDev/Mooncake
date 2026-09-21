@@ -74,13 +74,35 @@ jobs:
           - variant: non-cuda
             architecture: x86_64
             artifact-prefix: nightly-non-cuda-x86
+          - variant: non-cuda
+            architecture: arm64
+            artifact-prefix: nightly-non-cuda-arm64
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: ${{ matrix.variant }}
       architecture: ${{ matrix.architecture }}
-      python-versions: '["3.10", "3.12"]'
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
+  tone-sglang-integration:
+    needs: build-wheels
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ github.sha }}
+      source_run_id: ${{ github.run_id }}
+      artifact_name: nightly-cuda13-x86-py312
+    secrets: inherit
+
+  build-wheel-rocm:
+    needs: version-stamp
+    uses: ./.github/workflows/ci_rocm.yml
+
+  rocm-integration-test:
+    needs: build-wheel-rocm
+    uses: ./.github/workflows/integration-test-rocm.yml
+    with:
+      checkout_ref: ${{ github.sha }}
+    secrets: inherit
 
   build-musa:
     runs-on: ubuntu-22.04
@@ -108,7 +130,10 @@ jobs:
         run: |
           cd build
           source ~/.bashrc
-          cmake --build . --parallel 1
+          # Limit concurrency of Mooncake PG's setup.py build to avoid OOM
+          export MAX_JOBS=2
+          # Does not affect the Ninja system
+          cmake --build .
           cmake --install .
         shell: bash
 
@@ -130,7 +155,7 @@ jobs:
         run: |
           docker build -f docker/mooncake.Dockerfile \
             --build-arg PYTHON_VERSION=3.10 \
-            --build-arg EP_TORCH_VERSIONS="2.13.0" \
+            --build-arg EP_TORCH_VERSIONS="2.14.0" \
             --build-arg CLEAN_BUILD_ARTIFACTS=1 \
             -t mooncake:from-source .
 
@@ -201,13 +226,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install and start etcd
-        run: |
-          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-          sleep 3
-          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+        uses: ./.github/actions/setup-etcd
 
       - name: Free up disk space
         run: |
@@ -227,15 +246,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build
 
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Configure sccache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Set up compiler cache
+        uses: ./.github/actions/setup-sccache
 
       - name: Configure project (Release, no ASAN)
         run: |
@@ -245,13 +257,16 @@ jobs:
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
+            -DWITH_P2P_STORE=ON \
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
+
+      - name: Configure CUDA driver runtime
+        uses: ./.github/actions/setup-cuda-runtime
 
       - name: Build project
         run: |
           cd build
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
           cmake --build . -j$(nproc)
           sudo -E cmake --install .
 
@@ -259,23 +274,13 @@ jobs:
         run: |
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
 
       - name: Start Metadata Server
-        run: |
-          cd mooncake-transfer-engine/example/http-metadata-server-python
-          pip install aiohttp
-          python ./bootstrap_server.py &
-          sleep 2
+        uses: ./.github/actions/setup-metadata-server
 
       - name: Run CTest unit tests
-        run: |
-          cd build
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-          DEFAULT_KV_LEASE_TTL=500 \
-            ctest --parallel $(nproc) --output-on-failure
+        uses: ./.github/actions/run-ctest
 
       - name: Run Mooncake Store Rust smoke test
         env:
@@ -283,31 +288,98 @@ jobs:
           MOONCAKE_STORE_RUST_LINK_ASAN: "0"
         run: ./scripts/ci/run_store_rust_smoke.sh
 
+      - name: Run Transfer Engine Rust smoke test
+        env:
+          MOONCAKE_TE_RUST_LINK_ASAN: "0"
+        run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+
+      - name: Check Mooncake Store Rust bindings, examples, and tests
+        env:
+          MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
+          MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
+          MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+        run: |
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          cd mooncake-store/rust
+          cargo test --lib
+          cargo test --examples --tests --no-run
+          cargo clean
+
+      - name: Verify Mooncake Store Rust dlopen bindings and packaging
+        env:
+          MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+        run: |
+          cd mooncake-store/rust
+          cargo run --locked --example generate_dlopen_bindings
+          git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
+          cargo package --no-verify --allow-dirty
+          crate=$(ls target/package/mooncake_store-*.crate | head -1)
+          dest=$(mktemp -d)
+          tar xzf "$crate" -C "$dest"
+          (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
+
       - name: Run Go store binding integration tests
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_go_cluster
-          MOONCAKE_STORE_GO_LINK_COMMON: "0"
           MOONCAKE_STORE_GO_SANITIZED: "0"
         run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Build and install Python wheel for integration tests
         run: |
+          python -m venv "${RUNNER_TEMP}/mooncake-nightly-venv"
+          echo "${RUNNER_TEMP}/mooncake-nightly-venv/bin" >> "$GITHUB_PATH"
+          source "${RUNNER_TEMP}/mooncake-nightly-venv/bin/activate"
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           export CUDA_HOME=/usr/local/cuda
           PYTHON_VERSION=3.12 OUTPUT_DIR=dist ./scripts/build_wheel.sh
-          pip install mooncake-wheel/dist/*.whl
+          python -m pip install mooncake-wheel/dist/*.whl
 
       - name: Run Python integration tests (full suite)
         env:
           MC_METADATA_SERVER: http://127.0.0.1:8080/metadata
           RUN_TESTS_METADATA_SERVER_MODE: external
           DEFAULT_KV_LEASE_TTL: "500"
-          TEST_SSD_OFFLOAD_IN_EVICT: "1"
-          TEST_PROMOTION_ON_HIT: "1"
           TEST_CXL: "1"
         run: |
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
+
+      - name: Run Python API end-to-end tests
+        env:
+          MOONCAKE_MASTER: "127.0.0.1:50051"
+          MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+          MOONCAKE_PROTOCOL: "tcp"
+          LOCAL_HOSTNAME: "127.0.0.1"
+        run: |
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+          kill "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null || true
+          for _ in {1..50}; do
+            if ! kill -0 "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          if kill -0 "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null; then
+            kill -KILL "$NIGHTLY_METADATA_SERVER_PID"
+          fi
+          mkdir -p /tmp/mooncake_storage
+          mooncake_master \
+            --default_kv_lease_ttl=500 \
+            --eviction_high_watermark_ratio=0.95 \
+            --cluster_id=nightly_test_cluster \
+            --port 50051 \
+            --enable_http_metadata_server=true &
+          master_pid=$!
+          trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
+          sleep 3
+          python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
+          python python/tests/store/async_store_integration.py
+          python scripts/test_copy_move_api.py
+          python scripts/test_drain_http_api.py --timeout-sec 90
+
+      - name: Run RPC Communicator Bandwidth Test
+        run: ./scripts/ci/run_rpc_smoke.sh
+        shell: bash
 
   nightly-coverage:
     runs-on: ubuntu-22.04
@@ -331,13 +403,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install and start etcd
-        run: |
-          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-          sleep 3
-          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+        uses: ./.github/actions/setup-etcd
 
       - name: Free up disk space
         uses: ./.github/actions/free-disk-space
@@ -355,15 +421,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lcov gcovr ninja-build
 
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Test HugeTLB sizing helper
+        run: python3 scripts/test_hicache_hugepage_requirements.py
 
-      - name: Configure sccache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Set up compiler cache
+        uses: ./.github/actions/setup-sccache
 
       - name: Configure project with coverage support
         run: |
@@ -380,19 +442,29 @@ jobs:
           sudo cmake --install .
 
       - name: Start Metadata Server
-        run: |
-          cd mooncake-transfer-engine/example/http-metadata-server-python
-          pip install aiohttp
-          python ./bootstrap_server.py &
-          sleep 2
+        uses: ./.github/actions/setup-metadata-server
 
       - name: Run CTest with coverage
-        run: |
-          cd build
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-          DEFAULT_KV_LEASE_TTL=500 \
-            ctest --parallel $(nproc) --output-on-failure
+        uses: ./.github/actions/run-ctest
+        with:
+          reserve-rpc-port: 'false'
+
+      - name: Run Mooncake Store Rust sanitizer smoke test
+        env:
+          MOONCAKE_STORE_CLUSTER_ID: nightly_asan_rust_cluster
+          MOONCAKE_STORE_RUST_LINK_ASAN: "1"
+        run: ./scripts/ci/run_store_rust_smoke.sh
+
+      - name: Run Transfer Engine Rust sanitizer smoke test
+        env:
+          MOONCAKE_TE_RUST_LINK_ASAN: "1"
+        run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+
+      - name: Run Go store binding sanitizer integration tests
+        env:
+          MOONCAKE_STORE_CLUSTER_ID: nightly_asan_go_cluster
+          MOONCAKE_STORE_GO_SANITIZED: "1"
+        run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Generate coverage report
         id: coverage
@@ -453,6 +525,9 @@ jobs:
     needs:
       - version-stamp
       - build-wheels
+      - tone-sglang-integration
+      - build-wheel-rocm
+      - rocm-integration-test
       - build-musa
       - build-docker
       - ascend-test

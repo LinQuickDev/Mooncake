@@ -21,6 +21,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/transport.h"
 
@@ -170,6 +171,66 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
         << "Should use first in buffer_transports";
 }
 
+TEST(TransportSelectorTest, ForceTcpOverridesBufferTransportOrder) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"prefer-rdma","segment_type":"memory","transports":["rdma"]}]})")
+            .ok());
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+
+    auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
+    rdma->setDramToDram(true);
+    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
+    tcp->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, UNSPEC);
+}
+
+TEST(TransportSelectorTest, ForceTcpDoesNotOverrideFileTransportPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"file","segment_type":"file","transports":["gds"]}]})")
+            .ok());
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[GDS] = std::make_shared<FakeTransport>(GDS);
+    static_cast<FakeTransport*>(transports[GDS].get())->setDramToFile(true);
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::File;
+    ctx.same_machine = true;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = nullptr;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, GDS);
+}
+
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------
@@ -186,6 +247,8 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(AscendDirect), "ascend");
     EXPECT_STREQ(transportTypeName(SUNRISE_LINK), "sunrise_link");
     EXPECT_STREQ(transportTypeName(UB), "ub");
+    EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
+    EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -200,6 +263,8 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("ascend"), AscendDirect);
     EXPECT_EQ(parseTransportType("sunrise_link"), SUNRISE_LINK);
     EXPECT_EQ(parseTransportType("ub"), UB);
+    EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
+    EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
 }
 
@@ -209,7 +274,7 @@ TEST(TransportSelectorTest, UbTransportNameRoundTrips) {
     EXPECT_EQ(parseTransportType(name), UB);
 }
 
-TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
+TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(UNSPEC), 0);
     EXPECT_EQ(static_cast<int>(RDMA), 1);
     EXPECT_EQ(static_cast<int>(MNNVL), 2);
@@ -222,7 +287,46 @@ TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
     EXPECT_EQ(static_cast<int>(SUNRISE_LINK), 9);
     EXPECT_EQ(static_cast<int>(TPU), 10);
     EXPECT_EQ(static_cast<int>(UB), 11);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 12);
+    EXPECT_EQ(static_cast<int>(MPCOMM), 12);
+    EXPECT_EQ(static_cast<int>(HP_TCP), 13);
+    EXPECT_EQ(static_cast<int>(XPU), 14);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 15);
+}
+
+// MPComm is appended after UB, so it takes wire value 12. The same integer is
+// exposed through the C API macros and the Python binding, which makes it a
+// compatibility contract rather than an implementation detail. pybind.cpp
+// carries a matching static_assert so a divergence fails the build.
+TEST(TransportTypeTest, MpcommWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(MPCOMM), 12);
+    EXPECT_EQ(TRANSPORT_MPCOMM, static_cast<int>(MPCOMM));
+    EXPECT_EQ(TRANSPORT_UB, static_cast<int>(UB));
+    // The conversion the C API actually performs on an incoming hint.
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_MPCOMM), MPCOMM);
+    // Name mapping is what policy parsing relies on; a gap here would make
+    // "transports": ["mpcomm"] resolve to UNSPEC silently.
+    EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
+    EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
+}
+
+TEST(TransportTypeTest, HpTcpWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(HP_TCP), 13);
+    EXPECT_EQ(TRANSPORT_HP_TCP, static_cast<int>(HP_TCP));
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_HP_TCP), HP_TCP);
+    EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
+    EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
+}
+
+// XPU is appended after HP_TCP, so it takes wire value 14. Like the other
+// appended transports its integer is a compatibility contract shared with the
+// C API macro and the Python binding; pybind.cpp carries a matching
+// static_assert.
+TEST(TransportTypeTest, XpuWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(XPU), 14);
+    EXPECT_EQ(TRANSPORT_XPU, static_cast<int>(XPU));
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_XPU), XPU);
+    EXPECT_STREQ(transportTypeName(XPU), "xpu");
+    EXPECT_EQ(parseTransportType("xpu"), XPU);
 }
 
 // Topology::NicType is serialized as an integer. These values are therefore a
@@ -481,6 +585,143 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToDram) {
         << "RDMA should be available for CUDA-to-CPU";
 }
 
+// The XPU staging transport advertises only gpu_to_dram / dram_to_gpu, and XPU
+// VRAM (MTYPE_XPU) must be treated as a device type by the selector's is_gpu
+// predicate. The local VRAM->host stage is therefore routed to XpuTransport via
+// gpu_to_dram, and because XpuTransport never advertises gpu_to_gpu a VRAM<->
+// VRAM hop is not directly available (the engine stages it through host DRAM).
+TEST(TransportSelectorTest, XpuStagingRoutesDeviceToHostViaGpuToDram) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
+    xpu->setGpuToDram(true);
+    xpu->setDramToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {XPU};
+
+    // Local stage: XPU VRAM -> host DRAM. XpuTransport is a same-machine-only
+    // executor, so the staging hop is always same_machine.
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, XPU)
+        << "XPU VRAM->host stage should route to XpuTransport (gpu_to_dram)";
+
+    // The mirrored host->VRAM direction uses dram_to_gpu.
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_XPU;
+    result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, XPU)
+        << "host->XPU VRAM stage should route to XpuTransport (dram_to_gpu)";
+
+    // VRAM<->VRAM needs gpu_to_gpu, which XpuTransport never advertises, so it
+    // is not directly available and the engine must stage through host DRAM.
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_XPU;
+    result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, UNSPEC)
+        << "XPU VRAM<->VRAM must not be directly routable (forces staging)";
+}
+
+// Regression: XPU is a local-stage-only executor, so it must never be selected
+// for a remote (cross-machine) hop -- the same invariant TPU has. Without XPU
+// in the selector's same-machine guard, an XPU-tagged buffer on a remote
+// segment would be picked via gpu_to_dram and only fail later at execution
+// time.
+TEST(TransportSelectorTest, XpuIsNotRoutableAcrossMachines) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
+    xpu->setGpuToDram(true);
+    xpu->setDramToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {XPU};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;  // remote hop
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "XPU must never carry a remote hop; it is local-stage-only";
+    ctx.same_machine = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "a different segment on the same host is not process-local";
+}
+
+// Regression: a SelectionPolicy memory pattern of "xpu" must match XPU VRAM
+// (MTYPE_XPU). matchesMemoryPattern maps MTYPE_XPU -> "xpu"; without that arm
+// XPU fell through to "unknown" and no xpu-scoped policy could ever match.
+TEST(TransportSelectorTest, XpuMemoryPatternMatchesPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"xpu_stage","segment_type":"memory","local_memory":"xpu","transports":["xpu"]}]})")
+            .ok());
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    static_cast<FakeTransport*>(transports[XPU].get())->setGpuToDram(true);
+
+    std::vector<TransportType> buffer_transports = {XPU};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;  // XPU stage is same-machine only
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, XPU)
+        << "an 'xpu' local_memory policy must match MTYPE_XPU buffers";
+}
+
+TEST(TransportSelectorTest, XpuStagingUsesHostCapsWithoutBypassingPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(conf->load(R"({"policy":[{"name":"xpu_network",
+        "segment_type":"memory","local_memory":"xpu",
+        "transports":["hp_tcp","rdma"]}]})")
+                    .ok());
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {HP_TCP, RDMA, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        static_cast<FakeTransport*>(transports[type].get())
+            ->setDramToDram(true);
+    }
+    SelectionContext ctx{};
+    ctx.segment_type = SegmentType::Memory;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_XPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+    ctx.host_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, RDMA);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 0, XPU).transport, UNSPEC);
+    ctx.local_memory_type = MTYPE_CPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "staging must not bypass the original memory policy";
+}
+
 TEST(TransportSelectorTest, FileSegmentDramToFile) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
@@ -668,34 +909,18 @@ TEST(TransportSelectorTest, RocmMemoryTypeSupported) {
 
 TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     auto conf = std::make_shared<Config>();
-
-    // Set up a custom policy via JSON config
-    conf->set("policy", json::array());
-    auto policies = conf->getArray<json>("policy");
-
-    json policy;
-    policy["name"] = "test_memory_policy";
-    policy["segment_type"] = "memory";
-    policy["transports"] = {"tcp", "rdma"};  // Prefer TCP over RDMA
-
-    // We can't easily modify the config's internal JSON structure,
-    // so this test verifies the selector at least loads without error
-
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"hp_tcp_memory","segment_type":"memory","transports":["hp_tcp"]}]})")
+            .ok());
     TransportSelector selector(conf);
 
-    // Default behavior should still work
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transports{};
-    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
-    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    transports[HP_TCP] = std::make_shared<FakeTransport>(HP_TCP);
+    static_cast<FakeTransport*>(transports[HP_TCP].get())->setDramToDram(true);
 
-    auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->setDramToDram(true);
-    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
-    tcp->setDramToDram(true);
-
-    std::vector<TransportType> buffer_transports = {RDMA, TCP};
-
+    const std::vector<TransportType> buffer_transports = {HP_TCP};
     SelectionContext ctx;
     ctx.segment_type = SegmentType::Memory;
     ctx.same_machine = false;
@@ -703,9 +928,7 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     ctx.remote_memory_type = MTYPE_CPU;
     ctx.buffer_transports = &buffer_transports;
 
-    auto result = selector.select(ctx, transports);
-    // With default policies, should use buffer_transports order (RDMA first)
-    EXPECT_EQ(result.transport, RDMA);
+    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
 }
 
 TEST(TransportSelectorTest, PolicyCanPreferUb) {
@@ -1215,6 +1438,117 @@ TEST(TransportSelectorTest, ExplicitPolicyNameOverridesIntentFilter) {
     ctx.policy_name = "operator-override";
 
     EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+}
+
+// ---------------------------------------------------------------------------
+// Device mask resolution (names -> mask, once, at setTopology)
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Config> configWithDeviceList(
+    const std::vector<std::string>& devices) {
+    json policy;
+    policy["name"] = "device_pinned";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"tcp"};
+    policy["devices"] = devices;
+
+    auto conf = std::make_shared<Config>();
+    conf->set("policy", json::array({policy}));
+    return conf;
+}
+
+std::shared_ptr<Topology> topologyWithNics(size_t count) {
+    auto topology = std::make_shared<Topology>();
+    for (size_t i = 0; i < count; ++i) {
+        Topology::NicEntry nic;
+        nic.name = "mlx5_" + std::to_string(i);
+        nic.type = Topology::NIC_RDMA;
+        topology->nic_list_.push_back(nic);
+    }
+    return topology;
+}
+
+uint64_t selectDeviceMask(TransportSelector& selector) {
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = nullptr;
+    return selector.select(ctx, transports).device_mask;
+}
+
+TEST(TransportSelectorTest, DeviceMaskResolvesNamedNics) {
+    TransportSelector selector(configWithDeviceList({"mlx5_1", "mlx5_3"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), (1ULL << 1) | (1ULL << 3));
+}
+
+// The mask is resolved at setTopology, so it must be stable no matter how many
+// times select() runs -- this is the regression guard for resolving (and
+// re-logging) per request.
+TEST(TransportSelectorTest, DeviceMaskIsStableAcrossSelects) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+}
+
+// A replaced topology must re-resolve; a stale mask would name the wrong NICs.
+TEST(TransportSelectorTest, DeviceMaskReresolvesOnNewTopology) {
+    TransportSelector selector(configWithDeviceList({"mlx5_2"}));
+
+    selector.setTopology(topologyWithNics(4));
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 2);
+
+    // Same name, fewer NICs: mlx5_2 no longer exists, so the filter empties
+    // and falls open rather than pinning a NIC id that is now someone else's.
+    selector.setTopology(topologyWithNics(2));
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
+// Fail-open is deliberate: a typo must not stop transfers. The behavior is
+// pinned here so it stays a decision rather than drifting into a hard failure.
+TEST(TransportSelectorTest, DeviceMaskFailsOpenWhenNothingResolves) {
+    TransportSelector selector(configWithDeviceList({"nope_0", "nope_1"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
+// Partially unresolved: the names that do resolve still restrict the mask.
+TEST(TransportSelectorTest, DeviceMaskKeepsResolvedNamesOnPartialFailure) {
+    TransportSelector selector(configWithDeviceList({"mlx5_1", "nope"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 1);
+}
+
+// device_mask is 64 bits wide, so a NIC at index >= 64 cannot be named. It is
+// dropped from the mask, not silently promoted to "all devices".
+TEST(TransportSelectorTest, DeviceMaskDropsNicsPastMaskWidth) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0", "mlx5_64"}));
+    selector.setTopology(topologyWithNics(66));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+}
+
+// No topology bound: nothing to resolve names against, so the policy cannot
+// restrict anything and must not restrict everything either.
+TEST(TransportSelectorTest, DeviceMaskAllowsAllWithoutTopology) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0"}));
+
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
 }
 
 }  // namespace
