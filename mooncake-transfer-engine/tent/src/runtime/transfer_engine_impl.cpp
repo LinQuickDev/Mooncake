@@ -2352,6 +2352,11 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         input.derived_task_ids = owner.derived_task_ids;
         input.request = owner.request;
         input.kind = owner_kind;
+        // The transport is snapshotted with the admission decision, so the
+        // degradation prediction reads the bandwidth of the transport selected
+        // here. A later transport failover does not revisit this owner: the
+        // prediction is a pre-dispatch heuristic, and re-scoring an admitted
+        // owner would let the drop decision change underneath it.
         input.transport = owner.route.transport;
         input.degradation_eligible =
             (owner.route.transport == RDMA || owner.route.transport == UB) &&

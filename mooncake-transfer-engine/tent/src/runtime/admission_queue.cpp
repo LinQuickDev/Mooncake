@@ -16,6 +16,7 @@
 #include "tent/runtime/deadline_mlu.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <set>
@@ -292,15 +293,35 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     // including what this call already picked. No deadline or no bandwidth
     // (<= 0) means nothing to predict from, so never a drop -- not even
     // past the deadline; DeadlineMlu yields 0 there too, the explicit
-    // checks just keep the rule readable here. The rate is resolved per owner
-    // so transports that report their own bandwidth are not averaged into a
-    // process-wide aggregate.
+    // checks just keep the rule readable here.
+    //
+    // The rate stays per transport so transports that report their own
+    // bandwidth are not averaged into a process-wide aggregate, but the
+    // provider is resolved at most once per transport per scan: it reads live
+    // link state behind the transport lifecycle lock, and only RDMA and UB can
+    // carry degradation-eligible owners.
+    std::array<double, kSupportedTransportTypes> bandwidth_by_transport{};
+    std::array<bool, kSupportedTransportTypes> bandwidth_resolved{};
+    bandwidth_resolved.fill(false);
+    auto bandwidthFor = [&](TransportType type) -> double {
+        const int index = static_cast<int>(type);
+        if (index < 0 || index >= kSupportedTransportTypes) {
+            return transport_bandwidth_provider_
+                       ? transport_bandwidth_provider_(type)
+                       : bandwidth_provider_();
+        }
+        if (!bandwidth_resolved[index]) {
+            bandwidth_resolved[index] = true;
+            bandwidth_by_transport[index] =
+                transport_bandwidth_provider_
+                    ? transport_bandwidth_provider_(type)
+                    : bandwidth_provider_();
+        }
+        return bandwidth_by_transport[index];
+    };
     auto shouldDrop = [&](const QueueOwner& owner, size_t bytes_ahead) {
         if (!drop_enabled || !owner.degradation_eligible) return false;
-        const double bw_bps =
-            transport_bandwidth_provider_
-                ? transport_bandwidth_provider_(owner.transport)
-                : bandwidth_provider_();
+        const double bw_bps = bandwidthFor(owner.transport);
         if (owner.request.deadline_ns == 0 || bw_bps <= 0.0) return false;
         const double mlu =
             DeadlineMlu(bytes_ahead, owner.request.length,

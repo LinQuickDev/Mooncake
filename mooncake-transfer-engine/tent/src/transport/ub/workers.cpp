@@ -29,6 +29,19 @@ bool retryableStatus(const Status& status) {
            status.IsRdmaError();
 }
 
+// Rail health and quota are keyed by the physical rail, which deliberately
+// excludes the endpoint generation (see UbRailKey). These read-only probes
+// therefore only need a generation that satisfies UbPostPath::valid(); real
+// endpoint generations are monotonic and never below this value.
+constexpr uint64_t kRailProbeEndpointGeneration = 1;
+
+// Number of candidates always taken in pre-score order, regardless of which
+// local device they belong to. Two is the floor that keeps tryAcquireFirst from
+// deferring a slice when its top pick is preempted by another worker, including
+// on a single-local-device topology where per-device coverage alone would leave
+// only one candidate.
+constexpr size_t kMinResolvedCandidates = 2;
+
 }  // namespace
 
 struct UbWorkers::Route {
@@ -579,6 +592,19 @@ Status UbWorkers::chooseAndResolveEndpoint(
         UbPathSelectionScore score;
     };
 
+    // One local x remote combination, scored from rail-level state before any
+    // endpoint is resolved. Endpoint-level load is deliberately absent: it is
+    // only available after resolution and is applied to the finalists below.
+    struct RailCandidate {
+        Topology::NicID local_id;
+        int remote_id;
+        size_t topology_rank;
+        size_t retry_order;
+        UbPostPath probe_path;
+        RailStats rail_stats;
+        QuotaAvailability capacity;
+    };
+
     const auto local_devices = orderedLocalDevices(pending);
     if (route.remote_devices.empty()) {
         return Status::DeviceNotFound("No usable UB posting path" LOC_MARK);
@@ -620,16 +646,73 @@ Status UbWorkers::chooseAndResolveEndpoint(
         combinations == 0 ? 0 : snapshot.retry_count % combinations;
     Status first_error = Status::DeviceNotFound(
         "No ready UB endpoint for any posting path" LOC_MARK);
-    std::vector<Candidate> candidates;
-    candidates.reserve(combinations);
+
+    auto railScore = [](const RailCandidate& candidate) {
+        return UbPathSelectionScore{
+            candidate.capacity.can_acquire,
+            candidate.topology_rank,
+            candidate.capacity.normalized_inflight,
+            candidate.capacity.normalized_outstanding_wrs,
+            0,
+            0,
+            candidate.rail_stats.ewma_bandwidth_bytes_per_second >= 0.0,
+            candidate.rail_stats.ewma_bandwidth_bytes_per_second,
+            candidate.retry_order,
+            candidate.local_id,
+            candidate.remote_id};
+    };
+
+    // Phase 1: rank every combination from rail-level state only. Resolving an
+    // uncached endpoint costs a bootstrap RPC to the peer, so this pass must
+    // not resolve anything.
+    std::vector<RailCandidate> rails;
+    rails.reserve(combinations);
     for (size_t flat = 0; flat < combinations; ++flat) {
         const auto& local = local_devices[flat / route.remote_devices.size()];
-        const auto local_id = local.id;
         const auto remote_id =
             route.remote_devices[flat % route.remote_devices.size()];
-        auto context = context_by_topology_id_.at(local_id);
+        const UbPostPath probe_path{local.id, pending.target_id, remote_id,
+                                    kRailProbeEndpointGeneration};
+        // A non-inserting lookup: an unknown rail scores as "no health history
+        // yet" without being added to the map, so probing every local x remote
+        // combination cannot grow the rail map or seed a generation for a rail
+        // that is never posted to.
+        auto rail_stats = rail_monitor_->statsIfPresent(probe_path);
+        if (rail_stats.paused) continue;
+        rails.push_back(RailCandidate{
+            local.id, remote_id, local.topology_rank,
+            (flat + combinations - start) % combinations, probe_path,
+            std::move(rail_stats),
+            quota_->availability(probe_path, pending.slice->spec().length)});
+    }
+    std::stable_sort(rails.begin(), rails.end(),
+                     [&](const RailCandidate& lhs, const RailCandidate& rhs) {
+                         return betterUbPathScore(railScore(lhs),
+                                                  railScore(rhs));
+                     });
+
+    // Phase 2: resolve lazily in the order produced by
+    // ubResolutionAttemptOrder(), which takes the best rail of each local
+    // device first and the remaining rails only after that. So the candidates
+    // span devices instead of piling onto whichever device ranks best, and a
+    // rail that cannot be resolved simply yields to the next attempt -
+    // including the remaining rails on its own device from pass two. The
+    // bootstrap fan-out is therefore bounded by the number of local devices -
+    // one endpoint per device on a cold peer - rather than by the local x
+    // remote combination count.
+    const size_t resolve_limit =
+        std::max(kMinResolvedCandidates, local_devices.size());
+    std::vector<Topology::NicID> rail_local_ids;
+    rail_local_ids.reserve(rails.size());
+    for (const auto& rail : rails) rail_local_ids.push_back(rail.local_id);
+    std::vector<Candidate> candidates;
+    candidates.reserve(std::min(rails.size(), resolve_limit));
+    for (size_t attempt : ubResolutionAttemptOrder(rail_local_ids)) {
+        if (candidates.size() >= resolve_limit) break;
+        const auto& rail = rails[attempt];
+        auto context = context_by_topology_id_.at(rail.local_id);
         EndpointResolveRequest request{context, pending.target_id,
-                                       route.pin.get(), remote_id,
+                                       route.pin.get(), rail.remote_id,
                                        route.metadata.generation};
         std::shared_ptr<UbEndpoint> candidate_endpoint;
         auto status = endpoint_resolver_(request, candidate_endpoint);
@@ -639,25 +722,27 @@ Status UbWorkers::chooseAndResolveEndpoint(
                 first_error = status;
             continue;
         }
-        UbPostPath candidate_path{local_id, pending.target_id, remote_id,
+        UbPostPath candidate_path{rail.local_id, pending.target_id,
+                                  rail.remote_id,
                                   candidate_endpoint->generation()};
+        // Re-read rail state under the real generation: the rail may only have
+        // been created by the resolution above.
         const auto rail_stats = rail_monitor_->stats(candidate_path);
         if (rail_stats.paused) continue;
         const auto capacity =
             quota_->availability(candidate_path, pending.slice->spec().length);
-        const size_t retry_order = (flat + combinations - start) % combinations;
         const uint64_t endpoint_wrs = candidate_endpoint->outstandingWrs();
         const uint64_t endpoint_bytes = candidate_endpoint->outstandingBytes();
         candidates.push_back(
             Candidate{std::move(candidate_endpoint), candidate_path,
                       UbPathSelectionScore{
-                          capacity.can_acquire, local.topology_rank,
+                          capacity.can_acquire, rail.topology_rank,
                           capacity.normalized_inflight,
                           capacity.normalized_outstanding_wrs, endpoint_wrs,
                           endpoint_bytes,
                           rail_stats.ewma_bandwidth_bytes_per_second >= 0.0,
                           rail_stats.ewma_bandwidth_bytes_per_second,
-                          retry_order, local_id, remote_id}});
+                          rail.retry_order, rail.local_id, rail.remote_id}});
     }
     if (candidates.empty()) {
         if (first_error.IsTooManyRequests()) {
@@ -882,11 +967,9 @@ void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
         context->completeFailureCleanup();
         return;
     }
-    if (!status.ok()) {
-        LOG_EVERY_N(WARNING, 100)
-            << "UB endpoint retirement after local device failure is pending: "
-            << status.ToString();
-    }
+    LOG_EVERY_N(WARNING, 100)
+        << "UB endpoint retirement after local device failure is pending: "
+        << status.ToString();
 }
 
 void UbWorkers::handleCompletion(const Completion& completion) {

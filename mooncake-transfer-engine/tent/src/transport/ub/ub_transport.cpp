@@ -357,7 +357,17 @@ struct UbTransport::Impl {
     }
 
     Status failInstall(Status failure) {
-        (void)shutdownUnlocked();
+        // Install now fails fast, so a failed rollback can leave native
+        // resources owned by this object. Surface that instead of silently
+        // discarding it, otherwise the leak is only visible as a later
+        // install/uninstall failure.
+        auto cleanup = shutdownUnlocked();
+        if (!cleanup.ok()) {
+            LOG(WARNING)
+                << "UB transport rollback after a failed install could "
+                   "not release every native resource: "
+                << cleanup.ToString();
+        }
         return failure;
     }
 
@@ -422,10 +432,6 @@ struct UbTransport::Impl {
         local_topology.reset();
         conf.reset();
         local_segment_name.clear();
-        {
-            std::lock_guard<std::mutex> lock(endpoint_generation_mutex);
-            ready_endpoint_generations.clear();
-        }
         shutting_down.store(false, std::memory_order_release);
         return Status::OK();
     }
@@ -469,20 +475,16 @@ struct UbTransport::Impl {
     void recordReadyEndpoint(const std::shared_ptr<ub::UbEndpoint>& endpoint) {
         if (!endpoint || !endpoint->ready() || !rails) return;
 
-        const auto generation = endpoint->generation();
+        // RailMonitor keeps the per-rail generation watermark and ignores
+        // generations it has already seen, so this is safe to call from every
+        // resolve as well as from converging or retried rebuild paths. Keeping
+        // the watermark there also means no peer-keyed state accumulates here
+        // across peer restarts, and the posting hot path takes only
+        // RailMonitor's lock instead of a second transport-wide one.
         const auto& key = endpoint->key();
-        std::lock_guard<std::mutex> lock(endpoint_generation_mutex);
-        auto [it, inserted] =
-            ready_endpoint_generations.emplace(key, generation);
-        if (!inserted && generation > it->second) {
-            // Serialize the generation watermark with telemetry so a delayed
-            // callback for an older incarnation can neither roll the map back
-            // nor race a newer rebuild into a double count.
-            it->second = generation;
-            rails->recordEndpointRebuild(
-                ub::UbPostPath{key.local_topology_id, key.remote_segment_id,
-                               key.remote_topology_id, generation});
-        }
+        rails->recordEndpointRebuild(
+            ub::UbPostPath{key.local_topology_id, key.remote_segment_id,
+                           key.remote_topology_id, endpoint->generation()});
     }
 
     Status resolveEndpoint(const ub::EndpointResolveRequest& request,
@@ -588,7 +590,6 @@ struct UbTransport::Impl {
     }
 
     mutable std::mutex lifecycle_mutex;
-    mutable std::mutex endpoint_generation_mutex;
     std::shared_ptr<ub::UrmaAdapter> adapter;
     bool adapter_initialized{false};
     bool callback_installed{false};
@@ -609,8 +610,6 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::RailMonitor> rails;
     std::unique_ptr<ub::QuotaManager> quota;
     std::unique_ptr<ub::UbWorkers> workers;
-    std::unordered_map<ub::UbEndpointKey, uint64_t, ub::UbEndpointKeyHash>
-        ready_endpoint_generations;
 };
 
 UbTransport::UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter)

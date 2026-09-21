@@ -90,6 +90,41 @@ Inside `RdmaTransport`, each completion drives the rail monitor:
 
 This produces two independent recovery signals — cooldown expiry and live success — so a flaky rail does not stall forever if no other rail is posted to, and a recovered rail returns to service at the first good completion instead of waiting for the full cooldown.
 
+### UB rail recovery
+
+UB rails have their own monitor, `RailMonitor`, keyed by the physical rail
+(`UbRailKey`: local topology id, remote segment id, remote device id) rather
+than by the endpoint incarnation, so health and learned bandwidth survive an
+endpoint rebuild. Posting paths read it the same way RDMA reads its rail state:
+
+* Bad completion → `recordError` / `recordTimeout`; good completion →
+  `recordSuccess`, which also feeds the EWMA used to rank paths.
+* `error_threshold` (3) errors inside `error_window_ns` (10 s) pause the rail
+  for `cooldown_ns`, which is bound to `transports/ub/endpoint_cooldown_ms`
+  (default 1000 ms).
+* Path selection skips paused rails and ranks the rest by quota availability,
+  topology locality and learned bandwidth *before* resolving endpoints, so a
+  paused or loaded rail is avoided without paying a bootstrap round trip.
+* `recordEndpointRebuild` records at most one rebuild per endpoint generation
+  per rail and is safe to call from converging or retried rebuild paths. The
+  first generation to become ready establishes the rail's baseline, so the
+  initial bootstrap is not counted as a rebuild; only later generation
+  increases advance `endpoint_rebuilds`.
+
+Local device failure is handled separately from rail health. A failed local
+device marks its context unavailable, and the transport then calls
+`EndpointStore::retireLocalDevice`, which unpublishes every endpoint backed by
+that device and quarantines any whose native cleanup has not completed. The
+context only returns to service once every one of them reaches `Destroyed`,
+because reactivating JFC health before that barrier would post onto Jetty sets
+that still lack their flush fence. Quarantined endpoints are retried only when
+the store actually needs a slot, and at most once per sweep interval, so a
+still-failing device cannot turn every posting call into a serialized provider
+call.
+
+When UB cannot resolve or post a slice, the generic submit-stage failover
+described above moves the owner to the remaining candidate transports.
+
 ## Configuration
 
 All knobs live in the top-level `transfer-engine.json`. Defaults are safe for production; tune only if you have evidence.
@@ -161,3 +196,4 @@ Submit-stage recovery is exercised through the same FakeTransport harness with `
 * `markRecovered` (and cooldown expiry in `available`) clears the exponential-backoff memory entirely. A rail that flaps repeatedly therefore does not accumulate a growing cooldown across recovery cycles. If this becomes a problem the fix is to decay rather than reset.
 * Cross-transport failover is driven purely by return status; there is no latency-based "this transport is healthy but too slow, try another" signal. That belongs to the scheduler, not this document.
 * Runtime-layer failover is covered by FakeTransport tests in the `tent-ci` `cuda-off` legs. DMA integrity, real WC errors, and staging under NVLink still need hardware runners; see {ref}`TENT Testing <tent-testing>`.
+* UB rail health, endpoint-rebuild telemetry and device-failure cleanup are covered by fake-URMA-adapter tests (`tent_ub_core_test`, `tent_ub_teardown_test`, `tent_ub_native_data_path_test`, `tent_rail_monitor_test`). Real provider errors, bonding-device failover and the bootstrap fan-out of a cold multi-rail peer still need Kunpeng/URMA hardware runners.

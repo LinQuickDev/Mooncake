@@ -4,8 +4,10 @@
 #ifndef TENT_TRANSPORT_UB_ENDPOINT_STORE_H_
 #define TENT_TRANSPORT_UB_ENDPOINT_STORE_H_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -23,8 +25,14 @@ namespace mooncake::tent::ub {
 // generation and can never resurrect a failed Jetty set.
 class EndpointStore final {
    public:
+    // Time source for the quarantine-sweep throttle. Production leaves this
+    // empty and uses steady_clock; tests inject a controllable clock so the
+    // throttle is not sensitive to scheduler stalls.
+    using SteadyClock = std::function<std::chrono::steady_clock::time_point()>;
+
     EndpointStore(std::shared_ptr<UrmaAdapter> adapter, size_t max_size,
-                  uint32_t jetty_count, JettyOptions jetty_options = {});
+                  uint32_t jetty_count, JettyOptions jetty_options = {},
+                  SteadyClock clock = {});
     ~EndpointStore();
 
     EndpointStore(const EndpointStore&) = delete;
@@ -60,6 +68,7 @@ class EndpointStore final {
     const size_t max_size_;
     const uint32_t jetty_count_;
     const JettyOptions jetty_options_;
+    const SteadyClock clock_;
     mutable std::mutex mutex_;
     std::unordered_map<UbEndpointKey, Entry, UbEndpointKeyHash> endpoints_;
     // Unpublished endpoints whose native cleanup failed remain owned until a
@@ -67,6 +76,9 @@ class EndpointStore final {
     // while an ERROR Jetty still lacks its flush fence.
     std::vector<std::shared_ptr<UbEndpoint>> quarantined_;
     uint64_t next_insertion_order_{1};
+    // Earliest time the next quarantine sweep may run. Default initialized so
+    // the first sweep is always allowed.
+    std::chrono::steady_clock::time_point next_quarantine_sweep_{};
 };
 
 using UbEndpointStore = EndpointStore;
