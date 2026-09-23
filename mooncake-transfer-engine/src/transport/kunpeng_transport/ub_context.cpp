@@ -406,22 +406,12 @@ void UbWorkerPool::performPoll(int thread_id) {
     // are NOT returned from poll(), so this worker never dereferences them
     // after they may have been recycled by the submitting thread.
     std::unordered_map<volatile int*, int> jetty_depth_set;
+    std::vector<UbEndPoint*> deferred_deletes;
     std::vector<UbTransport::Slice*> failed_slices;
-    for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
-         jfc_index += kTransferWorkerCount) {
-        UbTransport::Slice* failed[kPollCount];
-        int num_failed = 0;
-        int nr_poll = context_.poll(kPollCount, failed, num_failed,
-                                    jetty_depth_set, jfc_index);
-        if (nr_poll < 0) {
-            LOG(ERROR) << "Worker: Failed to poll jetty for complete";
-            continue;
-        }
-        int num_success = nr_poll - num_failed;
-        success_nr_polls += num_success;
-        processed_slice_count += num_success;
-        for (int i = 0; i < num_failed; ++i) {
-            UbTransport::Slice* slice = failed[i];
+    // Failure handling shared by poll() completions and drain-timeout
+    // recoveries below.
+    auto handle_failed = [&](std::vector<UbTransport::Slice*>& failed) {
+        for (auto* slice : failed) {
             assert(slice);
             failed_nr_polls++;
             if (context_.active() && failed_nr_polls > 32 &&
@@ -439,12 +429,48 @@ void UbWorkerPool::performPoll(int thread_id) {
                 redispatch_counter_++;
             }
         }
-        if (nr_poll)
-            __sync_fetch_and_sub(context_.outstandingCount(jfc_index), nr_poll);
+    };
+    for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
+         jfc_index += kTransferWorkerCount) {
+        std::vector<UbTransport::Slice*> failed;
+        // Only completions resolved inside poll() are counted in this
+        // subtraction. Drain-timeout recoveries run after the loop and are
+        // accounted separately: mixing them in would make num_success go
+        // negative, and a negative success_nr_polls permanently disables
+        // the failed_nr_polls > 32 && !success_nr_polls RNIC-dead
+        // protection inside handle_failed.
+        int nr_resolved = context_.poll(kPollCount, failed, jetty_depth_set,
+                                        deferred_deletes, jfc_index);
+        if (nr_resolved < 0) {
+            LOG(ERROR) << "Worker: Failed to poll jetty for complete";
+            continue;
+        }
+        const int num_success = nr_resolved - static_cast<int>(failed.size());
+        success_nr_polls += num_success;
+        processed_slice_count += num_success;
+        handle_failed(failed);
+        if (nr_resolved)
+            __sync_fetch_and_sub(context_.outstandingCount(jfc_index),
+                                 nr_resolved);
     }
+
+    // Drain-timeout recovery runs once per round after every poll(): it
+    // flushes jetties whose FLUSH_ERR_DONE fence never arrived and delivers
+    // their residual WRs as failures. These are genuine failures (counted in
+    // failed_nr_polls), but they were never part of any poll() return value,
+    // so they must not be subtracted from num_success above. Must run before
+    // the jetty_depth_set accounting: recovered WRs aggregate their depth
+    // into it, and deferred endpoint deletes only happen after that.
+    std::vector<UbTransport::Slice*> drain_failed;
+    context_.checkJettyDrainTimeouts(jetty_depth_set, drain_failed,
+                                     deferred_deletes);
+    handle_failed(drain_failed);
 
     for (auto& entry : jetty_depth_set)
         __sync_fetch_and_sub(entry.first, entry.second);
+
+    for (auto* endpoint : deferred_deletes)
+        context_.deleteEndpointByPtr(endpoint);
 
     // Slices that hit max_retry: final markFailed() after all reads (and the
     // jetty depth returns above) are done. Failed slices were never published
