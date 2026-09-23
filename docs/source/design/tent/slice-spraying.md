@@ -113,11 +113,12 @@ The EWMA provides:
 #### Transmit Estimate
 
 Each device also keeps a second series, the **transmit estimate**, for the
-deadline predictors: the admission queue's deadline-infeasible drop
-(`runtime_queue/mlu_local_threshold`, reads the transmit estimate of the
-transport that will carry the owner) and the RDMA workers' bandwidth
-arbitration (`transports/rdma/deadline_bw_arbitration`, reads the local NIC's
-value). Both compute the same predicted MLU from it:
+deadline predictors (described end to end in
+[Deadline Scheduling](deadline-scheduling.md)): the admission queue's
+deadline-infeasible drop (`runtime_queue/mlu_local_threshold`, reads the
+transmit estimate of the transport that will carry the owner) and the RDMA
+workers' bandwidth arbitration (`transports/rdma/deadline_bw_arbitration`,
+reads the local NIC's value). Both compute the same predicted MLU from it:
 
 ```
 predicted_mlu = ((bytes_ahead + length) / transmit_bandwidth) / remaining_window
@@ -133,9 +134,8 @@ deliberately not the selector's `inflight_bytes`, which is charged when a slice
 is *allocated* and so would include the very slices being ordered as well as
 work still sitting in a worker queue. The order is then built one slot at a
 time — the slice that takes a slot joins `bytes_ahead` for the ones still
-waiting, since the QP posts them in that order (exactly for the first 64 slots,
-which is more than one post can take; the rest are ranked once against the bytes
-those slots accumulated).
+waiting, since the QP posts them in that order (exactly for the first 64 slots;
+the rest are ranked once against the bytes those slots accumulated).
 
 The deadline is absolute, so that wait counts against the window — as an
 additive delay over the wire rate, not as a slower bandwidth (which would
