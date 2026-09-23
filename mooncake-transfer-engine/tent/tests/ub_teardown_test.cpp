@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -655,6 +656,56 @@ TEST(UbTeardown, EndpointStoreReapsQuarantineBeforeReplacementAtCapacity) {
     EXPECT_NE(replacement, old_endpoint);
     EXPECT_EQ(store.size(), 1u);
 
+    EXPECT_TRUE(store.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
+TEST(UbTeardown, EndpointStoreThrottlesQuarantineSweepsAtCapacity) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    // Drive the sweep throttle from a controllable clock so the assertion does
+    // not depend on two adjacent calls landing inside a wall-clock window.
+    auto now = std::chrono::steady_clock::now();
+    EndpointStore store(adapter, 1, 1, {}, [&now] { return now; });
+    const UbEndpointKey old_key{0, 123, 8, "peer/ub:test:8"};
+    std::shared_ptr<UbEndpoint> old_endpoint;
+    ASSERT_TRUE(store.getOrCreate(old_key, context, old_endpoint).ok());
+
+    // Native cleanup keeps failing, so the retired endpoint stays quarantined
+    // and the cache stays at capacity.
+    adapter->delete_jetty_failures = 100;
+    EXPECT_TRUE(store.retire(old_endpoint));
+    EXPECT_EQ(store.size(), 0u);
+
+    std::shared_ptr<UbEndpoint> replacement;
+    EXPECT_FALSE(store
+                     .getOrCreate(UbEndpointKey{0, 123, 9, "peer/ub:test:9"},
+                                  context, replacement)
+                     .ok());
+    const int sweeps_after_first = adapter->delete_jetty_calls;
+    EXPECT_GT(sweeps_after_first, 0);
+
+    // A second attempt inside the sweep interval must not issue native retire
+    // calls again: that is what stops a still-failing device from serializing
+    // provider calls across every posting thread.
+    now += std::chrono::milliseconds(10);
+    EXPECT_FALSE(store
+                     .getOrCreate(UbEndpointKey{0, 123, 10, "peer/ub:test:10"},
+                                  context, replacement)
+                     .ok());
+    EXPECT_EQ(adapter->delete_jetty_calls, sweeps_after_first);
+
+    // Once the interval has elapsed a new attempt is allowed to sweep again.
+    now += std::chrono::milliseconds(300);
+    EXPECT_FALSE(store
+                     .getOrCreate(UbEndpointKey{0, 123, 11, "peer/ub:test:11"},
+                                  context, replacement)
+                     .ok());
+    EXPECT_GT(adapter->delete_jetty_calls, sweeps_after_first);
+
+    // clear() retries regardless of the throttle, so shutdown can still make
+    // progress once the provider recovers.
+    adapter->delete_jetty_failures = 0;
     EXPECT_TRUE(store.clear().ok());
     EXPECT_TRUE(context->shutdown().ok());
 }
