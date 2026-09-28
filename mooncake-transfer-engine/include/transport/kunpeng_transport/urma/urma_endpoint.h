@@ -18,7 +18,10 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 #include "common.h"
 #include "config.h"
 #include "urma_api.h"
@@ -47,8 +50,14 @@ static urma_import_seg_flag_t import_flag = {
            .reserved = 0}};
 
 // define the UrmaContext class
+class UrmaEndpoint;
+// Test hook: lets gtest fixtures seed a minimal UrmaContext (jfc/jfr/urma
+// context) without spinning up the worker pool that full construct() starts.
+class UrmaContextTestPeer;
+
 class UrmaContext : public UbContext {
     friend class UrmaEndpoint;
+    friend class UrmaContextTestPeer;
 
    public:
     UrmaContext(UbTransport& engine, std::string device_name,
@@ -58,8 +67,9 @@ class UrmaContext : public UbContext {
     int unregisterMemoryRegion(uint64_t va) override;
     int doProcessContextEvents() override;
     void* retrieveRemoteSeg(const std::string& value) override;
-    int poll(int num_entries, Transport::Slice** failed_slices, int& num_failed,
+    int poll(int num_entries, std::vector<Transport::Slice*>& failed_slices,
              std::unordered_map<volatile int*, int>& jetty_depth_set,
+             std::vector<UbEndPoint*>& deferred_deletes,
              int jfc_index) override;
     volatile int* outstandingCount(int jfc_index) override;
     int submitPostSend(
@@ -80,6 +90,17 @@ class UrmaContext : public UbContext {
     urma_jfce_t* JFCE();
     static bool uninit();
     static bool init();
+
+    void registerJettyOwner(uint32_t jetty_id, UrmaEndpoint* endpoint,
+                            int slot);
+    void unregisterJettyOwner(uint32_t jetty_id);
+    bool findJettyOwner(uint32_t jetty_id, UrmaEndpoint** endpoint, int* slot);
+    void addDrainingEndpoint(UrmaEndpoint* endpoint);
+    void removeDrainingEndpoint(UrmaEndpoint* endpoint);
+    void checkJettyDrainTimeouts(
+        std::unordered_map<volatile int*, int>& jetty_depth_set,
+        std::vector<Transport::Slice*>& failed_slices,
+        std::vector<UbEndPoint*>& deferred_deletes) override;
 
    private:
     int construct(GlobalConfig& config) override;
@@ -146,11 +167,43 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
+
+    RWSpinlock jetty_owner_lock_;
+    struct JettyOwner {
+        UrmaEndpoint* endpoint = nullptr;
+        int slot = -1;
+    };
+    std::unordered_map<uint32_t, JettyOwner> jetty_owner_map_;
+    std::unordered_set<UrmaEndpoint*> draining_endpoints_;
 };
+
+// Test hook for asserting the jetty state machine without touching private
+// members directly from the test body.
+class UrmaEndpointTestPeer;
 
 // define the UrmaEndpoint class
 class UrmaEndpoint : public UbEndPoint {
+    // UrmaContext::poll drives the jetty state machine via processWrCompletion.
+    friend class UrmaContext;
+    friend class UrmaEndpointTestPeer;
+
    public:
+    // PENDING_DRAIN: the slot hit ACK timeout while another jetty of this
+    // endpoint was draining/rebuilding. It is excluded from post selection
+    // and drained once the in-flight rebuild completes (rebuilds are
+    // serialized per endpoint).
+    enum JettyState {
+        ACTIVE = 0,
+        DRAINING = 1,
+        REBUILDING = 2,
+        PENDING_DRAIN = 3,
+        // Rebuild failed after the old jetty was already torn down
+        // (unbind/unimport) but could not be fully deleted or replaced. The
+        // old handle is kept in jetty_list_[slot] so deconstruct can retry
+        // urma_delete_jetty instead of leaking it. Never selected for post.
+        REBUILDING_FAILED = 4
+    };
+
     UrmaEndpoint(UrmaContext* context)
         : context_(context), jfc_outstanding_(nullptr) {}
 
@@ -173,6 +226,21 @@ class UrmaEndpoint : public UbEndPoint {
 
     const std::string toString() const override;
 
+    // Called from UrmaContext::poll on ACK timeout / flush-done / drain
+    // timeout.
+    void onJettyError(int slot, std::vector<UbEndPoint*>& deferred_deletes);
+    void onFlushDone(int slot,
+                     std::unordered_map<volatile int*, int>& jetty_depth_set,
+                     std::vector<Transport::Slice*>& failed_slices,
+                     std::vector<UbEndPoint*>& deferred_deletes,
+                     int& resolved_wr_count);
+    void checkDrainTimeout(
+        std::unordered_map<volatile int*, int>& jetty_depth_set,
+        std::vector<Transport::Slice*>& failed_slices,
+        std::vector<UbEndPoint*>& deferred_deletes);
+
+    int findSlotByDepth(volatile int* depth) const;
+
    private:
     void disconnectUnlocked() override;
 
@@ -187,6 +255,36 @@ class UrmaEndpoint : public UbEndPoint {
                           uint32_t peer_jetty_num,
                           std::string* reply_msg = nullptr);
 
+    bool hasNonActiveJettyUnlocked() const;
+    int selectActiveJettyUnlocked();
+    // Transitions `slot` to DRAINING via urma_modify_jetty(ERROR) and arms
+    // the flush-done wait. Caller must hold lock_. Returns ERR_ENDPOINT if
+    // modify failed (caller should fall back to deleting the endpoint).
+    int startDrainUnlocked(int slot);
+    int rebuildJettyUnlocked(
+        int slot, std::unordered_map<volatile int*, int>& jetty_depth_set,
+        std::vector<Transport::Slice*>& failed_slices,
+        std::vector<UbEndPoint*>& deferred_deletes, int& resolved_wr_count);
+
+    // Delivers one WR completion to the normal success/failure path.
+    // Returns true when the completion resolved a live WR (and must be counted
+    // in the JFC outstanding accounting). Returns false for completions from a
+    // stale jetty generation, which were already resolved during the rebuild
+    // flush and must be dropped entirely. When allow_error_trigger is false
+    // (the caller already holds lock_ while rebuilding/draining), an
+    // ACK_TIMEOUT completion is delivered as a plain failure without
+    // re-entering onJettyError.
+    bool processWrCompletion(
+        urma_cr_t& cr, std::unordered_map<volatile int*, int>& jetty_depth_set,
+        std::vector<Transport::Slice*>& failed_slices,
+        std::vector<UbEndPoint*>& deferred_deletes, int jfc_index,
+        bool allow_error_trigger);
+
+    int recreateJettyUnlocked(int slot, urma_jfc_t* reuse_jfc,
+                              urma_jfr_t* reuse_jfr);
+
+    static constexpr uint64_t kJettyDrainTimeoutNs = 3000000000ull;  // 3s
+
    private:
     UrmaContext* context_;
     urma_token_t urma_token = {.token = 0xACFE};
@@ -195,6 +293,14 @@ class UrmaEndpoint : public UbEndPoint {
     int max_wr_depth_;
     volatile int* jfc_outstanding_;
     std::unordered_map<urma_jetty_t*, urma_target_jetty_t*> imported_jetty_map_;
+
+    std::vector<JettyState> jetty_state_;
+    std::unordered_map<uint32_t, int> jetty_id_map_;
+    std::vector<uint32_t> peer_jetty_id_;
+    std::string peer_eid_;
+    uint64_t drain_start_ns_ = 0;
+    int draining_slot_ = -1;
+    std::vector<uint64_t> jetty_epoch_;
 };
 }  // namespace mooncake
 #endif  // URMA_ENDPOINT_H
