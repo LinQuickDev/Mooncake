@@ -3,6 +3,7 @@
 
 #include "tent/transport/ub/endpoint_store.h"
 
+#include <chrono>
 #include <iterator>
 #include <limits>
 #include <utility>
@@ -10,6 +11,12 @@
 
 namespace mooncake::tent::ub {
 namespace {
+
+// Minimum spacing between quarantine sweeps. A sweep issues native retire
+// calls (resetJetty/deleteJetty) while the store lock is held, so an
+// unconditional retry would let one failing device serialize failing provider
+// operations across every posting thread.
+constexpr auto kQuarantineSweepInterval = std::chrono::milliseconds(250);
 
 bool retirementComplete(const std::shared_ptr<UbEndpoint>& endpoint) {
     return endpoint && endpoint->state() == UbEndpoint::State::kDestroyed;
@@ -24,11 +31,12 @@ Status retirementPending() {
 
 EndpointStore::EndpointStore(std::shared_ptr<UrmaAdapter> adapter,
                              size_t max_size, uint32_t jetty_count,
-                             JettyOptions jetty_options)
+                             JettyOptions jetty_options, SteadyClock clock)
     : adapter_(std::move(adapter)),
       max_size_(max_size),
       jetty_count_(jetty_count),
-      jetty_options_(jetty_options) {}
+      jetty_options_(jetty_options),
+      clock_(std::move(clock)) {}
 
 EndpointStore::~EndpointStore() {
     auto status = clear();
@@ -76,10 +84,6 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // A transient provider busy/error must not permanently consume the
-        // cache. Retry unpublished ownership before deciding that no slot is
-        // available for a replacement generation.
-        (void)retryQuarantinedLocked();
         auto existing = endpoints_.find(key);
         if (existing != endpoints_.end()) {
             if (existing->second.endpoint &&
@@ -89,6 +93,19 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
                 auto evicted = std::move(existing->second.endpoint);
                 endpoints_.erase(existing);
                 (void)retireLocked(evicted);
+            }
+        }
+
+        // A transient provider busy/error must not permanently consume the
+        // cache, but sweeping quarantine is only worth its native calls when a
+        // slot is actually needed, and it is rate limited so a still-failing
+        // device cannot make every posting call pay for a full sweep.
+        if (!endpoint && endpoints_.size() + quarantined_.size() >= max_size_) {
+            const auto now =
+                clock_ ? clock_() : std::chrono::steady_clock::now();
+            if (now >= next_quarantine_sweep_) {
+                next_quarantine_sweep_ = now + kQuarantineSweepInterval;
+                (void)retryQuarantinedLocked();
             }
         }
 

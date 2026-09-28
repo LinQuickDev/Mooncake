@@ -22,6 +22,7 @@ Prefer one of the following documented prefixes:
 - ``[Bugfix]`` for bug fixes.
 - ``[CI/Build]`` for build or continuous integration improvements.
 - ``[Doc]`` for documentation fixes and improvements.
+- ``[Conductor]`` for changes in the ``mooncake-conductor``.
 - ``[Integration]`` for changes in the ``mooncake-integration``.
 - ``[P2PStore]`` for changes in the ``mooncake-p2p-store``.
 - ``[Store]`` for changes in the ``mooncake-store``.
@@ -34,9 +35,12 @@ when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
 ``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
 ``[TENT]``, and ``[Wheel]``.
 
-### RFC Discussion
+### Notes for Large Changes
 
-For major architectural changes (>500 LOC excluding tests), we would expect a GitHub issue (RFC) discussing the technical design and justification.
+Please keep changes as concise as possible. For major architectural changes
+(>500 LOC excluding kernel/data/config/test), we expect a GitHub issue (RFC)
+that discusses the technical design and justification. Otherwise, the PR may be
+tagged with `rfc-required` and might not be reviewed until an RFC is provided.
 
 
 ### Development Workflow & Pre-commit Hooks
@@ -65,9 +69,21 @@ committing again. Use `./scripts/code_format.sh --all` only when intentionally
 formatting the whole project.
 
 #### Usage
-Run hooks on all files (the first run installs hook environments). The C/C++
-hook remains limited to staged line ranges; use `./scripts/code_format.sh --all`
-for an intentional whole-project C/C++ format:
+After `pre-commit install`, hooks run on each commit. To run them manually on
+staged files (the first run may install hook environments):
+```bash
+pre-commit run
+```
+Before opening a PR, run hooks only on files changed against the PR base
+(default `origin/main`). The C/C++ hook remains limited to staged or changed
+line ranges:
+```bash
+git fetch origin main
+pre-commit run --files $(git diff --name-only --diff-filter=ACMR origin/main...HEAD)
+```
+Use full-repo checks only for intentional whole-project cleanup; do not fold
+unrelated rewrites into a feature PR. Prefer `./scripts/code_format.sh --all`
+for a deliberate whole-project C/C++ format:
 ```bash
 pre-commit run --all-files
 ```

@@ -4,6 +4,7 @@
 #include "tent/transport/ub/endpoint.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <exception>
 #include <iterator>
@@ -134,6 +135,11 @@ Status UbEndpoint::deleteJettysLocked() {
     retained_jfc_indices.reserve(jfc_indices_.size());
     for (size_t index = 0; index < jetties_.size(); ++index) {
         if (deleted[index]) continue;
+        // Both arrays are appended together, so a missing index means the
+        // bookkeeping is already corrupt. Fail loudly instead of silently
+        // rebinding a retained Jetty to JFC 0; the guard keeps release builds
+        // memory-safe.
+        assert(index < jfc_indices_.size());
         retained_jetties.push_back(std::move(jetties_[index]));
         retained_jfc_indices.push_back(
             index < jfc_indices_.size() ? jfc_indices_[index] : size_t{0});
@@ -216,7 +222,14 @@ Status UbEndpoint::prepare() {
             return failLocked(std::move(status));
         }
         if (!jetty || !jetty->valid() || jetty->id() == 0) {
-            if (jetty) jetties_.push_back(std::move(jetty));
+            if (jetty) {
+                // Adopt the invalid Jetty together with its JFC index: the
+                // cleanup path walks jetties_ and jfc_indices_ in lockstep, so
+                // appending to only one of them would misalign every later
+                // entry.
+                jetties_.push_back(std::move(jetty));
+                jfc_indices_.push_back(jfc_index);
+            }
             return failLocked(Status::InternalError(
                 "URMA adapter returned an invalid Jetty" LOC_MARK));
         }

@@ -24,17 +24,6 @@ _store_module = importlib.import_module(
 MooncakeDistributedStore = _store_module.MooncakeDistributedStore
 ReplicateConfig = _store_module.ReplicateConfig
 
-try:
-    get_alloc_func_addr = _store_module.get_alloc_func_addr
-    get_free_func_addr = _store_module.get_free_func_addr
-except AttributeError:
-
-    def get_alloc_func_addr():
-        return None
-
-    def get_free_func_addr():
-        return None
-
 
 LOG = logging.getLogger("store_kv_bench")
 
@@ -592,61 +581,41 @@ class StoreSession:
 
 
 class ZcopyBufferPool:
-    def __init__(self, store_obj, value_size: int, slots: int):
+    def __init__(self, store_obj, value_size: int, slots: int, local_buffer_size: int):
         self.store = store_obj
         self.value_size = value_size
         self.slots = slots
         self.total_size = self.value_size * self.slots
-        self._alloc_fn = None
-        self._free_fn = None
-        self._registered = False
+        self._pool = None
+        self._lease = None
         self.base_ptr = 0
 
-        alloc_addr = get_alloc_func_addr()
-        free_addr = get_free_func_addr()
-        if alloc_addr is None or free_addr is None:
-            raise RuntimeError(
-                "store module does not expose hugepage alloc/free helpers"
+        if self.total_size > local_buffer_size:
+            raise ValueError(
+                "zcopy pool requires "
+                f"{self.total_size} bytes, but --local-buffer-size is "
+                f"{local_buffer_size}; increase --local-buffer-size"
             )
 
-        self._alloc_fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t)(
-            get_alloc_func_addr()
+        self._pool = _store_module.BufferPool(
+            self.store, max_bytes=local_buffer_size, max_regions=1
         )
-        self._free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(get_free_func_addr())
-
-        raw_ptr = self._alloc_fn(self.total_size)
-        self.base_ptr = ctypes.cast(raw_ptr, ctypes.c_void_p).value or 0
-        if self.base_ptr == 0:
-            raise RuntimeError(
-                f"direct hugepage alloc failed for zcopy pool: size={self.total_size}"
-            )
-        ret = self.store.register_buffer(self.base_ptr, self.total_size)
-        if ret != 0:
-            failed_ptr = self.base_ptr
-            self._free_fn(ctypes.c_void_p(self.base_ptr))
-            self.base_ptr = 0
-            raise RuntimeError(
-                f"register_buffer failed for direct zcopy pool ptr={failed_ptr}: {ret}"
-            )
-        self._registered = True
-        self._buffer = (ctypes.c_ubyte * self.total_size).from_address(self.base_ptr)
+        try:
+            self._lease = self._pool.acquire(self.total_size, block=False)
+        except Exception:
+            self._pool.close()
+            self._pool = None
+            raise
+        self.base_ptr = self._lease.ptr
 
     def close(self) -> None:
-        self._buffer = None
-        if self.base_ptr:
-            if self._registered:
-                try:
-                    self.store.unregister_buffer(self.base_ptr)
-                except Exception:
-                    LOG.debug(
-                        "unregister_buffer failed for direct zcopy pool ptr=%s",
-                        self.base_ptr,
-                        exc_info=True,
-                    )
-                self._registered = False
-            if self._free_fn is not None:
-                self._free_fn(ctypes.c_void_p(self.base_ptr))
-            self.base_ptr = 0
+        self.base_ptr = 0
+        if self._lease is not None:
+            self._lease.release()
+            self._lease = None
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
 
     def slot_ptr(self, slot: int) -> int:
         if slot < 0 or slot >= self.slots:
@@ -714,7 +683,9 @@ class StoreRuntime:
         self.zcopy_pool: Optional[ZcopyBufferPool] = None
         if args.io_api == "zcopy":
             slots = max(1, args.batch_size) * lane_count
-            self.zcopy_pool = ZcopyBufferPool(self.store, args.value_size, slots)
+            self.zcopy_pool = ZcopyBufferPool(
+                self.store, args.value_size, slots, args.local_buffer_size
+            )
 
     def make_session(
         self,
@@ -994,11 +965,16 @@ class BenchmarkRunner:
         sessions = self._make_sessions()
         per_lane_stats: List[Optional[PhaseStats]] = [None] * self.lane_count
         threads: List[threading.Thread] = []
+        errors: List[Optional[BaseException]] = [None] * self.lane_count
 
         def runner(index: int, session: StoreSession) -> None:
             stats = PhaseStats(name=f"{phase_name}/lane{index}")
             stats.start_time = time.perf_counter()
-            worker_builder(session, index)(stats)
+            try:
+                worker_builder(session, index)(stats)
+            except BaseException as exc:
+                errors[index] = exc
+                return
             stats.end_time = time.perf_counter()
             per_lane_stats[index] = stats
 
@@ -1013,6 +989,11 @@ class BenchmarkRunner:
 
         for thread in threads:
             thread.join()
+
+        # Join every lane before allowing the caller to release shared buffers.
+        for lane_id, error in enumerate(errors):
+            if error is not None:
+                raise RuntimeError(f"{phase_name} lane {lane_id} failed") from error
 
         merged = merge_stats(phase_name, [s for s in per_lane_stats if s is not None])
         log_phase_stats(merged)

@@ -11,6 +11,70 @@
 
 namespace mooncake {
 
+struct ClientLivenessConfigSource {
+    std::optional<int64_t> active_ttl_sec;
+    std::optional<int64_t> legacy_ttl_sec;
+    std::optional<int64_t> suspicion_ttl_sec;
+};
+
+struct ResolvedClientLivenessConfig {
+    int64_t active_ttl_sec;
+    int64_t suspicion_ttl_sec;
+    bool config_active_conflict;
+    bool command_line_active_conflict;
+};
+
+inline ResolvedClientLivenessConfig ResolveClientLivenessConfig(
+    const ClientLivenessConfigSource& config_file,
+    const ClientLivenessConfigSource& command_line,
+    int64_t default_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
+    int64_t default_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC) {
+    const auto validate_source = [](const ClientLivenessConfigSource& source) {
+        for (const auto value : {source.active_ttl_sec, source.legacy_ttl_sec,
+                                 source.suspicion_ttl_sec}) {
+            if (value.has_value() && *value <= 0) {
+                throw std::invalid_argument(
+                    "Client liveness TTLs must be positive");
+            }
+        }
+    };
+    validate_source(config_file);
+    validate_source(command_line);
+    if (default_active_ttl_sec <= 0 || default_suspicion_ttl_sec <= 0) {
+        throw std::invalid_argument(
+            "Default Client liveness TTLs must be positive");
+    }
+
+    const bool config_conflict =
+        config_file.active_ttl_sec.has_value() &&
+        config_file.legacy_ttl_sec.has_value() &&
+        config_file.active_ttl_sec != config_file.legacy_ttl_sec;
+    const bool command_line_conflict =
+        command_line.active_ttl_sec.has_value() &&
+        command_line.legacy_ttl_sec.has_value() &&
+        command_line.active_ttl_sec != command_line.legacy_ttl_sec;
+
+    const int64_t config_active = config_file.active_ttl_sec.value_or(
+        config_file.legacy_ttl_sec.value_or(default_active_ttl_sec));
+    const int64_t active = command_line.active_ttl_sec.value_or(
+        command_line.legacy_ttl_sec.value_or(config_active));
+    const bool active_explicitly_configured =
+        command_line.active_ttl_sec.has_value() ||
+        command_line.legacy_ttl_sec.has_value() ||
+        config_file.active_ttl_sec.has_value() ||
+        config_file.legacy_ttl_sec.has_value();
+    const int64_t suspicion = command_line.suspicion_ttl_sec.value_or(
+        config_file.suspicion_ttl_sec.value_or(
+            active_explicitly_configured ? active : default_suspicion_ttl_sec));
+
+    return {
+        .active_ttl_sec = active,
+        .suspicion_ttl_sec = suspicion,
+        .config_active_conflict = config_conflict,
+        .command_line_active_conflict = command_line_conflict,
+    };
+}
+
 // Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
 class HttpMetadataServer;
 
@@ -30,6 +94,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 struct MasterConfig {
     bool enable_metric_reporting;
     uint32_t metrics_port;
+    std::string metrics_host;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
@@ -39,12 +104,15 @@ struct MasterConfig {
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    double tenant_eviction_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
-    int64_t client_live_ttl_sec;
+    int64_t client_active_ttl_sec;
+    int64_t client_suspicion_ttl_sec;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
@@ -57,6 +125,8 @@ struct MasterConfig {
 
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
@@ -139,6 +209,13 @@ struct MasterConfig {
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Dynamic MEMORY replica fanout for hot read-only objects.
+    // Kept intentionally small: mode + frequency window + max replicas.
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
+
     // KV Events publisher (RFC #1527) for cache-aware indexers.
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -169,7 +246,8 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> nof_eviction_ratio{"nof_eviction_ratio"};
     RequiredParam<double> nof_eviction_high_watermark_ratio{
         "nof_eviction_high_watermark_ratio"};
-    RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<int64_t> client_active_ttl_sec{"client_active_ttl_sec"};
+    RequiredParam<int64_t> client_suspicion_ttl_sec{"client_suspicion_ttl_sec"};
     RequiredParam<int64_t> nof_heartbeat_interval_sec{
         "nof_heartbeat_interval_sec"};
     RequiredParam<uint32_t> nof_heartbeat_probe_timeout_ms{
@@ -181,7 +259,11 @@ class MasterServiceSupervisorConfig {
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
+    double tenant_eviction_high_watermark_ratio =
+        DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
+    std::string metrics_host = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -190,6 +272,8 @@ class MasterServiceSupervisorConfig {
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
@@ -238,6 +322,10 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -269,16 +357,21 @@ class MasterServiceSupervisorConfig {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
+        metrics_host = config.metrics_host;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        tenant_eviction_high_watermark_ratio =
+            config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
-        client_live_ttl_sec = config.client_live_ttl_sec;
+        client_active_ttl_sec = config.client_active_ttl_sec;
+        client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -292,6 +385,13 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -317,6 +417,8 @@ class MasterServiceSupervisorConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
@@ -423,8 +525,11 @@ class MasterServiceSupervisorConfig {
             throw std::runtime_error(
                 "nof_eviction_high_watermark_ratio is not set");
         }
-        if (!client_live_ttl_sec.IsSet()) {
-            throw std::runtime_error("client_live_ttl_sec is not set");
+        if (!client_active_ttl_sec.IsSet()) {
+            throw std::runtime_error("client_active_ttl_sec is not set");
+        }
+        if (!client_suspicion_ttl_sec.IsSet()) {
+            throw std::runtime_error("client_suspicion_ttl_sec is not set");
         }
         if (!nof_heartbeat_interval_sec.IsSet()) {
             throw std::runtime_error("nof_heartbeat_interval_sec is not set");
@@ -453,6 +558,7 @@ class WrappedMasterServiceConfig {
 
     // Optional parameters (with default values)
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
@@ -460,11 +566,14 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double tenant_eviction_high_watermark_ratio =
+        DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
-    int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -480,6 +589,10 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -496,6 +609,8 @@ class WrappedMasterServiceConfig {
     std::string ha_backend_connstring;
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -544,17 +659,21 @@ class WrappedMasterServiceConfig {
 
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        tenant_eviction_high_watermark_ratio =
+            config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
-        client_live_ttl_sec = config.client_live_ttl_sec;
+        client_active_ttl_sec = config.client_active_ttl_sec;
+        client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -569,6 +688,13 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -586,6 +712,8 @@ class WrappedMasterServiceConfig {
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -659,17 +787,21 @@ class WrappedMasterServiceConfig {
 
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        tenant_eviction_high_watermark_ratio =
+            config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
-        client_live_ttl_sec = config.client_live_ttl_sec;
+        client_active_ttl_sec = config.client_active_ttl_sec;
+        client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -685,6 +817,13 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -702,6 +841,8 @@ class WrappedMasterServiceConfig {
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -748,16 +889,21 @@ class MasterServiceConfigBuilder {
    private:
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    uint64_t max_kv_soft_pin_ttl_ = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double tenant_eviction_high_watermark_ratio_ =
+        DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio_ =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
-    int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t client_active_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    bool client_active_ttl_explicitly_set_ = false;
+    std::optional<int64_t> client_suspicion_ttl_sec_;
     int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms_ =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -769,6 +915,8 @@ class MasterServiceConfigBuilder {
     std::string ha_backend_connstring_;
     // OpLog store configuration
     bool enable_oplog_ = false;
+    bool enable_oplog_snapshot_ = false;
+    uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -818,6 +966,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_kv_soft_pin_ttl(uint64_t ttl) {
+        max_kv_soft_pin_ttl_ = ttl;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
@@ -832,6 +985,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
         double ratio) {
         eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_tenant_eviction_high_watermark_ratio(
+        double ratio) {
+        tenant_eviction_high_watermark_ratio_ = ratio;
         return *this;
     }
 
@@ -852,7 +1011,19 @@ class MasterServiceConfigBuilder {
     }
 
     MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
-        client_live_ttl_sec_ = ttl;
+        client_active_ttl_sec_ = ttl;
+        client_active_ttl_explicitly_set_ = true;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_client_active_ttl_sec(int64_t ttl) {
+        client_active_ttl_sec_ = ttl;
+        client_active_ttl_explicitly_set_ = true;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_client_suspicion_ttl_sec(int64_t ttl) {
+        client_suspicion_ttl_sec_ = ttl;
         return *this;
     }
 
@@ -897,6 +1068,17 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
         enable_oplog_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_oplog_snapshot(bool enable) {
+        enable_oplog_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_chunk_object_count(
+        uint64_t count) {
+        snapshot_chunk_object_count_ = count;
         return *this;
     }
 
@@ -1105,16 +1287,22 @@ class MasterServiceConfig {
    public:
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double tenant_eviction_high_watermark_ratio =
+        DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Zero denotes a directly constructed, supervisor-unmanaged service;
+    // HA supervisor serving paths always inject the acquired non-zero view.
     ViewVersionId view_version = 0;
-    int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -1130,6 +1318,10 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -1146,6 +1338,8 @@ class MasterServiceConfig {
     std::string ha_backend_connstring;
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1192,15 +1386,19 @@ class MasterServiceConfig {
 
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        tenant_eviction_high_watermark_ratio =
+            config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
-        client_live_ttl_sec = config.client_live_ttl_sec;
+        client_active_ttl_sec = config.client_active_ttl_sec;
+        client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -1215,6 +1413,13 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -1230,6 +1435,8 @@ class MasterServiceConfig {
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -1279,17 +1486,28 @@ class MasterServiceConfig {
 
 // Implementation of MasterServiceConfigBuilder::build()
 inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
+    const int64_t suspicion_ttl = client_suspicion_ttl_sec_.value_or(
+        client_active_ttl_explicitly_set_ ? client_active_ttl_sec_
+                                          : DEFAULT_CLIENT_SUSPICION_TTL_SEC);
+    if (client_active_ttl_sec_ <= 0 || suspicion_ttl <= 0) {
+        throw std::invalid_argument("Client liveness TTLs must be positive");
+    }
+
     MasterServiceConfig config;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
+    config.max_kv_soft_pin_ttl = max_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.tenant_eviction_high_watermark_ratio =
+        tenant_eviction_high_watermark_ratio_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
     config.nof_eviction_high_watermark_ratio =
         nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
-    config.client_live_ttl_sec = client_live_ttl_sec_;
+    config.client_active_ttl_sec = client_active_ttl_sec_;
+    config.client_suspicion_ttl_sec = suspicion_ttl;
     config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
@@ -1298,6 +1516,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.enable_oplog = enable_oplog_;
+    config.enable_oplog_snapshot = enable_oplog_snapshot_;
+    config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.cluster_id = cluster_id_;

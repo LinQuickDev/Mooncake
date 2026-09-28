@@ -265,7 +265,12 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         return Status::OK();
     }
-    Status resetJetty(const JettyPtr&) override { return Status::OK(); }
+    Status resetJetty(const JettyPtr&) override {
+        if (fail_resets_.load(std::memory_order_acquire)) {
+            return Status::RdmaError("injected Jetty reset failure");
+        }
+        return Status::OK();
+    }
     Status quiesceJetty(const JettyPtr& jetty, uint32_t timeout_ms,
                         std::vector<Completion>& completions) override {
         completions.clear();
@@ -279,18 +284,20 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         const bool drop_completion = drop_next_quiesced_completion_.exchange(
             false, std::memory_order_acq_rel);
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        auto it = pending_.begin();
-        while (it != pending_.end()) {
-            if (it->jetty_id != fake->id()) {
-                ++it;
-                continue;
+        if (!quiesce_drops_completions_.load(std::memory_order_acquire)) {
+            auto it = pending_.begin();
+            while (it != pending_.end()) {
+                if (it->jetty_id != fake->id()) {
+                    ++it;
+                    continue;
+                }
+                if (!drop_completion) {
+                    completions.push_back(
+                        Completion{CompletionCategory::ENDPOINT_ERROR, 0,
+                                   it->request.token, 0, fake->id()});
+                }
+                it = pending_.erase(it);
             }
-            if (!drop_completion) {
-                completions.push_back(
-                    Completion{CompletionCategory::ENDPOINT_ERROR, 0,
-                               it->request.token, 0, fake->id()});
-            }
-            it = pending_.erase(it);
         }
         quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
@@ -360,6 +367,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextQuiesce() {
         fail_next_quiesce_.store(true, std::memory_order_release);
     }
+    void dropQuiesceCompletions() {
+        quiesce_drops_completions_.store(true, std::memory_order_release);
+    }
+    void failResets() { fail_resets_.store(true, std::memory_order_release); }
+    void allowResets() { fail_resets_.store(false, std::memory_order_release); }
     void failNextShutdown() {
         fail_next_shutdown_.store(true, std::memory_order_release);
     }
@@ -388,6 +400,8 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> hold_next_completion_{false};
     std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};
+    std::atomic<bool> quiesce_drops_completions_{false};
+    std::atomic<bool> fail_resets_{false};
     std::atomic<bool> fail_next_shutdown_{false};
     mutable std::mutex pending_mutex_;
     std::vector<Pending> pending_;
@@ -574,6 +588,159 @@ TEST(UbNativeDataPathTest,
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbNativeDataPathTest,
+     ProviderLostCompletionIsReclaimedAfterSuccessfulFence) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    std::vector<UbContextPtr> contexts{context};
+    auto topology = fakeTopology();
+    UbBufferManager buffers(adapter, contexts);
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    std::array<char, 64> recovered{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i + 1);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    BufferDesc recovered_desc{};
+    recovered_desc.addr = reinterpret_cast<uint64_t>(recovered.data());
+    recovered_desc.length = recovered.size();
+    recovered_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(buffers.addBuffer(source_desc, options).ok());
+    ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
+    ASSERT_TRUE(buffers.addBuffer(recovered_desc, options).ok());
+
+    SegmentManager manager(std::make_unique<NullRegistry>());
+    ASSERT_TRUE(
+        manager
+            .updateLocal([&](SegmentDesc& segment) {
+                segment.name = "local";
+                segment.type = SegmentType::Memory;
+                segment.detail = MemorySegmentDesc{};
+                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                memory.topology = *topology;
+                memory.buffers = {source_desc, target_desc, recovered_desc};
+                return Status::OK();
+            })
+            .ok());
+
+    EndpointStore endpoints(adapter, 16, 1);
+    RailMonitor rails;
+    QuotaManager quota;
+    UbParams params;
+    params.worker_count = 1;
+    params.poller_count = 1;
+    params.slice_size = 16;
+    params.max_retries = 1;
+    params.slice_timeout_ms = 20;
+
+    std::shared_ptr<UbEndpoint> fenced_endpoint;
+    EndpointResolver resolver = [&](const EndpointResolveRequest& request,
+                                    std::shared_ptr<UbEndpoint>& endpoint) {
+        UbEndpointKey key{request.local_context->topologyId(),
+                          request.remote_segment_id, request.remote_topology_id,
+                          "local@ub:fake0:eid0"};
+        auto status =
+            endpoints.getOrCreate(key, request.local_context, endpoint);
+        if (!status.ok()) return status;
+        if (!fenced_endpoint) fenced_endpoint = endpoint;
+        if (endpoint->ready()) return status;
+        UbBootstrapDesc peer;
+        peer.local_eid = fakeDevice().eid;
+        peer.endpoint_generation = 100;
+        peer.jetty_ids = {777};
+        return endpoint->bind(peer);
+    };
+    UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
+                      &quota, params, std::move(resolver),
+                      [&](const std::shared_ptr<UbEndpoint>& endpoint) {
+                          (void)endpoints.retire(endpoint);
+                      });
+    ASSERT_TRUE(workers.start().ok());
+    adapter->holdNextCompletion();
+    adapter->dropQuiesceCompletions();
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    auto task = UbTask::create(request);
+    for (size_t offset = 0; offset < request.length; offset += 16) {
+        ASSERT_NE(task->addSlice(UbSliceSpec{
+                      source.data() + offset,
+                      reinterpret_cast<uint64_t>(target.data() + offset), 16,
+                      offset, 1}),
+                  nullptr);
+    }
+    ASSERT_TRUE(task->seal());
+    ASSERT_TRUE(workers.submit(task).ok());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_GE(rails.stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1}).timeouts, 1U);
+    EXPECT_GE(adapter->quiesceCalls(), 1U);
+
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(quota.activeReservationCount(), 0U);
+    ASSERT_NE(fenced_endpoint, nullptr);
+    EXPECT_EQ(fenced_endpoint->outstandingWrs(), 0U);
+    EXPECT_EQ(fenced_endpoint->outstandingBytes(), 0U);
+
+    Request followup{};
+    followup.opcode = Request::WRITE;
+    followup.source = source.data();
+    followup.target_id = LOCAL_SEGMENT_ID;
+    followup.target_offset = reinterpret_cast<uint64_t>(recovered.data());
+    followup.length = source.size();
+    auto followup_task = UbTask::create(followup);
+    for (size_t offset = 0; offset < followup.length; offset += 16) {
+        ASSERT_NE(followup_task->addSlice(UbSliceSpec{
+                      source.data() + offset,
+                      reinterpret_cast<uint64_t>(recovered.data() + offset), 16,
+                      offset, 1}),
+                  nullptr);
+    }
+    ASSERT_TRUE(followup_task->seal());
+    ASSERT_TRUE(workers.submit(followup_task).ok());
+
+    const auto followup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (followup_task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < followup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(followup_task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(followup_task->transferStatus().transferred_bytes, source.size());
+    EXPECT_EQ(recovered, source);
+
+    EXPECT_TRUE(workers.stop().ok());
+    EXPECT_TRUE(endpoints.clear().ok());
+    EXPECT_TRUE(buffers.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbNativeDataPathTest, EndpointStoreNeverReusesRetiredGeneration) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -602,6 +769,38 @@ TEST(UbNativeDataPathTest, EndpointStoreNeverReusesRetiredGeneration) {
     EXPECT_GT(replacement->generation(), old_generation);
     EXPECT_FALSE(store.retire(key, old_generation));
     EXPECT_EQ(store.get(key), replacement);
+    EXPECT_TRUE(store.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbNativeDataPathTest,
+     EndpointStoreDoesNotReplaceEndpointWhenCleanupCannotComplete) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    EndpointStore store(adapter, 1, 1);
+    UbEndpointKey key{0, 9, 0, "peer@ub:fake0:eid0"};
+    std::shared_ptr<UbEndpoint> endpoint;
+    ASSERT_TRUE(store.getOrCreate(key, context, endpoint).ok());
+    UbBootstrapDesc peer;
+    peer.local_eid = fakeDevice().eid;
+    peer.endpoint_generation = 100;
+    peer.jetty_ids = {777};
+    ASSERT_TRUE(endpoint->bind(peer).ok());
+
+    adapter->failResets();
+    std::vector<Completion> completions;
+    EXPECT_FALSE(endpoint->quiesce(20, completions).ok());
+
+    std::shared_ptr<UbEndpoint> replacement;
+    const auto status = store.getOrCreate(key, context, replacement);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(replacement, nullptr);
+    EXPECT_EQ(store.size(), 0U);
+
+    adapter->allowResets();
     EXPECT_TRUE(store.clear().ok());
     EXPECT_TRUE(context->shutdown().ok());
     EXPECT_TRUE(adapter->shutdown().ok());
@@ -638,6 +837,7 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     config->set("transports/ub/jetty_per_endpoint", 1);
     config->set("transports/ub/max_endpoints", 16);
     config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
     config->set("transports/ub/max_retries", 1);
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
@@ -654,6 +854,8 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
 
     std::array<char, 64> source{};
     std::array<char, 64> target{};
+    std::array<char, 144> oversized_source{};
+    std::array<char, 144> oversized_target{};
     for (size_t i = 0; i < source.size(); ++i) {
         source[i] = static_cast<char>(100 - i);
     }
@@ -666,9 +868,20 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     target_desc.addr = reinterpret_cast<uint64_t>(target.data());
     target_desc.length = target.size();
     target_desc.location = kWildcardLocation;
+    BufferDesc oversized_source_desc{};
+    oversized_source_desc.addr =
+        reinterpret_cast<uint64_t>(oversized_source.data());
+    oversized_source_desc.length = oversized_source.size();
+    oversized_source_desc.location = kWildcardLocation;
+    BufferDesc oversized_target_desc{};
+    oversized_target_desc.addr =
+        reinterpret_cast<uint64_t>(oversized_target.data());
+    oversized_target_desc.length = oversized_target.size();
+    oversized_target_desc.location = kWildcardLocation;
     MemoryOptions options;
     options.perm = kGlobalReadWrite;
-    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    std::vector<BufferDesc> descriptors{
+        source_desc, target_desc, oversized_source_desc, oversized_target_desc};
     ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
     ASSERT_TRUE(control->segmentManager()
                     .updateLocal([&](SegmentDesc& segment) {
@@ -677,6 +890,20 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
                         return Status::OK();
                     })
                     .ok());
+
+    Transport::SubBatchRef rejected_batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(rejected_batch, 1).ok());
+    Request oversized_request{};
+    oversized_request.opcode = Request::WRITE;
+    oversized_request.source = oversized_source.data();
+    oversized_request.target_id = LOCAL_SEGMENT_ID;
+    oversized_request.target_offset =
+        reinterpret_cast<uint64_t>(oversized_target.data());
+    oversized_request.length = oversized_source.size();
+    EXPECT_TRUE(
+        transport.submitTransferTasks(rejected_batch, {oversized_request})
+            .IsInvalidArgument());
+    EXPECT_TRUE(transport.freeSubBatch(rejected_batch).ok());
 
     Transport::SubBatchRef batch = nullptr;
     ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());

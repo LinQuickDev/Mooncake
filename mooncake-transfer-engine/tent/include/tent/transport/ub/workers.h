@@ -93,6 +93,40 @@ struct UbPathSelectionScore {
     return lhs.remote_device_id < rhs.remote_device_id;
 }
 
+// Orders pre-scored rails for lazy endpoint resolution. `local_topology_ids`
+// holds each rail's local device in pre-score order, and the returned values
+// are indices into it.
+//
+// Pass one takes the highest-scoring rail of every local device, so the
+// candidates that actually get resolved span devices instead of piling onto
+// whichever device ranks best. Pass two appends the remaining rails, so a
+// caller that still needs candidates - a single-device topology, or a rail that
+// failed to resolve - can fill its floor without attempting a rail twice.
+[[nodiscard]] inline std::vector<size_t> ubResolutionAttemptOrder(
+    const std::vector<Topology::NicID>& local_topology_ids) {
+    const size_t count = local_topology_ids.size();
+    std::vector<bool> taken(count, false);
+    std::vector<size_t> order;
+    order.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        const auto id = local_topology_ids[index];
+        bool known_device = false;
+        for (size_t earlier : order) {
+            if (local_topology_ids[earlier] == id) {
+                known_device = true;
+                break;
+            }
+        }
+        if (known_device) continue;
+        order.push_back(index);
+        taken[index] = true;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        if (!taken[index]) order.push_back(index);
+    }
+    return order;
+}
+
 // Native UB scheduler. Posting lanes own request selection and URMA post;
 // poller lanes own completion dispatch. A monotonic numeric token, never a raw
 // UbSlice pointer, crosses the adapter boundary.
