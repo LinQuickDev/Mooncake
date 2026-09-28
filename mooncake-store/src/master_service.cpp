@@ -26,17 +26,16 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <ylt/util/tl/expected.hpp>
+#include <ylt/standalone/cinatra/url_encode_decode.hpp>
 #include <boost/algorithm/string.hpp>
 
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
+#include "common/network.h"
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
-#ifdef USE_HTTP
-#include "transfer_metadata_plugin.h"
-#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -55,7 +54,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "common/zstd_util.h"
 #include "common/file_util.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "random.h"
@@ -216,6 +215,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_offload_(config.enable_offload),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     config.ha_backend_type == "etcd"),
+      weight_management_mutations_enabled_(
+          !enable_oplog_ ||
+          config.weight_management_oplog_capability_confirmed),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
@@ -529,7 +531,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     replica_cleanup_worker_.Start();
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
-    // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
+    // setHttpMetadataRemoteUrl() once http_metadata_remote_url_ is set,
     // since that happens after this constructor returns (in
     // WrappedMasterService).
 
@@ -631,7 +633,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         bucket_allocator_ = allocator.get();
         dfs_allocator_ = std::move(allocator);
     } else {
-        auto allocator = std::make_unique<DfsGlobalAllocator>();
+        auto allocator = std::make_unique<ShardAllocator>();
         shard_allocator_ = allocator.get();
         dfs_allocator_ = std::move(allocator);
     }
@@ -1678,6 +1680,50 @@ std::shared_ptr<Lease> MasterService::RegisterGroupMember(
     }
     it->second.member_keys.insert(key);
     return it->second.lease;
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::BeginWeightImport(const BeginWeightImportRequest& request) {
+    return weight_manager_.BeginWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::CommitWeightImport(const CommitWeightImportRequest& request) {
+    return weight_manager_.CommitWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::AbortWeightImport(const AbortWeightImportRequest& request) {
+    return weight_manager_.AbortWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+MasterService::GetWeightRevision(
+    const GetWeightRevisionRequest& request) const {
+    return weight_manager_.GetWeightRevision(request);
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+MasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) const {
+    return weight_manager_.ListWeightRevisions(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+MasterService::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request) {
+    return weight_manager_.AcquireWeightRevisionLease(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+MasterService::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request) {
+    return weight_manager_.RenewWeightRevisionLease(request);
+}
+
+WeightMetadataStore::Result<void> MasterService::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return weight_manager_.ReleaseWeightRevisionLease(request);
 }
 
 void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
@@ -3456,9 +3502,11 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const WeightMetadataSnapshot& weight_metadata) {
     return RestoreFromStandbyState(&objects, nullptr, initial_oplog_sequence_id,
-                                   segments, objects.size(), std::nullopt);
+                                   segments, objects.size(), std::nullopt,
+                                   &weight_metadata);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
@@ -3471,7 +3519,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
     return RestoreFromStandbyState(nullptr, std::move(handoff.metadata_store),
                                    handoff.applied_cursor.last_seq,
                                    handoff.segments, chunk_object_count,
-                                   handoff.max_replica_id);
+                                   handoff.max_replica_id, nullptr);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
@@ -3479,14 +3527,22 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     std::unique_ptr<StandbyMetadataStore> metadata_store,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
-    std::optional<ReplicaID> expected_max_replica_id) {
+    std::optional<ReplicaID> expected_max_replica_id,
+    const WeightMetadataSnapshot* legacy_weight_metadata) {
     if (enable_dfs_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
                       "restoration is not supported";
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if ((legacy_objects == nullptr) == (metadata_store == nullptr) ||
-        (metadata_store && chunk_object_count == 0)) {
+        (metadata_store && chunk_object_count == 0) ||
+        (legacy_objects && legacy_weight_metadata == nullptr)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const WeightMetadataSnapshot weight_metadata =
+        metadata_store ? metadata_store->SnapshotWeightMetadata()
+                       : *legacy_weight_metadata;
+    if (!ValidateWeightMetadataSnapshot(weight_metadata)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     // The ordered writer initializes its sequence from durable_prefix.
@@ -3887,6 +3943,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
     if (enable_multi_tenants_) {
         RebuildTenantQuotaUsageFromMetadata();
+    }
+
+    auto restored_weight_metadata =
+        weight_manager_.RestoreSnapshot(weight_metadata);
+    if (!restored_weight_metadata) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count
@@ -12883,13 +12945,14 @@ void MasterService::NofHeartbeatThreadFunc() {
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-MasterService::MetadataSerializer::Serialize() {
+MasterService::MetadataSerializer::Serialize(
+    const WeightMetadataSnapshot* frozen_weight_metadata) {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Create top-level map with 3 fields: "shards", "discarded_replicas",
-    // "replica_next_id"
-    packer.pack_map(3);
+    // Weight metadata is optional on decode so snapshots produced before weight
+    // management remain valid.
+    packer.pack_map(4);
 
     // 1. Serialize metadata shards
     packer.pack("shards");
@@ -12970,6 +13033,18 @@ MasterService::MetadataSerializer::Serialize() {
     packer.pack("replica_next_id");
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
 
+    packer.pack("weight_metadata");
+    WeightMetadataSnapshot live_weight_metadata;
+    if (frozen_weight_metadata == nullptr) {
+        live_weight_metadata = service_->weight_manager_.ExportSnapshot();
+        frozen_weight_metadata = &live_weight_metadata;
+    }
+    const auto encoded_weight_metadata =
+        struct_pack::serialize(*frozen_weight_metadata);
+    packer.pack_bin(encoded_weight_metadata.size());
+    packer.pack_bin_body(encoded_weight_metadata.data(),
+                         encoded_weight_metadata.size());
+
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -12998,11 +13073,10 @@ MasterService::MetadataSerializer::Deserialize(
                                "Invalid MessagePack format: expected map"));
     }
 
-    // Expected format: top-level map with "shards", "discarded_replicas",
-    // and "replica_next_id"
     const msgpack::object* shards_obj = nullptr;
     const msgpack::object* discarded_replicas_obj = nullptr;
     const msgpack::object* replica_next_id_obj = nullptr;
+    const msgpack::object* weight_metadata_obj = nullptr;
 
     // Extract fields from top-level map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
@@ -13015,6 +13089,8 @@ MasterService::MetadataSerializer::Deserialize(
                 discarded_replicas_obj = &obj.via.map.ptr[i].val;
             } else if (key == "replica_next_id") {
                 replica_next_id_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "weight_metadata") {
+                weight_metadata_obj = &obj.via.map.ptr[i].val;
             }
         }
     }
@@ -13023,6 +13099,28 @@ MasterService::MetadataSerializer::Deserialize(
     if (shards_obj == nullptr) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
+    }
+
+    WeightMetadataSnapshot weight_metadata;
+    if (weight_metadata_obj != nullptr) {
+        if (weight_metadata_obj->type != msgpack::type::BIN) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Invalid MessagePack format: weight_metadata must be binary"));
+        }
+        const std::string encoded(weight_metadata_obj->via.bin.ptr,
+                                  weight_metadata_obj->via.bin.ptr +
+                                      weight_metadata_obj->via.bin.size);
+        if (struct_pack::deserialize_to(weight_metadata, encoded) !=
+            struct_pack::errc::ok) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Failed to deserialize weight_metadata snapshot"));
+        }
+    }
+    if (!ValidateWeightMetadataSnapshot(weight_metadata)) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "Invalid weight_metadata snapshot"));
     }
 
     // Iterate and deserialize each shard
@@ -13101,6 +13199,14 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
+
+    // Old snapshots restore an empty weight domain only after decoding
+    // succeeds.
+    auto restored = service_->weight_manager_.RestoreSnapshot(weight_metadata);
+    if (!restored) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "Invalid weight_metadata snapshot"));
+    }
     // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
     // shards before rebuilding the group domain (which is derived from
     // metadata).
@@ -13111,6 +13217,7 @@ MasterService::MetadataSerializer::Deserialize(
 }
 
 void MasterService::MetadataSerializer::Reset() {
+    service_->weight_manager_.Clear();
     service_->soft_pin_deadline_index_.Clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
@@ -14685,44 +14792,26 @@ void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
 
 void MasterService::setHttpMetadataRemoteUrl(
     const std::string& metadata_connstring) {
-#ifdef USE_HTTP
-    // Only http(s) is supported; guard the scheme to avoid
-    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other backends.
-    if (metadata_connstring.rfind("http://", 0) == 0 ||
-        metadata_connstring.rfind("https://", 0) == 0) {
-        try {
-            http_metadata_remote_ =
-                MetadataStoragePlugin::Create(metadata_connstring);
-            LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
-                         "(remote metadata server "
-                      << metadata_connstring << ")";
-            // Start async cleanup worker now that http_metadata_remote_ is
-            // ready
-            http_metadata_cleanup_running_ = true;
-            http_metadata_cleanup_thread_ = std::thread(
-                &MasterService::HttpMetadataCleanupThreadFunc, this);
-            LOG(INFO) << "HTTP metadata cleanup worker thread started";
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to initialize remote HTTP metadata client "
-                            "for "
-                         << metadata_connstring << ": " << e.what()
-                         << ". Metadata cleanup on timeout disabled.";
-            http_metadata_remote_.reset();
-        }
+    // The HTTP client is built without TLS, so only plain http:// metadata
+    // servers support remote cleanup.
+    if (metadata_connstring.rfind("http://", 0) != 0) {
+        LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
+                        "configured metadata server '"
+                     << metadata_connstring
+                     << "' is not an http:// endpoint; remote cleanup "
+                        "currently supports only plain HTTP. Metadata cleanup "
+                        "on timeout disabled.";
         return;
     }
-    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
-                    "configured metadata server '"
-                 << metadata_connstring
-                 << "' is not an HTTP endpoint; remote cleanup currently "
-                    "supports only http(s). Metadata cleanup on timeout "
-                    "disabled.";
-#else
-    (void)metadata_connstring;
-    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but this build "
-                    "has no HTTP metadata support (USE_HTTP=OFF); metadata "
-                    "cleanup on timeout disabled.";
-#endif
+    http_metadata_remote_url_ = metadata_connstring;
+    LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
+                 "(remote metadata server "
+              << metadata_connstring << ")";
+    // Start async cleanup worker now that http_metadata_remote_url_ is set.
+    http_metadata_cleanup_running_ = true;
+    http_metadata_cleanup_thread_ =
+        std::thread(&MasterService::HttpMetadataCleanupThreadFunc, this);
+    LOG(INFO) << "HTTP metadata cleanup worker thread started";
 }
 
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
@@ -14742,7 +14831,7 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
 
     // Separately-deployed: enqueue for async cleanup so a slow/unreachable
     // server never blocks the client monitor thread.
-    if (http_metadata_remote_) {
+    if (!http_metadata_remote_url_.empty()) {
         {
             std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
             http_metadata_cleanup_queue_.push_back(segment_name);
@@ -14752,6 +14841,20 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
     }
 
     // Neither configured: cleanup is disabled, nothing to do.
+}
+
+bool MasterService::removeRemoteHttpMetadataKey(const std::string& key) const {
+    // Matches the timeout the Transfer Engine HTTP metadata plugin used.
+    constexpr std::chrono::milliseconds kTimeout{3000};
+    auto result = httpDelete(
+        http_metadata_remote_url_ + "?key=" + code_utils::url_encode(key),
+        kTimeout);
+    if (!result) {
+        LOG(WARNING) << "Remote HTTP metadata cleanup failed for key: " << key
+                     << ": " << result.error();
+        return false;
+    }
+    return true;
 }
 
 void MasterService::HttpMetadataCleanupThreadFunc() {
@@ -14779,22 +14882,8 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
 
             // Each key attempted independently so one failure does not
             // prevent cleanup of the other.
-            bool ram_removed = false;
-            bool rpc_removed = false;
-            try {
-                ram_removed = http_metadata_remote_->remove(ram_key);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Remote HTTP metadata cleanup failed for ram_key: "
-                    << ram_key << ": " << e.what();
-            }
-            try {
-                rpc_removed = http_metadata_remote_->remove(rpc_key);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Remote HTTP metadata cleanup failed for rpc_key: "
-                    << rpc_key << ": " << e.what();
-            }
+            const bool ram_removed = removeRemoteHttpMetadataKey(ram_key);
+            const bool rpc_removed = removeRemoteHttpMetadataKey(rpc_key);
             LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
                       << segment_name << ", ram_key_removed=" << ram_removed
                       << ", rpc_key_removed=" << rpc_removed;

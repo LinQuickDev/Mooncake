@@ -41,6 +41,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "weight_store_manager.h"
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
@@ -69,7 +70,7 @@ struct MasterSnapshotPayloads;
 }  // namespace ha
 
 class EtcdOpLogStore;
-class DfsGlobalAllocator;
+class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
 
@@ -80,7 +81,6 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
-struct MetadataStoragePlugin;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -125,6 +125,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 
 class MasterService {
+    friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
@@ -155,6 +156,24 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request) const;
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
@@ -883,7 +902,8 @@ class MasterService {
     tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
@@ -935,7 +955,8 @@ class MasterService {
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
-        std::optional<ReplicaID> expected_max_replica_id);
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
@@ -1099,6 +1120,8 @@ class MasterService {
         std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
     };
     GroupDomain group_domain_;
+    MasterStoreBackend weight_backend_{*this};
+    WeightStoreManager weight_manager_{weight_backend_};
 
     class SoftPinDeadlineIndex {
         friend class test::MasterServiceTestPeer;
@@ -1875,7 +1898,8 @@ class MasterService {
         MetadataSerializer(MasterService* service) : service_(service) {}
 
         // Serialize metadata of all shards
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
+            const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
 
         tl::expected<void, SerializationError> Deserialize(
             const std::vector<uint8_t>& data);
@@ -2164,6 +2188,7 @@ class MasterService {
     static int64_t DynamicReplicationNowMs();
 
     const bool enable_oplog_;
+    const bool weight_management_mutations_enabled_;
     const uint32_t oplog_batch_max_entries_;
 
     // cluster id for persistent sub directory
@@ -2183,9 +2208,10 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Remote HTTP metadata client, used when the metadata server is deployed
-    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+    // Remote HTTP metadata server URL, used when the metadata server is
+    // deployed separately. Empty = no remote cleanup (co-located prefers the
+    // pointer).
+    std::string http_metadata_remote_url_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
@@ -2199,6 +2225,9 @@ class MasterService {
     std::vector<std::string> http_metadata_cleanup_queue_;
 
     void HttpMetadataCleanupThreadFunc();
+    // Sends an HTTP DELETE for one key to the remote metadata server; true on
+    // success.
+    bool removeRemoteHttpMetadataKey(const std::string& key) const;
 
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
     // segment. For the co-located case this is synchronous (no network I/O);
@@ -2208,7 +2237,7 @@ class MasterService {
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
-    DfsGlobalAllocator* shard_allocator_{nullptr};
+    ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
     // Serializes allocation-failure recovery so concurrent writers can reuse
     // capacity made available by the first recovery instead of each evicting

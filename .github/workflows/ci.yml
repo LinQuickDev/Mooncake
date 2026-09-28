@@ -393,7 +393,7 @@ jobs:
     - name: Run focused shell regression tests
       run: |
         bash scripts/tone_tests/tests/test_common_cleanup.sh
-        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
       shell: bash
 
   clang-format:
@@ -482,7 +482,8 @@ jobs:
         fi
 
         ruff check "${python_files[@]}"
-        ruff format --check "${python_files[@]}"
+        python scripts/ci/check_changed_python_format.py \
+          "$base_ref" "${python_files[@]}"
       shell: bash
 
 
