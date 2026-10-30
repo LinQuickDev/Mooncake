@@ -51,6 +51,64 @@ struct UbWorkers::Route {
     std::vector<Topology::NicID> remote_devices;
 };
 
+// Per-posting-lane LRU of decoded routes, keyed by the remote segment and
+// BufferDesc pointer resolved for this slice's address range. The
+// SegmentDescRef pin held by each cached Route keeps that BufferDesc valid for
+// as long as the entry lives, and a segment re-registration produces a new
+// SegmentDesc snapshot with new BufferDesc addresses, so the pointer itself
+// is the identity: a stale snapshot can never be matched by a lookup.
+struct UbWorkers::RouteCache {
+    struct Key {
+        SegmentID segment_id{LOCAL_SEGMENT_ID};
+        const BufferDesc* buffer{nullptr};
+
+        bool operator==(const Key& rhs) const {
+            return segment_id == rhs.segment_id && buffer == rhs.buffer;
+        }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& key) const {
+            auto h = std::hash<uint64_t>{};
+            size_t seed = h(key.segment_id);
+            seed ^= h(reinterpret_cast<uintptr_t>(key.buffer)) +
+                    0x9E3779B9U + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+    struct Entry {
+        Key key;
+        Route route;
+    };
+    // LRU list front = most recent; the index points into the list.
+    std::list<Entry> lru;
+    std::unordered_map<Key, typename std::list<Entry>::iterator, KeyHash>
+        index;
+
+    // Probe with the key the current slice produced. A hit splices the entry
+    // to the front and returns the cached route (copying it re-pins the
+    // segment snapshot for this slice).
+    const Route* lookup(const Key& key) {
+        auto found = index.find(key);
+        if (found == index.end()) return nullptr;
+        lru.splice(lru.begin(), lru, found->second);
+        return &found->second->route;
+    }
+
+    void insert(const Key& key, const Route& route) {
+        auto found = index.find(key);
+        if (found != index.end()) {
+            lru.erase(found->second);
+            index.erase(found);
+        }
+        lru.push_front(Entry{key, route});
+        index.emplace(key, lru.begin());
+        if (lru.size() > UbWorkers::kRouteCacheCapacity) {
+            index.erase(lru.back().key);
+            lru.pop_back();
+        }
+    }
+};
+
 struct UbWorkers::Inflight {
     uint64_t completion_token{0};
     PendingSlice pending;
@@ -118,6 +176,9 @@ Status UbWorkers::start() {
     posting_.store(true, std::memory_order_release);
     polling_.store(true, std::memory_order_release);
     timeout_scans_enabled_.store(true, std::memory_order_release);
+    route_caches_.clear();
+    route_caches_.resize(params_.worker_count);
+    for (auto& cache : route_caches_) cache = std::make_unique<RouteCache>();
     try {
         posting_threads_.reserve(params_.worker_count);
         for (uint32_t i = 0; i < params_.worker_count; ++i) {
@@ -176,6 +237,8 @@ Status UbWorkers::stop() {
         if (thread.joinable()) thread.join();
     }
     posting_threads_.clear();
+    // Route caches may pin SegmentDescRefs; drop them after the lanes join.
+    route_caches_.clear();
 
     // Wait for a timeout scan that began before the flag change. scanTimeouts
     // rechecks under this mutex, so no new endpoint can enter the drain set
@@ -358,10 +421,11 @@ bool UbWorkers::popPending(PendingSlice& pending) {
 }
 
 void UbWorkers::postingLoop(size_t worker_index) {
+    RouteCache& cache = *route_caches_[worker_index];
     while (posting_.load(std::memory_order_acquire)) {
         PendingSlice pending;
         if (!popPending(pending)) continue;
-        if (pending.slice) processPending(pending, worker_index);
+        if (pending.slice) processPending(pending, worker_index, cache);
     }
 }
 
@@ -465,7 +529,13 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
     pending.slice->requestCancellation();
 }
 
-Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
+Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route,
+                             RouteCache& cache) {
+    // Cache probe happens inside withCachedSegment's operation so the cache
+    // key can be built from the authoritative BufferDesc: the same remote
+    // address may resolve to a different buffer (or generation) after a
+    // registry refresh, in which case the key misses and the full decode
+    // path runs, repopulating the entry.
     return segment_manager_->withCachedSegment(
         pending.target_id, route.pin, [&](SegmentDesc* segment) -> Status {
             if (!segment || segment->type != SegmentType::Memory) {
@@ -484,6 +554,16 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
                 return Status::NeedsRefreshCache(
                     "UB target buffer has no transport metadata" LOC_MARK);
             }
+            if (const Route* cached = cache.lookup(
+                    RouteCache::Key{pending.target_id, buffer})) {
+                // The cached entry validated this exact BufferDesc pointer.
+                // Copying the route re-pins the segment snapshot for this
+                // slice.
+                route = *cached;
+                route_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                return Status::OK();
+            }
+            route_cache_misses_.fetch_add(1, std::memory_order_relaxed);
             UbBufferMetadata metadata;
             auto status = decodeBufferMetadata(attr->second, metadata);
             if (!status.ok()) return status;
@@ -494,6 +574,7 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
             }
+            cache.insert(RouteCache::Key{pending.target_id, buffer}, route);
             return Status::OK();
         });
 }
@@ -790,13 +871,13 @@ Status UbWorkers::chooseAndResolveEndpoint(
 }
 
 void UbWorkers::processPending(const PendingSlice& pending,
-                               size_t worker_index) {
+                               size_t worker_index, RouteCache& cache) {
     if (pending.slice->cancellationRequested()) {
         pending.slice->requestCancellation();
         return;
     }
     Route route;
-    auto status = buildRoute(pending, route);
+    auto status = buildRoute(pending, route, cache);
     if (!status.ok()) {
         const auto resolution = pending.slice->resolveBeforePost(
             FAILED, 0, retryableStatus(status));
@@ -836,7 +917,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     ImportedSegmentRef remote;
     status = buffers_->importRemote(pending.target_id, path.local_topology_id,
                                     path.remote_device_id, *route.remote_buffer,
-                                    pending.opcode,
+                                    route.metadata, pending.opcode,
                                     pending.slice->spec().remote_address,
                                     pending.slice->spec().length, remote);
     if (!status.ok()) {

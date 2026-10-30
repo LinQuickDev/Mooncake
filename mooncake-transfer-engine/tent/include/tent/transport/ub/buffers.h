@@ -93,6 +93,19 @@ class UbBufferManager final {
                         uint64_t address, size_t length,
                         ImportedSegmentRef& result);
 
+    // Same as importRemote(), but the caller already decoded the remote
+    // buffer's UB metadata (e.g. from the per-worker route cache). When the
+    // supplied metadata matches the buffer, the JSON decode inside is skipped
+    // entirely; on mismatch the metadata is re-decoded from the buffer, so a
+    // stale cache entry can never steer the import.
+    Status importRemote(SegmentID remote_segment_id,
+                        Topology::NicID local_topology_id,
+                        Topology::NicID remote_topology_id,
+                        const BufferDesc& remote_buffer,
+                        const UbBufferMetadata& decoded_metadata,
+                        Request::OpCode opcode, uint64_t address, size_t length,
+                        ImportedSegmentRef& result);
+
     [[nodiscard]] size_t localBufferCount() const;
     [[nodiscard]] size_t importedSegmentCount() const;
 

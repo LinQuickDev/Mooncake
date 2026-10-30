@@ -497,6 +497,32 @@ Status UbBufferManager::importRemote(SegmentID remote_segment_id,
     }
     UbBufferMetadata metadata;
     CHECK_STATUS(decodeBufferMetadata(attr->second, metadata));
+    return importRemote(remote_segment_id, local_topology_id,
+                        remote_topology_id, remote_buffer, metadata, opcode,
+                        address, length, result);
+}
+
+Status UbBufferManager::importRemote(
+    SegmentID remote_segment_id, Topology::NicID local_topology_id,
+    Topology::NicID remote_topology_id, const BufferDesc& remote_buffer,
+    const UbBufferMetadata& decoded_metadata, Request::OpCode opcode,
+    uint64_t address, size_t length, ImportedSegmentRef& result) {
+    auto attr = remote_buffer.transport_attrs.find(TransportType::UB);
+    if (attr == remote_buffer.transport_attrs.end()) {
+        return Status::NeedsRefreshCache(
+            "Remote buffer has no UB metadata" LOC_MARK);
+    }
+    // The decoded metadata may come from a per-worker route cache. The buffer
+    // identity check plus this re-validation makes a stale cached decode
+    // fail closed instead of steering an import: any mismatch re-decodes from
+    // the authoritative buffer attribute.
+    UbBufferMetadata metadata;
+    if (decoded_metadata.base != remote_buffer.addr ||
+        decoded_metadata.length != remote_buffer.length) {
+        CHECK_STATUS(decodeBufferMetadata(attr->second, metadata));
+    } else {
+        metadata = decoded_metadata;
+    }
     if (metadata.base != remote_buffer.addr ||
         metadata.length != remote_buffer.length) {
         return Status::NeedsRefreshCache(

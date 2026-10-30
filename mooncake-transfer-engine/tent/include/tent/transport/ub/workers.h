@@ -11,10 +11,12 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -155,6 +157,14 @@ class UbWorkers final {
     }
     [[nodiscard]] size_t queuedCount() const;
     [[nodiscard]] size_t inflightCount() const;
+    // Route-cache observability (aggregated across posting lanes). Zero on a
+    // fresh start; useful for verifying the cache engages on real workloads.
+    [[nodiscard]] uint64_t routeCacheHits() const noexcept {
+        return route_cache_hits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t routeCacheMisses() const noexcept {
+        return route_cache_misses_.load(std::memory_order_relaxed);
+    }
 
    private:
     struct PendingSlice {
@@ -170,6 +180,12 @@ class UbWorkers final {
     };
     struct Route;
     struct Inflight;
+    // Per-posting-lane LRU of decoded routes (definition lives in the .cpp
+    // next to Route). One instance per worker, owned exclusively by that
+    // lane's postingLoop, so no lock is needed.
+    struct RouteCache;
+    static constexpr size_t kRouteCacheCapacity = 64;
+
     struct LocalDeviceCandidate {
         Topology::NicID id{-1};
         size_t topology_rank{Topology::DevicePriorityRanks};
@@ -180,8 +196,10 @@ class UbWorkers final {
     bool popPending(PendingSlice& pending);
     void enqueueRetry(const PendingSlice& pending);
     void deferPending(const PendingSlice& pending);
-    void processPending(const PendingSlice& pending, size_t worker_index);
-    Status buildRoute(const PendingSlice& pending, Route& route);
+    void processPending(const PendingSlice& pending, size_t worker_index,
+                        RouteCache& cache);
+    Status buildRoute(const PendingSlice& pending, Route& route,
+                      RouteCache& cache);
     Status chooseAndResolveEndpoint(const PendingSlice& pending, Route& route,
                                     std::shared_ptr<UbEndpoint>& endpoint,
                                     UbPostPath& path,
@@ -241,6 +259,10 @@ class UbWorkers final {
     std::unordered_map<const UbJfc*, UbContextPtr> context_by_jfc_;
     std::vector<std::thread> posting_threads_;
     std::vector<std::thread> polling_threads_;
+    // One route cache per posting lane, indexed by worker_index.
+    std::vector<std::unique_ptr<RouteCache>> route_caches_;
+    std::atomic<uint64_t> route_cache_hits_{0};
+    std::atomic<uint64_t> route_cache_misses_{0};
     std::atomic<bool> accepting_{false};
     std::atomic<bool> posting_{false};
     std::atomic<bool> polling_{false};
