@@ -193,17 +193,20 @@ class UbWorkers final {
 
     void postingLoop(size_t worker_index);
     void pollingLoop(size_t poller_index);
-    bool popPending(PendingSlice& pending);
+    // Drains up to an adaptive K slices of one task under one queue lock.
+    void popTaskBatch(std::vector<PendingSlice>& batch);
     void enqueueRetry(const PendingSlice& pending);
     void deferPending(const PendingSlice& pending);
-    void processPending(const PendingSlice& pending, size_t worker_index,
-                        RouteCache& cache);
+    void processBatch(std::vector<PendingSlice>& batch, size_t worker_index,
+                      RouteCache& cache);
     Status buildRoute(const PendingSlice& pending, Route& route,
                       RouteCache& cache);
     Status chooseAndResolveEndpoint(const PendingSlice& pending, Route& route,
                                     std::shared_ptr<UbEndpoint>& endpoint,
                                     UbPostPath& path,
                                     QuotaReservation& reservation);
+    // Dispatches a poll batch under one inflight lock/notify pair.
+    void handleCompletions(const std::vector<Completion>& completions);
     void handleCompletion(const Completion& completion);
     void handleLocalDeviceFailure(const UbContextPtr& context);
     void progressLocalDeviceFailure(const UbContextPtr& context);

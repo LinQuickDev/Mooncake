@@ -70,8 +70,8 @@ struct UbWorkers::RouteCache {
         size_t operator()(const Key& key) const {
             auto h = std::hash<uint64_t>{};
             size_t seed = h(key.segment_id);
-            seed ^= h(reinterpret_cast<uintptr_t>(key.buffer)) +
-                    0x9E3779B9U + (seed << 6) + (seed >> 2);
+            seed ^= h(reinterpret_cast<uintptr_t>(key.buffer)) + 0x9E3779B9U +
+                    (seed << 6) + (seed >> 2);
             return seed;
         }
     };
@@ -81,8 +81,7 @@ struct UbWorkers::RouteCache {
     };
     // LRU list front = most recent; the index points into the list.
     std::list<Entry> lru;
-    std::unordered_map<Key, typename std::list<Entry>::iterator, KeyHash>
-        index;
+    std::unordered_map<Key, typename std::list<Entry>::iterator, KeyHash> index;
 
     // Probe with the key the current slice produced. A hit splices the entry
     // to the front and returns the cached route (copying it re-pins the
@@ -400,7 +399,15 @@ size_t UbWorkers::inflightCount() const {
     return inflight_.size();
 }
 
-bool UbWorkers::popPending(PendingSlice& pending) {
+// Pops up to kMaxBatch slices of ONE task from the highest non-empty queue.
+// Batching amortizes the queue lock and condition-variable wakeups, but the
+// batch size stays adaptive: K = clamp(queue_depth / worker_count, 1, 16), so
+// when few requests are in flight each slice still gets its own posting turn
+// and the jetty/rail parallelism across lanes is preserved. Slices are taken
+// from the queue front, so retry/defer ordering is unchanged.
+void UbWorkers::popTaskBatch(std::vector<PendingSlice>& batch) {
+    constexpr size_t kMaxBatch = 16;
+    batch.clear();
     std::unique_lock<std::mutex> lock(queue_mutex_);
     queue_cv_.wait(lock, [this] {
         if (!posting_.load(std::memory_order_acquire)) return true;
@@ -409,23 +416,43 @@ bool UbWorkers::popPending(PendingSlice& pending) {
         }
         return false;
     });
-    if (!posting_.load(std::memory_order_acquire)) return false;
+    if (!posting_.load(std::memory_order_acquire)) return;
     for (auto& queue : queues_) {
-        if (!queue.empty()) {
-            pending = std::move(queue.front());
+        if (queue.empty()) continue;
+        const UbTask* task = queue.front().task.get();
+        size_t depth = 0;
+        for (const auto& scan : queues_) depth += scan.size();
+        const size_t k =
+            std::clamp(depth / std::max<size_t>(1, params_.worker_count),
+                       size_t{1}, kMaxBatch);
+        size_t taken = 0;
+        // Slices of one task may sit in multiple priority lanes (a task is
+        // submitted at one priority, but retries/defers can requeue at the
+        // slice's original priority). Drain the lane that had the front first;
+        // slices of the same task in other lanes keep their queue position.
+        while (taken < k && !queue.empty() &&
+               queue.front().task.get() == task) {
+            batch.push_back(std::move(queue.front()));
             queue.pop_front();
-            return true;
+            ++taken;
         }
+        return;
     }
-    return false;
 }
 
 void UbWorkers::postingLoop(size_t worker_index) {
     RouteCache& cache = *route_caches_[worker_index];
+    std::vector<PendingSlice> batch;
     while (posting_.load(std::memory_order_acquire)) {
-        PendingSlice pending;
-        if (!popPending(pending)) continue;
-        if (pending.slice) processPending(pending, worker_index, cache);
+        popTaskBatch(batch);
+        if (batch.empty()) continue;
+        if (posting_.load(std::memory_order_acquire)) {
+            processBatch(batch, worker_index, cache);
+        } else {
+            for (auto& pending : batch) {
+                if (pending.slice) pending.slice->requestCancellation();
+            }
+        }
     }
 }
 
@@ -461,9 +488,7 @@ void UbWorkers::pollingLoop(size_t poller_index) {
                 }
             }
             progressed = progressed || !completions.empty();
-            for (const auto& completion : completions) {
-                if (completion.token != 0) handleCompletion(completion);
-            }
+            handleCompletions(completions);
         }
         const uint64_t now = steadyNowNs();
         if (timeout_scans_enabled_.load(std::memory_order_acquire) &&
@@ -554,8 +579,8 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route,
                 return Status::NeedsRefreshCache(
                     "UB target buffer has no transport metadata" LOC_MARK);
             }
-            if (const Route* cached = cache.lookup(
-                    RouteCache::Key{pending.target_id, buffer})) {
+            if (const Route* cached =
+                    cache.lookup(RouteCache::Key{pending.target_id, buffer})) {
                 // The cached entry validated this exact BufferDesc pointer.
                 // Copying the route re-pins the segment snapshot for this
                 // slice.
@@ -870,151 +895,202 @@ Status UbWorkers::chooseAndResolveEndpoint(
     return Status::OK();
 }
 
-void UbWorkers::processPending(const PendingSlice& pending,
-                               size_t worker_index, RouteCache& cache) {
-    if (pending.slice->cancellationRequested()) {
-        pending.slice->requestCancellation();
-        return;
-    }
-    Route route;
-    auto status = buildRoute(pending, route, cache);
-    if (!status.ok()) {
-        const auto resolution = pending.slice->resolveBeforePost(
-            FAILED, 0, retryableStatus(status));
-        if (resolution == UbAttemptResolution::kRetryScheduled) {
-            enqueueRetry(pending);
+void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
+                             size_t worker_index, RouteCache& cache) {
+    // Prepared, resource-acquired slices awaiting one merged post call.
+    struct Staged {
+        PendingSlice pending;
+        Route route;
+        std::shared_ptr<UbEndpoint> endpoint;
+        UbPostPath path;
+        QuotaReservation quota;
+        LocalSegmentRef local;
+        ImportedSegmentRef remote;
+        UbAttemptToken attempt;
+        std::shared_ptr<Inflight> inflight;
+        uint64_t completion_token{0};
+    };
+    std::vector<Staged> staged;
+    staged.reserve(batch.size());
+
+    for (auto& pending : batch) {
+        if (pending.slice->cancellationRequested()) {
+            pending.slice->requestCancellation();
+            continue;
         }
-        return;
-    }
-
-    std::shared_ptr<UbEndpoint> endpoint;
-    UbPostPath path;
-    QuotaReservation reservation;
-    status =
-        chooseAndResolveEndpoint(pending, route, endpoint, path, reservation);
-    if (!status.ok()) {
-        if (status.IsTooManyRequests()) {
-            deferPending(pending);
-            return;
-        }
-        const auto resolution = pending.slice->resolveBeforePost(
-            FAILED, 0, retryableStatus(status));
-        if (resolution == UbAttemptResolution::kRetryScheduled) {
-            enqueueRetry(pending);
-        }
-        return;
-    }
-
-    LocalSegmentRef local;
-    status = buffers_->findLocal(
-        reinterpret_cast<uint64_t>(pending.slice->spec().local_address),
-        pending.slice->spec().length, path.local_topology_id, local);
-    if (!status.ok()) {
-        (void)quota_->release(reservation);
-        (void)pending.slice->resolveBeforePost(FAILED, 0, false);
-        return;
-    }
-    ImportedSegmentRef remote;
-    status = buffers_->importRemote(pending.target_id, path.local_topology_id,
-                                    path.remote_device_id, *route.remote_buffer,
-                                    route.metadata, pending.opcode,
-                                    pending.slice->spec().remote_address,
-                                    pending.slice->spec().length, remote);
-    if (!status.ok()) {
-        (void)quota_->release(reservation);
-        const bool retryable = status.IsNeedsRefreshCache();
-        if (retryable && pending.target_id != LOCAL_SEGMENT_ID) {
-            (void)segment_manager_->invalidateRemote(pending.target_id);
-        }
-        const auto resolution =
-            pending.slice->resolveBeforePost(FAILED, 0, retryable);
-        if (resolution == UbAttemptResolution::kRetryScheduled) {
-            enqueueRetry(pending);
-        }
-        return;
-    }
-
-    if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
-        (void)quota_->release(reservation);
-        deferPending(pending);
-        return;
-    }
-
-    auto attempt = pending.slice->beginAttempt(path);
-    if (!attempt) {
-        endpoint->releaseOutstanding(pending.slice->spec().length);
-        (void)quota_->release(reservation);
-        return;
-    }
-
-    const uint64_t completion_token = nextCompletionToken();
-    auto inflight = std::make_shared<Inflight>();
-    inflight->completion_token = completion_token;
-    inflight->pending = pending;
-    inflight->attempt = *attempt;
-    inflight->path = path;
-    inflight->endpoint = endpoint;
-    inflight->local_segment = local.segment;
-    inflight->remote_segment = remote.segment;
-    inflight->quota = reservation;
-    inflight->posted_ns = steadyNowNs();
-    inflight->deadline_ns = deadlineAfter(
-        inflight->posted_ns,
-        static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
-
-    if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
-        endpoint->releaseOutstanding(pending.slice->spec().length);
-        (void)quota_->release(reservation);
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        inflight_.emplace(completion_token, inflight);
-    }
-
-    WorkRequest work;
-    work.operation =
-        pending.opcode == Request::READ ? Operation::READ : Operation::WRITE;
-    work.local_address =
-        reinterpret_cast<uint64_t>(pending.slice->spec().local_address);
-    work.remote_address = pending.slice->spec().remote_address;
-    work.length = pending.slice->spec().length;
-    work.token = completion_token;
-    work.local_segment = local.segment;
-    work.remote_segment = remote.segment;
-    auto jetty = endpoint->jetty(worker_index);
-    size_t posted_count = 0;
-    status = jetty ? adapter_->post(jetty, {work}, posted_count)
-                   : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
-    if (posted_count == 1) {
-        rail_monitor_->registerPath(path);
+        Route route;
+        auto status = buildRoute(pending, route, cache);
         if (!status.ok()) {
-            LOG_EVERY_N(WARNING, 1000)
-                << "UB post returned an error after accepting the WR: "
-                << status.ToString();
+            const auto resolution = pending.slice->resolveBeforePost(
+                FAILED, 0, retryableStatus(status));
+            if (resolution == UbAttemptResolution::kRetryScheduled) {
+                enqueueRetry(pending);
+            }
+            continue;
         }
-        return;
+
+        std::shared_ptr<UbEndpoint> endpoint;
+        UbPostPath path;
+        QuotaReservation reservation;
+        status = chooseAndResolveEndpoint(pending, route, endpoint, path,
+                                          reservation);
+        if (!status.ok()) {
+            if (status.IsTooManyRequests()) {
+                deferPending(pending);
+                return;
+            }
+            const auto resolution = pending.slice->resolveBeforePost(
+                FAILED, 0, retryableStatus(status));
+            if (resolution == UbAttemptResolution::kRetryScheduled) {
+                enqueueRetry(pending);
+            }
+            continue;
+        }
+
+        LocalSegmentRef local;
+        status = buffers_->findLocal(
+            reinterpret_cast<uint64_t>(pending.slice->spec().local_address),
+            pending.slice->spec().length, path.local_topology_id, local);
+        if (!status.ok()) {
+            (void)quota_->release(reservation);
+            (void)pending.slice->resolveBeforePost(FAILED, 0, false);
+            continue;
+        }
+        ImportedSegmentRef remote;
+        status = buffers_->importRemote(
+            pending.target_id, path.local_topology_id, path.remote_device_id,
+            *route.remote_buffer, route.metadata, pending.opcode,
+            pending.slice->spec().remote_address, pending.slice->spec().length,
+            remote);
+        if (!status.ok()) {
+            (void)quota_->release(reservation);
+            const bool retryable = status.IsNeedsRefreshCache();
+            if (retryable && pending.target_id != LOCAL_SEGMENT_ID) {
+                (void)segment_manager_->invalidateRemote(pending.target_id);
+            }
+            const auto resolution =
+                pending.slice->resolveBeforePost(FAILED, 0, retryable);
+            if (resolution == UbAttemptResolution::kRetryScheduled) {
+                enqueueRetry(pending);
+            }
+            continue;
+        }
+
+        if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
+            (void)quota_->release(reservation);
+            deferPending(pending);
+            continue;
+        }
+
+        auto attempt = pending.slice->beginAttempt(path);
+        if (!attempt) {
+            endpoint->releaseOutstanding(pending.slice->spec().length);
+            (void)quota_->release(reservation);
+            continue;
+        }
+
+        const uint64_t completion_token = nextCompletionToken();
+        auto inflight = std::make_shared<Inflight>();
+        inflight->completion_token = completion_token;
+        inflight->pending = pending;
+        inflight->attempt = *attempt;
+        inflight->path = path;
+        inflight->endpoint = endpoint;
+        inflight->local_segment = local.segment;
+        inflight->remote_segment = remote.segment;
+        inflight->quota = reservation;
+        inflight->posted_ns = steadyNowNs();
+        inflight->deadline_ns = deadlineAfter(
+            inflight->posted_ns,
+            static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
+
+        if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
+            endpoint->releaseOutstanding(pending.slice->spec().length);
+            (void)quota_->release(reservation);
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(inflight_mutex_);
+            inflight_.emplace(completion_token, inflight);
+        }
+
+        staged.push_back(Staged{
+            std::move(pending), std::move(route), std::move(endpoint), path,
+            std::move(reservation), std::move(local), std::move(remote),
+            *attempt, std::move(inflight), completion_token});
     }
 
-    if (status.ok()) {
+    if (staged.empty()) return;
+
+    // Submit every staged WR on this lane's jetty in one post call. The
+    // provider's WR chain runs them in order; each WR carries its own
+    // completion token, so completions resolve slices independently.
+    auto jetty = staged.front().endpoint->jetty(worker_index);
+    std::vector<WorkRequest> works;
+    works.reserve(staged.size());
+    for (const auto& item : staged) {
+        WorkRequest work;
+        work.operation = item.pending.opcode == Request::READ
+                             ? Operation::READ
+                             : Operation::WRITE;
+        work.local_address = reinterpret_cast<uint64_t>(
+            item.pending.slice->spec().local_address);
+        work.remote_address = item.pending.slice->spec().remote_address;
+        work.length = item.pending.slice->spec().length;
+        work.token = item.completion_token;
+        work.local_segment = item.local.segment;
+        work.remote_segment = item.remote.segment;
+        works.push_back(work);
+    }
+    size_t posted_count = 0;
+    Status status =
+        jetty ? adapter_->post(jetty, works, posted_count)
+              : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+
+    // posted_count counts leading WRs the provider accepted; those must
+    // complete through poll(). Anything past it failed synchronously and is
+    // rolled back below with the same semantics as the single-slice path.
+    for (size_t i = 0; i < posted_count; ++i) {
+        rail_monitor_->registerPath(staged[i].path);
+    }
+    if (status.ok() && posted_count == works.size()) return;
+    if (status.ok() && posted_count != works.size()) {
         status = Status::InternalError(
             "URMA adapter accepted an unexpected WR count" LOC_MARK);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        auto it = inflight_.find(completion_token);
-        if (it != inflight_.end() && it->second == inflight)
-            inflight_.erase(it);
+    // Synchronous failure: roll back only the WRs the provider did NOT
+    // accept (posted_count..end), leaving accepted WRs to complete. The
+    // provider rejected the WR chain once - record ONE rail error for the
+    // event, not one per rejected slice, so a 16-slice chain cannot blow
+    // through the rail error threshold and pause the rail for a whole
+    // cooldown period on a single failure. When the provider accepted a
+    // leading prefix the endpoint demonstrably works, so it is not retired -
+    // retiring here would leave retrying slices with no ready endpoint to
+    // resolve until the deferred teardown completes. A zero-acceptance
+    // failure retires the endpoint, matching the single-slice semantics.
+    const bool retire_endpoint = posted_count == 0;
+    if (!staged.empty() && posted_count < staged.size()) {
+        rail_monitor_->recordError(staged[posted_count].path);
     }
-    inflight_cv_.notify_all();
-    releaseInflight(inflight);
-    rail_monitor_->recordError(path);
-    if (endpoint_retirer_) endpoint_retirer_(endpoint);
-    const auto resolution = pending.slice->resolveAttempt(
-        *attempt, FAILED, 0, retryableStatus(status));
-    if (resolution == UbAttemptResolution::kRetryScheduled) {
-        enqueueRetry(pending);
+    for (size_t i = posted_count; i < staged.size(); ++i) {
+        const auto& item = staged[i];
+        {
+            std::lock_guard<std::mutex> lock(inflight_mutex_);
+            auto it = inflight_.find(item.completion_token);
+            if (it != inflight_.end() && it->second == item.inflight)
+                inflight_.erase(it);
+        }
+        inflight_cv_.notify_all();
+        releaseInflight(item.inflight);
+        if (retire_endpoint && endpoint_retirer_) {
+            endpoint_retirer_(item.endpoint);
+        }
+        const auto resolution = item.pending.slice->resolveAttempt(
+            item.attempt, FAILED, 0, retryableStatus(status));
+        if (resolution == UbAttemptResolution::kRetryScheduled) {
+            enqueueRetry(item.pending);
+        }
     }
 }
 
@@ -1053,64 +1129,79 @@ void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
         << status.ToString();
 }
 
-void UbWorkers::handleCompletion(const Completion& completion) {
-    std::shared_ptr<Inflight> inflight;
+// Batched completion dispatch. All inflight lookups happen under one
+// inflight_mutex_ hold and one inflight_cv_ notification instead of one
+// lock/notify pair per completion; per-completion semantics (rail stats,
+// quota release via releaseInflight, slice resolution) are identical to
+// processing them one by one.
+void UbWorkers::handleCompletions(const std::vector<Completion>& completions) {
+    std::vector<std::pair<const Completion*, std::shared_ptr<Inflight>>> ready;
     {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
-        auto it = inflight_.find(completion.token);
-        if (it == inflight_.end()) return;
-        inflight = std::move(it->second);
-        inflight_.erase(it);
+        ready.reserve(completions.size());
+        for (const auto& completion : completions) {
+            if (completion.token == 0) continue;
+            auto it = inflight_.find(completion.token);
+            if (it == inflight_.end()) continue;
+            ready.emplace_back(&completion, std::move(it->second));
+            inflight_.erase(it);
+        }
     }
     inflight_cv_.notify_all();
-    releaseInflight(inflight);
-    if (inflight->timed_out.load(std::memory_order_acquire)) {
-        // A natural or flush completion proves that this particular WR can no
-        // longer touch memory. Whichever side wins the timeout/drain race may
-        // advance the logical attempt; attempt matching makes the other call
-        // an idempotent no-op.
-        const uint64_t now = steadyNowNs();
-        recordTimeoutOnce(inflight, now);
-        resolveInflight(inflight, TIMEOUT, 0, true);
-        return;
-    }
-
-    const uint64_t now = steadyNowNs();
-    const uint64_t latency =
-        now >= inflight->posted_ns ? now - inflight->posted_ns : 0;
-    switch (completion.category) {
-        case CompletionCategory::SUCCESS:
-            rail_monitor_->recordSuccess(inflight->path,
-                                         inflight->pending.slice->spec().length,
-                                         latency, now);
-            resolveInflight(inflight, COMPLETED,
-                            inflight->pending.slice->spec().length, false);
-            break;
-        case CompletionCategory::TIMEOUT:
-            rail_monitor_->recordTimeout(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+    for (auto& [completion, inflight] : ready) {
+        releaseInflight(inflight);
+        if (inflight->timed_out.load(std::memory_order_acquire)) {
+            // A natural or flush completion proves that this particular WR
+            // can no longer touch memory. Whichever side wins the
+            // timeout/drain race may advance the logical attempt; attempt
+            // matching makes the other call an idempotent no-op.
+            const uint64_t now = steadyNowNs();
+            recordTimeoutOnce(inflight, now);
             resolveInflight(inflight, TIMEOUT, 0, true);
-            break;
-        case CompletionCategory::LOCAL_DEVICE_ERROR:
-            if (inflight->endpoint && inflight->endpoint->context()) {
-                handleLocalDeviceFailure(inflight->endpoint->context());
-            }
-            rail_monitor_->recordError(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
-            break;
-        case CompletionCategory::REMOTE_PATH_ERROR:
-        case CompletionCategory::ENDPOINT_ERROR:
-            rail_monitor_->recordError(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
-            break;
-        case CompletionCategory::MEMORY_ERROR:
-        case CompletionCategory::UNKNOWN_ERROR:
-            rail_monitor_->recordError(inflight->path, now);
-            resolveInflight(inflight, FAILED, 0, false);
-            break;
+            continue;
+        }
+
+        const uint64_t now = steadyNowNs();
+        const uint64_t latency =
+            now >= inflight->posted_ns ? now - inflight->posted_ns : 0;
+        switch (completion->category) {
+            case CompletionCategory::SUCCESS:
+                rail_monitor_->recordSuccess(
+                    inflight->path, inflight->pending.slice->spec().length,
+                    latency, now);
+                resolveInflight(inflight, COMPLETED,
+                                inflight->pending.slice->spec().length, false);
+                break;
+            case CompletionCategory::TIMEOUT:
+                rail_monitor_->recordTimeout(inflight->path, now);
+                if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+                resolveInflight(inflight, TIMEOUT, 0, true);
+                break;
+            case CompletionCategory::LOCAL_DEVICE_ERROR:
+                if (inflight->endpoint && inflight->endpoint->context()) {
+                    handleLocalDeviceFailure(inflight->endpoint->context());
+                }
+                rail_monitor_->recordError(inflight->path, now);
+                if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+                resolveInflight(inflight, FAILED, 0, true);
+                break;
+            case CompletionCategory::REMOTE_PATH_ERROR:
+            case CompletionCategory::ENDPOINT_ERROR:
+                rail_monitor_->recordError(inflight->path, now);
+                if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+                resolveInflight(inflight, FAILED, 0, true);
+                break;
+            case CompletionCategory::MEMORY_ERROR:
+            case CompletionCategory::UNKNOWN_ERROR:
+                rail_monitor_->recordError(inflight->path, now);
+                resolveInflight(inflight, FAILED, 0, false);
+                break;
+        }
     }
+}
+
+void UbWorkers::handleCompletion(const Completion& completion) {
+    handleCompletions({completion});
 }
 
 void UbWorkers::scanTimeouts() {

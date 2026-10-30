@@ -314,6 +314,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                 request.token == 0 || request.length == 0) {
                 return Status::InvalidArgument("bad WR");
             }
+            if (fail_wr_at_index_.load(std::memory_order_acquire) ==
+                static_cast<int>(posted_count)) {
+                fail_wr_at_index_.store(-1, std::memory_order_release);
+                return Status::RdmaError("injected mid-chain WR failure");
+            }
             const auto category = next_completion_.exchange(
                 CompletionCategory::SUCCESS, std::memory_order_acq_rel);
             if (hold_next_completion_.exchange(false,
@@ -367,6 +372,12 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextQuiesce() {
         fail_next_quiesce_.store(true, std::memory_order_release);
     }
+    // Fails the WR at this index of the NEXT post() call; WRs before it are
+    // accepted (posted_count covers them) and must complete through poll().
+    void failWrAtIndex(size_t index) {
+        fail_wr_at_index_.store(static_cast<int>(index),
+                                std::memory_order_release);
+    }
     void dropQuiesceCompletions() {
         quiesce_drops_completions_.store(true, std::memory_order_release);
     }
@@ -403,6 +414,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> quiesce_drops_completions_{false};
     std::atomic<bool> fail_resets_{false};
     std::atomic<bool> fail_next_shutdown_{false};
+    std::atomic<int> fail_wr_at_index_{-1};
     mutable std::mutex pending_mutex_;
     std::vector<Pending> pending_;
     std::atomic<uint64_t> quiesce_calls_{0};
@@ -1012,18 +1024,18 @@ TEST(UbNativeDataPathTest, RouteCacheServesSlicesIntoTheSameBuffer) {
     ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
 
     SegmentManager manager(std::make_unique<NullRegistry>());
-    ASSERT_TRUE(
-        manager
-            .updateLocal([&](SegmentDesc& segment) {
-                segment.name = "local";
-                segment.type = SegmentType::Memory;
-                segment.detail = MemorySegmentDesc{};
-                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
-                memory.topology = *topology;
-                memory.buffers = {source_desc, target_desc};
-                return Status::OK();
-            })
-            .ok());
+    ASSERT_TRUE(manager
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = "local";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *topology;
+                        memory.buffers = {source_desc, target_desc};
+                        return Status::OK();
+                    })
+                    .ok());
 
     EndpointStore endpoints(adapter, 16, 1);
     RailMonitor rails;
@@ -1085,6 +1097,128 @@ TEST(UbNativeDataPathTest, RouteCacheServesSlicesIntoTheSameBuffer) {
     // slice), every later slice served from the cache.
     EXPECT_EQ(workers.routeCacheMisses(), 1U);
     EXPECT_EQ(workers.routeCacheHits(), kSliceCount - 1);
+
+    EXPECT_TRUE(workers.stop().ok());
+    EXPECT_TRUE(endpoints.clear().ok());
+    EXPECT_TRUE(buffers.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// A multi-slice batch reaches the adapter as one WR chain. When the provider
+// rejects a WR in the middle of the chain, the WRs it already accepted (the
+// leading posted_count) must complete through poll(), while the rejected tail
+// rolls back its inflight/quota/outstanding resources and retries as normal
+// slices. The task as a whole must still reach COMPLETED with full bytes.
+TEST(UbNativeDataPathTest, MidChainWrFailureRollsBackOnlyTheRejectedTail) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    std::vector<UbContextPtr> contexts{context};
+    auto topology = fakeTopology();
+    UbBufferManager buffers(adapter, contexts);
+
+    constexpr size_t kSliceCount = 8;
+    constexpr size_t kSliceLen = 16;
+    std::array<char, kSliceCount * kSliceLen> source{};
+    std::array<char, kSliceCount * kSliceLen> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i + 1);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(buffers.addBuffer(source_desc, options).ok());
+    ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
+
+    SegmentManager manager(std::make_unique<NullRegistry>());
+    ASSERT_TRUE(
+        manager
+            .updateLocal([&](SegmentDesc& segment) {
+                segment.name = "local";
+                segment.type = SegmentType::Memory;
+                segment.detail = MemorySegmentDesc{};
+                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                memory.topology = *topology;
+                memory.buffers = {source_desc, target_desc};
+                return Status::OK();
+            })
+            .ok());
+
+    EndpointStore endpoints(adapter, 16, 1);
+    RailMonitor rails;
+    QuotaManager quota;
+    UbParams params;
+    params.worker_count = 1;
+    params.poller_count = 1;
+    params.slice_size = kSliceLen;
+    params.max_retries = 3;
+
+    EndpointResolver resolver = [&](const EndpointResolveRequest& request,
+                                    std::shared_ptr<UbEndpoint>& endpoint) {
+        UbEndpointKey key{request.local_context->topologyId(),
+                          request.remote_segment_id, request.remote_topology_id,
+                          "local@ub:fake0:eid0"};
+        auto status =
+            endpoints.getOrCreate(key, request.local_context, endpoint);
+        if (!status.ok() || endpoint->ready()) return status;
+        UbBootstrapDesc peer;
+        peer.local_eid = fakeDevice().eid;
+        peer.endpoint_generation = 100;
+        peer.jetty_ids = {777};
+        return endpoint->bind(peer);
+    };
+    UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
+                      &quota, params, std::move(resolver),
+                      [&](const std::shared_ptr<UbEndpoint>& endpoint) {
+                          (void)endpoints.retire(endpoint);
+                      });
+    ASSERT_TRUE(workers.start().ok());
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    auto task = UbTask::create(request);
+    for (size_t offset = 0; offset < request.length; offset += kSliceLen) {
+        ASSERT_NE(task->addSlice(UbSliceSpec{
+                      source.data() + offset,
+                      reinterpret_cast<uint64_t>(target.data() + offset),
+                      kSliceLen, offset, 5}),
+                  nullptr);
+    }
+    ASSERT_TRUE(task->seal());
+
+    // With one worker lane and a deep queue (8 slices of one task), the whole
+    // task is staged as one WR chain; reject the WR at index 4. The retries
+    // need budget for the mid-chain failure plus the endpoint's
+    // retirement/rebind cycle.
+    adapter->failWrAtIndex(4);
+    ASSERT_TRUE(workers.submit(task).ok());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
+    // The leading 4 WRs copied their bytes on post; the rejected 4 retried and
+    // completed. No bytes may be lost or duplicated.
+    EXPECT_EQ(source, target);
+    EXPECT_EQ(adapter->pendingCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
 
     EXPECT_TRUE(workers.stop().ok());
     EXPECT_TRUE(endpoints.clear().ok());
