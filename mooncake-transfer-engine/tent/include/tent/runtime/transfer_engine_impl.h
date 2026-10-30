@@ -41,6 +41,7 @@ namespace mooncake {
 class TransferEngineImplTestPeer;
 namespace tent {
 
+class BatchShardHashPeer;
 class Batch;
 class Topology;
 class Transport;
@@ -231,6 +232,7 @@ class TransferEngineImpl {
     friend class ProxyManager;
     friend class TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
+    friend class BatchShardHashPeer;
 
    public:
     TransferEngineImpl();
@@ -692,9 +694,19 @@ class TransferEngineImpl {
         std::unordered_set<Batch*> active_batches;
         std::unordered_set<BatchID> alive_batches;
     };
+    // Shard selection must spread allocator patterns that % 64 collapses:
+    // pointer alignment (low 3 bits zero) and same-congruence pointers across
+    // slab arenas (e.g. a thread-local freelist reusing one block per thread,
+    // or a 248-byte stride where only every 8th residue appears). Fibonacci
+    // hashing mixes the full pointer value; using the top 6 bits keeps the
+    // result within kBatchLockShards without a second reduction step.
+    static size_t batchShardIndex(BatchID batch_id) {
+        return (reinterpret_cast<uintptr_t>(batch_id) *
+                0x9E3779B97F4A7C15ULL) >>
+               58;
+    }
     BatchShard& batchShard(BatchID batch_id) {
-        return batch_shards_[reinterpret_cast<uintptr_t>(batch_id) %
-                             kBatchLockShards];
+        return batch_shards_[batchShardIndex(batch_id)];
     }
     std::recursive_mutex& batchShardMutex(BatchID batch_id) {
         return batchShard(batch_id).mtx;

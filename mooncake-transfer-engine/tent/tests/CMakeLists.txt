@@ -692,6 +692,13 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
+add_executable(tent_batch_shard_hash_test batch_shard_hash_test.cpp)
+target_link_libraries(tent_batch_shard_hash_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+target_include_directories(tent_batch_shard_hash_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_batch_shard_hash_test COMMAND tent_batch_shard_hash_test)
+
 add_executable(tent_local_memory_lifecycle_test local_memory_lifecycle_test.cpp)
 target_link_libraries(tent_local_memory_lifecycle_test PRIVATE gtest gtest_main
                                                                tent_link_group)
