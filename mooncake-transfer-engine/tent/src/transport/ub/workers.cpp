@@ -114,6 +114,9 @@ struct UbWorkers::Inflight {
     UbAttemptToken attempt;
     UbPostPath path;
     std::shared_ptr<UbEndpoint> endpoint;
+    // Posting lane that acquired the endpoint's outstanding slots. The
+    // endpoint maps it to the same Jetty (and depth slot) on release.
+    size_t jetty_lane{0};
     LocalSegmentPtr local_segment;
     RemoteSegmentPtr remote_segment;
     QuotaReservation quota;
@@ -936,8 +939,14 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
                                           reservation);
         if (!status.ok()) {
             if (status.IsTooManyRequests()) {
+                // Quota pressure defers this slice without consuming its
+                // retry budget. The batch continues with the remaining
+                // slices: a later slice may resolve a different path whose
+                // quota still fits, and dropping the batch tail here would
+                // strand already-popped slices with no owner to requeue
+                // them.
                 deferPending(pending);
-                return;
+                continue;
             }
             const auto resolution = pending.slice->resolveBeforePost(
                 FAILED, 0, retryableStatus(status));
@@ -976,7 +985,8 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
             continue;
         }
 
-        if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
+        if (!endpoint->tryAcquireOutstanding(worker_index,
+                                             pending.slice->spec().length)) {
             (void)quota_->release(reservation);
             deferPending(pending);
             continue;
@@ -984,7 +994,8 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
 
         auto attempt = pending.slice->beginAttempt(path);
         if (!attempt) {
-            endpoint->releaseOutstanding(pending.slice->spec().length);
+            endpoint->releaseOutstanding(worker_index,
+                                         pending.slice->spec().length);
             (void)quota_->release(reservation);
             continue;
         }
@@ -996,6 +1007,7 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
         inflight->attempt = *attempt;
         inflight->path = path;
         inflight->endpoint = endpoint;
+        inflight->jetty_lane = worker_index;
         inflight->local_segment = local.segment;
         inflight->remote_segment = remote.segment;
         inflight->quota = reservation;
@@ -1005,7 +1017,8 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
             static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
 
         if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
-            endpoint->releaseOutstanding(pending.slice->spec().length);
+            endpoint->releaseOutstanding(worker_index,
+                                         pending.slice->spec().length);
             (void)quota_->release(reservation);
             continue;
         }
@@ -1022,74 +1035,109 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
 
     if (staged.empty()) return;
 
-    // Submit every staged WR on this lane's jetty in one post call. The
-    // provider's WR chain runs them in order; each WR carries its own
-    // completion token, so completions resolve slices independently.
-    auto jetty = staged.front().endpoint->jetty(worker_index);
+    // Group the staged slices by endpoint. Every slice resolved its own path,
+    // so one batch can span several endpoints when quota pressure, retry
+    // rotation, or a multi-device peer spreads its slices across rails. Each
+    // group then posts one WR chain on this lane's Jetty of that group's
+    // endpoint: a WR submitted on another endpoint's Jetty would DMA through
+    // the wrong connection. Grouping also scopes rollback and rail error
+    // accounting to the connection that actually failed. Staging order is
+    // preserved inside and across groups.
+    using EndpointGroup =
+        std::pair<std::shared_ptr<UbEndpoint>, std::vector<size_t>>;
+    std::vector<EndpointGroup> groups;
+    groups.reserve(staged.size());
+    for (size_t index = 0; index < staged.size(); ++index) {
+        const auto& endpoint = staged[index].endpoint;
+        EndpointGroup* group = nullptr;
+        for (auto& entry : groups) {
+            if (entry.first == endpoint) {
+                group = &entry;
+                break;
+            }
+        }
+        if (!group) {
+            groups.emplace_back(endpoint, std::vector<size_t>{});
+            group = &groups.back();
+        }
+        group->second.push_back(index);
+    }
+
     std::vector<WorkRequest> works;
-    works.reserve(staged.size());
-    for (const auto& item : staged) {
-        WorkRequest work;
-        work.operation = item.pending.opcode == Request::READ
-                             ? Operation::READ
-                             : Operation::WRITE;
-        work.local_address = reinterpret_cast<uint64_t>(
-            item.pending.slice->spec().local_address);
-        work.remote_address = item.pending.slice->spec().remote_address;
-        work.length = item.pending.slice->spec().length;
-        work.token = item.completion_token;
-        work.local_segment = item.local.segment;
-        work.remote_segment = item.remote.segment;
-        works.push_back(work);
-    }
-    size_t posted_count = 0;
-    Status status =
-        jetty ? adapter_->post(jetty, works, posted_count)
-              : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
-
-    // posted_count counts leading WRs the provider accepted; those must
-    // complete through poll(). Anything past it failed synchronously and is
-    // rolled back below with the same semantics as the single-slice path.
-    for (size_t i = 0; i < posted_count; ++i) {
-        rail_monitor_->registerPath(staged[i].path);
-    }
-    if (status.ok() && posted_count == works.size()) return;
-    if (status.ok() && posted_count != works.size()) {
-        status = Status::InternalError(
-            "URMA adapter accepted an unexpected WR count" LOC_MARK);
-    }
-
-    // Synchronous failure: roll back only the WRs the provider did NOT
-    // accept (posted_count..end), leaving accepted WRs to complete. The
-    // provider rejected the WR chain once - record ONE rail error for the
-    // event, not one per rejected slice, so a 16-slice chain cannot blow
-    // through the rail error threshold and pause the rail for a whole
-    // cooldown period on a single failure. When the provider accepted a
-    // leading prefix the endpoint demonstrably works, so it is not retired -
-    // retiring here would leave retrying slices with no ready endpoint to
-    // resolve until the deferred teardown completes. A zero-acceptance
-    // failure retires the endpoint, matching the single-slice semantics.
-    const bool retire_endpoint = posted_count == 0;
-    if (!staged.empty() && posted_count < staged.size()) {
-        rail_monitor_->recordError(staged[posted_count].path);
-    }
-    for (size_t i = posted_count; i < staged.size(); ++i) {
-        const auto& item = staged[i];
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            auto it = inflight_.find(item.completion_token);
-            if (it != inflight_.end() && it->second == item.inflight)
-                inflight_.erase(it);
+    for (const auto& [endpoint, indices] : groups) {
+        // Submit this group's staged WRs on this lane's Jetty of the group's
+        // endpoint in one post call. The provider's WR chain runs them in
+        // order; each WR carries its own completion token, so completions
+        // resolve slices independently. Jetty-depth admission already capped
+        // this group at tryAcquireOutstanding() time.
+        auto jetty = endpoint->jetty(worker_index);
+        works.clear();
+        for (size_t index : indices) {
+            const auto& item = staged[index];
+            WorkRequest work;
+            work.operation = item.pending.opcode == Request::READ
+                                 ? Operation::READ
+                                 : Operation::WRITE;
+            work.local_address = reinterpret_cast<uint64_t>(
+                item.pending.slice->spec().local_address);
+            work.remote_address = item.pending.slice->spec().remote_address;
+            work.length = item.pending.slice->spec().length;
+            work.token = item.completion_token;
+            work.local_segment = item.local.segment;
+            work.remote_segment = item.remote.segment;
+            works.push_back(work);
         }
-        inflight_cv_.notify_all();
-        releaseInflight(item.inflight);
-        if (retire_endpoint && endpoint_retirer_) {
-            endpoint_retirer_(item.endpoint);
+        size_t posted_count = 0;
+        Status status =
+            jetty ? adapter_->post(jetty, works, posted_count)
+                  : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+
+        // posted_count counts leading WRs the provider accepted; those must
+        // complete through poll(). Anything past it failed synchronously and
+        // is rolled back below with the same semantics as the single-slice
+        // path.
+        for (size_t i = 0; i < posted_count; ++i) {
+            rail_monitor_->registerPath(staged[indices[i]].path);
         }
-        const auto resolution = item.pending.slice->resolveAttempt(
-            item.attempt, FAILED, 0, retryableStatus(status));
-        if (resolution == UbAttemptResolution::kRetryScheduled) {
-            enqueueRetry(item.pending);
+        if (status.ok() && posted_count == works.size()) continue;
+        if (status.ok() && posted_count != works.size()) {
+            status = Status::InternalError(
+                "URMA adapter accepted an unexpected WR count" LOC_MARK);
+        }
+
+        // Synchronous failure: roll back only the WRs the provider did NOT
+        // accept (posted_count..end), leaving accepted WRs to complete. The
+        // provider rejected this group's WR chain once - record ONE rail
+        // error for the event, not one per rejected slice, so a 16-slice
+        // chain cannot blow through the rail error threshold and pause the
+        // rail for a whole cooldown period on a single failure. When the
+        // provider accepted a leading prefix the endpoint demonstrably works,
+        // so it is not retired - retiring here would leave retrying slices
+        // with no ready endpoint to resolve until the deferred teardown
+        // completes. A zero-acceptance failure retires the endpoint, matching
+        // the single-slice semantics.
+        const bool retire_endpoint = posted_count == 0;
+        if (posted_count < indices.size()) {
+            rail_monitor_->recordError(staged[indices[posted_count]].path);
+        }
+        for (size_t i = posted_count; i < indices.size(); ++i) {
+            const auto& item = staged[indices[i]];
+            {
+                std::lock_guard<std::mutex> lock(inflight_mutex_);
+                auto it = inflight_.find(item.completion_token);
+                if (it != inflight_.end() && it->second == item.inflight)
+                    inflight_.erase(it);
+            }
+            inflight_cv_.notify_all();
+            releaseInflight(item.inflight);
+            if (retire_endpoint && endpoint_retirer_) {
+                endpoint_retirer_(item.endpoint);
+            }
+            const auto resolution = item.pending.slice->resolveAttempt(
+                item.attempt, FAILED, 0, retryableStatus(status));
+            if (resolution == UbAttemptResolution::kRetryScheduled) {
+                enqueueRetry(item.pending);
+            }
         }
     }
 }
@@ -1284,7 +1332,7 @@ void UbWorkers::releaseInflight(const std::shared_ptr<Inflight>& inflight) {
     }
     if (inflight->endpoint) {
         inflight->endpoint->releaseOutstanding(
-            inflight->pending.slice->spec().length);
+            inflight->jetty_lane, inflight->pending.slice->spec().length);
     }
     if (inflight->quota.valid()) (void)quota_->release(inflight->quota);
     queue_cv_.notify_all();

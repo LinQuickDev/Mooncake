@@ -344,21 +344,37 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     return Status::OK();
 }
 
-bool UbEndpoint::tryAcquireOutstanding(uint64_t bytes) noexcept {
+bool UbEndpoint::tryAcquireOutstanding(size_t jetty_index,
+                                       uint64_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (state_.load(std::memory_order_relaxed) != State::kReady || !context_ ||
         !context_->active()) {
         return false;
     }
 
+    if (!jetties_.empty()) {
+        const size_t slot = jetty_index % jetties_.size();
+        if (jetty_options_.depth != 0 &&
+            jetty_outstanding_wrs_[slot] >= jetty_options_.depth) {
+            return false;
+        }
+        ++jetty_outstanding_wrs_[slot];
+    }
     outstanding_wrs_.fetch_add(1, std::memory_order_relaxed);
     outstanding_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     context_->addInflight(bytes);
     return true;
 }
 
-void UbEndpoint::releaseOutstanding(uint64_t bytes) noexcept {
+void UbEndpoint::releaseOutstanding(size_t jetty_index,
+                                    uint64_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!jetties_.empty()) {
+        const size_t slot = jetty_index % jetties_.size();
+        if (jetty_outstanding_wrs_[slot] != 0) {
+            --jetty_outstanding_wrs_[slot];
+        }
+    }
     const uint64_t current_wrs =
         outstanding_wrs_.load(std::memory_order_relaxed);
     if (current_wrs == 0) return;

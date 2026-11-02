@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -157,7 +158,10 @@ class FakeJetty final : public Jetty {
 
 class FakeUrmaAdapter final : public UrmaAdapter {
    public:
-    explicit FakeUrmaAdapter(DeviceInfo device) : device_(std::move(device)) {}
+    explicit FakeUrmaAdapter(DeviceInfo device)
+        : FakeUrmaAdapter(std::vector<DeviceInfo>{std::move(device)}) {}
+    explicit FakeUrmaAdapter(std::vector<DeviceInfo> devices)
+        : devices_(std::move(devices)) {}
 
     bool available() const noexcept override { return true; }
     uint32_t nativeApiVersion() const noexcept override { return 1; }
@@ -175,15 +179,18 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
     Status discoverDevices(std::vector<DeviceInfo>& devices) override {
         if (!initialized_) return Status::InvalidArgument("not initialized");
-        devices = {device_};
+        devices = devices_;
         return Status::OK();
     }
     Status openContext(const DeviceInfo& device, ContextPtr& context) override {
-        if (!initialized_ || device.topology_name != device_.topology_name) {
-            return Status::DeviceNotFound("fake device missing");
+        if (!initialized_) return Status::InvalidArgument("not initialized");
+        for (const auto& candidate : devices_) {
+            if (candidate.topology_name == device.topology_name) {
+                context = std::make_shared<FakeContext>(device);
+                return Status::OK();
+            }
         }
-        context = std::make_shared<FakeContext>(device);
-        return Status::OK();
+        return Status::DeviceNotFound("fake device missing");
     }
     Status closeContext(ContextPtr& context) override {
         if (auto fake = std::dynamic_pointer_cast<FakeContext>(context)) {
@@ -287,7 +294,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (!quiesce_drops_completions_.load(std::memory_order_acquire)) {
             auto it = pending_.begin();
             while (it != pending_.end()) {
-                if (it->jetty_id != fake->id()) {
+                if (it->jetty->id() != fake->id()) {
                     ++it;
                     continue;
                 }
@@ -309,6 +316,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (!fake || !fake->valid() || !fake->bound()) {
             return Status::InvalidArgument("unbound Jetty");
         }
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            post_records_.push_back(
+                PostRecord{fake->id(), std::vector<WorkRequest>(requests)});
+        }
         for (const auto& request : requests) {
             if (!request.local_segment || !request.remote_segment ||
                 request.token == 0 || request.length == 0) {
@@ -322,9 +334,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
             const auto category = next_completion_.exchange(
                 CompletionCategory::SUCCESS, std::memory_order_acq_rel);
             if (hold_next_completion_.exchange(false,
-                                               std::memory_order_acq_rel)) {
+                                               std::memory_order_acq_rel) ||
+                hold_all_completions_.load(std::memory_order_acquire)) {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_.push_back(Pending{fake->id(), request});
+                pending_.push_back(Pending{fake, request});
                 ++posted_count;
                 continue;
             }
@@ -366,6 +379,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
     }
+    // Every WR is parked in pending_ instead of completing, so outstanding
+    // Jetty depth never drains until releaseHeldCompletions() runs.
+    void holdAllCompletions() {
+        hold_all_completions_.store(true, std::memory_order_release);
+    }
     void dropNextQuiescedCompletion() {
         drop_next_quiesced_completion_.store(true, std::memory_order_release);
     }
@@ -390,6 +408,42 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         return pending_.size();
     }
+    // Every post() call with its Jetty and the WR chain it submitted.
+    struct PostRecord {
+        uint32_t jetty_id{0};
+        std::vector<WorkRequest> requests;
+    };
+    std::vector<PostRecord> postRecords() const {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        return post_records_;
+    }
+    // Completes up to `count` held WRs: performs the data copy the provider
+    // would have finished by completion time and reports a SUCCESS completion
+    // on the WR's Jetty. Returns how many were released.
+    size_t releaseHeldCompletions(size_t count) {
+        size_t released = 0;
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        while (released < count && !pending_.empty()) {
+            auto held = *pending_.begin();
+            pending_.erase(pending_.begin());
+            if (held.request.operation == Operation::WRITE) {
+                std::memcpy(
+                    reinterpret_cast<void*>(held.request.remote_address),
+                    reinterpret_cast<const void*>(held.request.local_address),
+                    held.request.length);
+            } else {
+                std::memcpy(
+                    reinterpret_cast<void*>(held.request.local_address),
+                    reinterpret_cast<const void*>(held.request.remote_address),
+                    held.request.length);
+            }
+            held.jetty->jfc()->push(Completion{
+                CompletionCategory::SUCCESS, 0, held.request.token,
+                static_cast<uint32_t>(held.request.length), held.jetty->id()});
+            ++released;
+        }
+        return released;
+    }
     uint64_t quiesceCalls() const {
         return quiesce_calls_.load(std::memory_order_relaxed);
     }
@@ -399,16 +453,17 @@ class FakeUrmaAdapter final : public UrmaAdapter {
 
    private:
     struct Pending {
-        uint32_t jetty_id{0};
+        std::shared_ptr<FakeJetty> jetty;
         WorkRequest request;
     };
 
-    DeviceInfo device_;
+    std::vector<DeviceInfo> devices_;
     bool initialized_{false};
     uint32_t next_jetty_id_{1};
     std::atomic<CompletionCategory> next_completion_{
         CompletionCategory::SUCCESS};
     std::atomic<bool> hold_next_completion_{false};
+    std::atomic<bool> hold_all_completions_{false};
     std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};
     std::atomic<bool> quiesce_drops_completions_{false};
@@ -417,6 +472,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<int> fail_wr_at_index_{-1};
     mutable std::mutex pending_mutex_;
     std::vector<Pending> pending_;
+    std::vector<PostRecord> post_records_;
     std::atomic<uint64_t> quiesce_calls_{0};
     std::atomic<uint32_t> last_registered_access_{0};
 };
@@ -460,6 +516,46 @@ std::shared_ptr<Topology> fakeTopology(bool discovery_active = true) {
     memory.type = Topology::MEM_HOST;
     memory.numa_node = -1;
     memory.device_list[0].push_back(0);
+    topology->mem_list_.push_back(std::move(memory));
+    return topology;
+}
+
+DeviceInfo fakeSecondaryDevice() {
+    DeviceInfo info;
+    info.topology_name = "ub:fake1:eid0";
+    info.native_device_name = "fake1";
+    info.native_device_path = "/fake/fake1";
+    info.eid_index = 0;
+    info.eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    info.active = true;
+    info.capabilities.max_jfc = 4;
+    info.capabilities.max_jetty = 64;
+    return info;
+}
+
+// Two UB NICs (device ids 0 and 1) both reachable from the wildcard memory
+// location, so a buffer registered on both contexts advertises two remote
+// devices and one task's slices can split across two endpoints.
+std::shared_ptr<Topology> fakeTwoDeviceTopology() {
+    auto topology = std::make_shared<Topology>();
+    Topology::NicEntry nic0{.name = "ub:fake0:eid0",
+                            .pci_bus_id = "0000:00:00.0",
+                            .type = Topology::NIC_UB,
+                            .numa_node = 0};
+    Topology::NicEntry nic1{.name = "ub:fake1:eid0",
+                            .pci_bus_id = "0000:00:01.0",
+                            .type = Topology::NIC_UB,
+                            .numa_node = 0};
+    encodeTopologyDeviceAttributes(fakeDevice(), 0, nic0.device_attrs);
+    encodeTopologyDeviceAttributes(fakeSecondaryDevice(), 1, nic1.device_attrs);
+    topology->nic_list_.push_back(std::move(nic0));
+    topology->nic_list_.push_back(std::move(nic1));
+    Topology::MemEntry memory;
+    memory.name = kWildcardLocation;
+    memory.type = Topology::MEM_HOST;
+    memory.numa_node = -1;
+    memory.device_list[0].push_back(0);
+    memory.device_list[0].push_back(1);
     topology->mem_list_.push_back(std::move(memory));
     return topology;
 }
@@ -1216,6 +1312,327 @@ TEST(UbNativeDataPathTest, MidChainWrFailureRollsBackOnlyTheRejectedTail) {
     EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
     // The leading 4 WRs copied their bytes on post; the rejected 4 retried and
     // completed. No bytes may be lost or duplicated.
+    EXPECT_EQ(source, target);
+    EXPECT_EQ(adapter->pendingCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+
+    EXPECT_TRUE(workers.stop().ok());
+    EXPECT_TRUE(endpoints.clear().ok());
+    EXPECT_TRUE(buffers.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// One task's batch must post one WR chain PER ENDPOINT: slices that resolve
+// different paths go through different connections, and a WR submitted on
+// another endpoint's Jetty would DMA through the wrong connection. The
+// rail-0 quota (4 WRs) forces the 8-slice batch to split: slices 0..3 on the
+// remote-0 endpoint, slices 4..7 on the remote-1 endpoint.
+TEST(UbNativeDataPathTest, MultiEndpointBatchPostsEachGroupOnItsOwnJetty) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{fakeDevice(), fakeSecondaryDevice()});
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context0 = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    auto context1 =
+        std::make_shared<UbContext>(1, fakeSecondaryDevice(), adapter);
+    ASSERT_TRUE(context0->initialize(1, JfcOptions{}).ok());
+    ASSERT_TRUE(context1->initialize(1, JfcOptions{}).ok());
+    std::vector<UbContextPtr> contexts{context0, context1};
+    auto topology = fakeTwoDeviceTopology();
+    UbBufferManager buffers(adapter, contexts);
+
+    constexpr size_t kSliceCount = 8;
+    constexpr size_t kSliceLen = 16;
+    std::array<char, kSliceCount * kSliceLen> source{};
+    std::array<char, kSliceCount * kSliceLen> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i + 1);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(buffers.addBuffer(source_desc, options).ok());
+    ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
+
+    SegmentManager manager(std::make_unique<NullRegistry>());
+    ASSERT_TRUE(manager
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = "local";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *topology;
+                        memory.buffers = {source_desc, target_desc};
+                        return Status::OK();
+                    })
+                    .ok());
+
+    EndpointStore endpoints(adapter, 16, 1);
+    RailMonitor rails;
+    QuotaManager quota;
+    QuotaLimits rail0_limits;
+    rail0_limits.max_outstanding_wrs = kSliceCount / 2;
+    // The generation field only participates in path.valid(); the quota rail
+    // key itself is (local device, segment, remote device).
+    ASSERT_TRUE(quota.setPathLimits(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1},
+                                    rail0_limits));
+    UbParams params;
+    params.worker_count = 1;
+    params.poller_count = 1;
+    params.slice_size = kSliceLen;
+    params.max_retries = 3;
+
+    EndpointResolver resolver = [&](const EndpointResolveRequest& request,
+                                    std::shared_ptr<UbEndpoint>& endpoint) {
+        const bool secondary = request.remote_topology_id == 1;
+        UbEndpointKey key{
+            request.local_context->topologyId(), request.remote_segment_id,
+            request.remote_topology_id,
+            secondary ? "local@ub:fake1:eid0" : "local@ub:fake0:eid0"};
+        auto status =
+            endpoints.getOrCreate(key, request.local_context, endpoint);
+        if (!status.ok() || endpoint->ready()) return status;
+        UbBootstrapDesc peer;
+        peer.local_eid =
+            secondary ? fakeSecondaryDevice().eid : fakeDevice().eid;
+        peer.endpoint_generation = 100;
+        peer.jetty_ids = {777};
+        return endpoint->bind(peer);
+    };
+    UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
+                      &quota, params, std::move(resolver),
+                      [&](const std::shared_ptr<UbEndpoint>& endpoint) {
+                          (void)endpoints.retire(endpoint);
+                      });
+    ASSERT_TRUE(workers.start().ok());
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    auto task = UbTask::create(request);
+    for (size_t offset = 0; offset < request.length; offset += kSliceLen) {
+        ASSERT_NE(task->addSlice(UbSliceSpec{
+                      source.data() + offset,
+                      reinterpret_cast<uint64_t>(target.data() + offset),
+                      kSliceLen, offset, 5}),
+                  nullptr);
+    }
+    ASSERT_TRUE(task->seal());
+    // Pin the posting lanes to local device 0, so the two reachable paths
+    // differ only in the remote device and the batch resolves exactly two
+    // endpoints.
+    ASSERT_TRUE(workers.submit(task, /*device_mask=*/uint64_t{1}).ok());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+
+    std::shared_ptr<UbEndpoint> endpoint0;
+    ASSERT_TRUE(endpoints
+                    .getOrCreate(UbEndpointKey{0, LOCAL_SEGMENT_ID, 0,
+                                               "local@ub:fake0:eid0"},
+                                 context0, endpoint0)
+                    .ok());
+    ASSERT_TRUE(endpoint0 && endpoint0->ready());
+    std::shared_ptr<UbEndpoint> endpoint1;
+    ASSERT_TRUE(endpoints
+                    .getOrCreate(UbEndpointKey{0, LOCAL_SEGMENT_ID, 1,
+                                               "local@ub:fake1:eid0"},
+                                 context0, endpoint1)
+                    .ok());
+    ASSERT_TRUE(endpoint1 && endpoint1->ready());
+
+    auto jettyIds = [](const std::shared_ptr<UbEndpoint>& endpoint) {
+        std::set<uint32_t> ids;
+        for (const auto& jetty : endpoint->jetties()) {
+            ids.insert(jetty->id());
+        }
+        return ids;
+    };
+    const auto jetties0 = jettyIds(endpoint0);
+    const auto jetties1 = jettyIds(endpoint1);
+    ASSERT_FALSE(jetties0.empty());
+    ASSERT_FALSE(jetties1.empty());
+    for (uint32_t id : jetties0) {
+        EXPECT_EQ(jetties1.count(id), 0U);
+    }
+
+    // Slices 0..3 (the first half of the target buffer) resolve remote
+    // device 0, slices 4..7 resolve remote device 1: every post on one
+    // endpoint's Jetty may carry only that endpoint's half.
+    const uint64_t target_base = reinterpret_cast<uint64_t>(target.data());
+    const uint64_t split = target_base + source.size() / 2;
+    size_t posts_on_0 = 0;
+    size_t posts_on_1 = 0;
+    for (const auto& record : adapter->postRecords()) {
+        const bool on_endpoint0 = jetties0.count(record.jetty_id) != 0;
+        if (on_endpoint0) {
+            ++posts_on_0;
+        } else {
+            ++posts_on_1;
+        }
+        for (const auto& wr : record.requests) {
+            if (on_endpoint0) {
+                EXPECT_GE(wr.remote_address, target_base);
+                EXPECT_LT(wr.remote_address, split);
+            } else {
+                EXPECT_GE(wr.remote_address, split);
+                EXPECT_LT(wr.remote_address, target_base + source.size());
+            }
+        }
+    }
+    EXPECT_GT(posts_on_0, 0U);
+    EXPECT_GT(posts_on_1, 0U);
+
+    EXPECT_TRUE(workers.stop().ok());
+    EXPECT_TRUE(endpoints.clear().ok());
+    EXPECT_TRUE(buffers.clear().ok());
+    EXPECT_TRUE(context0->shutdown().ok());
+    EXPECT_TRUE(context1->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// The Jetty WR depth caps what one post batch may leave outstanding: the
+// excess slices defer (before any attempt state exists, so no retry budget
+// is consumed) and drain as completions free depth slots.
+TEST(UbNativeDataPathTest, JettyDepthDefersExcessSlicesUntilCompletionsDrain) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    std::vector<UbContextPtr> contexts{context};
+    auto topology = fakeTopology();
+    UbBufferManager buffers(adapter, contexts);
+
+    constexpr size_t kSliceCount = 8;
+    constexpr size_t kSliceLen = 16;
+    std::array<char, kSliceCount * kSliceLen> source{};
+    std::array<char, kSliceCount * kSliceLen> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i + 1);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(buffers.addBuffer(source_desc, options).ok());
+    ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
+
+    SegmentManager manager(std::make_unique<NullRegistry>());
+    ASSERT_TRUE(manager
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = "local";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *topology;
+                        memory.buffers = {source_desc, target_desc};
+                        return Status::OK();
+                    })
+                    .ok());
+
+    JettyOptions jetty_options;
+    jetty_options.depth = 2;
+    EndpointStore endpoints(adapter, 16, 1, jetty_options);
+    RailMonitor rails;
+    QuotaManager quota;
+    UbParams params;
+    params.worker_count = 1;
+    params.poller_count = 1;
+    params.slice_size = kSliceLen;
+    params.max_retries = 3;
+
+    EndpointResolver resolver = [&](const EndpointResolveRequest& request,
+                                    std::shared_ptr<UbEndpoint>& endpoint) {
+        UbEndpointKey key{request.local_context->topologyId(),
+                          request.remote_segment_id, request.remote_topology_id,
+                          "local@ub:fake0:eid0"};
+        auto status =
+            endpoints.getOrCreate(key, request.local_context, endpoint);
+        if (!status.ok() || endpoint->ready()) return status;
+        UbBootstrapDesc peer;
+        peer.local_eid = fakeDevice().eid;
+        peer.endpoint_generation = 100;
+        peer.jetty_ids = {777};
+        return endpoint->bind(peer);
+    };
+    UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
+                      &quota, params, std::move(resolver),
+                      [&](const std::shared_ptr<UbEndpoint>& endpoint) {
+                          (void)endpoints.retire(endpoint);
+                      });
+    ASSERT_TRUE(workers.start().ok());
+    adapter->holdAllCompletions();
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    auto task = UbTask::create(request);
+    for (size_t offset = 0; offset < request.length; offset += kSliceLen) {
+        // max_retries = 0: any retryable failure would fail the slice
+        // outright, so a COMPLETED task proves deferral never burned the
+        // retry budget.
+        ASSERT_NE(task->addSlice(UbSliceSpec{
+                      source.data() + offset,
+                      reinterpret_cast<uint64_t>(target.data() + offset),
+                      kSliceLen, offset, 0}),
+                  nullptr);
+    }
+    ASSERT_TRUE(task->seal());
+    ASSERT_TRUE(workers.submit(task).ok());
+
+    // Only two WRs fit the Jetty depth; they post and are held, while the
+    // other six slices keep deferring.
+    const auto settled =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (adapter->pendingCount() < 2 &&
+           std::chrono::steady_clock::now() < settled) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(adapter->pendingCount(), 2U);
+    EXPECT_EQ(task->transferStatus().s, PENDING);
+
+    // Each released completion frees a depth slot for one deferred slice;
+    // drain until the whole task completes.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (adapter->pendingCount() > 0) {
+            (void)adapter->releaseHeldCompletions(adapter->pendingCount());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
     EXPECT_EQ(source, target);
     EXPECT_EQ(adapter->pendingCount(), 0U);
     EXPECT_EQ(workers.inflightCount(), 0U);

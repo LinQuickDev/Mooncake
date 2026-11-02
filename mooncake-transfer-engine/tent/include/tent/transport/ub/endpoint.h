@@ -83,9 +83,15 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
 
     // Admission to the posting path is synchronized with retirement: once
     // kDestroying is visible no new work can acquire the endpoint. Every
-    // successful acquire must have one matching release.
-    [[nodiscard]] bool tryAcquireOutstanding(uint64_t bytes = 0) noexcept;
-    void releaseOutstanding(uint64_t bytes = 0) noexcept;
+    // successful acquire must have one matching release. `jetty_index` is the
+    // posting lane's Jetty selector - canonicalized modulo the Jetty count,
+    // exactly like jetty() - and admission additionally enforces the native
+    // per-Jetty WR depth: a lane whose Jetty is at capacity is rejected before
+    // any attempt state exists, so the caller can defer the slice without
+    // consuming its retry budget. A depth of zero disables the check.
+    [[nodiscard]] bool tryAcquireOutstanding(size_t jetty_index,
+                                             uint64_t bytes = 0) noexcept;
+    void releaseOutstanding(size_t jetty_index, uint64_t bytes = 0) noexcept;
 
     // Stops new posts immediately. With outstanding work, native resources
     // remain intact until either completions drain naturally or quiesce()
@@ -147,6 +153,11 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     mutable std::mutex lifecycle_mutex_;
     std::vector<JettyPtr> jetties_;
     std::vector<size_t> jfc_indices_;
+    // Outstanding WRs per Jetty, indexed like jetties_ and guarded by
+    // lifecycle_mutex_. Gives tryAcquireOutstanding() the exact headroom of
+    // the Jetty the caller's lane will post on, mirroring the native depth
+    // contract the provider enforces.
+    std::vector<uint64_t> jetty_outstanding_wrs_;
     UbBootstrapDesc peer_;
     Status lifecycle_status_;
     Status retire_status_;

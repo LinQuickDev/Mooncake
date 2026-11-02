@@ -590,7 +590,7 @@ TEST(UbTeardown, EndpointStoreUnpublishesEveryEndpointForFailedDevice) {
     peer.endpoint_generation = 7;
     peer.jetty_ids = {11};
     ASSERT_TRUE(first->bind(peer).ok());
-    ASSERT_TRUE(first->tryAcquireOutstanding(64));
+    ASSERT_TRUE(first->tryAcquireOutstanding(0, 64));
 
     EXPECT_TRUE(context->markUnavailable());
     EXPECT_TRUE(store.retireLocalDevice(0).IsTooManyRequests());
@@ -600,7 +600,7 @@ TEST(UbTeardown, EndpointStoreUnpublishesEveryEndpointForFailedDevice) {
     EXPECT_FALSE(context->recordPollSuccess(0, 0));
 
     adapter->delete_jetty_failures = 2;
-    first->releaseOutstanding(64);
+    first->releaseOutstanding(0, 64);
     EXPECT_EQ(first->state(), UbEndpoint::State::kDestroying);
     EXPECT_FALSE(store.retireLocalDevice(0).ok());
     EXPECT_TRUE(store.retireLocalDevice(0).ok());
