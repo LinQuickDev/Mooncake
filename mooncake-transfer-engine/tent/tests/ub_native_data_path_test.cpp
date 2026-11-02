@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -1378,12 +1379,19 @@ TEST(UbNativeDataPathTest, MultiEndpointBatchPostsEachGroupOnItsOwnJetty) {
     EndpointStore endpoints(adapter, 16, 1);
     RailMonitor rails;
     QuotaManager quota;
-    QuotaLimits rail0_limits;
-    rail0_limits.max_outstanding_wrs = kSliceCount / 2;
-    // The generation field only participates in path.valid(); the quota rail
-    // key itself is (local device, segment, remote device).
+    // Give both rails the same WR ceiling and hold completions, so nothing
+    // drains while the batch stages. The scheduler then alternates rails (it
+    // always prefers the less-loaded one, and an unlimited rail would look
+    // permanently idle), splitting the 8 slices 4/4 across the two endpoints
+    // deterministically instead of piling them onto one. The generation field
+    // only participates in path.valid(); the quota rail key itself is
+    // (local device, segment, remote device).
+    QuotaLimits rail_limits;
+    rail_limits.max_outstanding_wrs = kSliceCount / 2;
     ASSERT_TRUE(quota.setPathLimits(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1},
-                                    rail0_limits));
+                                    rail_limits));
+    ASSERT_TRUE(quota.setPathLimits(UbPostPath{0, LOCAL_SEGMENT_ID, 1, 1},
+                                    rail_limits));
     UbParams params;
     params.worker_count = 1;
     params.poller_count = 1;
@@ -1429,21 +1437,22 @@ TEST(UbNativeDataPathTest, MultiEndpointBatchPostsEachGroupOnItsOwnJetty) {
                   nullptr);
     }
     ASSERT_TRUE(task->seal());
+    // Hold every completion until the whole batch has posted, so quota is not
+    // released mid-staging and the 4/4 rail split is deterministic.
+    adapter->holdAllCompletions();
     // Pin the posting lanes to local device 0, so the two reachable paths
     // differ only in the remote device and the batch resolves exactly two
     // endpoints.
     ASSERT_TRUE(workers.submit(task, /*device_mask=*/uint64_t{1}).ok());
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (task->transferStatus().s == PENDING &&
-           std::chrono::steady_clock::now() < deadline) {
+    const auto posted_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (adapter->pendingCount() < kSliceCount &&
+           std::chrono::steady_clock::now() < posted_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_EQ(task->transferStatus().s, COMPLETED);
-    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
-    EXPECT_EQ(source, target);
-    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(adapter->pendingCount(), kSliceCount);
+    EXPECT_EQ(task->transferStatus().s, PENDING);
 
     std::shared_ptr<UbEndpoint> endpoint0;
     ASSERT_TRUE(endpoints
@@ -1475,32 +1484,59 @@ TEST(UbNativeDataPathTest, MultiEndpointBatchPostsEachGroupOnItsOwnJetty) {
         EXPECT_EQ(jetties1.count(id), 0U);
     }
 
-    // Slices 0..3 (the first half of the target buffer) resolve remote
-    // device 0, slices 4..7 resolve remote device 1: every post on one
-    // endpoint's Jetty may carry only that endpoint's half.
-    const uint64_t target_base = reinterpret_cast<uint64_t>(target.data());
-    const uint64_t split = target_base + source.size() / 2;
+    // Every slice recorded the path it actually resolved, so the expectation
+    // is exact rather than assumed: a WR on an endpoint's Jetty must belong to
+    // a slice that resolved that endpoint's remote device. Matching by
+    // remote_address works because each slice owns a distinct target range.
+    std::map<uint64_t, int> expected_remote_device;
+    for (const auto& slice : task->slices()) {
+        expected_remote_device[slice->spec().remote_address] =
+            slice->snapshot().path.remote_device_id;
+    }
+    ASSERT_EQ(expected_remote_device.size(), kSliceCount);
+
     size_t posts_on_0 = 0;
     size_t posts_on_1 = 0;
+    std::set<uint64_t> posted_addresses;
     for (const auto& record : adapter->postRecords()) {
         const bool on_endpoint0 = jetties0.count(record.jetty_id) != 0;
+        const bool on_endpoint1 = jetties1.count(record.jetty_id) != 0;
+        ASSERT_TRUE(on_endpoint0 || on_endpoint1)
+            << "WR chain posted on a Jetty belonging to neither endpoint";
         if (on_endpoint0) {
             ++posts_on_0;
         } else {
             ++posts_on_1;
         }
         for (const auto& wr : record.requests) {
-            if (on_endpoint0) {
-                EXPECT_GE(wr.remote_address, target_base);
-                EXPECT_LT(wr.remote_address, split);
-            } else {
-                EXPECT_GE(wr.remote_address, split);
-                EXPECT_LT(wr.remote_address, target_base + source.size());
-            }
+            const auto found = expected_remote_device.find(wr.remote_address);
+            ASSERT_NE(found, expected_remote_device.end())
+                << "WR for an address no slice owns";
+            EXPECT_EQ(found->second, on_endpoint0 ? 0 : 1)
+                << "slice resolved remote device " << found->second
+                << " but its WR was posted on the other endpoint's Jetty";
+            posted_addresses.insert(wr.remote_address);
         }
     }
     EXPECT_GT(posts_on_0, 0U);
     EXPECT_GT(posts_on_1, 0U);
+    EXPECT_EQ(posted_addresses.size(), kSliceCount);
+
+    // Release the held completions and let the task finish.
+    (void)adapter->releaseHeldCompletions(adapter->pendingCount());
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (adapter->pendingCount() > 0) {
+            (void)adapter->releaseHeldCompletions(adapter->pendingCount());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_EQ(workers.inflightCount(), 0U);
 
     EXPECT_TRUE(workers.stop().ok());
     EXPECT_TRUE(endpoints.clear().ok());

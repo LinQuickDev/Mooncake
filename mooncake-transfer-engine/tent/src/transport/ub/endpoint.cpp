@@ -69,7 +69,8 @@ UbEndpoint::UbEndpoint(UbEndpointKey key, UbContextPtr context,
       adapter_(std::move(adapter)),
       jetty_count_(jetty_count),
       jetty_options_(jetty_options),
-      generation_(allocateGeneration()) {}
+      generation_(allocateGeneration()),
+      jetty_outstanding_wrs_(jetty_count, 0) {}
 
 UbEndpoint::~UbEndpoint() {
     auto status = retire();
@@ -352,8 +353,12 @@ bool UbEndpoint::tryAcquireOutstanding(size_t jetty_index,
         return false;
     }
 
-    if (!jetties_.empty()) {
-        const size_t slot = jetty_index % jetties_.size();
+    // Index the depth counters by their own size, not by jetties_.size():
+    // resetAndUnbindLocked() shrinks jetties_ during teardown while the
+    // per-lane counters must stay stable, and both sides of a matched
+    // acquire/release have to resolve to the same slot.
+    if (!jetty_outstanding_wrs_.empty()) {
+        const size_t slot = jetty_index % jetty_outstanding_wrs_.size();
         if (jetty_options_.depth != 0 &&
             jetty_outstanding_wrs_[slot] >= jetty_options_.depth) {
             return false;
@@ -369,8 +374,8 @@ bool UbEndpoint::tryAcquireOutstanding(size_t jetty_index,
 void UbEndpoint::releaseOutstanding(size_t jetty_index,
                                     uint64_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    if (!jetties_.empty()) {
-        const size_t slot = jetty_index % jetties_.size();
+    if (!jetty_outstanding_wrs_.empty()) {
+        const size_t slot = jetty_index % jetty_outstanding_wrs_.size();
         if (jetty_outstanding_wrs_[slot] != 0) {
             --jetty_outstanding_wrs_[slot];
         }
