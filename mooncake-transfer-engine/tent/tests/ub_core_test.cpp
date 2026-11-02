@@ -232,6 +232,35 @@ TEST(UbQuotaTest, EndpointGenerationsShareOnePhysicalRailLimit) {
     EXPECT_TRUE(quota.release(*replacement_reservation));
 }
 
+TEST(UbQuotaTest, BatchAcquireReturnsTheLeadingEntriesThatFit) {
+    QuotaManager quota(/*default_device_limits=*/{1000, 100},
+                       /*default_path_limits=*/{100, 3});
+    const auto path = makePath(0, 1, 1);
+
+    // The path admits three WRs: the batch stops at the fourth entry and the
+    // fifth (which would fit on bytes alone) is not taken out of order.
+    auto reservations = quota.tryAcquireBatch(path, {10, 10, 10, 10, 1});
+    ASSERT_EQ(reservations.size(), 3u);
+    for (const auto& reservation : reservations) {
+        EXPECT_TRUE(reservation.valid());
+        EXPECT_EQ(reservation.path, path);
+        EXPECT_EQ(reservation.bytes, 10u);
+        EXPECT_EQ(reservation.wrs, 1u);
+    }
+    EXPECT_EQ(quota.pathStats(path).usage.outstanding_wrs, 3u);
+    EXPECT_EQ(quota.pathStats(path).usage.inflight_bytes, 30u);
+    EXPECT_EQ(quota.pathStats(path).rejected_acquisitions, 1u);
+    EXPECT_TRUE(quota.tryAcquireBatch(path, {1}).empty());
+
+    // Every reservation releases on its own, and only once.
+    EXPECT_TRUE(quota.release(reservations[1]));
+    EXPECT_FALSE(quota.release(reservations[1]));
+    EXPECT_EQ(quota.tryAcquireBatch(path, {10, 10}).size(), 1u);
+    EXPECT_TRUE(quota.release(reservations[0]));
+    EXPECT_TRUE(quota.release(reservations[2]));
+    EXPECT_TRUE(quota.tryAcquireBatch(path, {}).empty());
+}
+
 TEST(UbQuotaTest, ScoresProjectedPressureAndFallsBackAtomically) {
     QuotaManager quota(/*default_device_limits=*/{200, 4},
                        /*default_path_limits=*/{100, 2});

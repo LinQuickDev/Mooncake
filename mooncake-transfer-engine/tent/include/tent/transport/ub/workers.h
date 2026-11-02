@@ -197,6 +197,8 @@ class UbWorkers final {
     void popTaskBatch(std::vector<PendingSlice>& batch);
     void enqueueRetry(const PendingSlice& pending);
     void deferPending(const PendingSlice& pending);
+    // Requeues every deferred slice of a batch after ONE bounded backoff.
+    void deferPendingBatch(std::vector<PendingSlice>& pendings);
     void processBatch(std::vector<PendingSlice>& batch, size_t worker_index,
                       RouteCache& cache);
     Status buildRoute(const PendingSlice& pending, Route& route,

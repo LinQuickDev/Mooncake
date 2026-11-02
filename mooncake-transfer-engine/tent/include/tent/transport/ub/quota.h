@@ -123,6 +123,12 @@ class QuotaManager {
     // request is deferred.
     [[nodiscard]] std::optional<QuotaReservation> tryAcquireFirst(
         const std::vector<UbPostPath>& paths, uint64_t bytes, uint64_t wrs = 1);
+    // Acquires one independent single-WR reservation per entry of `bytes` on
+    // one path, under one lock. Stops at the first entry that does not fit
+    // and returns the reservations for the leading entries that did, so a
+    // partial result is a prefix. Each reservation is released on its own.
+    [[nodiscard]] std::vector<QuotaReservation> tryAcquireBatch(
+        const UbPostPath& path, const std::vector<uint64_t>& bytes);
 
     // Returns projected device/path pressure without reserving capacity.
     [[nodiscard]] QuotaAvailability availability(const UbPostPath& path,

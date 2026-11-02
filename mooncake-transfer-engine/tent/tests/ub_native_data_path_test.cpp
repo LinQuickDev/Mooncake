@@ -1202,6 +1202,125 @@ TEST(UbNativeDataPathTest, RouteCacheServesSlicesIntoTheSameBuffer) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+// Slices of one task that target the same remote buffer score the same rails,
+// so a batch runs full path selection once and the remaining slices reuse its
+// endpoint and path. Endpoint resolution is the observable cost: without
+// reuse every slice resolves its rail again.
+TEST(UbNativeDataPathTest, BatchReusesPathSelectionAcrossSlices) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    std::vector<UbContextPtr> contexts{context};
+    auto topology = fakeTopology();
+    UbBufferManager buffers(adapter, contexts);
+
+    constexpr size_t kSliceCount = 8;
+    constexpr size_t kSliceLen = 16;
+    std::array<char, kSliceCount * kSliceLen> source{};
+    std::array<char, kSliceCount * kSliceLen> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i + 1);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(buffers.addBuffer(source_desc, options).ok());
+    ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
+
+    SegmentManager manager(std::make_unique<NullRegistry>());
+    ASSERT_TRUE(manager
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = "local";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *topology;
+                        memory.buffers = {source_desc, target_desc};
+                        return Status::OK();
+                    })
+                    .ok());
+
+    EndpointStore endpoints(adapter, 16, 1);
+    RailMonitor rails;
+    QuotaManager quota;
+    UbParams params;
+    params.worker_count = 1;
+    params.poller_count = 1;
+    params.slice_size = kSliceLen;
+
+    std::atomic<size_t> resolver_calls{0};
+    EndpointResolver resolver = [&](const EndpointResolveRequest& request,
+                                    std::shared_ptr<UbEndpoint>& endpoint) {
+        resolver_calls.fetch_add(1);
+        UbEndpointKey key{request.local_context->topologyId(),
+                          request.remote_segment_id, request.remote_topology_id,
+                          "local@ub:fake0:eid0"};
+        auto status =
+            endpoints.getOrCreate(key, request.local_context, endpoint);
+        if (!status.ok() || endpoint->ready()) return status;
+        UbBootstrapDesc peer;
+        peer.local_eid = fakeDevice().eid;
+        peer.endpoint_generation = 100;
+        peer.jetty_ids = {777};
+        return endpoint->bind(peer);
+    };
+    UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
+                      &quota, params, std::move(resolver),
+                      [&](const std::shared_ptr<UbEndpoint>& endpoint) {
+                          (void)endpoints.retire(endpoint);
+                      });
+    ASSERT_TRUE(workers.start().ok());
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    auto task = UbTask::create(request);
+    for (size_t offset = 0; offset < request.length; offset += kSliceLen) {
+        ASSERT_NE(task->addSlice(UbSliceSpec{
+                      source.data() + offset,
+                      reinterpret_cast<uint64_t>(target.data() + offset),
+                      kSliceLen, offset, 1}),
+                  nullptr);
+    }
+    ASSERT_TRUE(task->seal());
+    ASSERT_TRUE(workers.submit(task).ok());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (task->transferStatus().s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+
+    // One worker lane and every slice queued before the lane wakes: the task
+    // is drained as one batch, so only its first slice runs full selection.
+    EXPECT_EQ(resolver_calls.load(), 1U);
+    // Every slice still took its own quota reservation and released it.
+    EXPECT_EQ(quota.aggregateStats().total_acquisitions, kSliceCount);
+    EXPECT_EQ(quota.activeReservationCount(), 0U);
+
+    EXPECT_TRUE(workers.stop().ok());
+    EXPECT_TRUE(endpoints.clear().ok());
+    EXPECT_TRUE(buffers.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 // A multi-slice batch reaches the adapter as one WR chain. When the provider
 // rejects a WR in the middle of the chain, the WRs it already accepted (the
 // leading posted_count) must complete through poll(), while the rejected tail
@@ -1237,18 +1356,18 @@ TEST(UbNativeDataPathTest, MidChainWrFailureRollsBackOnlyTheRejectedTail) {
     ASSERT_TRUE(buffers.addBuffer(target_desc, options).ok());
 
     SegmentManager manager(std::make_unique<NullRegistry>());
-    ASSERT_TRUE(
-        manager
-            .updateLocal([&](SegmentDesc& segment) {
-                segment.name = "local";
-                segment.type = SegmentType::Memory;
-                segment.detail = MemorySegmentDesc{};
-                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
-                memory.topology = *topology;
-                memory.buffers = {source_desc, target_desc};
-                return Status::OK();
-            })
-            .ok());
+    ASSERT_TRUE(manager
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = "local";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *topology;
+                        memory.buffers = {source_desc, target_desc};
+                        return Status::OK();
+                    })
+                    .ok());
 
     EndpointStore endpoints(adapter, 16, 1);
     RailMonitor rails;

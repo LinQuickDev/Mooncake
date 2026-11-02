@@ -530,31 +530,56 @@ void UbWorkers::enqueueRetry(const PendingSlice& pending) {
 }
 
 void UbWorkers::deferPending(const PendingSlice& pending) {
-    if (!pending.slice || pending.slice->cancellationRequested() ||
-        !posting_.load(std::memory_order_acquire)) {
+    std::vector<PendingSlice> pendings{pending};
+    deferPendingBatch(pendings);
+}
+
+void UbWorkers::deferPendingBatch(std::vector<PendingSlice>& pendings) {
+    auto live = [](const PendingSlice& pending) {
+        return pending.slice && !pending.slice->cancellationRequested();
+    };
+    auto cancel = [](const PendingSlice& pending) {
         if (pending.slice) pending.slice->requestCancellation();
+    };
+    if (pendings.empty()) return;
+    if (!posting_.load(std::memory_order_acquire)) {
+        for (const auto& pending : pendings) cancel(pending);
+        pendings.clear();
         return;
     }
     // Capacity pressure is not a transfer failure. A short bounded backoff
     // prevents a posting lane from exhausting CPU while completions release
-    // quota; releaseInflight() also wakes the queue condition variable.
+    // quota; releaseInflight() also wakes the queue condition variable. One
+    // wait covers every slice a batch deferred, so a batch that hits a full
+    // Jetty or quota stalls its lane once rather than once per slice.
+    size_t requeued = 0;
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         (void)queue_cv_.wait_for(lock, std::chrono::microseconds(50), [&] {
             return !posting_.load(std::memory_order_relaxed) ||
-                   pending.slice->cancellationRequested();
+                   std::none_of(pendings.begin(), pendings.end(), live);
         });
-        if (posting_.load(std::memory_order_relaxed) &&
-            !pending.slice->cancellationRequested()) {
-            queues_[std::clamp(pending.priority, static_cast<int>(PRIO_HIGH),
-                               static_cast<int>(PRIO_LOW))]
-                .push_back(pending);
-            lock.unlock();
-            queue_cv_.notify_one();
-            return;
+        if (posting_.load(std::memory_order_relaxed)) {
+            for (auto& pending : pendings) {
+                if (!live(pending)) continue;
+                queues_[std::clamp(pending.priority,
+                                   static_cast<int>(PRIO_HIGH),
+                                   static_cast<int>(PRIO_LOW))]
+                    .push_back(std::move(pending));
+                pending.slice.reset();
+                ++requeued;
+            }
         }
     }
-    pending.slice->requestCancellation();
+    // Whatever was not requeued (cancelled, or stop raced the wait) is
+    // finalized as cancelled, matching the single-slice behavior.
+    for (const auto& pending : pendings) cancel(pending);
+    pendings.clear();
+    if (requeued == 1) {
+        queue_cv_.notify_one();
+    } else if (requeued > 1) {
+        queue_cv_.notify_all();
+    }
 }
 
 Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route,
@@ -900,7 +925,9 @@ Status UbWorkers::chooseAndResolveEndpoint(
 
 void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
                              size_t worker_index, RouteCache& cache) {
-    // Prepared, resource-acquired slices awaiting one merged post call.
+    // A slice moving through the staging steps below. `alive` turns false
+    // once the slice leaves the batch (deferred, resolved, or retried); its
+    // resources are released at that point.
     struct Staged {
         PendingSlice pending;
         Route route;
@@ -912,128 +939,254 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
         UbAttemptToken attempt;
         std::shared_ptr<Inflight> inflight;
         uint64_t completion_token{0};
+        // Path copied from an earlier slice of this batch instead of selected.
+        bool reused{false};
+        bool alive{true};
     };
-    std::vector<Staged> staged;
-    staged.reserve(batch.size());
+    // Path chosen by the last full selection. Slices of one task that hit
+    // the same remote buffer with the same retry rotation would score the
+    // same rails, so they reuse it instead of re-running selection.
+    struct Selection {
+        bool valid{false};
+        SegmentID target_id{LOCAL_SEGMENT_ID};
+        const BufferDesc* buffer{nullptr};
+        uint64_t device_mask{~0ULL};
+        uint32_t retry_count{0};
+        std::shared_ptr<UbEndpoint> endpoint;
+        UbPostPath path;
+    };
 
+    std::vector<Staged> routed;
+    routed.reserve(batch.size());
+    std::vector<PendingSlice> deferred;
+    // Set once full selection reports every ready path at quota: later slices
+    // of this batch would only repeat the same failed scan, so they defer.
+    bool saturated = false;
+
+    auto failBeforePost = [&](const PendingSlice& pending, bool retryable) {
+        const auto resolution =
+            pending.slice->resolveBeforePost(FAILED, 0, retryable);
+        if (resolution == UbAttemptResolution::kRetryScheduled) {
+            enqueueRetry(pending);
+        }
+    };
+    auto deferItem = [&](Staged& item) {
+        deferred.push_back(std::move(item.pending));
+        item.alive = false;
+    };
+    // Full multi-rail selection; acquires the slice's quota on success.
+    auto selectFull = [&](Staged& item) -> bool {
+        item.reused = false;
+        if (saturated) {
+            deferItem(item);
+            return false;
+        }
+        auto status = chooseAndResolveEndpoint(
+            item.pending, item.route, item.endpoint, item.path, item.quota);
+        if (status.ok()) return true;
+        if (status.IsTooManyRequests()) {
+            // Quota pressure defers without consuming the retry budget.
+            saturated = true;
+            deferItem(item);
+            return false;
+        }
+        failBeforePost(item.pending, retryableStatus(status));
+        item.alive = false;
+        return false;
+    };
+
+    // Step 1: route every slice and pick its path. Only slices that cannot
+    // reuse the previous selection pay for the full scan.
+    Selection selection;
     for (auto& pending : batch) {
         if (pending.slice->cancellationRequested()) {
             pending.slice->requestCancellation();
             continue;
         }
-        Route route;
-        auto status = buildRoute(pending, route, cache);
+        Staged item;
+        item.pending = std::move(pending);
+        auto status = buildRoute(item.pending, item.route, cache);
         if (!status.ok()) {
-            const auto resolution = pending.slice->resolveBeforePost(
-                FAILED, 0, retryableStatus(status));
-            if (resolution == UbAttemptResolution::kRetryScheduled) {
-                enqueueRetry(pending);
-            }
+            failBeforePost(item.pending, retryableStatus(status));
             continue;
         }
+        const uint32_t retry_count = item.pending.slice->snapshot().retry_count;
+        if (selection.valid && selection.target_id == item.pending.target_id &&
+            selection.buffer == item.route.remote_buffer &&
+            selection.device_mask == item.pending.device_mask &&
+            selection.retry_count == retry_count &&
+            selection.endpoint->ready()) {
+            item.endpoint = selection.endpoint;
+            item.path = selection.path;
+            item.reused = true;
+            routed.push_back(std::move(item));
+            continue;
+        }
+        if (!selectFull(item)) continue;
+        selection = Selection{true,
+                              item.pending.target_id,
+                              item.route.remote_buffer,
+                              item.pending.device_mask,
+                              retry_count,
+                              item.endpoint,
+                              item.path};
+        routed.push_back(std::move(item));
+    }
 
-        std::shared_ptr<UbEndpoint> endpoint;
-        UbPostPath path;
-        QuotaReservation reservation;
-        status = chooseAndResolveEndpoint(pending, route, endpoint, path,
-                                          reservation);
-        if (!status.ok()) {
-            if (status.IsTooManyRequests()) {
-                // Quota pressure defers this slice without consuming its
-                // retry budget. The batch continues with the remaining
-                // slices: a later slice may resolve a different path whose
-                // quota still fits, and dropping the batch tail here would
-                // strand already-popped slices with no owner to requeue
-                // them.
-                deferPending(pending);
-                continue;
-            }
-            const auto resolution = pending.slice->resolveBeforePost(
-                FAILED, 0, retryableStatus(status));
-            if (resolution == UbAttemptResolution::kRetryScheduled) {
-                enqueueRetry(pending);
-            }
-            continue;
+    // Step 2: one quota transaction per reused path. Slices the path cannot
+    // fit fall back to full selection, which may still find another rail.
+    std::vector<std::pair<UbPostPath, std::vector<size_t>>> quota_groups;
+    for (size_t index = 0; index < routed.size(); ++index) {
+        if (!routed[index].reused) continue;
+        auto group = std::find_if(quota_groups.begin(), quota_groups.end(),
+                                  [&](const auto& entry) {
+                                      return entry.first == routed[index].path;
+                                  });
+        if (group == quota_groups.end()) {
+            quota_groups.emplace_back(routed[index].path,
+                                      std::vector<size_t>{});
+            group = std::prev(quota_groups.end());
         }
+        group->second.push_back(index);
+    }
+    std::vector<uint64_t> lengths;
+    for (const auto& [path, indices] : quota_groups) {
+        lengths.clear();
+        for (size_t index : indices) {
+            lengths.push_back(routed[index].pending.slice->spec().length);
+        }
+        auto reservations = quota_->tryAcquireBatch(path, lengths);
+        for (size_t k = 0; k < indices.size(); ++k) {
+            auto& item = routed[indices[k]];
+            if (k < reservations.size()) {
+                item.quota = reservations[k];
+            } else {
+                (void)selectFull(item);
+            }
+        }
+    }
 
-        LocalSegmentRef local;
-        status = buffers_->findLocal(
-            reinterpret_cast<uint64_t>(pending.slice->spec().local_address),
-            pending.slice->spec().length, path.local_topology_id, local);
+    // Step 3: resolve local and remote segments for the chosen path.
+    for (auto& item : routed) {
+        if (!item.alive) continue;
+        const auto& spec = item.pending.slice->spec();
+        auto status = buffers_->findLocal(
+            reinterpret_cast<uint64_t>(spec.local_address), spec.length,
+            item.path.local_topology_id, item.local);
+        if (!status.ok() && item.reused) {
+            // A reused path's local device may not cover this slice's local
+            // range (one request spanning differently registered buffers).
+            // Select this slice on its own, as before batching.
+            (void)quota_->release(item.quota);
+            item.quota = QuotaReservation{};
+            if (!selectFull(item)) continue;
+            status = buffers_->findLocal(
+                reinterpret_cast<uint64_t>(spec.local_address), spec.length,
+                item.path.local_topology_id, item.local);
+        }
         if (!status.ok()) {
-            (void)quota_->release(reservation);
-            (void)pending.slice->resolveBeforePost(FAILED, 0, false);
+            (void)quota_->release(item.quota);
+            (void)item.pending.slice->resolveBeforePost(FAILED, 0, false);
+            item.alive = false;
             continue;
         }
-        ImportedSegmentRef remote;
         status = buffers_->importRemote(
-            pending.target_id, path.local_topology_id, path.remote_device_id,
-            *route.remote_buffer, route.metadata, pending.opcode,
-            pending.slice->spec().remote_address, pending.slice->spec().length,
-            remote);
+            item.pending.target_id, item.path.local_topology_id,
+            item.path.remote_device_id, *item.route.remote_buffer,
+            item.route.metadata, item.pending.opcode, spec.remote_address,
+            spec.length, item.remote);
         if (!status.ok()) {
-            (void)quota_->release(reservation);
+            (void)quota_->release(item.quota);
             const bool retryable = status.IsNeedsRefreshCache();
-            if (retryable && pending.target_id != LOCAL_SEGMENT_ID) {
-                (void)segment_manager_->invalidateRemote(pending.target_id);
+            if (retryable && item.pending.target_id != LOCAL_SEGMENT_ID) {
+                (void)segment_manager_->invalidateRemote(
+                    item.pending.target_id);
             }
-            const auto resolution =
-                pending.slice->resolveBeforePost(FAILED, 0, retryable);
-            if (resolution == UbAttemptResolution::kRetryScheduled) {
-                enqueueRetry(pending);
-            }
-            continue;
+            failBeforePost(item.pending, retryable);
+            item.alive = false;
         }
+    }
 
-        if (!endpoint->tryAcquireOutstanding(worker_index,
-                                             pending.slice->spec().length)) {
-            (void)quota_->release(reservation);
-            deferPending(pending);
-            continue;
+    // Step 4: one outstanding/Jetty-depth admission per endpoint. Slices past
+    // the Jetty's remaining depth defer before any attempt state exists, so
+    // saturation never consumes retry budget.
+    std::vector<std::pair<UbEndpoint*, std::vector<size_t>>> endpoint_groups;
+    for (size_t index = 0; index < routed.size(); ++index) {
+        if (!routed[index].alive) continue;
+        UbEndpoint* endpoint = routed[index].endpoint.get();
+        auto group = std::find_if(
+            endpoint_groups.begin(), endpoint_groups.end(),
+            [&](const auto& entry) { return entry.first == endpoint; });
+        if (group == endpoint_groups.end()) {
+            endpoint_groups.emplace_back(endpoint, std::vector<size_t>{});
+            group = std::prev(endpoint_groups.end());
         }
+        group->second.push_back(index);
+    }
+    for (const auto& [endpoint, indices] : endpoint_groups) {
+        lengths.clear();
+        for (size_t index : indices) {
+            lengths.push_back(routed[index].pending.slice->spec().length);
+        }
+        const size_t admitted =
+            endpoint->tryAcquireOutstandingBatch(worker_index, lengths);
+        for (size_t k = admitted; k < indices.size(); ++k) {
+            auto& item = routed[indices[k]];
+            (void)quota_->release(item.quota);
+            deferItem(item);
+        }
+    }
 
-        auto attempt = pending.slice->beginAttempt(path);
+    // Step 5: commit attempts, then register them in one inflight lock hold.
+    std::vector<Staged> staged;
+    staged.reserve(routed.size());
+    for (auto& item : routed) {
+        if (!item.alive) continue;
+        const uint64_t length = item.pending.slice->spec().length;
+        auto attempt = item.pending.slice->beginAttempt(item.path);
         if (!attempt) {
-            endpoint->releaseOutstanding(worker_index,
-                                         pending.slice->spec().length);
-            (void)quota_->release(reservation);
+            item.endpoint->releaseOutstanding(worker_index, length);
+            (void)quota_->release(item.quota);
             continue;
         }
 
         const uint64_t completion_token = nextCompletionToken();
         auto inflight = std::make_shared<Inflight>();
         inflight->completion_token = completion_token;
-        inflight->pending = pending;
+        inflight->pending = item.pending;
         inflight->attempt = *attempt;
-        inflight->path = path;
-        inflight->endpoint = endpoint;
+        inflight->path = item.path;
+        inflight->endpoint = item.endpoint;
         inflight->jetty_lane = worker_index;
-        inflight->local_segment = local.segment;
-        inflight->remote_segment = remote.segment;
-        inflight->quota = reservation;
+        inflight->local_segment = item.local.segment;
+        inflight->remote_segment = item.remote.segment;
+        inflight->quota = item.quota;
         inflight->posted_ns = steadyNowNs();
         inflight->deadline_ns = deadlineAfter(
             inflight->posted_ns,
             static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
 
-        if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
-            endpoint->releaseOutstanding(worker_index,
-                                         pending.slice->spec().length);
-            (void)quota_->release(reservation);
+        if (!item.pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
+            item.endpoint->releaseOutstanding(worker_index, length);
+            (void)quota_->release(item.quota);
             continue;
         }
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            inflight_.emplace(completion_token, inflight);
+        item.attempt = *attempt;
+        item.inflight = std::move(inflight);
+        item.completion_token = completion_token;
+        staged.push_back(std::move(item));
+    }
+    if (!staged.empty()) {
+        std::lock_guard<std::mutex> lock(inflight_mutex_);
+        for (const auto& item : staged) {
+            inflight_.emplace(item.completion_token, item.inflight);
         }
-
-        staged.push_back(Staged{
-            std::move(pending), std::move(route), std::move(endpoint), path,
-            std::move(reservation), std::move(local), std::move(remote),
-            *attempt, std::move(inflight), completion_token});
     }
 
-    if (staged.empty()) return;
+    if (staged.empty()) {
+        deferPendingBatch(deferred);
+        return;
+    }
 
     // Group the staged slices by endpoint. Every slice resolved its own path,
     // so one batch can span several endpoints when quota pressure, retry
@@ -1140,6 +1293,7 @@ void UbWorkers::processBatch(std::vector<PendingSlice>& batch,
             }
         }
     }
+    deferPendingBatch(deferred);
 }
 
 void UbWorkers::handleLocalDeviceFailure(const UbContextPtr& context) {

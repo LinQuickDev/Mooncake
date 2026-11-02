@@ -98,6 +98,19 @@ std::optional<QuotaReservation> QuotaManager::tryAcquireFirst(
     return std::nullopt;
 }
 
+std::vector<QuotaReservation> QuotaManager::tryAcquireBatch(
+    const UbPostPath& path, const std::vector<uint64_t>& bytes) {
+    std::vector<QuotaReservation> reservations;
+    reservations.reserve(bytes.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (uint64_t entry : bytes) {
+        auto reservation = tryAcquireLocked(path, entry, 1, true);
+        if (!reservation) break;
+        reservations.push_back(*reservation);
+    }
+    return reservations;
+}
+
 QuotaAvailability QuotaManager::availability(const UbPostPath& path,
                                              uint64_t bytes,
                                              uint64_t wrs) const {

@@ -91,6 +91,12 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // consuming its retry budget. A depth of zero disables the check.
     [[nodiscard]] bool tryAcquireOutstanding(size_t jetty_index,
                                              uint64_t bytes = 0) noexcept;
+    // Batch form of tryAcquireOutstanding() under one lifecycle_mutex_ hold.
+    // Admits the longest prefix of `bytes` that fits the Jetty's remaining
+    // depth and returns its length; each admitted entry needs its own
+    // releaseOutstanding(jetty_index, bytes[i]).
+    [[nodiscard]] size_t tryAcquireOutstandingBatch(
+        size_t jetty_index, const std::vector<uint64_t>& bytes) noexcept;
     void releaseOutstanding(size_t jetty_index, uint64_t bytes = 0) noexcept;
 
     // Stops new posts immediately. With outstanding work, native resources

@@ -371,6 +371,34 @@ bool UbEndpoint::tryAcquireOutstanding(size_t jetty_index,
     return true;
 }
 
+size_t UbEndpoint::tryAcquireOutstandingBatch(
+    size_t jetty_index, const std::vector<uint64_t>& bytes) noexcept {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (bytes.empty() ||
+        state_.load(std::memory_order_relaxed) != State::kReady || !context_ ||
+        !context_->active()) {
+        return 0;
+    }
+    size_t admitted = bytes.size();
+    if (!jetty_outstanding_wrs_.empty()) {
+        const size_t slot = jetty_index % jetty_outstanding_wrs_.size();
+        if (jetty_options_.depth != 0) {
+            const uint64_t used = jetty_outstanding_wrs_[slot];
+            const uint64_t room =
+                used >= jetty_options_.depth ? 0 : jetty_options_.depth - used;
+            admitted = static_cast<size_t>(std::min<uint64_t>(admitted, room));
+        }
+        jetty_outstanding_wrs_[slot] += admitted;
+    }
+    if (admitted == 0) return 0;
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < admitted; ++i) total_bytes += bytes[i];
+    outstanding_wrs_.fetch_add(admitted, std::memory_order_relaxed);
+    outstanding_bytes_.fetch_add(total_bytes, std::memory_order_relaxed);
+    context_->addInflight(total_bytes);
+    return admitted;
+}
+
 void UbEndpoint::releaseOutstanding(size_t jetty_index,
                                     uint64_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
