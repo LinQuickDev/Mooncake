@@ -201,8 +201,7 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
-add_store_test(nof_probe_context_pool_test
-               nof_probe_context_pool_test.cpp)
+add_store_test(nof_probe_context_pool_test nof_probe_context_pool_test.cpp)
 if(USE_TENT)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
@@ -251,10 +250,9 @@ if(USE_TENT)
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
@@ -306,9 +304,12 @@ add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
-add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test
+               real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -318,6 +319,19 @@ if(USE_TENT)
            COMMAND standalone_client_test --gtest_filter=MetadataModes/*)
   set_tests_properties(standalone_client_tent_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1;MC_FORCE_TCP=1")
+endif()
+# Store over TENT UB without hardware: the test-only loopback URMA adapter
+# (USE_UB_MOCK=ON) carries data in-process, and every other data transport is
+# off, so a passing run means the data really went through UbTransport.
+if(USE_TENT AND USE_UB_MOCK)
+  set(STORE_UB_MOCK_ENV
+      "MC_USE_TENT=1;MC_TENT_UB_MOCK=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":false},\"shm\":{\"enable\":false},\"io_uring\":{\"enable\":false},\"ub\":{\"enable\":true}}}"
+  )
+  add_test(NAME client_integration_ub_mock_test COMMAND client_integration_test
+                                                        --protocol=ub)
+  set_tests_properties(
+    client_integration_ub_mock_test
+    PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}" TIMEOUT 600)
 endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
