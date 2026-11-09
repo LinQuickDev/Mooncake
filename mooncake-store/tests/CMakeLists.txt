@@ -324,6 +324,10 @@ endif()
 # (USE_UB_MOCK=ON) carries data in-process, and every other data transport is
 # off, so a passing run means the data really went through UbTransport.
 if(USE_TENT AND USE_UB_MOCK)
+  # Lets client_integration_test read the loopback adapter's counters.
+  target_compile_definitions(client_integration_test
+                             PRIVATE MOONCAKE_TEST_UB_MOCK)
+  target_link_libraries(client_integration_test PRIVATE tent)
   set(STORE_UB_MOCK_ENV
       "MC_USE_TENT=1;MC_TENT_UB_MOCK=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":false},\"shm\":{\"enable\":false},\"io_uring\":{\"enable\":false},\"ub\":{\"enable\":true}}}"
   )
