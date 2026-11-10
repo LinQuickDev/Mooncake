@@ -336,6 +336,16 @@ if(USE_TENT AND USE_UB_MOCK)
   set_tests_properties(
     client_integration_ub_mock_test
     PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}" TIMEOUT 600)
+  # Skips when the host has no hugepages (/proc/sys/vm/nr_hugepages).
+  add_test(
+    NAME real_client_hugepage_ub_mock_test
+    COMMAND
+      real_client_hugepage_register_test
+      --gtest_filter=RealClientHugepageRegisterTest.SetupSegmentHugepagesReleasedOnTeardown
+  )
+  set_tests_properties(
+    real_client_hugepage_ub_mock_test
+    PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV};PROTOCOL=ub" TIMEOUT 300)
 endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
