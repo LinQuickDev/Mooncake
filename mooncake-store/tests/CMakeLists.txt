@@ -331,8 +331,11 @@ if(USE_TENT AND USE_UB_MOCK)
   set(STORE_UB_MOCK_ENV
       "MC_USE_TENT=1;MC_TENT_UB_MOCK=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":false},\"shm\":{\"enable\":false},\"io_uring\":{\"enable\":false},\"ub\":{\"enable\":true}}}"
   )
-  add_test(NAME client_integration_ub_mock_test COMMAND client_integration_test
-                                                        --protocol=ub)
+  # BatchQueryIpOperations expects a loopback address, but TENT advertises the
+  # host NIC address with any transport, so it is left out of this UB run.
+  add_test(NAME client_integration_ub_mock_test
+           COMMAND client_integration_test --protocol=ub
+                   --gtest_filter=-ClientIntegrationTest.BatchQueryIpOperations)
   set_tests_properties(
     client_integration_ub_mock_test
     PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}" TIMEOUT 600)
