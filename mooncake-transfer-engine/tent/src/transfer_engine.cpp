@@ -41,6 +41,10 @@ TransferEngine::~TransferEngine() {}
 
 bool TransferEngine::available() const { return impl_->available(); }
 
+bool TransferEngine::hasTransport(TransportType type) const {
+    return impl_->hasTransport(type);
+}
+
 const std::string TransferEngine::getSegmentName() const {
     return impl_->getSegmentName();
 }
