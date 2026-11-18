@@ -14,6 +14,7 @@
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/jfc.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake::tent::ub {
@@ -55,6 +56,10 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     [[nodiscard]] Topology::NicID topologyId() const noexcept {
         return topology_id_;
     }
+    // Process-unique identity. Allocated once per constructed context and never
+    // reused, so it can key a PoolKey without a stale context sharing members
+    // with its replacement (W3 §5.2).
+    [[nodiscard]] uint64_t incarnation() const noexcept { return incarnation_; }
     [[nodiscard]] const DeviceInfo& deviceInfo() const noexcept {
         return device_;
     }
@@ -68,6 +73,13 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     [[nodiscard]] const std::vector<std::shared_ptr<UbJfc>>& jfcs() const {
         return jfcs_;
     }
+
+    // Pooled rm_pool data path (W3, D-2). Null unless the transport installed a
+    // per-attempt pool for this context; `pooledSendPool() != nullptr` is the
+    // single mode gate of the whole W3 post path, so RC/RM legacy behavior is
+    // untouched while the pool is absent.
+    void attachPooledSendPool(std::shared_ptr<SendJettyPool> pool);
+    [[nodiscard]] std::shared_ptr<SendJettyPool> pooledSendPool() const;
     [[nodiscard]] std::shared_ptr<UbJfc> jfc(size_t index) const;
 
     void addInflight(uint64_t bytes) noexcept;
@@ -88,11 +100,15 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
    private:
     Status shutdownLocked();
 
+    static uint64_t allocateIncarnation() noexcept;
+
     const Topology::NicID topology_id_;
     const DeviceInfo device_;
     std::shared_ptr<UrmaAdapter> adapter_;
+    const uint64_t incarnation_;
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
+    std::shared_ptr<SendJettyPool> pooled_send_pool_;
     mutable std::mutex lifecycle_mutex_;
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> inflight_bytes_{0};

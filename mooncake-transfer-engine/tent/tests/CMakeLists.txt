@@ -558,16 +558,211 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
+  # Completion gate W2a: the shared record, the gate and the counters, linked
+  # against nothing but completion_record.cpp so the gate stays testable
+  # without workers, slices, an adapter or the probe link manager.
+  add_executable(tent_ub_completion_gate_test ub_completion_gate_test.cpp
+                                              ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_gate_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_gate_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_gate_test
+           COMMAND tent_ub_completion_gate_test)
+
+  add_executable(tent_ub_completion_record_test ub_completion_record_test.cpp
+                                                ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_record_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_record_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_record_test
+           COMMAND tent_ub_completion_record_test)
+
+  # W3a/W3b/W3c: bounded queue arithmetic, the five-bucket defer registry and
+  # the task-level K gate. Header-only pieces plus slice.h, so the target needs
+  # no adapter, workers or segment manager.
+  add_executable(tent_ub_admission_test ub_admission_test.cpp)
+  target_link_libraries(tent_ub_admission_test PRIVATE tent_common gtest
+                                                         gtest_main)
+  target_include_directories(tent_ub_admission_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_admission_test COMMAND tent_ub_admission_test)
+
+  # W3d: the PLM business routing gate and the per-path in-flight ledger.
+  add_executable(
+    tent_ub_path_selection_test
+    ub_path_selection_test.cpp ../src/transport/ub/path_load_ledger.cpp
+    ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_path_selection_test PRIVATE tent_common gtest
+                                                           gtest_main)
+  target_include_directories(tent_ub_path_selection_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_path_selection_test
+           COMMAND tent_ub_path_selection_test)
+
+  # W3e: claim/return semantics against the real SendJettyPool.
+  add_executable(
+    tent_ub_post_claim_test
+    ub_post_claim_test.cpp ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/jfc.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_post_claim_test PRIVATE tent_common gtest
+                                                        gtest_main)
+  target_include_directories(tent_ub_post_claim_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_post_claim_test COMMAND tent_ub_post_claim_test)
+
+  # W3e integration: real workers + real pool + fake adapter. Covers the three
+  # required interleavings (early CQE, first error, timeout fence under a
+  # stopping pool) end to end.
+  add_executable(tent_ub_pool_integration_test
+                 ub_pool_integration_test.cpp)
+  target_link_libraries(tent_ub_pool_integration_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+  target_include_directories(tent_ub_pool_integration_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_pool_integration_test
+           COMMAND tent_ub_pool_integration_test)
+
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
     ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
-    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp)
+    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp
+    # M8: a Context drains its own pooled send Jetties before closing its JFCs,
+    # so the teardown target needs the pool module too.
+    ../src/transport/ub/send_jetty_pool.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_teardown_test COMMAND tent_ub_teardown_test)
+
+  # Probe-link W1a: state machine + campaign (design §14.2 #1-3, #11, #13,
+  # #14, #17). The scheduler/poster seam and the workers integration are
+  # separate milestone targets, so these link only the PLM implementation.
+  add_executable(
+    tent_ub_probe_plm_test
+    ub_probe_plm_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_plm_test PRIVATE tent_common gtest
+                                                      gtest_main)
+  target_include_directories(tent_ub_probe_plm_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_plm_test COMMAND tent_ub_probe_plm_test)
+
+  add_executable(
+    tent_ub_probe_campaign_test
+    ub_probe_campaign_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_campaign_test PRIVATE tent_common gtest
+                                                            gtest_main)
+  target_include_directories(tent_ub_probe_campaign_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_campaign_test COMMAND tent_ub_probe_campaign_test)
+
+  # Probe-link W1b: scheduler thread, poster seam, timeout, backoff and
+  # shutdown drain (design §14.2 #4-8, #10, #16).
+  add_executable(
+    tent_ub_probe_scheduler_test
+    ub_probe_scheduler_test.cpp ../src/transport/ub/probe_link_manager.cpp
+    ../src/transport/ub/probe_scheduler.cpp)
+  target_link_libraries(tent_ub_probe_scheduler_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_scheduler_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_scheduler_test
+           COMMAND tent_ub_probe_scheduler_test)
+
+  # Test mode (probe/test/*): periodic sweep of all links, optional health
+  # application, campaign priority.
+  add_executable(
+    tent_ub_probe_test_mode_test
+    ub_probe_test_mode_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_test_mode_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_test_mode_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_test_mode_test
+           COMMAND tent_ub_probe_test_mode_test)
+
+  # Probe-link W1c: workers seams + transport assembly against the fake URMA
+  # provider (design §14.2 #12). tent_link_group already contains the probe
+  # sources through tent_xport_ub, so they must not be compiled in again.
+  # Standalone probe resource provider (P1): owns probe-native resources
+  # without the business Jetty pool. Only the provider implementation is
+  # compiled in; the PLM/scheduler are not involved at this stage.
+  add_executable(
+    tent_ub_probe_standalone_provider_test
+    ub_probe_standalone_provider_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp)
+  target_link_libraries(tent_ub_probe_standalone_provider_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_standalone_provider_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_standalone_provider_test
+           COMMAND tent_ub_probe_standalone_provider_test)
+
+  # v1.7 self-owned resources: discovery, bond rejection, device filter and
+  # source-page-size validation.
+  add_executable(
+    tent_ub_probe_discovery_test
+    ub_probe_discovery_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp)
+  target_link_libraries(tent_ub_probe_discovery_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_discovery_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_discovery_test
+           COMMAND tent_ub_probe_discovery_test)
+
+  # Probe peer handshake seam (P2): descriptor validation, probe-area import
+  # and caching. The bootstrap wire that fills the descriptor source lands in
+  # P5; these tests drive the source directly.
+  add_executable(
+    tent_ub_probe_handshake_test ub_probe_handshake_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp
+    ../src/transport/ub/probe_peer_handshake.cpp)
+  target_link_libraries(tent_ub_probe_handshake_test PRIVATE tent_common gtest
+                                                             gtest_main)
+  target_include_directories(tent_ub_probe_handshake_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_handshake_test COMMAND tent_ub_probe_handshake_test)
+
+  # Probe poster over the RM adapter contract (P3): one-byte WRITE with a
+  # per-WR remote target, no bind.
+  add_executable(tent_ub_probe_poster_test
+                 ub_probe_poster_test.cpp
+                 ../src/transport/ub/probe_poster_urma.cpp)
+  target_link_libraries(tent_ub_probe_poster_test PRIVATE tent_common gtest
+                                                          gtest_main)
+  target_include_directories(tent_ub_probe_poster_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_poster_test COMMAND tent_ub_probe_poster_test)
+
+  # Lane retire/rebuild, interface-7 event and retired-page quarantine (P4).
+  add_executable(
+    tent_ub_probe_rebuild_test ub_probe_rebuild_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp)
+  target_link_libraries(tent_ub_probe_rebuild_test PRIVATE tent_common gtest
+                                                            gtest_main)
+  target_include_directories(tent_ub_probe_rebuild_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_rebuild_test COMMAND tent_ub_probe_rebuild_test)
+
+  # Two-node probe-only selftest tool (manual; not a ctest entry).
+  add_executable(tent_probe_selftest ub_probe_selftest.cpp)
+  target_link_libraries(tent_probe_selftest PRIVATE tent_xport_ub)
+  target_include_directories(tent_probe_selftest
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  add_executable(tent_ub_probe_integration_test ub_probe_integration_test.cpp)
+  target_link_libraries(tent_ub_probe_integration_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_ub_probe_integration_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_integration_test
+           COMMAND tent_ub_probe_integration_test)
 
   add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
   target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main

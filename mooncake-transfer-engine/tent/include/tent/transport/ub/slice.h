@@ -355,6 +355,71 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
         return resolution;
     }
 
+    // W3 defer exit (design §7.3 / W3-IN-3). Capacity pressure is not a
+    // transfer failure, so this returns the slice to kRetryPending WITHOUT
+    // incrementing retry_count_ and without notifying the task. A canceled
+    // slice still terminalizes CANCELED here, because nothing will ever post
+    // it.
+    bool deferAttempt(const UbAttemptToken& token, uint64_t now_ns = 0) {
+        bool canceled = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!matchesActiveAttemptLocked(token) ||
+                state_ != UbSliceState::kPosting) {
+                return false;
+            }
+            if (cancel_requested_.load(std::memory_order_acquire)) {
+                setTerminalLocked(CANCELED, 0, normalizedNow(now_ns));
+                canceled = true;
+            } else {
+                state_ = UbSliceState::kRetryPending;
+                queued_ns_ = normalizedNow(now_ns);
+            }
+        }
+        if (canceled) notifyTaskTerminal(CANCELED, 0);
+        return true;
+    }
+
+    // Re-admits a slice that was deferred while it was NOT owned by an attempt.
+    //
+    // The W3 defer exits before beginAttempt() (path quota, pool pre-screen,
+    // health gate, endpoint outstanding) leave the slice in kQueued, and
+    // markQueued() deliberately refuses kQueued (it is the "already queued"
+    // state). Reusing markQueued() there made the reflow cancel a perfectly
+    // healthy slice, which is why this entry exists:
+    //   kQueued      -> stays kQueued, wait timestamp refreshed, true
+    //   kRetryPending-> kQueued (the attempt was returned by deferAttempt)
+    //   anything else (kPosting/kPosted/terminal/canceled) -> false: an attempt
+    //   owns the slice and the defer path must not re-admit it.
+    bool requeueAfterDefer(uint64_t now_ns = 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (cancel_requested_.load(std::memory_order_acquire) ||
+            isTerminal(state_)) {
+            return false;
+        }
+        if (state_ == UbSliceState::kQueued) {
+            queued_ns_ = normalizedNow(now_ns);
+            return true;
+        }
+        if (state_ == UbSliceState::kRetryPending) {
+            state_ = UbSliceState::kQueued;
+            queued_ns_ = normalizedNow(now_ns);
+            return true;
+        }
+        return false;
+    }
+
+    // True when markQueued() could still accept this slice. submit() counts
+    // with this instead of mutating state, so a rejected Task leaves every
+    // slice untouched (W3-IN-4).
+    [[nodiscard]] bool queuedEligible() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !cancel_requested_.load(std::memory_order_acquire) &&
+               !isTerminal(state_) &&
+               (state_ == UbSliceState::kInitial ||
+                state_ == UbSliceState::kRetryPending);
+    }
+
     // Resolves work that failed (or completed locally) before any adapter post.
     // It deliberately refuses to terminalize kPosting/kPosted work; those must
     // drain through resolveAttempt().
@@ -508,16 +573,72 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     using Ptr = std::shared_ptr<UbTask>;
     using TerminalCallback = std::function<void(const TransferStatus&)>;
 
+    // `max_inflight_attempts` is the task-level K gate of W3 (D-6, upstream
+    // §5.3). 0 keeps the slice unlimited, which is what the RC/RM legacy path
+    // and every pre-W3 test expect: K only becomes a hard constraint once the
+    // transport configures a pooled rm_pool task.
     static Ptr create(Request request, TerminalCallback terminal_callback = {},
-                      uint64_t created_ns = 0) {
+                      uint64_t created_ns = 0,
+                      uint32_t max_inflight_attempts = 0) {
         return Ptr(new UbTask(std::move(request), std::move(terminal_callback),
-                              created_ns));
+                              created_ns, max_inflight_attempts));
     }
 
     UbTask(const UbTask&) = delete;
     UbTask& operator=(const UbTask&) = delete;
 
     [[nodiscard]] const Request& request() const { return request_; }
+
+    // ---- W3 task-level K (D-6) -------------------------------------------
+    // At most K slices of one task may hold an inflight attempt at a time. The
+    // slot is acquired just before the lease and released when the owner
+    // record dies, i.e. exactly when native responsibility for that attempt
+    // ends (W3-IN-5). The pooling side's process-wide TaskPermitLedger is
+    // deliberately not used: K must cap one task, not the whole process.
+    [[nodiscard]] bool tryAcquireAttemptSlot() noexcept {
+        const uint32_t limit = max_inflight_attempts_;
+        if (limit == 0) {
+            // Unlimited: the counter is still maintained so a later limit (or
+            // a diagnostic) sees the true fan-out.
+            inflight_attempts_.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+        uint32_t current = inflight_attempts_.load(std::memory_order_acquire);
+        while (current < limit) {
+            if (inflight_attempts_.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void releaseAttemptSlot() noexcept {
+        uint32_t current = inflight_attempts_.load(std::memory_order_acquire);
+        while (current != 0) {
+            if (inflight_attempts_.compare_exchange_weak(
+                    current, current - 1, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return;
+            }
+        }
+        // A release without a matching acquisition is a bookkeeping defect;
+        // never underflow the counter into a huge "unlimited" window, but do
+        // count it so a double release is observable (review minor).
+        slot_underflows_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint64_t slotUnderflows() const noexcept {
+        return slot_underflows_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint32_t inflightAttempts() const noexcept {
+        return inflight_attempts_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint32_t maxInflightAttempts() const noexcept {
+        return max_inflight_attempts_;
+    }
 
     // Slices must be added before seal(). Workers may begin processing only
     // after sealing, which prevents an early completion from finalizing a task
@@ -601,9 +722,10 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     friend class UbSlice;
 
     UbTask(Request request, TerminalCallback terminal_callback,
-           uint64_t created_ns)
+           uint64_t created_ns, uint32_t max_inflight_attempts)
         : request_(std::move(request)),
           created_ns_(created_ns == 0 ? steadyNowNs() : created_ns),
+          max_inflight_attempts_(max_inflight_attempts),
           terminal_callback_(std::move(terminal_callback)) {}
 
     static int terminalSeverity(TransferStatusEnum status) {
@@ -667,6 +789,9 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
 
     const Request request_;
     const uint64_t created_ns_;
+    const uint32_t max_inflight_attempts_;
+    std::atomic<uint32_t> inflight_attempts_{0};
+    std::atomic<uint64_t> slot_underflows_{0};
     mutable std::mutex mutex_;
     std::vector<UbSlice::Ptr> slices_;
     std::unordered_set<uint64_t> resolved_slice_ids_;

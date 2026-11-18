@@ -21,6 +21,13 @@
 
 namespace mooncake::tent::ub {
 
+// Capability strings exchanged in the v1 bootstrap descriptor. The transport
+// mode is carried here because protocol version 1 has no dedicated field, and a
+// peer must be able to reject a target whose receive side cannot accept its
+// WRs (review M9).
+inline constexpr const char* kUbCapabilityRmTransport = "transport_mode:rm";
+inline constexpr const char* kUbCapabilityRcTransport = "transport_mode:rc";
+
 // One cache entry represents a local-device to remote-device path. The peer
 // NIC path is part of the identity because a remote topology ID may be reused
 // after the peer republishes its topology.
@@ -124,6 +131,30 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     }
     [[nodiscard]] size_t jettyCount() const;
     [[nodiscard]] JettyPtr jetty(size_t index) const;
+
+    // ---- W3 pooled data path (design §5.2 / M-4) --------------------------
+    // The local send profile this endpoint incarnation was created with. It
+    // feeds the PoolKey, so two attempts with different profiles can never
+    // share a pooled member.
+    [[nodiscard]] const JettyOptions& jettyOptions() const noexcept {
+        return jetty_options_;
+    }
+    // RM endpoints never bind a local Jetty: every WR carries its own imported
+    // target (RM Legacy). The pooled data path polls this flag to choose the
+    // per-WR post overload.
+    [[nodiscard]] bool rmMode() const noexcept {
+        return jetty_options_.transport_mode == JettyTransportMode::kRm;
+    }
+    // The peer target for one posted WR: the peer's EID plus its advertised
+    // Jetty id/UASID for this slot. RM posts must reference it explicitly and
+    // the adapter never substitutes a bound remote Jetty for it.
+    //
+    // W3 adaptation note (M-4): the pooling side provides bootstrap-v2 target
+    // import (`importRemoteTarget`, `bindRm`). This baseline already carries
+    // the same identity in the v1 bootstrap descriptor, and the adapter imports
+    // the target lazily and caches it per Jetty, so W3 only consumes this
+    // accessor instead of duplicating the import machinery.
+    [[nodiscard]] RemoteJettyInfo rmTarget(size_t jetty_index) const;
     [[nodiscard]] size_t jfcIndex(size_t jetty_index) const;
     [[nodiscard]] std::vector<JettyPtr> jetties() const;
     [[nodiscard]] Status lifecycleStatus() const;

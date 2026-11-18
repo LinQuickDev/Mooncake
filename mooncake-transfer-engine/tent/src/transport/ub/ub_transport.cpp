@@ -1,6 +1,11 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tent/transport/ub/probe_link_manager.h"
+#include "tent/transport/ub/probe_peer_handshake.h"
+#include "tent/transport/ub/probe_poster_urma.h"
+#include "tent/transport/ub/probe_provider_standalone.h"
+#include "tent/transport/ub/probe_scheduler.h"
 #include "tent/transport/ub/ub_transport.h"
 
 #include <algorithm>
@@ -8,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -21,12 +27,15 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/segment.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/admission.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
+#include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
@@ -88,9 +97,15 @@ std::string encodeDeviceMetadata(Topology::NicID topology_id,
 }  // namespace
 
 struct UbTransport::Impl {
-    explicit Impl(std::shared_ptr<ub::UrmaAdapter> injected)
+    Impl(std::shared_ptr<ub::UrmaAdapter> injected,
+         std::shared_ptr<ub::ProbeResourceProvider> injected_probe_provider,
+         std::shared_ptr<ub::ProbePoster> injected_probe_poster,
+         ub::ProbePeerDescriptorSource* injected_peer_source)
         : adapter(injected ? std::move(injected)
-                           : ub::createDefaultUrmaAdapter()) {}
+                           : ub::createDefaultUrmaAdapter()),
+          probe_peer_source(injected_peer_source),
+          probe_provider(std::move(injected_probe_provider)),
+          probe_poster(std::move(injected_probe_poster)) {}
 
     Status install(const std::string& segment_name,
                    std::shared_ptr<ControlService> control,
@@ -126,6 +141,16 @@ struct UbTransport::Impl {
             return Status::NotImplemented(
                 "UB notifications are not supported by protocol version "
                 "1" LOC_MARK);
+        }
+        if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmLegacy) {
+            // W3 wires exactly two profiles: the untouched RC legacy baseline
+            // and the pooled rm_pool path (D-2). RM legacy depends on the
+            // pooling side's bootstrap-v2 target import, which this baseline
+            // does not carry yet (M-4), so it fails closed instead of silently
+            // running RC under an RM label.
+            return Status::NotImplemented(
+                "runtime_profile=rm_legacy is not wired in W3; use rc_legacy "
+                "or rm_pool" LOC_MARK);
         }
 
         shutting_down.store(false, std::memory_order_release);
@@ -182,6 +207,14 @@ struct UbTransport::Impl {
             }
 
             ub::JfcOptions jfc_options;
+            // W3 B2: UMDK requires JFS.trans_mode == shared JFR.trans_mode
+            // (urma_adapter.cpp RealJetty::initialize). The business JFC of an
+            // rm_pool context therefore has to create an RM JFR, otherwise
+            // every createJetty for a pooled member is rejected by the provider
+            // and tryLease can never succeed.
+            if (params.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
+                jfc_options.transport_mode = ub::JettyTransportMode::kRm;
+            }
             const auto& device_caps = found->second.capabilities;
             if (device_caps.max_jfc_depth != 0) {
                 jfc_options.depth =
@@ -276,6 +309,13 @@ struct UbTransport::Impl {
                     jetty_options.max_sge, device_caps.max_remote_sge));
             }
         }
+        // rm_pool runs the RM transport (validated by the config gate). Both
+        // the pooled members and this side's endpoint Jetties are created in RM
+        // mode, and an RM Jetty is never bound: every WR carries its own
+        // imported target (design §5.2 / M-4).
+        if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
+            jetty_options.transport_mode = ub::JettyTransportMode::kRm;
+        }
         if (safe_slice_size == 0 || jetty_options.depth == 0 ||
             jetty_options.max_sge == 0) {
             return failInstall(Status::InvalidArgument(
@@ -317,6 +357,31 @@ struct UbTransport::Impl {
                                 device_wrs});
         }
 
+        // ---- W3 pooled assembly (design §11.1) --------------------------
+        // One SendJettyPool + one JfcCreditLedger per Context, and one
+        // NativeBudget per physical device shared by every Context of that
+        // device. Every step is fail-closed: a pool that cannot be budgeted or
+        // credited must not exist, because a lease without credit accounting
+        // would post WRs the JFC cannot hold.
+        if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
+            // M9: rm_pool runs the RM transport, so every selected device must
+            // advertise it. Failing here is much cheaper than failing on the
+            // first createJetty.
+            for (const auto& context : contexts) {
+                if (!context) continue;
+                const uint16_t modes =
+                    context->deviceInfo().capabilities.transport_modes;
+                if (modes != 0 && (modes & ub::kUrmaTransportModeRm) == 0) {
+                    return failInstall(Status::InvalidArgument(
+                        "runtime_profile=rm_pool requires devices that support "
+                        "the RM transport mode" LOC_MARK));
+                }
+            }
+            status = installPooledSendPools(parsed, jetty_options,
+                                            jfc_depth_by_device);
+            if (!status.ok()) return failInstall(status);
+        }
+
         status = publishLocalDevices();
         if (!status.ok()) return failInstall(status);
 
@@ -325,6 +390,85 @@ struct UbTransport::Impl {
                 return onBootstrap(request, response);
             });
         callback_installed = true;
+
+        // Probe assembly (design §13.3). Probing is disabled by default; when
+        // enabled, the pooling side must supply a complete graph and a poster,
+        // otherwise installation fails fast instead of degrading silently.
+        std::vector<ub::ProbeJfcSlot> probe_jfcs;
+        if (params.probe.enabled) {
+            if (!probe_provider || !probe_poster) {
+                if (params.probe.provider !=
+                    ub::ProbeProviderKind::kStandalone) {
+                    return failInstall(Status::InvalidArgument(
+                        "UB probe is enabled but no probe provider/poster is "
+                        "installed; inject one or set "
+                        "transports/ub/probe/provider=standalone" LOC_MARK));
+                }
+                if (probe_peer_source == nullptr) {
+                    return failInstall(Status::InvalidArgument(
+                        "UB probe provider=standalone requires a peer "
+                        "descriptor source" LOC_MARK));
+                }
+                auto standalone =
+                    std::make_shared<ub::StandaloneProbeResourceProvider>(
+                        adapter, params.probe,
+                        [topology =
+                             local_topology](const std::string& topology_name) {
+                            return topology ? topology->getNicId(topology_name)
+                                            : static_cast<Topology::NicID>(-1);
+                        });
+                auto discover = standalone->discover();
+                if (!discover.ok()) return failInstall(discover);
+                probe_directory =
+                    std::make_shared<ub::HandshakeProbePeerDirectory>(
+                        adapter, standalone->contexts(), probe_peer_source);
+                standalone->setRemoteDirectory(probe_directory.get());
+                probe_provider = standalone;
+                probe_poster = std::make_shared<ub::UrmaProbePoster>(adapter);
+            }
+            ub::ProbeGraph graph;
+            status = probe_provider->snapshot(graph);
+            if (!status.ok()) return failInstall(status);
+            probe_manager =
+                std::make_unique<ub::ProbeLinkManager>(params.probe);
+            probe_manager->setReportSink(probe_provider.get());
+            status = probe_manager->initialize(graph);
+            if (!status.ok()) return failInstall(status);
+            probe_provider->setAvailabilitySink(
+                probe_manager->availabilitySink());
+            probe_provider->setCompletionSink(
+                [manager = probe_manager.get()](
+                    const ub::Completion& completion) -> Status {
+                    if (manager == nullptr) {
+                        return Status::InvalidArgument(
+                            "probe manager is gone" LOC_MARK);
+                    }
+                    // Quiesce is per probe Jetty, so every completion here
+                    // belongs to the probe namespace.
+                    if (!ub::isProbeToken(completion.token)) {
+                        return Status::InvalidArgument(
+                            "non-probe completion on a probe lane" LOC_MARK);
+                    }
+                    if (!manager->onProbeCompletion(completion)) {
+                        return Status::InternalError(
+                            "probe completion was not accepted" LOC_MARK);
+                    }
+                    return Status::OK();
+                });
+            for (const auto& supply : graph.ports) {
+                if (context_by_topology_id.find(supply.local_nic) ==
+                    context_by_topology_id.end()) {
+                    return failInstall(
+                        Status::InvalidArgument("UB probe port has no matching "
+                                                "local context" LOC_MARK));
+                }
+                // nullptr means shared mode: probe completions land on the
+                // business JFC and are routed by token namespace.
+                if (!supply.probe_jfc) continue;
+                probe_jfcs.push_back(
+                    ub::ProbeJfcSlot{supply.local_nic, supply.probe_jfc});
+            }
+        }
 
         workers = std::make_unique<ub::UbWorkers>(
             adapter, contexts, local_topology, &metadata->segmentManager(),
@@ -343,11 +487,135 @@ struct UbTransport::Impl {
                         "failure cleanup" LOC_MARK);
                 }
                 return endpoints->retireLocalDevice(local_topology_id);
-            });
+            },
+            probe_manager.get(), std::move(probe_jfcs));
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
+        // Pollers run before the scheduler so a probe completion can always be
+        // consumed (design §13.3).
+        if (probe_manager) {
+            try {
+                probe_scheduler = std::make_unique<ub::ProbeScheduler>(
+                    *probe_manager, *probe_poster);
+                probe_scheduler->start();
+            } catch (const std::exception& error) {
+                return failInstall(Status::InternalError(
+                    std::string("Cannot start the UB probe scheduler: ") +
+                    error.what() + LOC_MARK));
+            }
+        }
+
         installed.store(true, std::memory_order_release);
+        return Status::OK();
+    }
+
+    // W3 pooled assembly (design §11.1). One pool + credit ledger per Context
+    // and one native budget per physical device. Called from install() after
+    // every device gate passed and before any pooled Jetty can be created.
+    Status installPooledSendPools(
+        const ub::UbParams& parsed, const ub::JettyOptions& jetty_options,
+        const std::unordered_map<Topology::NicID, uint32_t>&
+            jfc_depth_by_device) {
+        const uint64_t credit_reserve = parsed.send_pool.jfc_credit_reserve;
+        // M5: a static Serving target that the device budget cannot hold makes
+        // tryLease miss forever (permanent defer instead of fail-fast).
+        std::unordered_map<std::string, uint64_t> contexts_per_device;
+        for (const auto& context : contexts) {
+            if (!context) continue;
+            const auto& device = context->deviceInfo();
+            ++contexts_per_device[device.native_device_name + ":" +
+                                  device.native_device_path + ":" + device.eid];
+        }
+        std::unordered_map<std::string, std::shared_ptr<ub::NativeBudget>>
+            budgets;
+        for (const auto& context : contexts) {
+            if (!context || !context->handle()) continue;
+            const auto& device = context->deviceInfo();
+            // A physical device is identified by name + path + EID, so every
+            // Context sitting on the same device shares one ledger and can
+            // never overcommit the device's Jetty limit (C05).
+            const std::string device_key = device.native_device_name + ":" +
+                                           device.native_device_path + ":" +
+                                           device.eid;
+            auto& budget = budgets[device_key];
+            if (!budget) {
+                budget = std::make_shared<ub::NativeBudget>();
+                const uint64_t verified = device.capabilities.max_jetty;
+                // Derivation keeps the replacement reserve outside the device's
+                // own limit: NativeBudget::configure() checks
+                // (configured + reserve) <= verified, so deriving configured as
+                // `verified` fails install on every device that reports its
+                // limit. See deriveNativeBudgetJetties().
+                const uint64_t configured = ub::deriveNativeBudgetJetties(
+                    verified, parsed.native_budget.max_jetty_per_device,
+                    parsed.native_budget.replacement_reserve,
+                    parsed.send_pool.desired_per_context);
+                // M5: the pooled members alone must fit per device. Endpoint
+                // Jetties stay outside the NativeBudget ledger for now
+                // (RK5/M10), so their share is surfaced instead of being
+                // silently overcommitted.
+                const uint64_t per_context =
+                    static_cast<uint64_t>(parsed.send_pool.desired_per_context);
+                const uint64_t contexts_on_device =
+                    contexts_per_device.count(device_key) != 0
+                        ? contexts_per_device[device_key]
+                        : 1;
+                const uint64_t endpoint_share =
+                    static_cast<uint64_t>(parsed.jetty_per_endpoint);
+                if (configured < per_context * contexts_on_device) {
+                    return Status::InvalidArgument(
+                        "transports/ub/native_budget/max_jetty_per_device is "
+                        "smaller than send_pool/desired_per_context for " +
+                        device_key);
+                }
+                if (verified != 0 && configured + endpoint_share > verified) {
+                    LOG(WARNING)
+                        << "UB rm_pool budget for device " << device_key
+                        << " leaves no room for the endpoint Jetty set: "
+                           "budget="
+                        << configured << " endpoint=" << endpoint_share
+                        << " verified=" << verified
+                        << "; endpoint Jetties remain outside the ledger "
+                           "(RK5)";
+                }
+                auto status =
+                    budget->configure(device_key, verified, configured,
+                                      parsed.native_budget.replacement_reserve);
+                if (!status.ok()) return status;
+            }
+
+            auto credits = std::make_shared<ub::JfcCreditLedger>();
+            const auto depth_it =
+                jfc_depth_by_device.find(context->topologyId());
+            const uint64_t depth =
+                depth_it == jfc_depth_by_device.end() ? 0 : depth_it->second;
+            if (depth <= credit_reserve) {
+                return Status::InvalidArgument(
+                    "transports/ub/send_pool/jfc_credit_reserve must be "
+                    "smaller than the JFC depth" LOC_MARK);
+            }
+            for (const auto& jfc : context->jfcs()) {
+                if (!jfc) continue;
+                // capacity = jfc_depth - jfc_credit_reserve: the reserve
+                // belongs to control records (markers, AE) and business WRs
+                // never see it (C05/C06).
+                auto status =
+                    credits->install(jfc->index(), depth - credit_reserve);
+                if (!status.ok()) return status;
+            }
+
+            ub::SendJettyPoolOptions options;
+            options.desired_serving = parsed.send_pool.desired_per_context;
+            options.max_creating = parsed.send_pool.max_creating_per_key;
+            options.jetty_options = jetty_options;
+            auto pool = std::make_shared<ub::SendJettyPool>(
+                adapter, context->handle(), context->jfcs(), budget, device_key,
+                credits, options);
+            // Attaching the pool is what flips this Context into the W3 path
+            // (D-2). Nothing else in the transport changes behavior.
+            context->attachPooledSendPool(std::move(pool));
+        }
         return Status::OK();
     }
 
@@ -381,6 +649,13 @@ struct UbTransport::Impl {
             metadata->setBootstrapUbCallback({});
             callback_installed = false;
         }
+        // Stop interface-7 rebuilds before draining workers: a retire during
+        // teardown must stay a record, not create resources that are about to
+        // be destroyed.
+        if (probe_provider) {
+            probe_provider->setAvailabilitySink(nullptr);
+            probe_provider->setCompletionSink(nullptr);
+        }
         if (workers) {
             auto status = workers->stop();
             if (!status.ok()) {
@@ -391,6 +666,29 @@ struct UbTransport::Impl {
                 return status;
             }
             workers.reset();
+        }
+        // Workers joined the scheduler through drainBeforePollStop(); destroy
+        // the PLM only after the workers that reference it are gone.
+        probe_scheduler.reset();
+        probe_manager.reset();
+        probe_poster.reset();
+        // Unimport remote probe areas while the probe Contexts are still
+        // alive; the self-owned provider closes them in its shutdown.
+        if (probe_directory) (void)probe_directory->shutdown();
+        probe_provider.reset();
+        probe_directory.reset();
+        // W3 pooled teardown safety net (design §11.2). workers->stop() already
+        // drained the pools, but an install that failed before the workers
+        // existed can leave a pool attached to its context. beginStop() and
+        // both drains are idempotent, so running them here covers both paths
+        // and guarantees that no pooled Jetty outlives its budget ledger.
+        for (const auto& context : contexts) {
+            if (!context) continue;
+            auto pool = context->pooledSendPool();
+            if (!pool) continue;
+            pool->beginStop();
+            (void)pool->drainIdle();
+            (void)pool->drainQuarantined();
         }
         if (endpoints) {
             auto status = endpoints->clear();
@@ -609,11 +907,27 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::EndpointStore> endpoints;
     std::unique_ptr<ub::RailMonitor> rails;
     std::unique_ptr<ub::QuotaManager> quota;
+    // Declared before `workers` so destruction runs workers -> scheduler ->
+    // manager -> provider/poster (the workers hold a raw manager pointer).
+    // probe_directory is declared before probe_provider so it is destroyed
+    // after the provider that borrows it.
+    ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
+    std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
+    std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
+    std::shared_ptr<ub::ProbePoster> probe_poster;
+    std::unique_ptr<ub::ProbeLinkManager> probe_manager;
+    std::unique_ptr<ub::ProbeScheduler> probe_scheduler;
     std::unique_ptr<ub::UbWorkers> workers;
 };
 
-UbTransport::UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter)
-    : impl_(std::make_unique<Impl>(std::move(adapter))) {}
+UbTransport::UbTransport(
+    std::shared_ptr<ub::UrmaAdapter> adapter,
+    std::shared_ptr<ub::ProbeResourceProvider> probe_provider,
+    std::shared_ptr<ub::ProbePoster> probe_poster,
+    ub::ProbePeerDescriptorSource* probe_peer_source)
+    : impl_(
+          std::make_unique<Impl>(std::move(adapter), std::move(probe_provider),
+                                 std::move(probe_poster), probe_peer_source)) {}
 
 UbTransport::~UbTransport() {
     auto status = uninstall();
@@ -716,11 +1030,19 @@ Status UbTransport::submitTransferTasks(
                 "UB request exceeds "
                 "transports/ub/max_slices_per_task" LOC_MARK);
         }
+        // W3 D-6: K lives on the task and only binds in pooled mode. A pooled
+        // task is capped at task_max_inflight_attempts inflight attempts; the
+        // legacy profiles keep the unlimited slice behavior of W2.
+        const uint32_t task_limit =
+            impl_->params.pooledSendPoolRequested()
+                ? impl_->params.task_max_inflight_attempts
+                : 0;
         auto task = ub::UbTask::create(
             request,
             [notify_progress, progress_batch_id](const TransferStatus&) {
                 if (notify_progress) notify_progress(progress_batch_id);
-            });
+            },
+            /*created_ns=*/0, task_limit);
         size_t offset = 0;
         while (offset < request.length) {
             const size_t length =

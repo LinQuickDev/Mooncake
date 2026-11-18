@@ -46,6 +46,126 @@ TEST(UbParamsTest, ParsesStrictValuesAndAllowsRetryDisable) {
     EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
 }
 
+TEST(UbParamsTest, ParsesProbeConfigAndRejectsIllegalValues) {
+    Config empty;
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(empty, params).ok());
+    EXPECT_FALSE(params.probe.enabled);
+    EXPECT_EQ(params.probe.interval_ms, 1000U);
+    EXPECT_EQ(params.probe.backoff_max_ms, 30000U);
+    EXPECT_EQ(params.probe.timeout_ms, 1000U);
+    EXPECT_EQ(params.probe.peer_budget, 4U);
+    EXPECT_EQ(params.probe.failure_threshold, 3U);
+    EXPECT_TRUE(params.probe.stop_on_recovery);
+    EXPECT_EQ(params.probe.recover_success_threshold, 1U);
+    EXPECT_EQ(params.probe.jfc_mode, ProbeJfcMode::kDedicated);
+    EXPECT_EQ(params.probe.provider, ProbeProviderKind::kPool);
+    EXPECT_TRUE(params.probe.device_filter.empty());
+    EXPECT_EQ(params.probe.source_page_size, 0U);
+    EXPECT_FALSE(params.probe.test_periodic_all);
+    EXPECT_EQ(params.probe.test_interval_ms, 5000U);
+    EXPECT_TRUE(params.probe.test_apply_health);
+    EXPECT_EQ(params.probe.jfc_depth, 64U);
+    EXPECT_EQ(params.probe.credit_reserve, 8U);
+
+    Config full;
+    full.set("transports/ub/probe/enabled", true);
+    full.set("transports/ub/probe/interval_ms", 500);
+    full.set("transports/ub/probe/backoff_max_ms", 4000);
+    full.set("transports/ub/probe/timeout_ms", 250);
+    full.set("transports/ub/probe/peer_budget", 2);
+    full.set("transports/ub/probe/failure_threshold", 5);
+    full.set("transports/ub/probe/stop_on_recovery", true);
+    full.set("transports/ub/probe/recover_success_threshold", 1);
+    full.set("transports/ub/probe/jfc_mode", "shared");
+    full.set("transports/ub/probe/jfc_depth", 32);
+    full.set("transports/ub/probe/credit_reserve", 2);
+    ASSERT_TRUE(UbParams::FromConfig(full, params).ok());
+    EXPECT_TRUE(params.probe.enabled);
+    EXPECT_EQ(params.probe.interval_ms, 500U);
+    EXPECT_EQ(params.probe.backoff_max_ms, 4000U);
+    EXPECT_EQ(params.probe.timeout_ms, 250U);
+    EXPECT_EQ(params.probe.peer_budget, 2U);
+    EXPECT_EQ(params.probe.failure_threshold, 5U);
+    EXPECT_EQ(params.probe.jfc_mode, ProbeJfcMode::kShared);
+    EXPECT_EQ(params.probe.jfc_depth, 32U);
+    EXPECT_EQ(params.probe.credit_reserve, 2U);
+
+    Config standalone;
+    standalone.set("transports/ub/probe/enabled", true);
+    standalone.set("transports/ub/probe/provider", "standalone");
+    ASSERT_TRUE(UbParams::FromConfig(standalone, params).ok());
+    EXPECT_EQ(params.probe.provider, ProbeProviderKind::kStandalone);
+
+    Config test_mode;
+    test_mode.set("transports/ub/probe/enabled", true);
+    test_mode.set("transports/ub/probe/test/periodic_all", true);
+    test_mode.set("transports/ub/probe/test/interval_ms", 2000);
+    test_mode.set("transports/ub/probe/test/apply_health", false);
+    test_mode.set("transports/ub/probe/device_filter", "fake0");
+    test_mode.set("transports/ub/probe/source_page_size", 8192);
+    ASSERT_TRUE(UbParams::FromConfig(test_mode, params).ok());
+    EXPECT_TRUE(params.probe.test_periodic_all);
+    EXPECT_EQ(params.probe.test_interval_ms, 2000U);
+    EXPECT_FALSE(params.probe.test_apply_health);
+    ASSERT_EQ(params.probe.device_filter.size(), 1U);
+    EXPECT_EQ(params.probe.device_filter[0], "fake0");
+    EXPECT_EQ(params.probe.source_page_size, 8192U);
+
+    auto expect_invalid = [](const std::string& key, const json& value) {
+        Config config;
+        config.set(key, value);
+        UbParams parsed;
+        const auto status = UbParams::FromConfig(config, parsed);
+        EXPECT_TRUE(status.IsInvalidArgument()) << key << ": " << value;
+    };
+
+    expect_invalid("transports/ub/probe/interval_ms", 0);
+    expect_invalid("transports/ub/probe/interval_ms", -1);
+    expect_invalid("transports/ub/probe/interval_ms", "1000");
+    expect_invalid("transports/ub/probe/backoff_max_ms", 0);
+    expect_invalid("transports/ub/probe/timeout_ms", 0);
+    expect_invalid("transports/ub/probe/peer_budget", 0);
+    expect_invalid("transports/ub/probe/failure_threshold", 0);
+    expect_invalid("transports/ub/probe/stop_on_recovery", false);
+    expect_invalid("transports/ub/probe/recover_success_threshold", 2);
+    expect_invalid("transports/ub/probe/provider", "bogus");
+    expect_invalid("transports/ub/probe/test/periodic_all", "yes");
+    expect_invalid("transports/ub/probe/test/interval_ms", 0);
+    expect_invalid("transports/ub/probe/test/apply_health", 1);
+    expect_invalid("transports/ub/probe/source_page_size", -1);
+    expect_invalid("transports/ub/probe/device_filter", 42);
+    expect_invalid("transports/ub/probe/provider", 1);
+    expect_invalid("transports/ub/probe/jfc_mode", "bogus");
+    expect_invalid("transports/ub/probe/jfc_mode", 1);
+    expect_invalid("transports/ub/probe/jfc_depth", 4);
+    expect_invalid("transports/ub/probe/credit_reserve", -1);
+    expect_invalid("transports/ub/probe/enabled", "yes");
+
+    // Cross-key constraints are rejected with a stable error type.
+    auto expect_pair_invalid = [](const std::string& first,
+                                  const json& first_value,
+                                  const std::string& second,
+                                  const json& second_value) {
+        Config config;
+        config.set(first, first_value);
+        config.set(second, second_value);
+        UbParams parsed;
+        EXPECT_TRUE(UbParams::FromConfig(config, parsed).IsInvalidArgument())
+            << first << " / " << second;
+    };
+    expect_pair_invalid("transports/ub/probe/interval_ms", 1000,
+                        "transports/ub/probe/backoff_max_ms", 500);
+    expect_pair_invalid("transports/ub/probe/interval_ms", 1000,
+                        "transports/ub/probe/timeout_ms", 2000);
+    expect_pair_invalid("transports/ub/probe/jfc_mode", "shared",
+                        "transports/ub/probe/credit_reserve", 0);
+    expect_pair_invalid("transports/ub/probe/provider", "standalone",
+                        "transports/ub/probe/jfc_mode", "shared");
+    expect_pair_invalid("transports/ub/probe/test/periodic_all", true,
+                        "transports/ub/probe/enabled", false);
+}
+
 Request makeRequest(size_t length) {
     Request request{};
     request.opcode = Request::WRITE;
@@ -271,8 +391,8 @@ TEST(UbPathSelectionScoreTest, AppliesCapacityLocalityPressureAndBandwidth) {
     base.topology_rank = 0;
     base.normalized_inflight = 0.5;
     base.normalized_quota_wrs = 0.5;
-    base.endpoint_outstanding_wrs = 2;
-    base.endpoint_outstanding_bytes = 128;
+    base.path_inflight_wrs = 2;
+    base.path_inflight_bytes = 128;
     base.has_bandwidth_sample = true;
     base.ewma_bandwidth_bytes_per_second = 100.0;
 
@@ -291,9 +411,11 @@ TEST(UbPathSelectionScoreTest, AppliesCapacityLocalityPressureAndBandwidth) {
     busier.normalized_inflight = 0.75;
     EXPECT_TRUE(betterUbPathScore(base, busier));
 
-    auto endpoint_busier = base;
-    endpoint_busier.endpoint_outstanding_wrs = 3;
-    EXPECT_TRUE(betterUbPathScore(base, endpoint_busier));
+    // W3 D-11: the tie-break is the per-path in-flight ledger, not the
+    // endpoint counter.
+    auto path_busier = base;
+    path_busier.path_inflight_wrs = 3;
+    EXPECT_TRUE(betterUbPathScore(base, path_busier));
 
     auto slower = base;
     slower.ewma_bandwidth_bytes_per_second = 50.0;

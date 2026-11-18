@@ -25,433 +25,13 @@
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
+#include "ub_fake_topology.h"
+#include "ub_fake_urma.h"
 
 namespace mooncake::tent::ub {
 namespace {
 
-class FakeContext final : public Context {
-   public:
-    explicit FakeContext(DeviceInfo info) : info_(std::move(info)) {}
-    bool valid() const noexcept override { return valid_; }
-    const DeviceInfo& deviceInfo() const noexcept override { return info_; }
-    int asyncFd() const noexcept override { return -1; }
-    void close() { valid_ = false; }
-
-   private:
-    DeviceInfo info_;
-    bool valid_{true};
-};
-
-class FakeJfc final : public Jfc {
-   public:
-    bool valid() const noexcept override { return valid_; }
-    int eventFd() const noexcept override { return -1; }
-
-    void push(Completion completion) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        completions_.push_back(completion);
-    }
-    void poll(size_t maximum, std::vector<Completion>& output) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        while (!completions_.empty() && output.size() < maximum) {
-            output.push_back(completions_.front());
-            completions_.pop_front();
-        }
-    }
-    void close() { valid_ = false; }
-
-   private:
-    std::mutex mutex_;
-    std::deque<Completion> completions_;
-    bool valid_{true};
-};
-
-SegmentDescriptor makeDescriptor(uint64_t address, uint64_t length) {
-    return SegmentDescriptor{
-        SegmentDescriptor::kSchemaVersion, 1, 16,
-        std::to_string(address) + ":" + std::to_string(length)};
-}
-
-bool parseDescriptor(const SegmentDescriptor& descriptor, uint64_t& address,
-                     uint64_t& length) {
-    const auto colon = descriptor.hex.find(':');
-    if (descriptor.schema_version != SegmentDescriptor::kSchemaVersion ||
-        descriptor.urma_api_version != 1 || descriptor.urma_abi_size != 16 ||
-        colon == std::string::npos) {
-        return false;
-    }
-    try {
-        address = std::stoull(descriptor.hex.substr(0, colon));
-        length = std::stoull(descriptor.hex.substr(colon + 1));
-        return length != 0;
-    } catch (...) {
-        return false;
-    }
-}
-
-class FakeLocalSegment final : public LocalSegment {
-   public:
-    FakeLocalSegment(uint64_t address, uint64_t length)
-        : address_(address),
-          length_(length),
-          descriptor_(makeDescriptor(address, length)) {}
-    bool valid() const noexcept override { return valid_; }
-    uint64_t address() const noexcept override { return address_; }
-    uint64_t length() const noexcept override { return length_; }
-    const SegmentDescriptor& descriptor() const noexcept override {
-        return descriptor_;
-    }
-    void close() { valid_ = false; }
-
-   private:
-    uint64_t address_;
-    uint64_t length_;
-    SegmentDescriptor descriptor_;
-    bool valid_{true};
-};
-
-class FakeRemoteSegment final : public RemoteSegment {
-   public:
-    FakeRemoteSegment(uint64_t address, uint64_t length,
-                      SegmentDescriptor descriptor)
-        : address_(address),
-          length_(length),
-          descriptor_(std::move(descriptor)) {}
-    bool valid() const noexcept override { return valid_; }
-    uint64_t address() const noexcept override { return address_; }
-    uint64_t length() const noexcept override { return length_; }
-    const SegmentDescriptor& descriptor() const noexcept override {
-        return descriptor_;
-    }
-    void close() { valid_ = false; }
-
-   private:
-    uint64_t address_;
-    uint64_t length_;
-    SegmentDescriptor descriptor_;
-    bool valid_{true};
-};
-
-class FakeJetty final : public Jetty {
-   public:
-    FakeJetty(uint32_t id, std::shared_ptr<FakeJfc> jfc)
-        : id_(id), jfc_(std::move(jfc)) {}
-    bool valid() const noexcept override { return valid_; }
-    uint32_t id() const noexcept override { return id_; }
-    uint32_t uasid() const noexcept override { return 0; }
-    std::shared_ptr<FakeJfc> jfc() const { return jfc_; }
-    bool bound() const { return bound_; }
-    void bind() { bound_ = true; }
-    void unbind() { bound_ = false; }
-    void close() {
-        valid_ = false;
-        bound_ = false;
-    }
-
-   private:
-    uint32_t id_;
-    std::shared_ptr<FakeJfc> jfc_;
-    bool valid_{true};
-    bool bound_{false};
-};
-
-class FakeUrmaAdapter final : public UrmaAdapter {
-   public:
-    explicit FakeUrmaAdapter(DeviceInfo device) : device_(std::move(device)) {}
-
-    bool available() const noexcept override { return true; }
-    uint32_t nativeApiVersion() const noexcept override { return 1; }
-    size_t nativeSegmentDescriptorSize() const noexcept override { return 16; }
-    Status initialize() override {
-        initialized_ = true;
-        return Status::OK();
-    }
-    Status shutdown() override {
-        if (fail_next_shutdown_.exchange(false, std::memory_order_acq_rel)) {
-            return Status::InternalError("injected adapter shutdown failure");
-        }
-        initialized_ = false;
-        return Status::OK();
-    }
-    Status discoverDevices(std::vector<DeviceInfo>& devices) override {
-        if (!initialized_) return Status::InvalidArgument("not initialized");
-        devices = {device_};
-        return Status::OK();
-    }
-    Status openContext(const DeviceInfo& device, ContextPtr& context) override {
-        if (!initialized_ || device.topology_name != device_.topology_name) {
-            return Status::DeviceNotFound("fake device missing");
-        }
-        context = std::make_shared<FakeContext>(device);
-        return Status::OK();
-    }
-    Status closeContext(ContextPtr& context) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeContext>(context)) {
-            fake->close();
-        }
-        context.reset();
-        return Status::OK();
-    }
-    Status createJfc(const ContextPtr&, const JfcOptions&,
-                     JfcPtr& jfc) override {
-        jfc = std::make_shared<FakeJfc>();
-        return Status::OK();
-    }
-    Status deleteJfc(JfcPtr& jfc) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeJfc>(jfc)) fake->close();
-        jfc.reset();
-        return Status::OK();
-    }
-    Status registerLocalSegment(const ContextPtr&, uint64_t address,
-                                size_t length, const SegmentOptions& options,
-                                LocalSegmentPtr& segment) override {
-        if (length == 0) return Status::InvalidArgument("empty segment");
-        last_registered_access_.store(options.access,
-                                      std::memory_order_release);
-        segment = std::make_shared<FakeLocalSegment>(address, length);
-        return Status::OK();
-    }
-    Status unregisterLocalSegment(LocalSegmentPtr& segment) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeLocalSegment>(segment)) {
-            fake->close();
-        }
-        segment.reset();
-        return Status::OK();
-    }
-    Status importRemoteSegment(const ContextPtr&,
-                               const SegmentDescriptor& descriptor,
-                               const SegmentOptions&,
-                               RemoteSegmentPtr& segment) override {
-        uint64_t address = 0;
-        uint64_t length = 0;
-        if (!parseDescriptor(descriptor, address, length)) {
-            return Status::InvalidArgument("bad descriptor");
-        }
-        segment =
-            std::make_shared<FakeRemoteSegment>(address, length, descriptor);
-        return Status::OK();
-    }
-    Status unimportRemoteSegment(RemoteSegmentPtr& segment) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeRemoteSegment>(segment)) {
-            fake->close();
-        }
-        segment.reset();
-        return Status::OK();
-    }
-    Status createJetty(const ContextPtr&, const JfcPtr& jfc,
-                       const JettyOptions&, JettyPtr& jetty) override {
-        auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
-        if (!fake_jfc) return Status::InvalidArgument("bad JFC");
-        jetty = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
-        return Status::OK();
-    }
-    Status deleteJetty(JettyPtr& jetty) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty)) {
-            fake->close();
-        }
-        jetty.reset();
-        return Status::OK();
-    }
-    Status bindJetty(const JettyPtr& jetty, const RemoteJettyInfo&) override {
-        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
-        if (!fake || !fake->valid())
-            return Status::InvalidArgument("bad Jetty");
-        fake->bind();
-        return Status::OK();
-    }
-    Status unbindJetty(const JettyPtr& jetty) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty)) {
-            fake->unbind();
-        }
-        return Status::OK();
-    }
-    Status resetJetty(const JettyPtr&) override {
-        if (fail_resets_.load(std::memory_order_acquire)) {
-            return Status::RdmaError("injected Jetty reset failure");
-        }
-        return Status::OK();
-    }
-    Status quiesceJetty(const JettyPtr& jetty, uint32_t timeout_ms,
-                        std::vector<Completion>& completions) override {
-        completions.clear();
-        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
-        if (!fake || !fake->valid() || timeout_ms == 0) {
-            return Status::InvalidArgument("bad Jetty quiesce");
-        }
-        if (fail_next_quiesce_.exchange(false, std::memory_order_acq_rel)) {
-            return Status::RdmaError("injected quiesce failure");
-        }
-        const bool drop_completion = drop_next_quiesced_completion_.exchange(
-            false, std::memory_order_acq_rel);
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        if (!quiesce_drops_completions_.load(std::memory_order_acquire)) {
-            auto it = pending_.begin();
-            while (it != pending_.end()) {
-                if (it->jetty_id != fake->id()) {
-                    ++it;
-                    continue;
-                }
-                if (!drop_completion) {
-                    completions.push_back(
-                        Completion{CompletionCategory::ENDPOINT_ERROR, 0,
-                                   it->request.token, 0, fake->id()});
-                }
-                it = pending_.erase(it);
-            }
-        }
-        quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
-        return Status::OK();
-    }
-    Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
-                size_t& posted_count) override {
-        posted_count = 0;
-        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
-        if (!fake || !fake->valid() || !fake->bound()) {
-            return Status::InvalidArgument("unbound Jetty");
-        }
-        for (const auto& request : requests) {
-            if (!request.local_segment || !request.remote_segment ||
-                request.token == 0 || request.length == 0) {
-                return Status::InvalidArgument("bad WR");
-            }
-            const auto category = next_completion_.exchange(
-                CompletionCategory::SUCCESS, std::memory_order_acq_rel);
-            if (hold_next_completion_.exchange(false,
-                                               std::memory_order_acq_rel)) {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_.push_back(Pending{fake->id(), request});
-                ++posted_count;
-                continue;
-            }
-            if (category == CompletionCategory::SUCCESS) {
-                if (request.operation == Operation::WRITE) {
-                    std::memcpy(
-                        reinterpret_cast<void*>(request.remote_address),
-                        reinterpret_cast<const void*>(request.local_address),
-                        request.length);
-                } else {
-                    std::memcpy(
-                        reinterpret_cast<void*>(request.local_address),
-                        reinterpret_cast<const void*>(request.remote_address),
-                        request.length);
-                }
-            }
-            fake->jfc()->push(
-                Completion{category, 0, request.token,
-                           category == CompletionCategory::SUCCESS
-                               ? static_cast<uint32_t>(request.length)
-                               : 0,
-                           fake->id()});
-            ++posted_count;
-        }
-        return Status::OK();
-    }
-    Status poll(const JfcPtr& jfc, size_t maximum,
-                std::vector<Completion>& completions) override {
-        completions.clear();
-        auto fake = std::dynamic_pointer_cast<FakeJfc>(jfc);
-        if (!fake || !fake->valid()) return Status::InvalidArgument("bad JFC");
-        fake->poll(maximum, completions);
-        return Status::OK();
-    }
-
-    void failNextCompletion(CompletionCategory category) {
-        next_completion_.store(category, std::memory_order_release);
-    }
-    void holdNextCompletion() {
-        hold_next_completion_.store(true, std::memory_order_release);
-    }
-    void dropNextQuiescedCompletion() {
-        drop_next_quiesced_completion_.store(true, std::memory_order_release);
-    }
-    void failNextQuiesce() {
-        fail_next_quiesce_.store(true, std::memory_order_release);
-    }
-    void dropQuiesceCompletions() {
-        quiesce_drops_completions_.store(true, std::memory_order_release);
-    }
-    void failResets() { fail_resets_.store(true, std::memory_order_release); }
-    void allowResets() { fail_resets_.store(false, std::memory_order_release); }
-    void failNextShutdown() {
-        fail_next_shutdown_.store(true, std::memory_order_release);
-    }
-    size_t pendingCount() const {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        return pending_.size();
-    }
-    uint64_t quiesceCalls() const {
-        return quiesce_calls_.load(std::memory_order_relaxed);
-    }
-    uint32_t lastRegisteredAccess() const {
-        return last_registered_access_.load(std::memory_order_acquire);
-    }
-
-   private:
-    struct Pending {
-        uint32_t jetty_id{0};
-        WorkRequest request;
-    };
-
-    DeviceInfo device_;
-    bool initialized_{false};
-    uint32_t next_jetty_id_{1};
-    std::atomic<CompletionCategory> next_completion_{
-        CompletionCategory::SUCCESS};
-    std::atomic<bool> hold_next_completion_{false};
-    std::atomic<bool> drop_next_quiesced_completion_{false};
-    std::atomic<bool> fail_next_quiesce_{false};
-    std::atomic<bool> quiesce_drops_completions_{false};
-    std::atomic<bool> fail_resets_{false};
-    std::atomic<bool> fail_next_shutdown_{false};
-    mutable std::mutex pending_mutex_;
-    std::vector<Pending> pending_;
-    std::atomic<uint64_t> quiesce_calls_{0};
-    std::atomic<uint32_t> last_registered_access_{0};
-};
-
-class NullRegistry final : public SegmentRegistry {
-   public:
-    Status getSegmentDesc(SegmentDescRef&, const std::string&) override {
-        return Status::InvalidEntry("not used");
-    }
-    Status putSegmentDesc(SegmentDescRef&) override { return Status::OK(); }
-    Status deleteSegmentDesc(const std::string&) override {
-        return Status::OK();
-    }
-};
-
-DeviceInfo fakeDevice() {
-    DeviceInfo info;
-    info.topology_name = "ub:fake0:eid0";
-    info.native_device_name = "fake0";
-    info.native_device_path = "/fake/fake0";
-    info.eid_index = 0;
-    info.eid = "0001:0000:0000:0000:0000:0000:0000:0000";
-    info.active = true;
-    info.capabilities.max_jfc = 4;
-    info.capabilities.max_jetty = 64;
-    return info;
-}
-
-std::shared_ptr<Topology> fakeTopology(bool discovery_active = true) {
-    auto topology = std::make_shared<Topology>();
-    Topology::NicEntry nic{.name = "ub:fake0:eid0",
-                           .pci_bus_id = "0000:00:00.0",
-                           .type = Topology::NIC_UB,
-                           .numa_node = 0};
-    auto device = fakeDevice();
-    device.active = discovery_active;
-    encodeTopologyDeviceAttributes(device, 0, nic.device_attrs);
-    topology->nic_list_.push_back(std::move(nic));
-    Topology::MemEntry memory;
-    memory.name = kWildcardLocation;
-    memory.type = Topology::MEM_HOST;
-    memory.numa_node = -1;
-    memory.device_list[0].push_back(0);
-    topology->mem_list_.push_back(std::move(memory));
-    return topology;
-}
-
+using namespace fake;
 TEST(UbNativeDataPathTest, LocalBuffersRequestProviderLocalOnlyAccess) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -739,6 +319,340 @@ TEST(UbNativeDataPathTest,
     EXPECT_TRUE(buffers.clear().ok());
     EXPECT_TRUE(context->shutdown().ok());
     EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// ---------------------------------------------------------------------------
+// W2 completion-gate integration cases (design §11.2 I-1..I-3, D-7).
+
+namespace {
+
+// Minimal harness for the gate cases: one local context, one registered
+// source/target pair, one resolvable endpoint and a started worker pool. The
+// existing cases stay untouched so their baseline behaviour keeps being
+// asserted verbatim.
+struct GateEnv {
+    std::shared_ptr<FakeUrmaAdapter> adapter;
+    std::shared_ptr<UbContext> context;
+    std::vector<UbContextPtr> contexts;
+    std::shared_ptr<Topology> topology;
+    std::unique_ptr<UbBufferManager> buffers;
+    std::unique_ptr<SegmentManager> manager;
+    std::unique_ptr<EndpointStore> endpoints;
+    std::unique_ptr<RailMonitor> rails;
+    std::unique_ptr<QuotaManager> quota;
+    std::unique_ptr<UbWorkers> workers;
+    std::shared_ptr<UbEndpoint> endpoint;
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    UbParams params;
+
+    GateEnv() = default;
+    GateEnv(const GateEnv&) = delete;
+    GateEnv& operator=(const GateEnv&) = delete;
+
+    bool initialize(uint32_t slice_timeout_ms = 20) {
+        adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+        if (!adapter->initialize().ok()) return false;
+        context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+        if (!context->initialize(1, JfcOptions{}).ok()) return false;
+        contexts = {context};
+        topology = fakeTopology();
+        buffers = std::make_unique<UbBufferManager>(adapter, contexts);
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<char>(i + 1);
+        }
+        BufferDesc source_desc{};
+        source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+        source_desc.length = source.size();
+        source_desc.location = kWildcardLocation;
+        BufferDesc target_desc{};
+        target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+        target_desc.length = target.size();
+        target_desc.location = kWildcardLocation;
+        MemoryOptions options;
+        options.perm = kGlobalReadWrite;
+        if (!buffers->addBuffer(source_desc, options).ok()) return false;
+        if (!buffers->addBuffer(target_desc, options).ok()) return false;
+
+        manager =
+            std::make_unique<SegmentManager>(std::make_unique<NullRegistry>());
+        if (!manager
+                 ->updateLocal([&](SegmentDesc& segment) {
+                     segment.name = "local";
+                     segment.type = SegmentType::Memory;
+                     segment.detail = MemorySegmentDesc{};
+                     auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                     memory.topology = *topology;
+                     memory.buffers = {source_desc, target_desc};
+                     return Status::OK();
+                 })
+                 .ok()) {
+            return false;
+        }
+        endpoints = std::make_unique<EndpointStore>(adapter, 16, 1);
+        rails = std::make_unique<RailMonitor>();
+        quota = std::make_unique<QuotaManager>();
+        params.worker_count = 1;
+        params.poller_count = 1;
+        params.slice_size = 16;
+        params.max_retries = 1;
+        params.slice_timeout_ms = slice_timeout_ms;
+        EndpointResolver resolver = [&](const EndpointResolveRequest& request,
+                                        std::shared_ptr<UbEndpoint>& resolved) {
+            UbEndpointKey key{
+                request.local_context->topologyId(), request.remote_segment_id,
+                request.remote_topology_id, "local@ub:fake0:eid0"};
+            auto status =
+                endpoints->getOrCreate(key, request.local_context, resolved);
+            if (!status.ok()) return status;
+            if (!endpoint) endpoint = resolved;
+            if (resolved->ready()) return status;
+            UbBootstrapDesc peer;
+            peer.local_eid = fakeDevice().eid;
+            peer.endpoint_generation = 100;
+            peer.jetty_ids = {777};
+            return resolved->bind(peer);
+        };
+        workers = std::make_unique<UbWorkers>(
+            adapter, contexts, topology, manager.get(), buffers.get(),
+            rails.get(), quota.get(), params, std::move(resolver),
+            [&](const std::shared_ptr<UbEndpoint>& retired) {
+                (void)endpoints->retire(retired);
+            });
+        return workers->start().ok();
+    }
+
+    ~GateEnv() {
+        if (workers) {
+            EXPECT_TRUE(workers->stop().ok());
+        }
+        workers.reset();
+        if (endpoints) {
+            EXPECT_TRUE(endpoints->clear().ok());
+        }
+        endpoints.reset();
+        if (buffers) {
+            EXPECT_TRUE(buffers->clear().ok());
+        }
+        buffers.reset();
+        manager.reset();
+        if (context) {
+            EXPECT_TRUE(context->shutdown().ok());
+        }
+        context.reset();
+        if (adapter) {
+            EXPECT_TRUE(adapter->shutdown().ok());
+        }
+    }
+
+    // Submits one write of `length` bytes with exactly one slice (so one record
+    // and one native post), keeping the task alive for the caller.
+    UbTask::Ptr submitWrite(size_t length = 16, const char* sink = nullptr) {
+        const char* destination = sink ? sink : target.data();
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(destination);
+        request.length = length;
+        auto task = UbTask::create(request);
+        if (!task->addSlice(UbSliceSpec{source.data(),
+                                        reinterpret_cast<uint64_t>(destination),
+                                        length, 0, 1})) {
+            return nullptr;
+        }
+        if (!task->seal()) return nullptr;
+        if (!workers->submit(task).ok()) return nullptr;
+        return task;
+    }
+
+    static bool waitFor(
+        const std::function<bool()>& predicate,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        return predicate();
+    }
+
+    [[nodiscard]] JfcPtr businessJfc() const {
+        return context->jfc(0)->handle();
+    }
+};
+
+}  // namespace
+
+// I-1: a completion that beats the blocking post call must not release the
+// endpoint or the quota while the post call stack is still alive, and the
+// settlement must happen exactly once afterwards.
+TEST(UbNativeDataPathTest, EarlyCompletionWaitsForPostReturn) {
+    GateEnv env;
+    ASSERT_TRUE(env.initialize(/*slice_timeout_ms=*/20));
+
+    std::atomic<uint64_t> outstanding_inside_gate{0};
+    std::atomic<uint64_t> reservations_inside_gate{0};
+    std::atomic<uint64_t> records_inside_gate{0};
+    std::atomic<uint64_t> returned_inside_gate{0};
+    std::atomic<uint64_t> gate_runs{0};
+    std::atomic<bool> early_cqe_inside_gate{false};
+
+    env.adapter->setPostGate([&](uint64_t) {
+        // Wait until the poller settled the completion while this call stack
+        // still holds its handler reference.
+        early_cqe_inside_gate.store(
+            GateEnv::waitFor(
+                [&] { return env.workers->completionStats().early_cqe > 0; }),
+            std::memory_order_release);
+        outstanding_inside_gate.store(env.endpoint->outstandingWrs(),
+                                      std::memory_order_relaxed);
+        reservations_inside_gate.store(env.quota->activeReservationCount(),
+                                       std::memory_order_relaxed);
+        records_inside_gate.store(env.workers->inflightCount(),
+                                  std::memory_order_relaxed);
+        returned_inside_gate.store(
+            env.workers->completionStats().record_returned,
+            std::memory_order_relaxed);
+        gate_runs.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    auto task = env.submitWrite();
+    ASSERT_NE(task, nullptr);
+    ASSERT_TRUE(
+        GateEnv::waitFor([&] { return task->transferStatus().s != PENDING; }));
+
+    EXPECT_TRUE(early_cqe_inside_gate.load(std::memory_order_acquire));
+    EXPECT_GE(gate_runs.load(std::memory_order_relaxed), 1U);
+    // Nothing was released while the post had not returned (the whole point of
+    // W2): the WR still owns its endpoint slot, its quota and its record.
+    EXPECT_EQ(outstanding_inside_gate.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(reservations_inside_gate.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(records_inside_gate.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(returned_inside_gate.load(std::memory_order_relaxed), 0U);
+
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(task->transferStatus().transferred_bytes, 16U);
+    EXPECT_EQ(env.source[0], env.target[0]);
+
+    const auto stats = env.workers->completionStats();
+    EXPECT_GE(stats.early_cqe, 1U);
+    EXPECT_EQ(stats.record_published, 1U);
+    EXPECT_EQ(stats.record_settled, 1U);
+    EXPECT_EQ(stats.record_returned, 1U);
+    EXPECT_EQ(stats.record_finalized, 0U);
+    EXPECT_EQ(stats.record_rejected, 0U);
+    EXPECT_EQ(stats.duplicate_cr, 0U);
+    EXPECT_EQ(stats.unknown_token, 0U);
+    EXPECT_EQ(stats.one_shot_violations, 0U);
+    EXPECT_EQ(stats.handler_ref_leak_on_finalize, 0U);
+
+    EXPECT_EQ(env.workers->inflightCount(), 0U);
+    EXPECT_EQ(env.quota->activeReservationCount(), 0U);
+    ASSERT_NE(env.endpoint, nullptr);
+    EXPECT_EQ(env.endpoint->outstandingWrs(), 0U);
+    env.adapter->clearPostGate();
+}
+
+// I-2: an unknown token is accounted, reported through the interface-8 seam and
+// neither crashes the poller nor disturbs any other responsibility.
+TEST(UbNativeDataPathTest, UnknownCompletionTokenIsCountedAndIsolated) {
+    GateEnv env;
+    ASSERT_TRUE(env.initialize());
+
+    const uint64_t unknown_token = (7ULL << 32) | 0x5A5A;
+    env.adapter->injectCompletion(env.businessJfc(), unknown_token);
+    ASSERT_TRUE(GateEnv::waitFor(
+        [&] { return env.workers->completionStats().unknown_token >= 1; }));
+    EXPECT_EQ(env.workers->completionStats().duplicate_cr, 0U);
+    EXPECT_GE(env.workers->entityEvents().unknownTokenCount(), 1U);
+    EXPECT_EQ(env.adapter->injectedCompletionCount(), 1U);
+
+    // The poller keeps working and an unrelated transfer still completes.
+    auto task = env.submitWrite();
+    ASSERT_NE(task, nullptr);
+    ASSERT_TRUE(
+        GateEnv::waitFor([&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    EXPECT_EQ(env.workers->completionStats().record_returned, 1U);
+    EXPECT_EQ(env.workers->inflightCount(), 0U);
+}
+
+// I-3: a duplicate completion for a still-registered record is counted, never
+// applied twice, and the record is returned exactly once. The second completion
+// is injected from the post gate so it is guaranteed to arrive while the record
+// is still registered (an unknown token would prove the record was already
+// disposed instead).
+TEST(UbNativeDataPathTest, DuplicateCompletionIsCountedNotReapplied) {
+    GateEnv env;
+    ASSERT_TRUE(env.initialize());
+
+    std::atomic<bool> duplicate_seen{false};
+    env.adapter->setPostGate([&](uint64_t token) {
+        env.adapter->injectCompletion(env.businessJfc(), token);
+        duplicate_seen.store(
+            GateEnv::waitFor([&] {
+                return env.workers->completionStats().duplicate_cr > 0;
+            }),
+            std::memory_order_release);
+    });
+
+    auto task = env.submitWrite();
+    ASSERT_NE(task, nullptr);
+    ASSERT_TRUE(
+        GateEnv::waitFor([&] { return task->transferStatus().s != PENDING; }));
+
+    EXPECT_TRUE(duplicate_seen.load(std::memory_order_acquire));
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    const auto stats = env.workers->completionStats();
+    EXPECT_EQ(stats.duplicate_cr, 1U);
+    EXPECT_EQ(stats.record_settled, 1U);
+    EXPECT_EQ(stats.record_returned, 1U);
+    EXPECT_EQ(stats.record_finalized, 0U);
+    EXPECT_EQ(stats.unknown_token, 0U);
+    EXPECT_EQ(env.workers->inflightCount(), 0U);
+    ASSERT_NE(env.endpoint, nullptr);
+    EXPECT_EQ(env.endpoint->outstandingWrs(), 0U);
+    EXPECT_EQ(env.quota->activeReservationCount(), 0U);
+    env.adapter->clearPostGate();
+}
+
+// D-7: a deadline that expires while the native post has not returned must not
+// be fenced. The scan defers, nothing is quiesced, and the record completes
+// normally once the post returns.
+TEST(UbNativeDataPathTest, DeadlineScanDefersWhilePostHasNotReturned) {
+    GateEnv env;
+    ASSERT_TRUE(env.initialize(/*slice_timeout_ms=*/1));
+
+    std::atomic<uint64_t> quiesce_inside_gate{0};
+    std::atomic<bool> deferred{false};
+    env.adapter->setPostGate([&](uint64_t) {
+        deferred.store(GateEnv::waitFor([&] {
+                           return env.workers->completionStats()
+                                      .timeout_deferred_by_post_return > 0;
+                       }),
+                       std::memory_order_release);
+        quiesce_inside_gate.store(env.adapter->quiesceCalls(),
+                                  std::memory_order_relaxed);
+    });
+
+    auto task = env.submitWrite();
+    ASSERT_NE(task, nullptr);
+    ASSERT_TRUE(
+        GateEnv::waitFor([&] { return task->transferStatus().s != PENDING; }));
+
+    EXPECT_TRUE(deferred.load(std::memory_order_acquire));
+    // The post had not returned, so the scan must not have fenced or settled.
+    EXPECT_EQ(quiesce_inside_gate.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    const auto stats = env.workers->completionStats();
+    EXPECT_GE(stats.timeout_deferred_by_post_return, 1U);
+    EXPECT_EQ(stats.record_returned, 1U);
+    EXPECT_EQ(stats.record_finalized, 0U);
+    EXPECT_EQ(env.adapter->quiesceCalls(), 0U);
+    EXPECT_EQ(env.rails->stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1}).timeouts,
+              0U);
+    env.adapter->clearPostGate();
 }
 
 TEST(UbNativeDataPathTest, EndpointStoreNeverReusesRetiredGeneration) {

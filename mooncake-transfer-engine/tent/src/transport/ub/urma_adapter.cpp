@@ -21,10 +21,12 @@
 #include <climits>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -402,6 +404,7 @@ class RealJfc final : public Jfc {
     ~RealJfc() override { (void)close(); }
 
     Status initialize(const JfcOptions& options) {
+        send_only_ = options.send_only;
         if (options.enable_completion_events) {
             jfce_ = urma_create_jfce(context_->native());
             if (jfce_ == nullptr) return nativePointerError("urma_create_jfce");
@@ -413,31 +416,54 @@ class RealJfc final : public Jfc {
         send_jfc_ = urma_create_jfc(context_->native(), &send_cfg);
         if (send_jfc_ == nullptr)
             return nativePointerError("urma_create_jfc(send)");
+        if (send_only_) return Status::OK();
 
-        urma_jfc_cfg_t receive_cfg{};
-        receive_cfg.depth = options.receiver_depth;
-        receive_jfc_ = urma_create_jfc(context_->native(), &receive_cfg);
-        if (receive_jfc_ == nullptr) {
-            return nativePointerError("urma_create_jfc(receive)");
+        if (options.transport_mode == JettyTransportMode::kRm) {
+            // UMDK's RM health probe uses one JFC for both the JFS and the JFR.
+            shared_jfc_ = true;
+            receive_jfc_ = send_jfc_;
+        } else {
+            urma_jfc_cfg_t receive_cfg{};
+            receive_cfg.depth = options.receiver_depth;
+            receive_jfc_ = urma_create_jfc(context_->native(), &receive_cfg);
+            if (receive_jfc_ == nullptr) {
+                return nativePointerError("urma_create_jfc(receive)");
+            }
         }
 
         urma_jfr_cfg_t receiver_cfg{};
         receiver_cfg.depth = options.receiver_depth;
         receiver_cfg.flag.bs.tag_matching = 0;
-        receiver_cfg.trans_mode = URMA_TM_RC;
+        receiver_cfg.trans_mode =
+            options.transport_mode == JettyTransportMode::kRm ? URMA_TM_RM
+                                                              : URMA_TM_RC;
         receiver_cfg.max_sge = 1;
-        receiver_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+        // UMDK's own RM health probe leaves min_rnr_timer at 0 and uses a
+        // depth-1 JFR; mirror it for the probe JFC.
+        receiver_cfg.min_rnr_timer =
+            options.transport_mode == JettyTransportMode::kRm
+                ? 0
+                : URMA_TYPICAL_MIN_RNR_TIMER;
         receiver_cfg.jfc = receive_jfc_;
         receiver_cfg.token_value.token = options.token;
         receiver_jfr_ = urma_create_jfr(context_->native(), &receiver_cfg);
         if (receiver_jfr_ == nullptr)
             return nativePointerError("urma_create_jfr");
+        if (options.transport_mode == JettyTransportMode::kRm) {
+            LOG(INFO) << "probe RM JFC created: jfr_depth="
+                      << receiver_jfr_->jfr_cfg.depth << " jfr_trans_mode="
+                      << static_cast<int>(receiver_jfr_->jfr_cfg.trans_mode)
+                      << " jfr_min_rnr_timer="
+                      << static_cast<int>(receiver_jfr_->jfr_cfg.min_rnr_timer)
+                      << " jfr_token=" << options.token;
+        }
         return Status::OK();
     }
 
     bool valid() const noexcept override {
-        return send_jfc_ != nullptr && receive_jfc_ != nullptr &&
-               receiver_jfr_ != nullptr;
+        if (send_jfc_ == nullptr) return false;
+        return send_only_ ||
+               (receive_jfc_ != nullptr && receiver_jfr_ != nullptr);
     }
 
     int eventFd() const noexcept override {
@@ -523,11 +549,13 @@ class RealJfc final : public Jfc {
             if (rc != URMA_SUCCESS) return nativeError("urma_delete_jfr", rc);
             receiver_jfr_ = nullptr;
         }
-        if (receive_jfc_ != nullptr) {
+        if (receive_jfc_ != nullptr && !shared_jfc_) {
             const int rc = urma_delete_jfc(receive_jfc_);
             if (rc != URMA_SUCCESS) {
                 return nativeError("urma_delete_jfc(receive)", rc);
             }
+            receive_jfc_ = nullptr;
+        } else if (shared_jfc_) {
             receive_jfc_ = nullptr;
         }
         if (send_jfc_ != nullptr) {
@@ -548,6 +576,8 @@ class RealJfc final : public Jfc {
    private:
     std::shared_ptr<RealContext> context_;
     urma_jfce_t* jfce_ = nullptr;
+    bool send_only_{false};
+    bool shared_jfc_{false};
     urma_jfc_t* send_jfc_ = nullptr;
     urma_jfc_t* receive_jfc_ = nullptr;
     urma_jfr_t* receiver_jfr_ = nullptr;
@@ -669,9 +699,12 @@ class RealJetty final : public Jetty {
 
     Status initialize(const JettyOptions& options) {
         urma_jetty_cfg_t config{};
+        reliable_message_ = options.transport_mode == JettyTransportMode::kRm;
+        // UMDK requires JFS.trans_mode == shared JFR.trans_mode; the probe JFC
+        // is created with an RM JFR so RM Jetties share it like RC ones do.
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
-        config.jfs_cfg.trans_mode = URMA_TM_RC;
+        config.jfs_cfg.trans_mode = reliable_message_ ? URMA_TM_RM : URMA_TM_RC;
         config.jfs_cfg.priority = context_->isBondingDevice()
                                       ? context_->ctpPriority()
                                       : options.priority;
@@ -679,15 +712,41 @@ class RealJetty final : public Jetty {
             config.jfs_cfg.flag.bs.multi_path = 1;
         }
         config.jfs_cfg.max_sge = options.max_sge;
-        config.jfs_cfg.max_rsge = options.max_sge;
-        config.jfs_cfg.rnr_retry = options.rnr_retry;
-        config.jfs_cfg.err_timeout = options.error_timeout;
+        if (reliable_message_) {
+            // Mirror UMDK's own RM health-probe Jetty: leave max_rsge at the
+            // device default and disable the RC-style error timeout. Some RM
+            // devices reject the RC values with URMA_EINVAL.
+            config.jfs_cfg.max_rsge = 0;
+            config.jfs_cfg.rnr_retry = options.rnr_retry;
+            config.jfs_cfg.err_timeout = 0;
+        } else {
+            config.jfs_cfg.max_rsge = options.max_sge;
+            config.jfs_cfg.rnr_retry = options.rnr_retry;
+            config.jfs_cfg.err_timeout = options.error_timeout;
+        }
         config.jfs_cfg.jfc = jfc_->nativeSendJfc();
         config.shared.jfr = jfc_->nativeReceiver();
         config.shared.jfc = nullptr;
 
         native_ = urma_create_jetty(context_->native(), &config);
-        if (native_ == nullptr) return nativePointerError("urma_create_jetty");
+        if (native_ == nullptr) {
+            auto* jfr = jfc_->nativeReceiver();
+            LOG(WARNING)
+                << "urma_create_jetty failed: trans_mode="
+                << (reliable_message_ ? "RM" : "RC")
+                << " share_jfr=" << config.flag.bs.share_jfr
+                << " jfr=" << config.shared.jfr << " jfr_trans_mode="
+                << (jfr ? static_cast<int>(jfr->jfr_cfg.trans_mode) : -1)
+                << " depth=" << config.jfs_cfg.depth
+                << " max_sge=" << config.jfs_cfg.max_sge
+                << " max_rsge=" << static_cast<int>(config.jfs_cfg.max_rsge)
+                << " rnr_retry=" << static_cast<int>(config.jfs_cfg.rnr_retry)
+                << " err_timeout="
+                << static_cast<int>(config.jfs_cfg.err_timeout)
+                << " device_transport_modes="
+                << context_->deviceInfo().capabilities.transport_modes;
+            return nativePointerError("urma_create_jetty");
+        }
         depth_ = options.depth;
         return Status::OK();
     }
@@ -707,7 +766,13 @@ class RealJetty final : public Jetty {
     std::mutex& mutex() noexcept { return mutex_; }
     urma_jetty_t* native() const noexcept { return native_; }
     urma_target_jetty_t* remote() const noexcept { return remote_; }
-    bool postable() const noexcept { return state_ == State::BOUND; }
+    bool postable() const noexcept {
+        // RC Jetties must be bound; RM Jetties are usable immediately after
+        // creation and carry their target per WR.
+        return reliable_message_ ? state_ == State::CREATED
+                                 : state_ == State::BOUND;
+    }
+    bool reliableMessage() const noexcept { return reliable_message_; }
     uint32_t depth() const noexcept { return depth_; }
 
     Status beginError() {
@@ -747,6 +812,10 @@ class RealJetty final : public Jetty {
                 const urma_eid_t& remote_eid) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (native_ == nullptr) return invalidHandle("Jetty");
+        if (reliable_message_) {
+            return Status::InvalidArgument(
+                "RM Jetty imports a target per WR and cannot be bound");
+        }
         if (state_ == State::RESET) {
             return Status::InvalidArgument("cannot bind a reset Jetty");
         }
@@ -811,6 +880,53 @@ class RealJetty final : public Jetty {
         return Status::OK();
     }
 
+    // Imports (or reuses) the RM target for one WR. The caller must hold
+    // mutex_. Targets stay cached until unbind/close/cleanup.
+    Status importTargetLocked(const RemoteJettyInfo& remote,
+                              urma_target_jetty_t*& target) {
+        if (remote.id == 0) {
+            return Status::InvalidArgument("remote Jetty ID must be non-zero");
+        }
+        urma_eid_t remote_eid{};
+        if (!parseEid(remote.eid, remote_eid) || isAllZero(remote_eid)) {
+            return Status::InvalidArgument("invalid or null remote EID");
+        }
+        TargetKey key{};
+        std::memcpy(key.eid.data(), remote_eid.raw, URMA_EID_SIZE);
+        key.id = remote.id;
+        key.uasid = remote.uasid;
+        key.token = remote.token;
+        auto found = targets_.find(key);
+        if (found != targets_.end()) {
+            target = found->second;
+            return Status::OK();
+        }
+
+        urma_rjetty_t descriptor{};
+        descriptor.jetty_id.eid = remote_eid;
+        descriptor.jetty_id.uasid = remote.uasid;
+        descriptor.jetty_id.id = remote.id;
+        descriptor.trans_mode = URMA_TM_RM;
+        descriptor.type = URMA_JETTY;
+        descriptor.tp_type = URMA_CTP;
+        urma_token_t token{.token = remote.token};
+        urma_target_jetty_t* imported =
+            urma_import_jetty(context_->native(), &descriptor, &token);
+        if (imported == nullptr) {
+            return nativePointerError("urma_import_jetty");
+        }
+        targets_.emplace(key, imported);
+        target = imported;
+        return Status::OK();
+    }
+
+    void releaseTargetsLocked() noexcept {
+        for (auto& [key, target] : targets_) {
+            (void)urma_unimport_jetty(target);
+        }
+        targets_.clear();
+    }
+
     Status reset() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (native_ == nullptr) return invalidHandle("Jetty");
@@ -832,6 +948,10 @@ class RealJetty final : public Jetty {
     Status unbind() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (native_ == nullptr) return invalidHandle("Jetty");
+        if (reliable_message_) {
+            releaseTargetsLocked();
+            return Status::OK();
+        }
         if (remote_ == nullptr) return Status::OK();
 
         if (needs_native_unbind_) {
@@ -861,6 +981,7 @@ class RealJetty final : public Jetty {
             return Status::InvalidArgument(
                 "Jetty must be reset and unbound before deletion");
         }
+        if (reliable_message_) releaseTargetsLocked();
         const int rc = urma_delete_jetty(native_);
         if (rc != URMA_SUCCESS) return nativeError("urma_delete_jetty", rc);
         native_ = nullptr;
@@ -898,6 +1019,7 @@ class RealJetty final : public Jetty {
             (void)urma_unimport_jetty(remote_);
             remote_ = nullptr;
         }
+        releaseTargetsLocked();
         state_ = State::RESET;
     }
 
@@ -908,10 +1030,24 @@ class RealJetty final : public Jetty {
     urma_eid_t remote_eid_{};
     uint32_t remote_id_ = 0;
     uint32_t remote_uasid_ = 0;
+    struct TargetKey {
+        std::array<uint8_t, URMA_EID_SIZE> eid{};
+        uint32_t id{0};
+        uint32_t uasid{0};
+        uint32_t token{0};
+
+        bool operator<(const TargetKey& other) const {
+            return std::tie(eid, id, uasid, token) <
+                   std::tie(other.eid, other.id, other.uasid, other.token);
+        }
+    };
+
     // True only while remote_ is natively bound. A non-null remote_ with this
     // flag clear is an imported-only cleanup phase retained after rollback or
     // after a successful unbind followed by a failed unimport.
     bool needs_native_unbind_{false};
+    bool reliable_message_{false};
+    std::map<TargetKey, urma_target_jetty_t*> targets_;
     uint32_t depth_ = 0;
     State state_ = State::CREATED;
     bool flush_fenced_{false};
@@ -1548,6 +1684,10 @@ class RealUrmaAdapter final : public UrmaAdapter {
         CHECK_STATUS(getRuntime(runtime));
         auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
         if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        if (real_jetty->reliableMessage()) {
+            return Status::InvalidArgument(
+                "RM Jetty requires a per-WR remote target");
+        }
         if (requests.empty()) return Status::OK();
 
         struct NativeWorkRequest {
@@ -1645,6 +1785,91 @@ class RealUrmaAdapter final : public UrmaAdapter {
         for (size_t i = posted_count; i < requests.size(); ++i) {
             real_jetty->jfc()->releaseSegment(requests[i].token);
         }
+        return nativeError("urma_post_jetty_send_wr", rc);
+    }
+
+    Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                const WorkRequest& request, size_t& posted_count) override {
+        posted_count = 0;
+        std::shared_ptr<RuntimeLease> runtime;
+        CHECK_STATUS(getRuntime(runtime));
+        auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
+        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        if (!real_jetty->reliableMessage()) {
+            return Status::InvalidArgument(
+                "per-WR remote target requires an RM Jetty");
+        }
+        if (request.token == 0) {
+            return Status::InvalidArgument(
+                "work request token zero is reserved");
+        }
+        if (request.length == 0 ||
+            request.length > std::numeric_limits<uint32_t>::max()) {
+            return Status::InvalidArgument("invalid work request length");
+        }
+        auto local =
+            std::dynamic_pointer_cast<RealLocalSegment>(request.local_segment);
+        auto remote = std::dynamic_pointer_cast<RealRemoteSegment>(
+            request.remote_segment);
+        if (!local || !local->valid()) return invalidHandle("LocalSegment");
+        if (!remote || !remote->valid()) return invalidHandle("RemoteSegment");
+        if (local->context().get() != real_jetty->context().get() ||
+            remote->context().get() != real_jetty->context().get()) {
+            return Status::InvalidArgument(
+                "work request segments belong to another Context");
+        }
+        if (!checkedRangeContains(local->address(), local->length(),
+                                  request.local_address, request.length) ||
+            !checkedRangeContains(remote->address(), remote->length(),
+                                  request.remote_address, request.length)) {
+            return Status::InvalidArgument(
+                "work request lies outside a registered segment");
+        }
+
+        std::lock_guard<std::mutex> jetty_lock(real_jetty->mutex());
+        if (!real_jetty->postable()) {
+            return Status::InvalidArgument("Jetty is not postable");
+        }
+        urma_target_jetty_t* native_target = nullptr;
+        CHECK_STATUS(real_jetty->importTargetLocked(target, native_target));
+
+        urma_sge_t local_sge{};
+        local_sge.addr = request.local_address;
+        local_sge.len = static_cast<uint32_t>(request.length);
+        local_sge.tseg = local->native();
+        urma_sge_t remote_sge{};
+        remote_sge.addr = request.remote_address;
+        remote_sge.len = static_cast<uint32_t>(request.length);
+        remote_sge.tseg = remote->native();
+
+        urma_jfs_wr_t wr{};
+        wr.opcode = request.operation == Operation::READ ? URMA_OPC_READ
+                                                         : URMA_OPC_WRITE;
+        wr.flag.bs.complete_enable = 1;
+        wr.tjetty = native_target;
+        wr.user_ctx = request.token;
+        if (request.operation == Operation::READ) {
+            wr.rw.src.sge = &remote_sge;
+            wr.rw.dst.sge = &local_sge;
+        } else {
+            wr.rw.src.sge = &local_sge;
+            wr.rw.dst.sge = &remote_sge;
+        }
+        wr.rw.src.num_sge = 1;
+        wr.rw.dst.num_sge = 1;
+        wr.next = nullptr;
+
+        std::vector<WorkRequest> retained{request};
+        CHECK_STATUS(
+            real_jetty->jfc()->retainSegments(real_jetty->id(), retained));
+        urma_jfs_wr_t* bad_wr = nullptr;
+        const int rc =
+            urma_post_jetty_send_wr(real_jetty->native(), &wr, &bad_wr);
+        if (rc == URMA_SUCCESS) {
+            posted_count = 1;
+            return Status::OK();
+        }
+        real_jetty->jfc()->releaseSegment(request.token);
         return nativeError("urma_post_jetty_send_wr", rc);
     }
 

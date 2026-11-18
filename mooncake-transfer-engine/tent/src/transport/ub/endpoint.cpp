@@ -287,6 +287,26 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
             return failLocked(Status::InvalidArgument(
                 "Peer UB bootstrap contains a zero Jetty ID" LOC_MARK));
         }
+        if (rmMode()) {
+            // RM Legacy: a local Jetty is never bound to a remote one; the WR
+            // carries its target per post (see rmTarget()). The peer
+            // descriptor is still validated above and kept as the target
+            // identity, so the pooled path can post through a leased member.
+            //
+            // Review M9: an RM WR can only target a peer whose receive side is
+            // RM as well. Peers advertise it as an extra capability string; a
+            // peer that does not is rejected fail-closed instead of producing a
+            // silently unusable target.
+            const auto rm_capability =
+                std::find(peer.capabilities.begin(), peer.capabilities.end(),
+                          kUbCapabilityRmTransport);
+            if (rm_capability == peer.capabilities.end()) {
+                return failLocked(Status::InvalidArgument(
+                    "Peer UB bootstrap does not advertise RM transport; an "
+                    "RM endpoint cannot target it" LOC_MARK));
+            }
+            continue;
+        }
         RemoteJettyInfo remote;
         remote.eid = peer.local_eid;
         remote.id = peer.jetty_ids[index];
@@ -302,6 +322,22 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
     lifecycle_status_ = Status::OK();
     state_.store(State::kReady, std::memory_order_release);
     return Status::OK();
+}
+
+RemoteJettyInfo UbEndpoint::rmTarget(size_t jetty_index) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    RemoteJettyInfo target;
+    if (!rmMode() || jetties_.empty() || peer_.local_eid.empty() ||
+        peer_.jetty_ids.empty()) {
+        return target;
+    }
+    const size_t index = jetty_index % peer_.jetty_ids.size();
+    target.eid = peer_.local_eid;
+    target.id = peer_.jetty_ids[index];
+    if (peer_.jetty_uasids.size() == peer_.jetty_ids.size()) {
+        target.uasid = peer_.jetty_uasids[index];
+    }
+    return target;
 }
 
 Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
@@ -340,7 +376,13 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     }
     output.endpoint_generation = generation_;
     output.segment_generation = segment_generation;
+    // Review M9/B3: the capability list is assigned exactly once, and the
+    // transport mode is part of it. A separate push_back() before this
+    // assignment was overwritten, so peers never saw the mode and an RM
+    // endpoint rejected every peer while the peer rejected it back.
     output.capabilities = {"read", "write", "endpoint_generation"};
+    output.capabilities.push_back(rmMode() ? kUbCapabilityRmTransport
+                                           : kUbCapabilityRcTransport);
     return Status::OK();
 }
 

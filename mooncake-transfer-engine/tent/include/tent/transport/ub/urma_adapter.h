@@ -22,10 +22,21 @@
 #include <vector>
 
 #include "tent/common/status.h"
+// W3 D-12: PostAcceptance is defined once, in the shared completion kernel, so
+// the gate and the adapter agree on the enum identity (interface 5). This is a
+// leaf header: completion_record.h includes no adapter header, so there is no
+// include cycle.
+#include "tent/transport/ub/completion_record.h"
 
 namespace mooncake {
 namespace tent {
 namespace ub {
+
+// Adapter-neutral transport-mode bits, mirroring the public UMDK ABI. They
+// participate in the pooled PoolKey so two attempts with different native
+// modes can never share a member (design §5.2).
+inline constexpr uint16_t kUrmaTransportModeRm = 0x1;
+inline constexpr uint16_t kUrmaTransportModeRc = 0x1 << 1;
 
 // Adapter-neutral subset of the capabilities needed by the TENT UB data
 // plane. Values of zero mean that the provider did not report a limit.
@@ -140,11 +151,25 @@ struct SegmentOptions {
     bool cacheable = false;
 };
 
+// RC Jetties are bound once and post through their binding. RM Jetties stay
+// unbound and carry a remote target on every WR (see the per-WR post overload
+// below). Business traffic keeps the RC default; probe traffic uses RM.
+enum class JettyTransportMode : uint8_t {
+    kRc,
+    kRm,
+};
+
 struct JfcOptions {
     uint32_t depth = 4096;
     uint32_t receiver_depth = 2048;
     uint32_t token = 0xACFE;
     bool enable_completion_events = false;
+    // UMDK requires the JFS and its shared JFR to use the same transport mode.
+    // Probe JFCs therefore create an RM JFR even though they only send.
+    JettyTransportMode transport_mode{JettyTransportMode::kRc};
+    // Experimental send-only mode; not used by the probe path because UMDK
+    // currently validates JFS/JFR mode through the shared JFR.
+    bool send_only = false;
 };
 
 struct JettyOptions {
@@ -153,6 +178,7 @@ struct JettyOptions {
     uint8_t max_sge = 1;
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
+    JettyTransportMode transport_mode{JettyTransportMode::kRc};
 };
 
 struct RemoteJettyInfo {
@@ -166,6 +192,36 @@ enum class Operation : uint8_t {
     READ,
     WRITE,
 };
+
+// W3 tristate acceptance for one post attempt (D-12, upstream §6). The single
+// normalization point: the posting side may roll back only on a *definite*
+// zero acceptance, and must keep every owner alive otherwise.
+//
+//   posted_count == request_count  -> Accepted
+//       The WR crossed the native boundary. A status that turns non-OK
+//       afterwards does not undo the acceptance (§9.1), so it still waits for
+//       a CQE or a fence.
+//   !status.ok() && posted_count == 0 -> NotAccepted
+//       Definite zero acceptance: the only case the post side may roll back
+//       (and the only rollback that may hand the member straight back).
+//   everything else -> Unknown
+//       Contradictory provider result (success with a short count, partial
+//       acceptance, more accepted WRs than submitted). Never replay, never
+//       roll back: drain until a CQE or the timeout fence settles it.
+[[nodiscard]] inline PostAcceptance classifyPostAcceptance(
+    const Status& post_status, size_t posted_count,
+    size_t request_count) noexcept {
+    if (posted_count == request_count) {
+        // Includes the empty batch: nothing was requested and nothing was
+        // posted, so there is nothing to wait for. (`!ok` with an empty batch
+        // also lands here; the caller owns no WR either way.)
+        return PostAcceptance::kAccepted;
+    }
+    if (!post_status.ok() && posted_count == 0) {
+        return PostAcceptance::kNotAccepted;
+    }
+    return PostAcceptance::kUnknown;
+}
 
 struct WorkRequest {
     Operation operation = Operation::READ;
@@ -268,6 +324,57 @@ class UrmaAdapter {
     virtual Status post(const JettyPtr& jetty,
                         const std::vector<WorkRequest>& requests,
                         size_t& posted_count) = 0;
+
+    // RM post: the Jetty must have been created with
+    // JettyOptions::transport_mode == kRm; the target is imported and cached by
+    // the adapter and installed as wr.tjetty for this WR only. The default
+    // implementation rejects the call for adapters without RM support.
+    virtual Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                        const WorkRequest& request, size_t& posted_count) {
+        (void)jetty;
+        (void)target;
+        (void)request;
+        posted_count = 0;
+        return Status::NotImplemented(
+            "per-WR remote target is not supported by this adapter");
+    }
+
+    // ---- W3 tristate post (D-12, upstream §6) -----------------------------
+    // The single acceptance normalization point. `acceptance` is written by
+    // every adapter through classifyPostAcceptance(), so the posting side never
+    // infers "did the WR cross the native boundary" from posted_count again.
+    // The default implementation derives the tristate from the legacy contract,
+    // which keeps every existing adapter correct without an override.
+    virtual Status post(const JettyPtr& jetty,
+                        const std::vector<WorkRequest>& requests,
+                        size_t& posted_count, PostAcceptance& acceptance) {
+        const Status status = post(jetty, requests, posted_count);
+        acceptance =
+            classifyPostAcceptance(status, posted_count, requests.size());
+        return status;
+    }
+
+    // RM variant of the tristate post, used by the pooled data path when the
+    // lease member is an RM Jetty: the WR must reference the endpoint's
+    // imported target and the acceptance classification is identical.
+    virtual Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                        const WorkRequest& request, size_t& posted_count,
+                        PostAcceptance& acceptance) {
+        const Status status = post(jetty, target, request, posted_count);
+        if (status.IsNotImplemented()) {
+            // The adapter has no RM path at all: nothing was posted, but this
+            // is a hard configuration error, not a business rejection.
+            // Classifying it as Unknown keeps the record off the rollback+retry
+            // path and lets the fence settle it (rm_pool also rejects such a
+            // device at install, review minor).
+            posted_count = 0;
+            acceptance = PostAcceptance::kUnknown;
+            return status;
+        }
+        acceptance = classifyPostAcceptance(status, posted_count, 1);
+        return status;
+    }
+
     virtual Status poll(const JfcPtr& jfc, size_t max_completions,
                         std::vector<Completion>& completions) = 0;
 };

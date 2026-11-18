@@ -9,6 +9,7 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/ub/probe_resources.h"
 
 namespace mooncake::tent {
 
@@ -27,9 +28,23 @@ struct UbSubBatch final : public Transport::SubBatch {
 // TENT-native UB transport. The implementation owns its task/slice scheduler,
 // endpoint store and URMA resources; it never converts requests to Classic TE
 // types or calls the Classic UbTransport/UbWorkerPool data path.
+namespace ub {
+class ProbePeerDescriptorSource;
+}  // namespace ub
+
 class UbTransport final : public Transport {
    public:
-    explicit UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter = nullptr);
+    // probe_provider/probe_poster are the W1 seam for the pooling-side
+    // resources. When transports/ub/probe/enabled is set and they are null,
+    // probe/provider=standalone builds them from the local contexts; that mode
+    // also needs probe_peer_source, which must outlive the transport. With
+    // probe/provider=pool (default), missing provider/poster fails installation
+    // instead of silently degrading to "no probing" (design §12.3).
+    explicit UbTransport(
+        std::shared_ptr<ub::UrmaAdapter> adapter = nullptr,
+        std::shared_ptr<ub::ProbeResourceProvider> probe_provider = nullptr,
+        std::shared_ptr<ub::ProbePoster> probe_poster = nullptr,
+        ub::ProbePeerDescriptorSource* probe_peer_source = nullptr);
     ~UbTransport() override;
 
     UbTransport(const UbTransport&) = delete;

@@ -4,6 +4,7 @@
 #include "tent/transport/ub/context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <limits>
 
@@ -17,13 +18,33 @@ uint64_t steadyNowNs() noexcept {
             .count());
 }
 
+// Starts at 1 on purpose: a PoolKey never leaves the process - the pool that
+// consumes it lives in this process - so process uniqueness is the whole
+// requirement. A cross-process value would need a random seed and buy nothing.
+std::atomic<uint64_t> g_next_context_incarnation{1};
+
 }  // namespace
+
+uint64_t UbContext::allocateIncarnation() noexcept {
+    return g_next_context_incarnation.fetch_add(1, std::memory_order_relaxed);
+}
 
 UbContext::UbContext(Topology::NicID topology_id, DeviceInfo device,
                      std::shared_ptr<UrmaAdapter> adapter)
     : topology_id_(topology_id),
       device_(std::move(device)),
-      adapter_(std::move(adapter)) {}
+      adapter_(std::move(adapter)),
+      incarnation_(allocateIncarnation()) {}
+
+void UbContext::attachPooledSendPool(std::shared_ptr<SendJettyPool> pool) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    pooled_send_pool_ = std::move(pool);
+}
+
+std::shared_ptr<SendJettyPool> UbContext::pooledSendPool() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return pooled_send_pool_;
+}
 
 UbContext::~UbContext() { (void)shutdown(); }
 
@@ -97,6 +118,17 @@ Status UbContext::shutdownLocked() {
     state_.store(State::kDraining, std::memory_order_release);
 
     Status first_error = Status::OK();
+    // W3 M8: the pooled send Jetties are children of this context's JFCs.
+    // Drain them before the first JFC is deleted, otherwise a direct
+    // context->shutdown() (teardown, failed install, tests) deletes a JFC while
+    // a pooled member still references it. beginStop()/drainIdle()/
+    // drainQuarantined() are idempotent, so the workers-driven shutdown path
+    // having already drained the pool is harmless.
+    if (pooled_send_pool_) {
+        pooled_send_pool_->beginStop();
+        (void)pooled_send_pool_->drainIdle();
+        (void)pooled_send_pool_->drainQuarantined();
+    }
     for (size_t index = jfcs_.size(); index > 0;) {
         --index;
         auto& jfc = jfcs_[index];
